@@ -94,43 +94,62 @@ class OpenCodeBackend:
     # -- event streaming -----------------------------------------------------
 
     async def subscribe_events(self, session_id: str) -> AsyncIterator[AgentEvent]:
-        """Yield typed ``AgentEvent`` objects from the OpenCode SSE stream."""
+        """Yield typed ``AgentEvent`` objects from the OpenCode SSE stream.
+
+        Tracks the current message-part type (``reasoning`` vs ``text``)
+        via ``message.part.updated`` events so that ``message.part.delta``
+        events — which always arrive with ``field="text"`` — are correctly
+        routed to ``ReasoningDelta`` or ``TextDelta``.
+        """
+        current_part = "text"
         async for raw in self._oc.subscribe_events(session_id):
-            for ev in self._convert(raw, session_id):
+            etype = raw.get("type", "")
+
+            if etype == "message.part.updated":
+                part = raw.get("properties", {}).get("part", {})
+                ptype = part.get("type", "")
+                if ptype in ("reasoning", "text"):
+                    current_part = ptype
+
+            for ev in self._convert(raw, session_id, current_part):
                 yield ev
 
     @staticmethod
-    def _convert(raw: dict, session_id: str) -> list[AgentEvent]:
+    def _convert(
+        raw: dict,
+        session_id: str,
+        current_part: str = "text",
+    ) -> list[AgentEvent]:
         etype = raw.get("type", "")
         props = raw.get("properties", {})
         out: list[AgentEvent] = []
 
         if etype == "message.part.delta":
             delta = props.get("delta", "")
-            field = props.get("field", "")
-            if delta and field in ("text", ""):
-                out.append(TextDelta(text=delta))
-            elif delta and field == "reasoning":
-                out.append(ReasoningDelta(text=delta))
+            if delta:
+                if current_part == "reasoning":
+                    out.append(ReasoningDelta(text=delta))
+                else:
+                    out.append(TextDelta(text=delta))
 
         elif etype == "message.part.updated":
-            if props.get("type") != "tool-invocation":
-                return out
-            state = props.get("state", "")
-            name = props.get("toolName", "unknown")
-            call_id = props.get("callID", props.get("id", ""))
-            if state == "running":
-                out.append(ToolStart(name=name, call_id=call_id))
-            elif state in ("completed", "result"):
-                out.append(ToolEnd(
-                    name=name, call_id=call_id, state="completed",
-                    title=props.get("title", ""),
-                ))
-            elif state == "error":
-                out.append(ToolEnd(
-                    name=name, call_id=call_id, state="error",
-                    error=props.get("error", ""),
-                ))
+            part = props.get("part", props)
+            if part.get("type") == "tool-invocation":
+                state = part.get("state", "")
+                name = part.get("toolName", "unknown")
+                call_id = part.get("callID", part.get("id", ""))
+                if state == "running":
+                    out.append(ToolStart(name=name, call_id=call_id))
+                elif state in ("completed", "result"):
+                    out.append(ToolEnd(
+                        name=name, call_id=call_id, state="completed",
+                        title=part.get("title", ""),
+                    ))
+                elif state == "error":
+                    out.append(ToolEnd(
+                        name=name, call_id=call_id, state="error",
+                        error=part.get("error", ""),
+                    ))
 
         elif etype == "session.idle":
             out.append(SessionIdle())
