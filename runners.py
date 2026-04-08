@@ -1,0 +1,340 @@
+"""SessionRunner — per-session state machine using protocol abstractions.
+
+Drives one agent session ↔ one messenger chat/thread pair.
+All interactions go through Messenger and AgentBackend protocols —
+no Telegram or OpenCode imports.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Callable, Coroutine, Any, Optional
+
+from . import config
+from .formatter import split_chunks
+from .protocols import (
+    AgentBackend,
+    AgentEvent,
+    MessagePart,
+    Messenger,
+    ModelRef,
+    PermissionRequest,
+    ReasoningDelta,
+    SessionError,
+    SessionIdle,
+    StatusUpdate,
+    TextDelta,
+    ToolEnd,
+    ToolStart,
+)
+
+log = logging.getLogger(__name__)
+
+STATES = ("warmup", "idle", "generating", "sleeping", "reconnecting", "error")
+
+
+def _html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+LongContentHandler = Callable[[str, str], Coroutine[Any, Any, str]]
+
+
+class SessionRunner:
+    """Drives one agent session ↔ one messenger conversation."""
+
+    def __init__(
+        self,
+        session_id: str,
+        chat_id: str,
+        thread_id: Optional[str],
+        agent: AgentBackend,
+        messenger: Messenger,
+        *,
+        long_content_handler: Optional[LongContentHandler] = None,
+    ):
+        self.session_id = session_id
+        self.chat_id = chat_id
+        self.thread_id = thread_id
+        self.agent = agent
+        self.messenger = messenger
+        self._long_content = long_content_handler
+
+        self.state: str = "warmup"
+        self.last_active: float = time.monotonic()
+        self.sse_task: Optional[asyncio.Task] = None
+        self.typing_task: Optional[asyncio.Task] = None
+
+        self._msg_id: Optional[str] = None
+        self._accumulated_text: str = ""
+        self._last_edit_at: float = 0.0
+        self._pending_edit: Optional[asyncio.Task] = None
+        self._last_sent_text: str = ""
+        self._stream_parse_mode: Optional[str] = None
+
+        self._reasoning_text: str = ""
+        self._in_reasoning: bool = False
+
+        self.tool_msgs: dict[str, str] = {}
+        self.pending_permissions: dict[str, str] = {}
+
+    # -- public API ---------------------------------------------------------
+
+    async def wake_and_prompt(
+        self,
+        parts: list[MessagePart],
+        model: Optional[ModelRef] = None,
+    ) -> None:
+        self.last_active = time.monotonic()
+
+        if self.state == "sleeping":
+            self.state = "reconnecting"
+            await self.messenger.send_message(self.chat_id, "\U0001f504 Reconnecting\u2026", self.thread_id)
+
+        if self.sse_task is None or self.sse_task.done():
+            self.sse_task = asyncio.create_task(self._sse_loop())
+
+        self.state = "generating"
+        self._accumulated_text = ""
+        self._last_sent_text = ""
+        self._last_edit_at = 0.0
+        self._stream_parse_mode = None
+        self._reasoning_text = ""
+        self._in_reasoning = False
+
+        self._msg_id = await self.messenger.send_message(self.chat_id, "\u2699\ufe0f", self.thread_id)
+        self._start_typing()
+
+        try:
+            await self.agent.send_prompt(self.session_id, parts, model)
+        except Exception as exc:
+            log.error("send_prompt failed: %s", exc)
+            if self._msg_id:
+                await self.messenger.edit_message(self.chat_id, self._msg_id, f"\u274c {exc}")
+            self.state = "error"
+
+    async def close_sse(self) -> None:
+        self._stop_typing()
+        if self.sse_task and not self.sse_task.done():
+            self.sse_task.cancel()
+            try:
+                await self.sse_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.sse_task = None
+        self.state = "sleeping"
+
+    async def reconnect(self) -> None:
+        self.state = "reconnecting"
+        if self.sse_task and not self.sse_task.done():
+            self.sse_task.cancel()
+        self.sse_task = asyncio.create_task(self._sse_loop())
+
+    async def shutdown(self) -> None:
+        self._stop_typing()
+        if self.sse_task and not self.sse_task.done():
+            self.sse_task.cancel()
+            try:
+                await self.sse_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # -- SSE loop -----------------------------------------------------------
+
+    async def _sse_loop(self) -> None:
+        try:
+            async for event in self.agent.subscribe_events(self.session_id):
+                self.last_active = time.monotonic()
+                await self._handle_event(event)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.error("SSE loop crashed: %s", exc)
+            self.state = "error"
+
+    # -- event dispatch -----------------------------------------------------
+
+    _REASONING_TAIL = 600
+
+    async def _handle_event(self, event: AgentEvent) -> None:
+        if isinstance(event, ReasoningDelta):
+            self._in_reasoning = True
+            self._reasoning_text += event.text
+            tail = self._reasoning_text[-self._REASONING_TAIL:]
+            if len(self._reasoning_text) > self._REASONING_TAIL:
+                tail = "\u2026" + tail
+            escaped = _html_escape(tail)
+            self._accumulated_text = f"\U0001f4ad <i>{escaped}</i>"
+            self._stream_parse_mode = "HTML"
+            await self._throttled_edit()
+
+        elif isinstance(event, TextDelta):
+            if self._in_reasoning:
+                self._in_reasoning = False
+                self._accumulated_text = ""
+                self._last_sent_text = ""
+                self._stream_parse_mode = None
+            self._accumulated_text += event.text
+            await self._throttled_edit()
+
+        elif isinstance(event, ToolStart):
+            mid = await self.messenger.send_message(
+                self.chat_id, f"\U0001f527 `{event.name}`\u2026",
+                self.thread_id, parse_mode="Markdown",
+            )
+            if event.call_id:
+                self.tool_msgs[event.call_id] = mid
+
+        elif isinstance(event, ToolEnd):
+            mid = self.tool_msgs.pop(event.call_id, None)
+            if mid:
+                if event.state == "completed":
+                    label = f"\u2705 `{event.name}`"
+                    if event.title:
+                        label += f" \u2014 {event.title}"
+                else:
+                    label = f"\u274c `{event.name}`"
+                    if event.error:
+                        label += f" \u2014 {event.error}"
+                max_len = self.messenger.max_message_length
+                await self.messenger.edit_message(
+                    self.chat_id, mid, label[:max_len], parse_mode="Markdown",
+                )
+
+        elif isinstance(event, PermissionRequest):
+            if event.info.id in self.pending_permissions:
+                return
+            mid = await self.messenger.send_permission_request(
+                self.chat_id, self.thread_id, event.info,
+            )
+            self.pending_permissions[event.info.id] = mid
+
+        elif isinstance(event, SessionIdle):
+            self.pending_permissions.clear()
+            await self._finalize_response()
+
+        elif isinstance(event, SessionError):
+            self._stop_typing()
+            if self._msg_id:
+                max_len = self.messenger.max_message_length
+                await self.messenger.edit_message(
+                    self.chat_id, self._msg_id,
+                    f"\u274c {event.error}"[:max_len],
+                )
+            self.state = "error"
+
+        elif isinstance(event, StatusUpdate):
+            if event.status == "idle":
+                await self._finalize_response()
+            elif event.status == "busy":
+                self.state = "generating"
+            elif event.status == "retry":
+                log.info("session %s: %s", self.session_id, event.message)
+
+    # -- streaming edits (throttled) ----------------------------------------
+
+    async def _throttled_edit(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_edit_at
+        if elapsed >= config.EDIT_INTERVAL_SECONDS:
+            await self._do_edit()
+        elif self._pending_edit is None or self._pending_edit.done():
+            delay = config.EDIT_INTERVAL_SECONDS - elapsed
+            self._pending_edit = asyncio.create_task(self._delayed_edit(delay))
+
+    async def _delayed_edit(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await self._do_edit()
+
+    async def _do_edit(self) -> None:
+        if not self._msg_id or not self._accumulated_text:
+            return
+        text = self._accumulated_text
+        if text == self._last_sent_text:
+            return
+        self._last_sent_text = text
+        self._last_edit_at = time.monotonic()
+        max_len = self.messenger.max_message_length
+        await self.messenger.edit_message(
+            self.chat_id, self._msg_id, text[:max_len],
+            parse_mode=self._stream_parse_mode,
+        )
+
+    # -- finalize (session idle) --------------------------------------------
+
+    async def _finalize_response(self) -> None:
+        self._stop_typing()
+        if self._in_reasoning:
+            self._in_reasoning = False
+            self._accumulated_text = ""
+            self._last_sent_text = ""
+        if self._pending_edit and not self._pending_edit.done():
+            self._pending_edit.cancel()
+
+        text = self._accumulated_text
+        if not text.strip():
+            if self._msg_id:
+                await self.messenger.edit_message(self.chat_id, self._msg_id, "(empty response)")
+            self._reset_editor()
+            self.state = "idle"
+            return
+
+        max_len = self.messenger.max_message_length
+        chunks = split_chunks(text, max_len)
+
+        if len(chunks) <= config.MAX_MESSAGE_CHUNKS:
+            await self._send_chunks(chunks)
+        else:
+            if self._long_content:
+                first_line = text.split("\n", 1)[0][:120] or "Response"
+                try:
+                    url = await self._long_content(first_line, text)
+                    if self._msg_id:
+                        await self.messenger.edit_message(
+                            self.chat_id, self._msg_id,
+                            f"\U0001f4c4 [Full response]({url})",
+                            parse_mode="Markdown",
+                        )
+                    self._reset_editor()
+                    self.state = "idle"
+                    return
+                except Exception as exc:
+                    log.warning("long content handler failed, falling back: %s", exc)
+            await self._send_chunks(chunks[:config.MAX_MESSAGE_CHUNKS + 2])
+
+        self._reset_editor()
+        self.state = "idle"
+
+    async def _send_chunks(self, chunks: list[str]) -> None:
+        if self._msg_id and chunks:
+            ok = await self.messenger.edit_message(
+                self.chat_id, self._msg_id, chunks[0], parse_mode="Markdown",
+            )
+            if not ok:
+                await self.messenger.edit_message(self.chat_id, self._msg_id, chunks[0])
+        for chunk in chunks[1:]:
+            await self.messenger.send_message(self.chat_id, chunk, self.thread_id)
+
+    def _reset_editor(self) -> None:
+        self._accumulated_text = ""
+        self._msg_id = None
+
+    # -- typing indicator ---------------------------------------------------
+
+    def _start_typing(self) -> None:
+        self._stop_typing()
+        self.typing_task = asyncio.create_task(self._typing_loop())
+
+    def _stop_typing(self) -> None:
+        if self.typing_task and not self.typing_task.done():
+            self.typing_task.cancel()
+        self.typing_task = None
+
+    async def _typing_loop(self) -> None:
+        try:
+            while True:
+                await self.messenger.send_typing(self.chat_id, self.thread_id)
+                await asyncio.sleep(config.TYPING_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            pass
