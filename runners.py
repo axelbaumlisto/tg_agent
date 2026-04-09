@@ -81,7 +81,10 @@ class SessionRunner:
         self._in_reasoning: bool = False
         self._reasoning_start: float = 0.0
 
-        self.tool_msgs: dict[str, str] = {}
+        self._response_text: str = ""
+        self._tool_lines: dict[str, str] = {}
+        self._tool_order: list[str] = []
+
         self.pending_permissions: dict[str, str] = {}
         self.pending_questions: dict[str, QuestionRequest] = {}
 
@@ -99,9 +102,7 @@ class SessionRunner:
     ) -> None:
         self.last_active = time.monotonic()
 
-        if self.state == "sleeping":
-            self.state = "reconnecting"
-            await self.messenger.send_message(self.chat_id, "\U0001f504 Reconnecting\u2026", self.thread_id)
+        reconnecting = self.state == "sleeping"
 
         if self.sse_task is None or self.sse_task.done():
             self.sse_task = asyncio.create_task(self._sse_loop())
@@ -114,8 +115,12 @@ class SessionRunner:
         self._reasoning_text = ""
         self._in_reasoning = False
         self._reasoning_start = 0.0
+        self._response_text = ""
+        self._tool_lines.clear()
+        self._tool_order.clear()
 
-        self._msg_id = await self.messenger.send_message(self.chat_id, "\u2699\ufe0f", self.thread_id)
+        placeholder = "\U0001f504 Reconnecting\u2026" if reconnecting else "\u2699\ufe0f"
+        self._msg_id = await self.messenger.send_message(self.chat_id, placeholder, self.thread_id)
         self._start_typing()
 
         preview = "; ".join(p.text[:60] if hasattr(p, "text") else str(p)[:60] for p in parts)
@@ -197,54 +202,62 @@ class SessionRunner:
             self._reasoning_start = time.monotonic()
         self._in_reasoning = True
         self._reasoning_text += event.text
-        tail = self._reasoning_text[-self._REASONING_TAIL:]
-        if len(self._reasoning_text) > self._REASONING_TAIL:
-            tail = "\u2026" + tail
-        escaped = html_escape(tail)
-        self._accumulated_text = f"\U0001f4ad <i>{escaped}</i>"
-        self._stream_parse_mode = "HTML"
+        self._rebuild_composite()
         await self._throttled_edit()
 
     async def _on_text(self, event: TextDelta) -> None:
         if self._in_reasoning:
             self._in_reasoning = False
-            self._accumulated_text = ""
-            self._last_sent_text = ""
-            self._stream_parse_mode = None
-        self._accumulated_text += event.text
+        self._response_text += event.text
+        self._rebuild_composite()
         await self._throttled_edit()
 
     async def _on_tool_start(self, event: ToolStart) -> None:
-        mid = await self.messenger.send_message(
-            self.chat_id, f"\U0001f527 `{event.name}`\u2026",
-            self.thread_id, parse_mode="Markdown",
-        )
-        if event.call_id:
-            self.tool_msgs[event.call_id] = mid
+        cid = event.call_id or f"_anon_{len(self._tool_order)}"
+        self._tool_lines[cid] = f"\U0001f527 <b>{html_escape(event.name)}</b>\u2026"
+        if cid not in self._tool_order:
+            self._tool_order.append(cid)
+        self._rebuild_composite()
+        await self._throttled_edit()
 
     async def _on_tool_end(self, event: ToolEnd) -> None:
-        mid = self.tool_msgs.pop(event.call_id, None)
-        if mid:
-            name_esc = html_escape(event.name)
-            if event.state == "completed":
-                label = f"\u2705 <b>{name_esc}</b>"
-                if event.title:
-                    label += f" \u2014 {html_escape(event.title)}"
-                if event.output:
-                    preview = event.output.strip()[:300]
-                    if len(event.output.strip()) > 300:
-                        preview += "\u2026"
-                    label += f"\n<pre>{html_escape(preview)}</pre>"
-            else:
-                label = f"\u274c <b>{name_esc}</b>"
-                if event.error:
-                    label += f" \u2014 {html_escape(event.error)}"
-            max_len = self.messenger.max_message_length
-            await self.messenger.edit_message(
-                self.chat_id, mid, label[:max_len], parse_mode="HTML",
-            )
+        cid = event.call_id
+        name_esc = html_escape(event.name)
+        if event.state == "completed":
+            label = f"\u2705 <b>{name_esc}</b>"
+            if event.title:
+                label += f" \u2014 {html_escape(event.title[:80])}"
+        else:
+            label = f"\u274c <b>{name_esc}</b>"
+            if event.error:
+                label += f" \u2014 {html_escape(event.error[:80])}"
+        self._tool_lines[cid] = label
+        self._rebuild_composite()
+        await self._throttled_edit()
         if event.state == "completed" and event.name in ("write", "save"):
             await self._try_deliver_file(event.title)
+
+    def _rebuild_composite(self) -> None:
+        """Build a single message from reasoning + tools + response text."""
+        parts: list[str] = []
+
+        if self._in_reasoning and self._reasoning_text:
+            tail = self._reasoning_text[-self._REASONING_TAIL:]
+            if len(self._reasoning_text) > self._REASONING_TAIL:
+                tail = "\u2026" + tail
+            parts.append(f"\U0001f4ad <i>{html_escape(tail)}</i>")
+
+        last_tools = self._tool_order[-5:]
+        for cid in last_tools:
+            line = self._tool_lines.get(cid, "")
+            if line:
+                parts.append(line)
+
+        if self._response_text:
+            parts.append(self._response_text)
+
+        self._accumulated_text = "\n".join(parts) if parts else "\u2699\ufe0f"
+        self._stream_parse_mode = "HTML" if (self._in_reasoning or self._tool_lines) and not self._response_text else None
 
     async def _on_permission(self, event: PermissionRequest) -> None:
         if event.info.id in self.pending_permissions:
@@ -359,14 +372,11 @@ class SessionRunner:
 
     async def _finalize_response(self) -> None:
         self._stop_typing()
-        if self._in_reasoning:
-            self._in_reasoning = False
-            self._accumulated_text = ""
-            self._last_sent_text = ""
+        self._in_reasoning = False
         if self._pending_edit and not self._pending_edit.done():
             self._pending_edit.cancel()
 
-        text = self._accumulated_text
+        text = self._response_text or self._accumulated_text
         if not text.strip():
             if self._msg_id:
                 await self.messenger.edit_message(self.chat_id, self._msg_id, "(empty response)")
@@ -445,6 +455,9 @@ class SessionRunner:
 
     def _reset_editor(self) -> None:
         self._accumulated_text = ""
+        self._response_text = ""
+        self._tool_lines.clear()
+        self._tool_order.clear()
         self._msg_id = None
 
     # -- file delivery -------------------------------------------------------

@@ -23,7 +23,8 @@ from opencode_tg.runners import SessionRunner
 from opencode_tg.session_manager import SessionManager
 from opencode_tg.protocols import (
     MessagePart, PermissionInfo, PermissionRequest,
-    QuestionRequest, SessionIdle, ToolEnd,
+    QuestionRequest, ReasoningDelta, SessionIdle,
+    TextDelta, ToolEnd, ToolStart,
 )
 from opencode_tg import commands
 
@@ -193,7 +194,7 @@ class TestRunnerFileDelivery(unittest.IsolatedAsyncioTestCase):
             directory="/tmp",
         )
         runner.state = "generating"
-        runner.tool_msgs["c1"] = "tool_msg_1"
+        runner._msg_id = "main_msg"
 
         with tempfile.NamedTemporaryFile(suffix=".py", dir="/tmp", delete=False) as f:
             f.write(b"print(1)\n")
@@ -888,7 +889,7 @@ class TestRunnerQuestionHandling(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 class TestToolEndOutput(unittest.IsolatedAsyncioTestCase):
-    async def test_tool_end_shows_output(self):
+    async def test_tool_end_shows_status_in_composite(self):
         agent = AsyncMock()
         messenger = AsyncMock()
         messenger.max_message_length = 4096
@@ -899,17 +900,25 @@ class TestToolEndOutput(unittest.IsolatedAsyncioTestCase):
             agent, messenger,
         )
         runner.state = "generating"
-        runner.tool_msgs["c1"] = "tool_msg_1"
+        runner._msg_id = "main_msg"
 
-        event = ToolEnd(
+        start = ToolStart(name="bash", call_id="c1")
+        await runner.handle_event(start)
+
+        composite = runner._accumulated_text
+        self.assertIn("bash", composite)
+        self.assertIn("\U0001f527", composite)
+
+        end = ToolEnd(
             name="bash", call_id="c1", state="completed",
             title="ls -la", output="total 42\ndrwxr-xr-x ...",
         )
-        await runner.handle_event(event)
+        await runner.handle_event(end)
 
-        msg = messenger.edit_message.call_args[0][2]
-        self.assertIn("bash", msg)
-        self.assertIn("total 42", msg)
+        composite = runner._accumulated_text
+        self.assertIn("bash", composite)
+        self.assertIn("\u2705", composite)
+        self.assertIn("ls -la", composite)
 
 
 # ---------------------------------------------------------------------------
@@ -1122,6 +1131,67 @@ class TestSummarizeError(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         all_texts = " ".join(str(c) for c in messenger.send_message.call_args_list)
         self.assertIn("Summarize failed", all_texts)
+
+
+# ---------------------------------------------------------------------------
+# Single-message composite: reasoning → tools → response
+# ---------------------------------------------------------------------------
+
+class TestCompositeMessage(unittest.IsolatedAsyncioTestCase):
+    def _make_runner(self):
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        messenger.edit_message = AsyncMock(return_value=True)
+        runner = SessionRunner("ses_1", "chat_1", None, agent, messenger)
+        runner.state = "generating"
+        runner._msg_id = "main_msg"
+        return runner, messenger
+
+    async def test_reasoning_tools_response_single_message(self):
+        runner, messenger = self._make_runner()
+
+        await runner.handle_event(ReasoningDelta(text="Let me think..."))
+        self.assertIn("\U0001f4ad", runner._accumulated_text)
+        self.assertIn("think", runner._accumulated_text)
+
+        await runner.handle_event(ToolStart(name="bash", call_id="c1"))
+        self.assertIn("\U0001f527", runner._accumulated_text)
+        self.assertIn("bash", runner._accumulated_text)
+
+        await runner.handle_event(ToolEnd(name="bash", call_id="c1", state="completed", title="ls"))
+        self.assertIn("\u2705", runner._accumulated_text)
+
+        await runner.handle_event(TextDelta(text="Here is the result"))
+        self.assertIn("Here is the result", runner._accumulated_text)
+        self.assertNotIn("\U0001f4ad", runner._accumulated_text)
+
+        messenger.send_message.assert_not_called()
+
+    async def test_no_separate_messages_for_tools(self):
+        runner, messenger = self._make_runner()
+
+        await runner.handle_event(ToolStart(name="read", call_id="t1"))
+        await runner.handle_event(ToolStart(name="write", call_id="t2"))
+
+        messenger.send_message.assert_not_called()
+        self.assertIn("read", runner._accumulated_text)
+        self.assertIn("write", runner._accumulated_text)
+
+    async def test_finalize_uses_response_text(self):
+        runner, messenger = self._make_runner()
+
+        await runner.handle_event(ReasoningDelta(text="thinking..."))
+        await runner.handle_event(ToolStart(name="bash", call_id="c1"))
+        await runner.handle_event(ToolEnd(name="bash", call_id="c1", state="completed", title="ls"))
+        runner._response_text = "Final answer here"
+
+        await runner._finalize_response()
+
+        edit_text = messenger.edit_message.call_args[0][2]
+        self.assertIn("Final answer", edit_text)
+        self.assertNotIn("\U0001f527", edit_text)
+        self.assertEqual(runner.state, "idle")
 
 
 # ---------------------------------------------------------------------------
