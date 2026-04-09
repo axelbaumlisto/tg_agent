@@ -238,7 +238,18 @@ class SessionRunner:
             await self._try_deliver_file(event.title)
 
     def _rebuild_composite(self) -> None:
-        """Build a single message from reasoning + tools + response text."""
+        """Build a single message from reasoning + tools + streaming response.
+
+        Layout (all phases coexist, scrolling window of last 5 tools):
+            💭 <reasoning tail>
+            🔧 tool_a…
+            ✅ tool_b — title
+            🔧 tool_c…
+            ─────────
+            <response text so far>
+
+        On finalize, the entire message is replaced with the final response.
+        """
         parts: list[str] = []
 
         if self._in_reasoning and self._reasoning_text:
@@ -254,10 +265,13 @@ class SessionRunner:
                 parts.append(line)
 
         if self._response_text:
+            if parts:
+                parts.append("\u2500" * 12)
             parts.append(self._response_text)
 
         self._accumulated_text = "\n".join(parts) if parts else "\u2699\ufe0f"
-        self._stream_parse_mode = "HTML" if (self._in_reasoning or self._tool_lines) and not self._response_text else None
+        has_html = self._in_reasoning or self._tool_lines
+        self._stream_parse_mode = "HTML" if has_html and not self._response_text else None
 
     async def _on_permission(self, event: PermissionRequest) -> None:
         if event.info.id in self.pending_permissions:
@@ -367,6 +381,7 @@ class SessionRunner:
             self.chat_id, self._msg_id, text[:max_len],
             parse_mode=self._stream_parse_mode,
         )
+        await self.messenger.send_typing(self.chat_id, self.thread_id)
 
     # -- finalize (session idle) --------------------------------------------
 
