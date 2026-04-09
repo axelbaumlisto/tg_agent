@@ -117,7 +117,9 @@ class TelegramMessenger:
             action="typing",
         )
 
-    async def download_attachment(self, raw_attachment: dict) -> Attachment:
+    async def download_attachment(
+        self, raw_attachment: dict, *, target_dir: Optional[str] = None,
+    ) -> Attachment:
         file_id = raw_attachment["file_id"]
         mime = raw_attachment.get("mime", "application/octet-stream")
         filename = raw_attachment.get("filename", "file")
@@ -127,14 +129,20 @@ class TelegramMessenger:
         if not file_path:
             raise RuntimeError(f"getFile returned no file_path for {file_id}")
 
-        ext = Path(filename).suffix or _MIME_EXT.get(mime, "")
-        local_name = f"ab-tg-{uuid.uuid4().hex[:12]}{ext}"
-        local = Path("/tmp") / local_name
-
         http = await self._ensure_http()
         download_url = f"{TG_API}/file/bot{self._token}/{file_path}"
         async with http.get(download_url) as resp:
-            local.write_bytes(await resp.read())
+            content = await resp.read()
+
+        if target_dir and os.path.isdir(target_dir):
+            safe_name = Path(filename).name or "file"
+            local = Path(target_dir) / safe_name
+            local.write_bytes(content)
+        else:
+            ext = Path(filename).suffix or _MIME_EXT.get(mime, "")
+            local_name = f"ab-tg-{uuid.uuid4().hex[:12]}{ext}"
+            local = Path("/tmp") / local_name
+            local.write_bytes(content)
 
         log.debug("downloaded %s → %s", filename, local)
         return Attachment(mime=mime, filename=filename, local_path=local)
@@ -225,6 +233,13 @@ class TelegramMessenger:
             })
         if msg.get("voice"):
             refs.append({"file_id": msg["voice"]["file_id"], "mime": "audio/ogg", "filename": "voice.ogg"})
+        if msg.get("audio"):
+            audio = msg["audio"]
+            refs.append({
+                "file_id": audio["file_id"],
+                "mime": audio.get("mime_type", "audio/mpeg"),
+                "filename": audio.get("file_name", "audio.mp3"),
+            })
         return refs
 
     # -- file delivery -------------------------------------------------------

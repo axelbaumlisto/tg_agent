@@ -93,6 +93,9 @@ class OpenCodeBackend:
     async def session_todo(self, session_id: str, *, directory: Optional[str] = None) -> list[dict]:
         return await self._oc.session_todo(session_id, directory=directory)
 
+    async def summarize_session(self, session_id: str, *, directory: Optional[str] = None) -> str:
+        return await self._oc.summarize_session(session_id, directory=directory)
+
     # -- questions -----------------------------------------------------------
 
     async def reply_question(self, request_id: str, answers: list[dict], *, directory: Optional[str] = None) -> None:

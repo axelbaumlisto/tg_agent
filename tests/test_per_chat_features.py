@@ -323,20 +323,20 @@ class TestGitCommand(unittest.IsolatedAsyncioTestCase):
         msg_text = messenger.send_message.call_args[0][1]
         self.assertIn("Usage", msg_text)
 
-    async def test_git_status_sends_prompt(self):
+    async def test_git_status_direct_api(self):
         messenger = AsyncMock()
         manager = MagicMock()
-        manager.get_model = MagicMock(return_value=None)
-        manager.handle_message = AsyncMock()
+        manager.get_directory = MagicMock(return_value="/proj")
         agent = AsyncMock()
+        agent.vcs_get = AsyncMock(return_value={"branch": "main", "dirty": True})
 
         result = await commands.handle_command(
             "/git status", "123", "t1", messenger, manager, agent,
         )
         self.assertTrue(result)
-        manager.handle_message.assert_awaited_once()
-        parts = manager.handle_message.call_args[0][2]
-        self.assertIn("git status", parts[0].text)
+        agent.vcs_get.assert_awaited_once()
+        sent_text = messenger.send_message.call_args[0][1]
+        self.assertIn("main", sent_text)
 
 
 # ---------------------------------------------------------------------------
@@ -680,31 +680,47 @@ class TestFileCommands(unittest.IsolatedAsyncioTestCase):
         msg = messenger.send_message.call_args[0][1]
         self.assertIn("Usage", msg)
 
-    async def test_grep_sends_prompt(self):
+    async def test_grep_direct_api(self):
         messenger = AsyncMock()
         manager = MagicMock()
-        manager.get_directory = MagicMock(return_value=None)
-        manager.get_model = MagicMock(return_value=None)
-        manager.handle_message = AsyncMock()
+        manager.get_directory = MagicMock(return_value="/proj")
         agent = AsyncMock()
+        agent.find_text = AsyncMock(return_value=[
+            {"file": "main.py", "line": 10, "text": "hello world"},
+        ])
 
         result = await commands.handle_command("/grep hello", "123", None, messenger, manager, agent)
         self.assertTrue(result)
-        manager.handle_message.assert_awaited_once()
-        parts = manager.handle_message.call_args[0][2]
-        self.assertIn("hello", parts[0].text.lower())
+        agent.find_text.assert_awaited_once_with("hello", directory="/proj")
+        sent_text = messenger.send_message.call_args[0][1]
+        self.assertIn("main.py", sent_text)
 
-    async def test_find_sends_prompt(self):
+    async def test_grep_no_results(self):
         messenger = AsyncMock()
         manager = MagicMock()
         manager.get_directory = MagicMock(return_value=None)
-        manager.get_model = MagicMock(return_value=None)
-        manager.handle_message = AsyncMock()
         agent = AsyncMock()
+        agent.find_text = AsyncMock(return_value=[])
+
+        result = await commands.handle_command("/grep xyz", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        sent_text = messenger.send_message.call_args[0][1]
+        self.assertIn("No matches", sent_text)
+
+    async def test_find_direct_api(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value="/proj")
+        agent = AsyncMock()
+        agent.find_files = AsyncMock(return_value=[
+            {"file": "setup.py"}, {"file": "main.py"},
+        ])
 
         result = await commands.handle_command("/find *.py", "123", None, messenger, manager, agent)
         self.assertTrue(result)
-        manager.handle_message.assert_awaited_once()
+        agent.find_files.assert_awaited_once_with("*.py", directory="/proj")
+        sent_text = messenger.send_message.call_args[0][1]
+        self.assertIn("setup.py", sent_text)
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +910,312 @@ class TestToolEndOutput(unittest.IsolatedAsyncioTestCase):
         msg = messenger.edit_message.call_args[0][2]
         self.assertIn("bash", msg)
         self.assertIn("total 42", msg)
+
+
+# ---------------------------------------------------------------------------
+# /summarize command
+# ---------------------------------------------------------------------------
+
+class TestSummarizeCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_summarize_returns_text(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value="/proj")
+        agent = AsyncMock()
+        agent.summarize_session = AsyncMock(return_value="The session discussed X and Y.")
+
+        result = await commands.handle_command("/summarize", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.summarize_session.assert_awaited_once_with("ses_1", directory="/proj")
+        all_texts = [str(c) for c in messenger.send_message.call_args_list]
+        combined = " ".join(all_texts)
+        self.assertIn("X and Y", combined)
+
+    async def test_summarize_no_session(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/summarize", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        sent_text = messenger.send_message.call_args[0][1]
+        self.assertIn("No active session", sent_text)
+
+
+# ---------------------------------------------------------------------------
+# Document fallback for long /cat and /diff
+# ---------------------------------------------------------------------------
+
+class TestDocumentFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_cat_long_file_sends_document(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("x" * 5000)
+            tmp_path = f.name
+
+        try:
+            result = await commands.handle_command(f"/cat {tmp_path}", "123", None, messenger, manager, agent)
+            self.assertTrue(result)
+            messenger.send_document.assert_awaited_once()
+        finally:
+            os.unlink(tmp_path)
+
+    async def test_diff_long_sends_document(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.session_diff = AsyncMock(return_value="+" * 5000)
+
+        result = await commands.handle_command("/diff", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        messenger.send_document.assert_awaited_once()
+
+    async def test_cat_short_file_sends_inline(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write("short content")
+            tmp_path = f.name
+
+        try:
+            result = await commands.handle_command(f"/cat {tmp_path}", "123", None, messenger, manager, agent)
+            self.assertTrue(result)
+            messenger.send_document.assert_not_awaited()
+            sent_text = messenger.send_message.call_args[0][1]
+            self.assertIn("short content", sent_text)
+        finally:
+            os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Audio extraction in TelegramMessenger
+# ---------------------------------------------------------------------------
+
+class TestAudioExtraction(unittest.TestCase):
+    def test_audio_message_extracted(self):
+        from opencode_tg.messengers.telegram import TelegramMessenger
+        msg = {
+            "audio": {
+                "file_id": "aud_123",
+                "mime_type": "audio/mpeg",
+                "file_name": "song.mp3",
+                "duration": 180,
+            }
+        }
+        refs = TelegramMessenger._extract_attachment_refs(msg)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["file_id"], "aud_123")
+        self.assertEqual(refs[0]["mime"], "audio/mpeg")
+        self.assertEqual(refs[0]["filename"], "song.mp3")
+
+    def test_audio_defaults(self):
+        from opencode_tg.messengers.telegram import TelegramMessenger
+        msg = {"audio": {"file_id": "aud_456"}}
+        refs = TelegramMessenger._extract_attachment_refs(msg)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["mime"], "audio/mpeg")
+        self.assertEqual(refs[0]["filename"], "audio.mp3")
+
+    def test_voice_and_audio_separate(self):
+        from opencode_tg.messengers.telegram import TelegramMessenger
+        msg = {
+            "voice": {"file_id": "v1"},
+            "audio": {"file_id": "a1", "mime_type": "audio/mp4", "file_name": "clip.m4a"},
+        }
+        refs = TelegramMessenger._extract_attachment_refs(msg)
+        self.assertEqual(len(refs), 2)
+        file_ids = {r["file_id"] for r in refs}
+        self.assertEqual(file_ids, {"v1", "a1"})
+
+
+# ---------------------------------------------------------------------------
+# SessionManager.find_runner_for_question
+# ---------------------------------------------------------------------------
+
+class TestFindRunnerForQuestion(unittest.IsolatedAsyncioTestCase):
+    def _make_manager(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        tmp.write(b"{}")
+        tmp.close()
+        self._tmp_path = tmp.name
+
+        store = SessionStore(pathlib.Path(tmp.name))
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        messenger.name = "test"
+        from opencode_tg.session_manager import SessionManager
+        mgr = SessionManager(store, agent, messenger)
+        return mgr
+
+    def tearDown(self):
+        if hasattr(self, "_tmp_path"):
+            os.unlink(self._tmp_path)
+
+    async def test_finds_runner_with_pending_question(self):
+        from opencode_tg.protocols import QuestionRequest
+        mgr = self._make_manager()
+        runner = MagicMock()
+        runner.pending_questions = {"req_42": QuestionRequest("req_42", "ses_1", [])}
+        mgr._runners["chat_1"] = runner
+
+        found = mgr.find_runner_for_question("req_42")
+        self.assertIs(found, runner)
+
+    async def test_returns_none_when_not_found(self):
+        mgr = self._make_manager()
+        runner = MagicMock()
+        runner.pending_questions = {}
+        mgr._runners["chat_1"] = runner
+
+        self.assertIsNone(mgr.find_runner_for_question("req_nope"))
+
+
+# ---------------------------------------------------------------------------
+# /find no results
+# ---------------------------------------------------------------------------
+
+class TestFindNoResults(unittest.IsolatedAsyncioTestCase):
+    async def test_find_no_results(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.find_files = AsyncMock(return_value=[])
+
+        result = await commands.handle_command("/find *.xyz", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        sent_text = messenger.send_message.call_args[0][1]
+        self.assertIn("No files", sent_text)
+
+
+# ---------------------------------------------------------------------------
+# /summarize error handling
+# ---------------------------------------------------------------------------
+
+class TestSummarizeError(unittest.IsolatedAsyncioTestCase):
+    async def test_summarize_api_error(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.summarize_session = AsyncMock(side_effect=RuntimeError("API down"))
+
+        result = await commands.handle_command("/summarize", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        all_texts = " ".join(str(c) for c in messenger.send_message.call_args_list)
+        self.assertIn("Summarize failed", all_texts)
+
+
+# ---------------------------------------------------------------------------
+# Runner long response sends document
+# ---------------------------------------------------------------------------
+
+class TestRunnerLongResponseDocument(unittest.IsolatedAsyncioTestCase):
+    async def test_long_response_sent_as_document(self):
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        messenger.edit_message = AsyncMock(return_value=True)
+        messenger.send_document = AsyncMock(return_value="doc_msg_1")
+
+        runner = SessionRunner(
+            "ses_1", "chat_1", None,
+            agent, messenger,
+        )
+        runner.state = "generating"
+        runner._msg_id = "msg_1"
+        runner._accumulated_text = "x" * 20000
+
+        await runner._finalize_response()
+
+        messenger.send_document.assert_awaited_once()
+        self.assertEqual(runner.state, "idle")
+
+    async def test_long_response_falls_back_to_telegraph(self):
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        messenger.edit_message = AsyncMock(return_value=True)
+        messenger.send_document = AsyncMock(side_effect=RuntimeError("doc fail"))
+
+        telegraph_called = False
+        async def fake_telegraph(title, text):
+            nonlocal telegraph_called
+            telegraph_called = True
+            return "https://telegra.ph/test"
+
+        runner = SessionRunner(
+            "ses_1", "chat_1", None,
+            agent, messenger,
+            long_content_handler=fake_telegraph,
+        )
+        runner.state = "generating"
+        runner._msg_id = "msg_1"
+        runner._accumulated_text = "y" * 20000
+
+        await runner._finalize_response()
+
+        self.assertTrue(telegraph_called)
+        self.assertEqual(runner.state, "idle")
+
+
+# ---------------------------------------------------------------------------
+# File upload to project directory (bot.py integration)
+# ---------------------------------------------------------------------------
+
+class TestFileUploadToProjectDir(unittest.IsolatedAsyncioTestCase):
+    async def test_attachments_copied_to_project_dir(self):
+        from opencode_tg.bot import _handle_message
+        from opencode_tg.protocols import Attachment
+
+        with tempfile.TemporaryDirectory() as project_dir:
+            src = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+            src.write(b"print('hello')")
+            src.close()
+
+            msg = MagicMock()
+            msg.text = "check this"
+            msg.sender_id = "123"
+            msg.thread_id = None
+            msg.attachments = [Attachment(mime="text/x-python", filename="test.py", local_path=src.name)]
+
+            manager = MagicMock()
+            manager.get_directory = MagicMock(return_value=project_dir)
+            manager.get_model = MagicMock(return_value=None)
+            manager.handle_message = AsyncMock()
+
+            messenger = AsyncMock()
+            messenger.cleanup_attachment = MagicMock()
+
+            agent = AsyncMock()
+
+            await _handle_message(msg, manager, messenger, agent)
+
+            manager.handle_message.assert_awaited_once()
+            parts = manager.handle_message.call_args[0][2]
+            file_part = [p for p in parts if p.type == "file"][0]
+            self.assertIn(project_dir, file_part.url)
+            self.assertTrue(os.path.isfile(os.path.join(project_dir, "test.py")))
+
+            os.unlink(src.name)
 
 
 if __name__ == "__main__":

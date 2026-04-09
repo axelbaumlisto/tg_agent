@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 
 from . import config
@@ -57,19 +58,65 @@ async def _handle_command(msg, messenger, manager, agent):
         )
 
 
-async def _handle_message(msg, manager, messenger):
+import re
+import shutil
+
+_QUESTION_RE = re.compile(r"^q:([^:]+):(.+)$", re.DOTALL)
+
+
+async def _try_question_reply(msg, manager, agent, messenger) -> bool:
+    """Handle ``q:<request_id>:<answer>`` replies. Returns True if consumed."""
+    if not msg.text:
+        return False
+    m = _QUESTION_RE.match(msg.text.strip())
+    if not m:
+        return False
+    request_id, answer = m.group(1), m.group(2).strip()
+    runner = manager.find_runner_for_question(request_id)
+    if not runner:
+        await messenger.send_message(msg.sender_id, "\u274c Question not found or expired.", msg.thread_id)
+        return True
+    event = runner.pending_questions.pop(request_id)
+    answers = []
+    for q in event.questions:
+        answers.append({"id": q.get("id", ""), "value": answer})
+    directory = runner.directory
+    try:
+        await agent.reply_question(request_id, answers, directory=directory)
+        await messenger.send_message(msg.sender_id, f"\u2705 Answer sent.", msg.thread_id)
+    except Exception as exc:
+        await messenger.send_message(msg.sender_id, f"\u274c Reply failed: {exc}", msg.thread_id)
+    return True
+
+
+async def _handle_message(msg, manager, messenger, agent):
+    if msg.text and await _try_question_reply(msg, manager, agent, messenger):
+        return
+
     if msg.text and await try_model_selection(
         msg.text, msg.sender_id, msg.thread_id, messenger, manager,
     ):
         return
 
+    project_dir = manager.get_directory(msg.sender_id, msg.thread_id)
+
     parts: list[MessagePart] = []
+    copied_paths: list[str] = []
     if msg.text:
         parts.append(MessagePart(type="text", text=msg.text))
     for att in msg.attachments:
+        local = str(att.local_path)
+        if project_dir and os.path.isdir(project_dir):
+            dest = os.path.join(project_dir, att.filename)
+            try:
+                shutil.copy2(local, dest)
+                copied_paths.append(dest)
+                local = dest
+            except OSError as exc:
+                log.warning("copy to project dir failed: %s", exc)
         parts.append(MessagePart(
             type="file", mime=att.mime,
-            filename=att.filename, url=f"file://{att.local_path}",
+            filename=att.filename, url=f"file://{local}",
         ))
     if not parts:
         return
@@ -125,7 +172,7 @@ async def main() -> None:
             elif msg.is_command:
                 asyncio.create_task(_handle_command(msg, messenger, manager, agent))
             else:
-                asyncio.create_task(_handle_message(msg, manager, messenger))
+                asyncio.create_task(_handle_message(msg, manager, messenger, agent))
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("shutting down...")
     finally:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, TYPE_CHECKING
@@ -33,7 +34,8 @@ ALL_COMMANDS = (
     "/reset /new /stop /undo /redo\n"
     "/model /models /id /project /approve\n"
     "/diff /git /files /cat /grep /find\n"
-    "/history /sessions /todo /agent /tools"
+    "/history /sessions /todo /summarize\n"
+    "/agent /tools"
 )
 
 
@@ -69,6 +71,27 @@ async def _require_session(ctx: CommandContext) -> Optional[str]:
     if not sid:
         await ctx.messenger.send_message(ctx.chat_id, "No active session.", ctx.thread_id)
     return sid
+
+
+_DOC_THRESHOLD = 3500
+
+
+async def _send_as_document(ctx: CommandContext, content: str, filename: str, caption: str = "") -> None:
+    """Write *content* to a temp file and send as a Telegram document."""
+    suffix = os.path.splitext(filename)[1] or ".txt"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, prefix="oc-tg-", delete=False) as f:
+        f.write(content)
+        tmp_path = f.name
+    try:
+        await ctx.messenger.send_document(
+            ctx.chat_id, tmp_path, ctx.thread_id,
+            caption=caption or filename,
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 async def _delegate_prompt(ctx: CommandContext, prompt_text: str) -> bool:
@@ -265,12 +288,12 @@ async def _handle_diff(ctx: CommandContext) -> bool:
             ctx.chat_id, "\U0001f4ad No pending changes for this session.", ctx.thread_id,
         )
         return True
-    max_len = ctx.messenger.max_message_length - 20
-    if len(content) > max_len:
-        content = content[:max_len] + "\n\u2026(truncated)"
-    await ctx.messenger.send_message(
-        ctx.chat_id, f"```diff\n{content}\n```", ctx.thread_id, parse_mode="Markdown",
-    )
+    if len(content) > _DOC_THRESHOLD:
+        await _send_as_document(ctx, content, "changes.diff", caption="Session diff")
+    else:
+        await ctx.messenger.send_message(
+            ctx.chat_id, f"```diff\n{content}\n```", ctx.thread_id, parse_mode="Markdown",
+        )
     return True
 
 
@@ -310,6 +333,37 @@ async def _handle_git(ctx: CommandContext) -> bool:
             parse_mode="Markdown",
         )
         return True
+    if ctx.args.strip().lower() == "status":
+        try:
+            vcs = await ctx.agent.vcs_get(directory=ctx.directory)
+            branch = vcs.get("branch", vcs.get("head", "?"))
+            dirty = vcs.get("dirty", False)
+            ahead = vcs.get("ahead", 0)
+            behind = vcs.get("behind", 0)
+            lines = [f"\U0001f4e6 Branch: `{branch}`"]
+            if dirty:
+                lines.append("  Modified (dirty)")
+            if ahead:
+                lines.append(f"  Ahead: {ahead}")
+            if behind:
+                lines.append(f"  Behind: {behind}")
+            changes = vcs.get("changes", vcs.get("files", []))
+            if isinstance(changes, list):
+                for f in changes[:20]:
+                    if isinstance(f, dict):
+                        path = f.get("path", f.get("file", "?"))
+                        status = f.get("status", "?")
+                        lines.append(f"  {status:10s} {path}")
+                    else:
+                        lines.append(f"  {f}")
+                if len(changes) > 20:
+                    lines.append(f"  \u2026and {len(changes) - 20} more")
+            await ctx.messenger.send_message(
+                ctx.chat_id, "\n".join(lines), ctx.thread_id, parse_mode="Markdown",
+            )
+            return True
+        except Exception as exc:
+            log.debug("vcs_get failed, falling back to prompt: %s", exc)
     return await _delegate_prompt(ctx, f"Run this git command and show the output: git {ctx.args}")
 
 
@@ -363,13 +417,13 @@ async def _handle_cat(ctx: CommandContext) -> bool:
         if not content:
             await ctx.messenger.send_message(ctx.chat_id, "(empty file)", ctx.thread_id)
             return True
-        max_len = ctx.messenger.max_message_length - 40
-        if len(content) > max_len:
-            content = content[:max_len] + "\n\u2026(truncated)"
-        escaped = html_escape(content)
-        await ctx.messenger.send_message(
-            ctx.chat_id, f"<pre>{escaped}</pre>", ctx.thread_id, parse_mode="HTML",
-        )
+        if len(content) > _DOC_THRESHOLD:
+            await _send_as_document(ctx, content, os.path.basename(path))
+        else:
+            escaped = html_escape(content)
+            await ctx.messenger.send_message(
+                ctx.chat_id, f"<pre>{escaped}</pre>", ctx.thread_id, parse_mode="HTML",
+            )
     except Exception as exc:
         await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
     return True
@@ -382,9 +436,32 @@ async def _handle_grep(ctx: CommandContext) -> bool:
             ctx.chat_id, "Usage: `/grep pattern`", ctx.thread_id, parse_mode="Markdown",
         )
         return True
-    return await _delegate_prompt(
-        ctx, f"Search the codebase for: {ctx.args.strip()} — show file paths, line numbers, and matching lines. Limit to 30 results.",
-    )
+    try:
+        results = await ctx.agent.find_text(ctx.args.strip(), directory=ctx.directory)
+        if not results:
+            await ctx.messenger.send_message(ctx.chat_id, "No matches found.", ctx.thread_id)
+            return True
+        lines = [f"\U0001f50d Results for `{html_escape(ctx.args.strip())}`:"]
+        for r in results[:30]:
+            path = r.get("file", r.get("path", "?"))
+            line_no = r.get("line", "")
+            text = r.get("text", r.get("content", ""))[:120]
+            entry = f"  {path}"
+            if line_no:
+                entry += f":{line_no}"
+            if text:
+                entry += f" — {text}"
+            lines.append(entry)
+        if len(results) > 30:
+            lines.append(f"  \u2026and {len(results) - 30} more")
+        content = "\n".join(lines)
+        if len(content) > _DOC_THRESHOLD:
+            await _send_as_document(ctx, content, "grep-results.txt")
+        else:
+            await ctx.messenger.send_message(ctx.chat_id, content, ctx.thread_id, parse_mode="HTML")
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Grep failed: {exc}", ctx.thread_id)
+    return True
 
 
 @command("/find")
@@ -394,9 +471,25 @@ async def _handle_find(ctx: CommandContext) -> bool:
             ctx.chat_id, "Usage: `/find pattern`", ctx.thread_id, parse_mode="Markdown",
         )
         return True
-    return await _delegate_prompt(
-        ctx, f"Find files matching pattern: {ctx.args.strip()} — list their paths. Limit to 50 results.",
-    )
+    try:
+        results = await ctx.agent.find_files(ctx.args.strip(), directory=ctx.directory)
+        if not results:
+            await ctx.messenger.send_message(ctx.chat_id, "No files found.", ctx.thread_id)
+            return True
+        lines = [f"\U0001f4c2 Files matching `{html_escape(ctx.args.strip())}`:"]
+        for r in results[:50]:
+            path = r.get("file", r.get("path", str(r)))
+            lines.append(f"  {path}")
+        if len(results) > 50:
+            lines.append(f"  \u2026and {len(results) - 50} more")
+        content = "\n".join(lines)
+        if len(content) > _DOC_THRESHOLD:
+            await _send_as_document(ctx, content, "find-results.txt")
+        else:
+            await ctx.messenger.send_message(ctx.chat_id, content, ctx.thread_id, parse_mode="HTML")
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Find failed: {exc}", ctx.thread_id)
+    return True
 
 
 @command("/history")
@@ -469,6 +562,26 @@ async def _handle_todo(ctx: CommandContext) -> bool:
         await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
     except Exception as exc:
         await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/summarize")
+async def _handle_summarize(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        await ctx.messenger.send_message(ctx.chat_id, "\u23f3 Summarizing session\u2026", ctx.thread_id)
+        summary = await ctx.agent.summarize_session(session_id, directory=ctx.directory)
+        if not summary or not summary.strip():
+            await ctx.messenger.send_message(ctx.chat_id, "No summary available.", ctx.thread_id)
+            return True
+        max_len = ctx.messenger.max_message_length - 20
+        if len(summary) > max_len:
+            summary = summary[:max_len] + "\n\u2026(truncated)"
+        await ctx.messenger.send_message(ctx.chat_id, summary, ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Summarize failed: {exc}", ctx.thread_id)
     return True
 
 

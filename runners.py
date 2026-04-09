@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 import time
 from typing import Callable, Coroutine, Any, Optional
 
@@ -82,6 +83,7 @@ class SessionRunner:
 
         self.tool_msgs: dict[str, str] = {}
         self.pending_permissions: dict[str, str] = {}
+        self.pending_questions: dict[str, QuestionRequest] = {}
 
         self._last_parts: list[MessagePart] = []
         self._last_model: Optional[ModelRef] = None
@@ -285,7 +287,6 @@ class SessionRunner:
         await self.messenger.send_message(
             self.chat_id, "\n".join(lines), self.thread_id, parse_mode="Markdown",
         )
-        self.pending_questions = getattr(self, "pending_questions", {})
         self.pending_questions[event.request_id] = event
 
     async def _on_idle(self, event: SessionIdle) -> None:
@@ -379,25 +380,58 @@ class SessionRunner:
         if len(chunks) <= config.MAX_MESSAGE_CHUNKS:
             await self._send_chunks(chunks)
         else:
-            if self._long_content:
-                first_line = text.split("\n", 1)[0][:120] or "Response"
-                try:
-                    url = await self._long_content(first_line, text)
-                    if self._msg_id:
-                        await self.messenger.edit_message(
-                            self.chat_id, self._msg_id,
-                            f"\U0001f4c4 [Full response]({url})",
-                            parse_mode="Markdown",
-                        )
-                    self._reset_editor()
-                    self.state = "idle"
-                    return
-                except Exception as exc:
-                    log.warning("long content handler failed, falling back: %s", exc)
-            await self._send_chunks(chunks[:config.MAX_MESSAGE_CHUNKS + 2])
+            await self._send_long_response(text, chunks)
 
         self._reset_editor()
         self.state = "idle"
+
+    async def _send_long_response(self, text: str, chunks: list[str]) -> None:
+        """Handle responses too long for inline messages — try document, then Telegraph."""
+        sent_doc = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".md", prefix="response-", delete=False,
+            ) as f:
+                f.write(text)
+                tmp_path = f.name
+            await self.messenger.send_document(
+                self.chat_id, tmp_path, self.thread_id,
+                caption="Full response",
+            )
+            sent_doc = True
+        except Exception as exc:
+            log.warning("document delivery for long response failed: %s", exc)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        if sent_doc:
+            if self._msg_id:
+                preview = text[:300] + "\u2026" if len(text) > 300 else text
+                ok = await self.messenger.edit_message(
+                    self.chat_id, self._msg_id, preview, parse_mode="Markdown",
+                )
+                if not ok:
+                    await self.messenger.edit_message(self.chat_id, self._msg_id, preview)
+            return
+
+        if self._long_content:
+            first_line = text.split("\n", 1)[0][:120] or "Response"
+            try:
+                url = await self._long_content(first_line, text)
+                if self._msg_id:
+                    await self.messenger.edit_message(
+                        self.chat_id, self._msg_id,
+                        f"\U0001f4c4 [Full response]({url})",
+                        parse_mode="Markdown",
+                    )
+                return
+            except Exception as exc:
+                log.warning("long content handler failed, falling back: %s", exc)
+
+        await self._send_chunks(chunks[:config.MAX_MESSAGE_CHUNKS + 2])
 
     async def _send_chunks(self, chunks: list[str]) -> None:
         if self._msg_id and chunks:

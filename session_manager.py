@@ -167,6 +167,13 @@ class SessionManager:
                 return runner.session_id
         return None
 
+    def find_runner_for_question(self, request_id: str) -> Optional[SessionRunner]:
+        """Look up the runner that has a pending question with *request_id*."""
+        for runner in self._runners.values():
+            if request_id in runner.pending_questions:
+                return runner
+        return None
+
     def find_directory_for_session(self, session_id: str) -> Optional[str]:
         """Return the working directory associated with *session_id*."""
         ck = self._store.find_by_session_id(session_id)
