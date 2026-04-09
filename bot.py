@@ -18,6 +18,30 @@ from .watchdog import watchdog_loop
 
 log = logging.getLogger(__name__)
 
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ("reset", "Reset / start a new session"),
+    ("stop", "Stop current generation"),
+    ("undo", "Revert last change"),
+    ("redo", "Restore reverted change"),
+    ("model", "Set model: /model provider/model"),
+    ("models", "List available models"),
+    ("project", "Set project directory"),
+    ("approve", "Toggle auto-approve: on/off"),
+    ("diff", "Show session diff"),
+    ("git", "Run git command"),
+    ("files", "List modified files"),
+    ("cat", "Show file contents"),
+    ("grep", "Search code for pattern"),
+    ("find", "Find files by pattern"),
+    ("history", "Show recent messages"),
+    ("sessions", "List sessions"),
+    ("todo", "Show session TODOs"),
+    ("summarize", "Summarize current session"),
+    ("agent", "List or use agents"),
+    ("tools", "List available tools"),
+    ("id", "Show chat/session info"),
+]
+
 
 def _is_allowed(chat_id: str) -> bool:
     if not config.ALLOWED_CHAT_IDS:
@@ -154,6 +178,8 @@ async def main() -> None:
         long_content_handler=long_handler,
     )
     await manager.startup_reconnect()
+
+    await messenger.set_commands(BOT_COMMANDS)
 
     watchdog = asyncio.create_task(watchdog_loop(manager))
 

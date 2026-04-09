@@ -65,6 +65,14 @@ class TelegramMessenger:
                 log.warning("TG %s failed: %s", method, data)
             return data
 
+    # -- bot commands menu ----------------------------------------------------
+
+    async def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Register slash commands in the Telegram bot menu via setMyCommands."""
+        await self._tg("deleteMyCommands")
+        bot_commands = [{"command": cmd, "description": desc} for cmd, desc in commands]
+        await self._tg("setMyCommands", commands=bot_commands)
+
     # -- Messenger protocol --------------------------------------------------
 
     async def send_message(
