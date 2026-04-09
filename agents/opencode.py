@@ -34,14 +34,14 @@ class OpenCodeBackend:
 
     # -- session lifecycle ---------------------------------------------------
 
-    async def create_session(self, title: str) -> str:
-        return await self._oc.create_session(title)
+    async def create_session(self, title: str, *, directory: Optional[str] = None) -> str:
+        return await self._oc.create_session(title, directory=directory)
 
-    async def delete_session(self, session_id: str) -> None:
-        await self._oc.delete_session(session_id)
+    async def delete_session(self, session_id: str, *, directory: Optional[str] = None) -> None:
+        await self._oc.delete_session(session_id, directory=directory)
 
-    async def get_session(self, session_id: str) -> Optional[dict]:
-        return await self._oc.get_session(session_id)
+    async def get_session(self, session_id: str, *, directory: Optional[str] = None) -> Optional[dict]:
+        return await self._oc.get_session(session_id, directory=directory)
 
     # -- prompting -----------------------------------------------------------
 
@@ -50,17 +50,20 @@ class OpenCodeBackend:
         session_id: str,
         parts: list[MessagePart],
         model: Optional[ModelRef] = None,
+        *,
+        directory: Optional[str] = None,
     ) -> None:
         raw_parts = [p.to_dict() for p in parts]
         raw_model = model.to_dict() if model else None
-        await self._oc.prompt_async(session_id, raw_parts, raw_model)
+        await self._oc.prompt_async(session_id, raw_parts, raw_model, directory=directory)
 
     # -- permissions ---------------------------------------------------------
 
     async def respond_permission(
         self, session_id: str, perm_id: str, response: str,
+        *, directory: Optional[str] = None,
     ) -> None:
-        await self._oc.respond_permission(session_id, perm_id, response)
+        await self._oc.respond_permission(session_id, perm_id, response, directory=directory)
 
     # -- models --------------------------------------------------------------
 
@@ -93,7 +96,9 @@ class OpenCodeBackend:
 
     # -- event streaming -----------------------------------------------------
 
-    async def subscribe_events(self, session_id: str) -> AsyncIterator[AgentEvent]:
+    async def subscribe_events(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> AsyncIterator[AgentEvent]:
         """Yield typed ``AgentEvent`` objects from the OpenCode SSE stream.
 
         Tracks the current message-part type (``reasoning`` vs ``text``)
@@ -102,8 +107,13 @@ class OpenCodeBackend:
         routed to ``ReasoningDelta`` or ``TextDelta``.
         """
         current_part = "text"
-        async for raw in self._oc.subscribe_events(session_id):
+        async for raw in self._oc.subscribe_events(session_id, directory=directory):
             etype = raw.get("type", "")
+
+            if etype == "__sse_reconnected":
+                log.info("SSE reconnected for %s, resetting current_part", session_id)
+                current_part = "text"
+                continue
 
             if etype == "message.part.updated":
                 part = raw.get("properties", {}).get("part", {})
@@ -134,21 +144,29 @@ class OpenCodeBackend:
 
         elif etype == "message.part.updated":
             part = props.get("part", props)
-            if part.get("type") == "tool-invocation":
-                state = part.get("state", "")
-                name = part.get("toolName", "unknown")
+            ptype = part.get("type", "")
+            if ptype in ("tool-invocation", "tool"):
+                tool_state = part.get("state", {})
+                status = tool_state.get("status", "") if isinstance(tool_state, dict) else str(tool_state)
+                name = part.get("toolName") or part.get("tool") or "unknown"
                 call_id = part.get("callID", part.get("id", ""))
-                if state == "running":
+                if status == "running":
                     out.append(ToolStart(name=name, call_id=call_id))
-                elif state in ("completed", "result"):
+                elif status in ("completed", "result"):
+                    title = part.get("title", "")
+                    if not title and isinstance(tool_state, dict):
+                        title = tool_state.get("title", "")
                     out.append(ToolEnd(
                         name=name, call_id=call_id, state="completed",
-                        title=part.get("title", ""),
+                        title=title,
                     ))
-                elif state == "error":
+                elif status == "error":
+                    error = part.get("error", "")
+                    if not error and isinstance(tool_state, dict):
+                        error = tool_state.get("error", "")
                     out.append(ToolEnd(
                         name=name, call_id=call_id, state="error",
-                        error=part.get("error", ""),
+                        error=error,
                     ))
 
         elif etype == "session.idle":
@@ -168,14 +186,16 @@ class OpenCodeBackend:
                     msg = f"retry #{attempt}: {status.get('message', '')}"
                 out.append(StatusUpdate(status="retry", message=msg))
 
-        elif etype == "permission.updated":
+        elif etype in ("permission.updated", "permission.asked"):
             perm_id = props.get("id", "")
             if perm_id:
+                patterns = props.get("patterns", [])
+                pattern_str = ", ".join(patterns) if patterns else props.get("pattern", "")
                 out.append(PermissionRequest(info=PermissionInfo(
                     id=perm_id,
                     session_id=session_id,
                     title=props.get("title", props.get("permission", "")),
-                    pattern=props.get("pattern", ""),
+                    pattern=pattern_str,
                 )))
 
         elif etype == "session.error":

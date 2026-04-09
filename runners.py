@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Callable, Coroutine, Any, Optional
 
@@ -52,6 +53,8 @@ class SessionRunner:
         agent: AgentBackend,
         messenger: Messenger,
         *,
+        directory: Optional[str] = None,
+        auto_approve: bool = False,
         long_content_handler: Optional[LongContentHandler] = None,
     ):
         self.session_id = session_id
@@ -59,6 +62,8 @@ class SessionRunner:
         self.thread_id = thread_id
         self.agent = agent
         self.messenger = messenger
+        self.directory = directory
+        self.auto_approve = auto_approve
         self._long_content = long_content_handler
 
         self.state: str = "warmup"
@@ -75,9 +80,15 @@ class SessionRunner:
 
         self._reasoning_text: str = ""
         self._in_reasoning: bool = False
+        self._reasoning_start: float = 0.0
 
         self.tool_msgs: dict[str, str] = {}
         self.pending_permissions: dict[str, str] = {}
+
+        self._last_parts: list[MessagePart] = []
+        self._last_model: Optional[ModelRef] = None
+        self._retry_callback: Optional[Callable[["SessionRunner", str], Coroutine[Any, Any, None]]] = None
+        self._success_callback: Optional[Callable[[str, str], None]] = None
 
     # -- public API ---------------------------------------------------------
 
@@ -102,12 +113,19 @@ class SessionRunner:
         self._stream_parse_mode = None
         self._reasoning_text = ""
         self._in_reasoning = False
+        self._reasoning_start = 0.0
 
         self._msg_id = await self.messenger.send_message(self.chat_id, "\u2699\ufe0f", self.thread_id)
         self._start_typing()
 
+        preview = "; ".join(p.text[:60] if hasattr(p, "text") else str(p)[:60] for p in parts)
+        log.info("prompt → session %s: %s", self.session_id, preview)
+
+        self._last_parts = parts
+        self._last_model = model
+
         try:
-            await self.agent.send_prompt(self.session_id, parts, model)
+            await self.agent.send_prompt(self.session_id, parts, model, directory=self.directory)
         except Exception as exc:
             log.error("send_prompt failed: %s", exc)
             if self._msg_id:
@@ -144,7 +162,7 @@ class SessionRunner:
 
     async def _sse_loop(self) -> None:
         try:
-            async for event in self.agent.subscribe_events(self.session_id):
+            async for event in self.agent.subscribe_events(self.session_id, directory=self.directory):
                 self.last_active = time.monotonic()
                 await self._handle_event(event)
         except asyncio.CancelledError:
@@ -159,6 +177,8 @@ class SessionRunner:
 
     async def _handle_event(self, event: AgentEvent) -> None:
         if isinstance(event, ReasoningDelta):
+            if not self._in_reasoning:
+                self._reasoning_start = time.monotonic()
             self._in_reasoning = True
             self._reasoning_text += event.text
             tail = self._reasoning_text[-self._REASONING_TAIL:]
@@ -201,9 +221,20 @@ class SessionRunner:
                 await self.messenger.edit_message(
                     self.chat_id, mid, label[:max_len], parse_mode="Markdown",
                 )
+            if event.state == "completed" and event.name in ("write", "save"):
+                await self._try_deliver_file(event.title)
 
         elif isinstance(event, PermissionRequest):
             if event.info.id in self.pending_permissions:
+                log.debug("duplicate permission %s, skipping", event.info.id)
+                return
+            log.info("permission request %s: %s (%s)", event.info.id, event.info.title, event.info.pattern)
+            if self.auto_approve:
+                log.info("auto-approving permission %s", event.info.id)
+                await self.agent.respond_permission(
+                    self.session_id, event.info.id, "always",
+                    directory=self.directory,
+                )
                 return
             mid = await self.messenger.send_permission_request(
                 self.chat_id, self.thread_id, event.info,
@@ -211,10 +242,25 @@ class SessionRunner:
             self.pending_permissions[event.info.id] = mid
 
         elif isinstance(event, SessionIdle):
-            self.pending_permissions.clear()
-            await self._finalize_response()
+            if self.state != "idle":
+                log.info("SessionIdle for %s (accumulated %d chars)", self.session_id, len(self._accumulated_text))
+                self.pending_permissions.clear()
+                if self._success_callback and self._last_model:
+                    self._success_callback(
+                        self._last_model.provider_id, self._last_model.model_id,
+                    )
+                await self._finalize_response()
 
         elif isinstance(event, SessionError):
+            if config.is_provider_error(event.error) and self._retry_callback:
+                log.warning("provider error detected: %s — triggering fallback", event.error[:120])
+                if self._msg_id:
+                    await self.messenger.edit_message(
+                        self.chat_id, self._msg_id,
+                        f"\u26a0\ufe0f Provider error, switching\u2026",
+                    )
+                await self._retry_callback(self, event.error)
+                return
             self._stop_typing()
             if self._msg_id:
                 max_len = self.messenger.max_message_length
@@ -225,7 +271,7 @@ class SessionRunner:
             self.state = "error"
 
         elif isinstance(event, StatusUpdate):
-            if event.status == "idle":
+            if event.status == "idle" and self.state != "idle":
                 await self._finalize_response()
             elif event.status == "busy":
                 self.state = "generating"
@@ -319,6 +365,38 @@ class SessionRunner:
     def _reset_editor(self) -> None:
         self._accumulated_text = ""
         self._msg_id = None
+
+    # -- file delivery -------------------------------------------------------
+
+    _DELIVERABLE_EXTENSIONS = {
+        ".pdf", ".zip", ".tar", ".gz", ".tgz", ".bz2",
+        ".py", ".rs", ".js", ".ts", ".sh", ".md", ".txt",
+        ".csv", ".json", ".yaml", ".yml", ".toml",
+    }
+
+    async def _try_deliver_file(self, title: str) -> None:
+        """If the tool title looks like a file path with a deliverable extension, send it."""
+        if not title:
+            return
+        path = title.strip()
+        if not os.path.isabs(path):
+            base = self.directory or config.OC_DIRECTORY
+            path = os.path.join(base, path)
+        if not os.path.isfile(path):
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in self._DELIVERABLE_EXTENSIONS:
+            return
+        size = os.path.getsize(path)
+        if size > 50 * 1024 * 1024:
+            return
+        try:
+            await self.messenger.send_document(
+                self.chat_id, path, self.thread_id,
+                caption=os.path.basename(path),
+            )
+        except Exception as exc:
+            log.warning("file delivery failed for %s: %s", path, exc)
 
     # -- typing indicator ---------------------------------------------------
 

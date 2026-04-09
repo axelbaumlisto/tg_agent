@@ -201,6 +201,17 @@ class Messenger(Protocol):
         """Update the permission UI after user response."""
         ...
 
+    async def send_document(
+        self,
+        recipient: str,
+        file_path: str,
+        thread_id: Optional[str] = None,
+        *,
+        caption: Optional[str] = None,
+    ) -> str:
+        """Send a file/document to the chat. Return msg_id."""
+        ...
+
     async def close(self) -> None:
         """Release resources."""
         ...
@@ -214,28 +225,35 @@ class Messenger(Protocol):
 class AgentBackend(Protocol):
     """Any coding agent that can run sessions, accept prompts, and stream events."""
 
-    async def create_session(self, title: str) -> str:
+    async def create_session(self, title: str, *, directory: Optional[str] = None) -> str:
         """Create a new agent session. Return session_id."""
         ...
 
-    async def delete_session(self, session_id: str) -> None: ...
+    async def delete_session(self, session_id: str, *, directory: Optional[str] = None) -> None: ...
 
-    async def get_session(self, session_id: str) -> Optional[dict]: ...
+    async def get_session(self, session_id: str, *, directory: Optional[str] = None) -> Optional[dict]: ...
 
     async def send_prompt(
         self,
         session_id: str,
         parts: list[MessagePart],
         model: Optional[ModelRef] = None,
+        *,
+        directory: Optional[str] = None,
     ) -> None:
         """Fire-and-forget prompt submission."""
         ...
 
-    async def subscribe_events(self, session_id: str) -> AsyncIterator[AgentEvent]:
+    async def subscribe_events(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> AsyncIterator[AgentEvent]:
         """Stream typed events from the agent for this session."""
         ...
 
-    async def respond_permission(self, session_id: str, perm_id: str, response: str) -> None: ...
+    async def respond_permission(
+        self, session_id: str, perm_id: str, response: str,
+        *, directory: Optional[str] = None,
+    ) -> None: ...
 
     async def list_models(self) -> list[ModelInfo]: ...
 

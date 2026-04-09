@@ -52,3 +52,35 @@ MAX_MESSAGE_CHUNKS: int = 3
 TYPING_INTERVAL_SECONDS: float = 5.0
 RECONNECT_BACKOFF_MAX: float = 60.0
 WATCHDOG_INTERVAL_SECONDS: float = float(_get("OC_TG_WATCHDOG_INTERVAL", "60"))
+STALL_TIMEOUT_SECONDS: float = float(_get("OC_TG_STALL_TIMEOUT", "90"))
+GENERATING_STALL_SECONDS: float = float(_get("OC_TG_GENERATING_STALL", "90"))
+REASONING_STALL_SECONDS: float = float(_get("OC_TG_REASONING_STALL", "120"))
+
+# Provider fallback — ordered list of "provider/model" to try on balance/auth errors
+_raw_fallback = _get("OC_TG_FALLBACK_MODELS",
+                      "minimax/MiniMax-M2.7-highspeed,"
+                      "minimax-coding-plan/MiniMax-M2.7-highspeed,"
+                      "kimi-for-coding/k2p5,"
+                      "glm/glm-5.1")
+FALLBACK_MODELS: list[tuple[str, str]] = []
+for _entry in _raw_fallback.split(","):
+    _entry = _entry.strip()
+    if "/" in _entry:
+        _p, _m = _entry.split("/", 1)
+        FALLBACK_MODELS.append((_p, _m))
+
+_BALANCE_ERROR_PATTERNS: list[str] = [
+    "insufficient balance",
+    "insufficient_quota",
+    "rate_limit",
+    "invalid api key",
+    "authentication_error",
+    "billing",
+    "quota exceeded",
+]
+
+
+def is_provider_error(text: str) -> bool:
+    """Return True if the error text looks like a provider balance/auth failure."""
+    low = text.lower()
+    return any(p in low for p in _BALANCE_ERROR_PATTERNS)

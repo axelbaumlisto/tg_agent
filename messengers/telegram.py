@@ -227,6 +227,42 @@ class TelegramMessenger:
             refs.append({"file_id": msg["voice"]["file_id"], "mime": "audio/ogg", "filename": "voice.ogg"})
         return refs
 
+    # -- file delivery -------------------------------------------------------
+
+    async def send_document(
+        self,
+        recipient: str,
+        file_path: str,
+        thread_id: Optional[str] = None,
+        *,
+        caption: Optional[str] = None,
+    ) -> str:
+        """Send a local file as a Telegram document."""
+        http = await self._ensure_http()
+        url = f"{TG_API}/bot{self._token}/sendDocument"
+
+        data = aiohttp.FormData()
+        data.add_field("chat_id", str(int(recipient)))
+        if thread_id:
+            data.add_field("message_thread_id", str(int(thread_id)))
+        if caption:
+            data.add_field("caption", caption[:1024])
+
+        file_p = Path(file_path)
+        data.add_field(
+            "document",
+            open(file_p, "rb"),
+            filename=file_p.name,
+        )
+
+        async with http.post(url, data=data) as resp:
+            result = await resp.json(content_type=None)
+            if not result.get("ok"):
+                log.warning("sendDocument failed: %s", result)
+                return ""
+            msg_id = result.get("result", {}).get("message_id")
+            return str(msg_id) if msg_id else ""
+
     # -- permissions ---------------------------------------------------------
 
     async def send_permission_request(
@@ -240,9 +276,9 @@ class TelegramMessenger:
             text += f"\n`{perm.pattern}`"
         keyboard = {
             "inline_keyboard": [[
-                {"text": "\u2705 Once", "callback_data": f"perm:once:{perm.session_id}:{perm.id}"},
-                {"text": "\u2705 Always", "callback_data": f"perm:always:{perm.session_id}:{perm.id}"},
-                {"text": "\u274c Deny", "callback_data": f"perm:reject:{perm.session_id}:{perm.id}"},
+                {"text": "\u2705 Once", "callback_data": f"p:o:{perm.id}"},
+                {"text": "\u2705 Always", "callback_data": f"p:a:{perm.id}"},
+                {"text": "\u274c Deny", "callback_data": f"p:d:{perm.id}"},
             ]]
         }
         return await self.send_message(recipient, text, thread_id, parse_mode="Markdown", reply_markup=keyboard)

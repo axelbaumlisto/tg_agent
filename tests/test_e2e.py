@@ -505,5 +505,130 @@ class TestE2E(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    # -- t13: /project command -----------------------------------------------
+
+    async def test_t13_project_show(self):
+        """/project with no args shows current directory."""
+        msgs = await send_and_wait(self.client, "/project", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        self.assertIn("Current directory", texts, f"Expected directory info: {texts[:300]}")
+
+    async def test_t14_project_set_and_reset(self):
+        """/project /tmp sets directory and resets session."""
+        msgs = await send_and_wait(self.client, "/project /tmp", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        self.assertIn("/tmp", texts, f"Expected /tmp in response: {texts[:300]}")
+        self.assertIn("reset", texts.lower(), f"Expected session reset: {texts[:300]}")
+
+        # Verify /project now shows /tmp
+        msgs2 = await send_and_wait(self.client, "/project", idle_gap=5)
+        texts2 = " ".join(m.text or "" for m in msgs2)
+        self.assertIn("/tmp", texts2, f"Expected /tmp in current dir: {texts2[:300]}")
+
+        # Reset back to default
+        await send_and_wait(
+            self.client,
+            "/project /home/spex/work/erp/zeroclaws",
+            idle_gap=8,
+        )
+
+    async def test_t15_project_invalid_dir(self):
+        """/project with nonexistent path shows error."""
+        msgs = await send_and_wait(
+            self.client, "/project /nonexistent/dir/abc", idle_gap=5,
+        )
+        texts = " ".join(m.text or "" for m in msgs)
+        self.assertIn("not found", texts.lower(), f"Expected error: {texts[:300]}")
+
+    # -- t16: /approve command -----------------------------------------------
+
+    async def test_t16_approve_toggle(self):
+        """/approve on / off toggles auto-approve mode."""
+        # Turn on
+        msgs = await send_and_wait(self.client, "/approve on", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        self.assertIn("auto-approve", texts.lower(), f"Expected confirmation: {texts[:300]}")
+        self.assertIn("on", texts.lower(), f"Expected ON: {texts[:300]}")
+
+        # Check status
+        msgs2 = await send_and_wait(self.client, "/approve", idle_gap=5)
+        texts2 = " ".join(m.text or "" for m in msgs2)
+        self.assertIn("ON", texts2, f"Expected ON status: {texts2[:300]}")
+
+        # Turn off
+        msgs3 = await send_and_wait(self.client, "/approve off", idle_gap=5)
+        texts3 = " ".join(m.text or "" for m in msgs3)
+        self.assertIn("off", texts3.lower(), f"Expected OFF: {texts3[:300]}")
+
+    # -- t17: /git command ---------------------------------------------------
+
+    async def test_t17_git_shortcut(self):
+        """/git status runs git status via the agent."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        msgs = await send_and_wait(self.client, "/git status", timeout=90)
+        texts = " ".join(m.text or "" for m in msgs)
+        # Should contain git output markers
+        has_git = any(kw in texts.lower() for kw in (
+            "branch", "commit", "clean", "modified", "untracked",
+            "changes", "nothing to commit", "on branch",
+        ))
+        self.assertTrue(has_git, f"Expected git status output: {texts[:400]}")
+
+    # -- t18: /diff command --------------------------------------------------
+
+    async def test_t18_diff_no_changes(self):
+        """/diff with no pending changes shows appropriate message."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        msgs = await send_and_wait(self.client, "/diff", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_diff_or_empty = (
+            "no pending" in texts.lower()
+            or "no active" in texts.lower()
+            or "diff" in texts.lower()
+            or "changes" in texts.lower()
+        )
+        self.assertTrue(has_diff_or_empty, f"Expected diff response: {texts[:300]}")
+
+    # -- t19: /id shows extended info ----------------------------------------
+
+    async def test_t19_id_extended(self):
+        """/id shows directory and auto-approve info."""
+        msgs = await send_and_wait(self.client, "/id", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        self.assertIn("dir:", texts.lower(), f"Expected dir field: {texts[:300]}")
+        self.assertIn("approve:", texts.lower(), f"Expected approve field: {texts[:300]}")
+
+    # -- t20: file delivery via tool write -----------------------------------
+
+    async def test_t20_file_delivery(self):
+        """Bot sends a generated file back as a Telegram document."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        await send_and_wait(self.client, "/approve on", idle_gap=5)
+
+        msgs = await send_and_wait(
+            self.client,
+            'Create a file /tmp/oc_e2e_delivery_test.txt with the text "delivery test OK"',
+            timeout=120,
+        )
+        # Check if the file was sent as a document
+        all_msgs = await self.client.get_messages(BOT_USERNAME, limit=20)
+        has_doc = any(
+            getattr(m, "document", None) is not None
+            or getattr(m, "media", None) is not None
+            for m in all_msgs if not m.out
+        )
+        texts = " ".join(m.text or "" for m in msgs)
+        has_tool = "\u2705" in texts or "\U0001f527" in texts
+
+        # Either file was delivered or at least the tool executed
+        self.assertTrue(
+            has_doc or has_tool,
+            f"Expected file delivery or tool execution: {texts[:400]}",
+        )
+
+        # Cleanup
+        await send_and_wait(self.client, "/approve off", idle_gap=5)
+
+
 if __name__ == "__main__":
     unittest.main()

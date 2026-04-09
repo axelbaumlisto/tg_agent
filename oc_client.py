@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Optional
 
 import aiohttp
@@ -33,7 +34,7 @@ def parse_sse_line(line: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Client
+# Exceptions
 # ---------------------------------------------------------------------------
 
 
@@ -44,6 +45,10 @@ class OcClientError(Exception):
         self.status = status
         self.body = body
         super().__init__(f"OpenCode HTTP {status}: {body}")
+
+
+class SseStallError(Exception):
+    """No useful SSE event for too long despite a live connection."""
 
 
 class OcClient:
@@ -84,8 +89,8 @@ class OcClient:
 
     # -- helpers ------------------------------------------------------------
 
-    def _headers(self) -> dict[str, str]:
-        return {"x-opencode-directory": self.directory}
+    def _headers(self, directory: Optional[str] = None) -> dict[str, str]:
+        return {"x-opencode-directory": directory or self.directory}
 
     async def _request(
         self,
@@ -94,10 +99,11 @@ class OcClient:
         *,
         json_body: Any = None,
         expect_status: set[int] | None = None,
+        directory: Optional[str] = None,
     ) -> aiohttp.ClientResponse:
         session = await self._get_session()
         url = f"{self.base_url}{path}"
-        kwargs: dict[str, Any] = {"headers": self._headers()}
+        kwargs: dict[str, Any] = {"headers": self._headers(directory)}
         if json_body is not None:
             kwargs["json"] = json_body
 
@@ -111,22 +117,26 @@ class OcClient:
 
     # -- session management -------------------------------------------------
 
-    async def create_session(self, title: str = "") -> str:
+    async def create_session(
+        self, title: str = "", *, directory: Optional[str] = None,
+    ) -> str:
         """Create a new OpenCode session. Returns the session ID."""
         body: dict[str, Any] = {}
         if title:
             body["title"] = title
-        resp = await self._request("POST", "/session", json_body=body)
+        resp = await self._request("POST", "/session", json_body=body, directory=directory)
         data = await resp.json(content_type=None)
         session_id: str = data["id"]
         log.info("created OC session %s (title=%r)", session_id, title)
         return session_id
 
-    async def get_session(self, session_id: str) -> Optional[dict]:
+    async def get_session(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> Optional[dict]:
         """Return session info dict, or *None* if 404."""
         session = await self._get_session()
         url = f"{self.base_url}/session/{session_id}"
-        async with session.get(url, headers=self._headers()) as resp:
+        async with session.get(url, headers=self._headers(directory)) as resp:
             if resp.status == 404:
                 return None
             if resp.status >= 400:
@@ -134,11 +144,13 @@ class OcClient:
                 raise OcClientError(resp.status, body)
             return await resp.json(content_type=None)
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> None:
         """Delete a session. Idempotent (404 is not an error)."""
         session = await self._get_session()
         url = f"{self.base_url}/session/{session_id}"
-        async with session.delete(url, headers=self._headers()) as resp:
+        async with session.delete(url, headers=self._headers(directory)) as resp:
             if resp.status not in (200, 204, 404):
                 body = await resp.text()
                 raise OcClientError(resp.status, body)
@@ -151,6 +163,8 @@ class OcClient:
         session_id: str,
         parts: list[dict],
         model: Optional[dict] = None,
+        *,
+        directory: Optional[str] = None,
     ) -> None:
         """Fire-and-forget prompt (POST prompt_async, expects 204)."""
         body: dict[str, Any] = {"parts": parts}
@@ -161,6 +175,7 @@ class OcClient:
             f"/session/{session_id}/prompt_async",
             json_body=body,
             expect_status={204, 200},
+            directory=directory,
         )
         resp.release()
         log.debug("prompt_async sent to session %s", session_id)
@@ -172,6 +187,8 @@ class OcClient:
         session_id: str,
         perm_id: str,
         response: str,
+        *,
+        directory: Optional[str] = None,
     ) -> None:
         """Approve / deny a permission request.
 
@@ -181,6 +198,7 @@ class OcClient:
             "POST",
             f"/session/{session_id}/permissions/{perm_id}",
             json_body={"response": response},
+            directory=directory,
         )
         resp.release()
         log.debug("permission %s → %s (session %s)", perm_id, response, session_id)
@@ -225,38 +243,56 @@ class OcClient:
     async def subscribe_events(
         self,
         session_id: str,
+        *,
+        directory: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """Yield parsed SSE event dicts for *session_id*.
 
         Reconnects automatically with exponential back-off on disconnect.
-        Filter events by ``sessionID`` in ``properties`` where applicable.
-
-        The generator runs until cancelled (``async for`` break or
-        ``aclose()``).
+        After each reconnect, polls ``GET /session/{id}`` and emits a
+        synthetic ``session.idle`` if the session finished while disconnected.
+        Also emits ``__sse_reconnected`` so upstream layers can reset state.
         """
         backoff = 0.5
         max_backoff = config.RECONNECT_BACKOFF_MAX
+        first_connect = True
 
         while True:
             try:
-                async for event in self._sse_stream(session_id):
-                    backoff = 0.5  # reset on successful event
+                async for event in self._sse_stream(session_id, directory=directory):
+                    backoff = 0.5
                     yield event
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError, SseStallError) as exc:
                 log.warning("SSE stream error (%s), reconnecting in %.1fs", exc, backoff)
             except StopAsyncIteration:
-                log.info("SSE stream closed for session %s, reconnecting in %.1fs", session_id, backoff)
+                log.info("SSE stream ended for %s, reconnecting in %.1fs", session_id, backoff)
 
+            if not first_connect:
+                yield {"type": "__sse_reconnected", "properties": {"sessionID": session_id}}
+
+                try:
+                    info = await self.get_session(session_id, directory=directory)
+                    status = (info or {}).get("status")
+                    if status in (None, "idle"):
+                        log.info("session %s is idle after reconnect, emitting synthetic idle", session_id)
+                        yield {"type": "session.idle", "properties": {"sessionID": session_id}}
+                except Exception:
+                    log.debug("failed to poll session %s after reconnect", session_id, exc_info=True)
+
+            first_connect = False
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
-    async def _sse_stream(self, session_id: str) -> AsyncIterator[dict]:
+    async def _sse_stream(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> AsyncIterator[dict]:
         """Single SSE connection; yields events; raises on disconnect."""
         session = await self._get_session()
         url = f"{self.base_url}/event"
-        headers = {**self._headers(), "Accept": "text/event-stream"}
+        headers = {**self._headers(directory), "Accept": "text/event-stream"}
+        stall_timeout = config.STALL_TIMEOUT_SECONDS
 
-        timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=120)
         async with session.get(url, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
                 body = await resp.text()
@@ -269,6 +305,7 @@ class OcClient:
             log.info("SSE connected for session %s", session_id)
 
             buf = ""
+            last_useful = time.monotonic()
             async for chunk in resp.content.iter_any():
                 buf += chunk.decode("utf-8", errors="replace")
                 while "\n" in buf:
@@ -276,11 +313,20 @@ class OcClient:
                     line = line.rstrip("\r")
                     if not line:
                         continue
+                    if line.startswith(":"):
+                        log.debug("SSE keepalive for %s", session_id)
+                        if time.monotonic() - last_useful > stall_timeout:
+                            raise SseStallError(
+                                f"no useful event for {stall_timeout}s (session {session_id})"
+                            )
+                        continue
                     event = parse_sse_line(line)
                     if event is None:
+                        log.debug("SSE unparsed line: %.120s", line)
                         continue
                     props = event.get("properties", {})
                     evt_session = props.get("sessionID", "")
                     if evt_session and evt_session != session_id:
                         continue
+                    last_useful = time.monotonic()
                     yield event

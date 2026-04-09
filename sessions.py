@@ -79,6 +79,26 @@ class SessionStore:
                 del self._data[k]
                 self._save()
 
+    def clear_session(self, chat_id: str, thread_id: Optional[str] = None):
+        """Remove session_id and model but preserve directory and auto_approve."""
+        with self._lock:
+            k = self.key(chat_id, thread_id)
+            entry = self._data.get(k)
+            if entry is None:
+                return
+            changed = False
+            if "session_id" in entry:
+                del entry["session_id"]
+                changed = True
+            if "model" in entry:
+                del entry["model"]
+                changed = True
+            if not entry:
+                del self._data[k]
+                changed = True
+            if changed:
+                self._save()
+
     def all_entries(self) -> dict[str, str]:
         """Return {key: session_id} for all stored sessions."""
         with self._lock:
@@ -123,3 +143,45 @@ class SessionStore:
             if entry and "model" in entry:
                 del entry["model"]
                 self._save()
+
+    # -- per-chat directory ---------------------------------------------------
+
+    def get_directory(self, chat_id: str, thread_id: Optional[str] = None) -> Optional[str]:
+        with self._lock:
+            entry = self._data.get(self.key(chat_id, thread_id))
+            if entry is None:
+                return None
+            return entry.get("directory")
+
+    def set_directory(self, chat_id: str, thread_id: Optional[str], directory: str):
+        with self._lock:
+            k = self.key(chat_id, thread_id)
+            entry = self._data.get(k, {})
+            entry["directory"] = directory
+            self._data[k] = entry
+            self._save()
+
+    def delete_directory(self, chat_id: str, thread_id: Optional[str] = None):
+        with self._lock:
+            k = self.key(chat_id, thread_id)
+            entry = self._data.get(k)
+            if entry and "directory" in entry:
+                del entry["directory"]
+                self._save()
+
+    # -- auto-approve toggle --------------------------------------------------
+
+    def get_auto_approve(self, chat_id: str, thread_id: Optional[str] = None) -> bool:
+        with self._lock:
+            entry = self._data.get(self.key(chat_id, thread_id))
+            if entry is None:
+                return False
+            return bool(entry.get("auto_approve"))
+
+    def set_auto_approve(self, chat_id: str, thread_id: Optional[str], value: bool):
+        with self._lock:
+            k = self.key(chat_id, thread_id)
+            entry = self._data.get(k, {})
+            entry["auto_approve"] = value
+            self._data[k] = entry
+            self._save()

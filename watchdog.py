@@ -18,5 +18,6 @@ async def watchdog_loop(manager: SessionManager) -> None:
         try:
             await manager.idle_sweep()
             await manager.check_dead_sse()
+            await manager.check_stalled_generating()
         except Exception as exc:
             log.error("watchdog error: %s", exc)

@@ -24,13 +24,24 @@ def _is_allowed(chat_id: str) -> bool:
     return chat_id in config.ALLOWED_CHAT_IDS
 
 
-async def _handle_callback(msg, agent, messenger):
-    parts = msg.callback_data.split(":", 3)
-    if len(parts) != 4 or parts[0] != "perm":
+async def _handle_callback(msg, agent, messenger, manager):
+    _RESPONSE_MAP = {"o": "once", "a": "always", "d": "reject"}
+    parts = msg.callback_data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "p":
         return
-    _, response, session_id, perm_id = parts
+    _, short_resp, perm_id = parts
+    response = _RESPONSE_MAP.get(short_resp, short_resp)
+    session_id = manager.find_session_for_perm(perm_id)
+    if not session_id:
+        log.warning("no session found for perm %s", perm_id)
+        return
+    chat_thread = manager._store.find_by_session_id(session_id)
+    perm_dir = None
+    if chat_thread:
+        perm_dir = manager.get_directory(chat_thread[0], chat_thread[1])
+    log.info("permission callback: %s %s (session %s)", response, perm_id, session_id)
     try:
-        await agent.respond_permission(session_id, perm_id, response)
+        await agent.respond_permission(session_id, perm_id, response, directory=perm_dir)
     except Exception as exc:
         log.warning("permission response failed: %s", exc)
     perm_msg_id = str(msg.raw.get("message", {}).get("message_id", ""))
@@ -44,7 +55,9 @@ async def _handle_command(msg, messenger, manager, agent):
     if not consumed:
         await messenger.send_message(
             msg.sender_id,
-            "Unknown command. Available: /reset /new /model /models /id",
+            "Unknown command. Available:\n"
+            "/reset /new /model /models /id\n"
+            "/project /approve /diff /undo /git",
             msg.thread_id,
         )
 
@@ -113,7 +126,7 @@ async def main() -> None:
                 log.warning("blocked message from unauthorized chat %s", msg.sender_id)
                 continue
             if msg.callback_data:
-                asyncio.create_task(_handle_callback(msg, agent, messenger))
+                asyncio.create_task(_handle_callback(msg, agent, messenger, manager))
             elif msg.is_command:
                 asyncio.create_task(_handle_command(msg, messenger, manager, agent))
             else:
