@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 from ..oc_client import OcClient
 from ..protocols import (
@@ -14,6 +15,7 @@ from ..protocols import (
     ModelRef,
     PermissionInfo,
     PermissionRequest,
+    QuestionRequest,
     ReasoningDelta,
     SessionError,
     SessionIdle,
@@ -64,6 +66,70 @@ class OpenCodeBackend:
         *, directory: Optional[str] = None,
     ) -> None:
         await self._oc.respond_permission(session_id, perm_id, response, directory=directory)
+
+    # -- abort / revert / diff -----------------------------------------------
+
+    async def abort_session(self, session_id: str, *, directory: Optional[str] = None) -> None:
+        await self._oc.abort_session(session_id, directory=directory)
+
+    async def revert_session(self, session_id: str, *, message_id: Optional[str] = None, directory: Optional[str] = None) -> None:
+        await self._oc.revert_session(session_id, message_id=message_id, directory=directory)
+
+    async def unrevert_session(self, session_id: str, *, directory: Optional[str] = None) -> None:
+        await self._oc.unrevert_session(session_id, directory=directory)
+
+    async def session_diff(self, session_id: str, *, message_id: Optional[str] = None, directory: Optional[str] = None) -> str:
+        return await self._oc.session_diff(session_id, message_id=message_id, directory=directory)
+
+    async def session_messages(self, session_id: str, *, limit: int = 20, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.session_messages(session_id, limit=limit, directory=directory)
+
+    async def list_sessions(self, *, limit: int = 10, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.list_sessions(limit=limit, directory=directory)
+
+    async def fork_session(self, session_id: str, *, message_id: Optional[str] = None, directory: Optional[str] = None) -> str:
+        return await self._oc.fork_session(session_id, message_id=message_id, directory=directory)
+
+    async def session_todo(self, session_id: str, *, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.session_todo(session_id, directory=directory)
+
+    # -- questions -----------------------------------------------------------
+
+    async def reply_question(self, request_id: str, answers: list[dict], *, directory: Optional[str] = None) -> None:
+        await self._oc.reply_question(request_id, answers, directory=directory)
+
+    async def reject_question(self, request_id: str, *, directory: Optional[str] = None) -> None:
+        await self._oc.reject_question(request_id, directory=directory)
+
+    # -- file / find ---------------------------------------------------------
+
+    async def file_list(self, *, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.file_list(directory=directory)
+
+    async def file_read(self, path: str, *, directory: Optional[str] = None) -> str:
+        return await self._oc.file_read(path, directory=directory)
+
+    async def file_status(self, *, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.file_status(directory=directory)
+
+    async def find_text(self, pattern: str, *, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.find_text(pattern, directory=directory)
+
+    async def find_files(self, pattern: str, *, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.find_files(pattern, directory=directory)
+
+    # -- VCS -----------------------------------------------------------------
+
+    async def vcs_get(self, *, directory: Optional[str] = None) -> dict:
+        return await self._oc.vcs_get(directory=directory)
+
+    # -- tools / agents -------------------------------------------------------
+
+    async def tool_ids(self, *, directory: Optional[str] = None) -> list[str]:
+        return await self._oc.tool_ids(directory=directory)
+
+    async def app_agents(self, *, directory: Optional[str] = None) -> list[dict]:
+        return await self._oc.app_agents(directory=directory)
 
     # -- models --------------------------------------------------------------
 
@@ -121,89 +187,140 @@ class OpenCodeBackend:
                 if ptype in ("reasoning", "text"):
                     current_part = ptype
 
-            for ev in self._convert(raw, session_id, current_part):
+            for ev in self.convert_event(raw, session_id, current_part):
                 yield ev
 
     @staticmethod
-    def _convert(
+    def convert_event(
         raw: dict,
         session_id: str,
         current_part: str = "text",
     ) -> list[AgentEvent]:
         etype = raw.get("type", "")
-        props = raw.get("properties", {})
-        out: list[AgentEvent] = []
-
-        if etype == "message.part.delta":
-            delta = props.get("delta", "")
-            if delta:
-                if current_part == "reasoning":
-                    out.append(ReasoningDelta(text=delta))
-                else:
-                    out.append(TextDelta(text=delta))
-
-        elif etype == "message.part.updated":
-            part = props.get("part", props)
-            ptype = part.get("type", "")
-            if ptype in ("tool-invocation", "tool"):
-                tool_state = part.get("state", {})
-                status = tool_state.get("status", "") if isinstance(tool_state, dict) else str(tool_state)
-                name = part.get("toolName") or part.get("tool") or "unknown"
-                call_id = part.get("callID", part.get("id", ""))
-                if status == "running":
-                    out.append(ToolStart(name=name, call_id=call_id))
-                elif status in ("completed", "result"):
-                    title = part.get("title", "")
-                    if not title and isinstance(tool_state, dict):
-                        title = tool_state.get("title", "")
-                    out.append(ToolEnd(
-                        name=name, call_id=call_id, state="completed",
-                        title=title,
-                    ))
-                elif status == "error":
-                    error = part.get("error", "")
-                    if not error and isinstance(tool_state, dict):
-                        error = tool_state.get("error", "")
-                    out.append(ToolEnd(
-                        name=name, call_id=call_id, state="error",
-                        error=error,
-                    ))
-
-        elif etype == "session.idle":
-            out.append(SessionIdle())
-
-        elif etype == "session.status":
-            status = props.get("status", props)
-            stype = status.get("type", "") if isinstance(status, dict) else str(status)
-            if stype == "idle":
-                out.append(SessionIdle())
-            elif stype == "busy":
-                out.append(StatusUpdate(status="busy"))
-            elif stype == "retry":
-                msg = ""
-                if isinstance(status, dict):
-                    attempt = status.get("attempt", "?")
-                    msg = f"retry #{attempt}: {status.get('message', '')}"
-                out.append(StatusUpdate(status="retry", message=msg))
-
-        elif etype in ("permission.updated", "permission.asked"):
-            perm_id = props.get("id", "")
-            if perm_id:
-                patterns = props.get("patterns", [])
-                pattern_str = ", ".join(patterns) if patterns else props.get("pattern", "")
-                out.append(PermissionRequest(info=PermissionInfo(
-                    id=perm_id,
-                    session_id=session_id,
-                    title=props.get("title", props.get("permission", "")),
-                    pattern=pattern_str,
-                )))
-
-        elif etype == "session.error":
-            out.append(SessionError(error=props.get("error", str(props))))
-
-        return out
+        handler = _EVENT_CONVERTERS.get(etype)
+        if handler:
+            return handler(raw, session_id, current_part)
+        return []
 
     # -- cleanup -------------------------------------------------------------
 
     async def close(self) -> None:
         await self._oc.close()
+
+
+# -- convert_event dispatch handlers ----------------------------------------
+
+def _conv_part_delta(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    delta = raw.get("properties", {}).get("delta", "")
+    if not delta:
+        return []
+    cls = ReasoningDelta if current_part == "reasoning" else TextDelta
+    return [cls(text=delta)]
+
+
+def _conv_part_updated(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    props = raw.get("properties", {})
+    part = props.get("part", props)
+    ptype = part.get("type", "")
+    if ptype not in ("tool-invocation", "tool"):
+        return []
+
+    tool_state = part.get("state", {})
+    status = tool_state.get("status", "") if isinstance(tool_state, dict) else str(tool_state)
+    name = part.get("toolName") or part.get("tool") or "unknown"
+    call_id = part.get("callID", part.get("id", ""))
+
+    if status == "running":
+        return [ToolStart(name=name, call_id=call_id)]
+
+    if status in ("completed", "result"):
+        title = part.get("title", "")
+        if not title and isinstance(tool_state, dict):
+            title = tool_state.get("title", "")
+        output = ""
+        if isinstance(tool_state, dict):
+            output = tool_state.get("output", tool_state.get("content", ""))
+        if not output:
+            output = part.get("output", part.get("content", ""))
+        if isinstance(output, (dict, list)):
+            output = json.dumps(output, ensure_ascii=False)[:500]
+        return [ToolEnd(
+            name=name, call_id=call_id, state="completed",
+            title=title, output=str(output)[:1000] if output else "",
+        )]
+
+    if status == "error":
+        error = part.get("error", "")
+        if not error and isinstance(tool_state, dict):
+            error = tool_state.get("error", "")
+        return [ToolEnd(name=name, call_id=call_id, state="error", error=error)]
+
+    return []
+
+
+def _conv_session_idle(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    return [SessionIdle()]
+
+
+def _conv_session_status(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    props = raw.get("properties", {})
+    status = props.get("status", props)
+    stype = status.get("type", "") if isinstance(status, dict) else str(status)
+    if stype == "idle":
+        return [SessionIdle()]
+    if stype == "busy":
+        return [StatusUpdate(status="busy")]
+    if stype == "retry":
+        msg = ""
+        if isinstance(status, dict):
+            attempt = status.get("attempt", "?")
+            msg = f"retry #{attempt}: {status.get('message', '')}"
+        return [StatusUpdate(status="retry", message=msg)]
+    return []
+
+
+def _conv_permission(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    props = raw.get("properties", {})
+    perm_id = props.get("id", "")
+    if not perm_id:
+        return []
+    patterns = props.get("patterns", [])
+    pattern_str = ", ".join(patterns) if patterns else props.get("pattern", "")
+    return [PermissionRequest(info=PermissionInfo(
+        id=perm_id,
+        session_id=session_id,
+        title=props.get("title", props.get("permission", "")),
+        pattern=pattern_str,
+    ))]
+
+
+def _conv_session_error(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    props = raw.get("properties", {})
+    return [SessionError(error=props.get("error", str(props)))]
+
+
+def _conv_question(raw: dict, session_id: str, current_part: str) -> list[AgentEvent]:
+    props = raw.get("properties", {})
+    req_id = props.get("requestID", props.get("id", ""))
+    if not req_id:
+        return []
+    return [QuestionRequest(
+        request_id=req_id,
+        session_id=session_id,
+        questions=props.get("questions", []),
+    )]
+
+
+_EventConverter = Callable[[dict, str, str], list[AgentEvent]]
+
+_EVENT_CONVERTERS: dict[str, _EventConverter] = {
+    "message.part.delta": _conv_part_delta,
+    "message.part.updated": _conv_part_updated,
+    "session.idle": _conv_session_idle,
+    "session.status": _conv_session_status,
+    "permission.updated": _conv_permission,
+    "permission.asked": _conv_permission,
+    "session.error": _conv_session_error,
+    "question.asked": _conv_question,
+    "question.updated": _conv_question,
+}

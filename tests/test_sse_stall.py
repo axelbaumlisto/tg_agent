@@ -50,6 +50,9 @@ class FakeResponse:
 
 class TestSseStall(unittest.IsolatedAsyncioTestCase):
 
+    def _make_client(self) -> OcClient:
+        return OcClient(base_url="http://fake", directory="/fake")
+
     async def test_raises_on_keepalives_only(self):
         chunks = [
             b"data: {\"type\": \"session.status\", \"properties\": {\"sessionID\": \"s1\"}}\n",
@@ -59,10 +62,7 @@ class TestSseStall(unittest.IsolatedAsyncioTestCase):
         ]
         fake_resp = FakeResponse(200, FakeContent(chunks))
 
-        client = OcClient.__new__(OcClient)
-        client.base_url = "http://fake"
-        client.directory = "/fake"
-        client._session = MagicMock()
+        client = self._make_client()
 
         sess_mock = MagicMock()
         sess_mock.get.return_value = fake_resp
@@ -87,9 +87,7 @@ class TestSseStall(unittest.IsolatedAsyncioTestCase):
         ]
         fake_resp = FakeResponse(200, FakeContent(chunks))
 
-        client = OcClient.__new__(OcClient)
-        client.base_url = "http://fake"
-        client.directory = "/fake"
+        client = self._make_client()
 
         sess_mock = MagicMock()
         sess_mock.get.return_value = fake_resp
@@ -123,8 +121,7 @@ class TestReconnectResetsState(unittest.IsolatedAsyncioTestCase):
             for ev in raw_events:
                 yield ev
 
-        backend = OpenCodeBackend.__new__(OpenCodeBackend)
-        backend._oc = MagicMock()
+        backend = OpenCodeBackend(base_url="http://fake", directory="/fake")
         backend._oc.subscribe_events = fake_subscribe
 
         results = []
@@ -156,10 +153,7 @@ class TestReconnectPollsSession(unittest.IsolatedAsyncioTestCase):
             else:
                 return
 
-        client = OcClient.__new__(OcClient)
-        client.base_url = "http://fake"
-        client.directory = "/fake"
-        client._session = None
+        client = OcClient(base_url="http://fake", directory="/fake")
 
         async def fake_get_session(sid, **kwargs):
             return {"id": sid, "status": "idle"}
@@ -187,6 +181,13 @@ class TestReconnectPollsSession(unittest.IsolatedAsyncioTestCase):
 
 class TestStalledGeneratingWatchdog(unittest.IsolatedAsyncioTestCase):
 
+    def _make_manager(self, runners: dict) -> SessionManager:
+        manager = SessionManager(
+            store=MagicMock(), agent=AsyncMock(), messenger=AsyncMock(),
+        )
+        manager._runners = runners
+        return manager
+
     async def test_reconnects_stalled_runner(self):
         runner = MagicMock()
         runner.state = "generating"
@@ -195,8 +196,7 @@ class TestStalledGeneratingWatchdog(unittest.IsolatedAsyncioTestCase):
         runner._reasoning_start = 0.0
         runner.reconnect = AsyncMock()
 
-        manager = SessionManager.__new__(SessionManager)
-        manager._runners = {"chat:1": runner}
+        manager = self._make_manager({"chat:1": runner})
 
         with patch("opencode_tg.session_manager.config") as cfg:
             cfg.GENERATING_STALL_SECONDS = 300
@@ -213,8 +213,7 @@ class TestStalledGeneratingWatchdog(unittest.IsolatedAsyncioTestCase):
         runner._reasoning_start = 0.0
         runner.reconnect = AsyncMock()
 
-        manager = SessionManager.__new__(SessionManager)
-        manager._runners = {"chat:1": runner}
+        manager = self._make_manager({"chat:1": runner})
 
         with patch("opencode_tg.session_manager.config") as cfg:
             cfg.GENERATING_STALL_SECONDS = 300
@@ -229,8 +228,7 @@ class TestStalledGeneratingWatchdog(unittest.IsolatedAsyncioTestCase):
         runner.last_active = time.monotonic() - 600
         runner.reconnect = AsyncMock()
 
-        manager = SessionManager.__new__(SessionManager)
-        manager._runners = {"chat:1": runner}
+        manager = self._make_manager({"chat:1": runner})
 
         with patch("opencode_tg.session_manager.config") as cfg:
             cfg.GENERATING_STALL_SECONDS = 300

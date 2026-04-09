@@ -92,6 +92,51 @@ class OcClient:
     def _headers(self, directory: Optional[str] = None) -> dict[str, str]:
         return {"x-opencode-directory": directory or self.directory}
 
+    @staticmethod
+    async def _safe_json(resp: aiohttp.ClientResponse) -> Any:
+        """Parse JSON from response, returning None for empty/HTML bodies."""
+        text = await resp.text()
+        stripped = text.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("<!doctype") or stripped.startswith("<html"):
+            return None
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    @staticmethod
+    def _as_list(data: Any, *keys: str) -> list:
+        """Normalize an API response into a list, trying *keys* on dicts."""
+        if data is None:
+            return []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in keys:
+                if k in data:
+                    val = data[k]
+                    if isinstance(val, list):
+                        return val
+                    if isinstance(val, dict):
+                        return list(val.values())
+        return []
+
+    @staticmethod
+    def _as_str(data: Any, *keys: str) -> str:
+        """Normalize an API response into a string, trying *keys* on dicts."""
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            for k in keys:
+                if k in data:
+                    return str(data[k])
+            return json.dumps(data, indent=2)
+        return str(data)
+
     async def _request(
         self,
         method: str,
@@ -203,21 +248,297 @@ class OcClient:
         resp.release()
         log.debug("permission %s → %s (session %s)", perm_id, response, session_id)
 
+    # -- abort / revert / diff -----------------------------------------------
+
+    async def abort_session(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> None:
+        """Abort a running session (stop generation)."""
+        resp = await self._request(
+            "POST", f"/session/{session_id}/abort",
+            expect_status={200, 204}, directory=directory,
+        )
+        resp.release()
+        log.info("aborted session %s", session_id)
+
+    async def revert_session(
+        self, session_id: str, *, message_id: Optional[str] = None,
+        directory: Optional[str] = None,
+    ) -> None:
+        """Revert the last (or specific) message changes atomically.
+
+        If *message_id* is not given, fetches messages and uses the last
+        assistant message ID (the API requires a valid ``msg_*`` ID).
+        """
+        if not message_id:
+            msgs = await self.session_messages(session_id, directory=directory)
+            for m in reversed(msgs):
+                info = m.get("info", m)
+                if info.get("role") == "assistant":
+                    message_id = info.get("id", "")
+                    break
+            if not message_id:
+                raise OcClientError(400, "No assistant message to revert")
+
+        body = {"messageID": message_id}
+        resp = await self._request(
+            "POST", f"/session/{session_id}/revert",
+            json_body=body, expect_status={200, 204},
+            directory=directory,
+        )
+        resp.release()
+        log.info("reverted session %s (msg=%s)", session_id, message_id)
+
+    async def unrevert_session(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> None:
+        """Restore previously reverted messages."""
+        resp = await self._request(
+            "POST", f"/session/{session_id}/unrevert",
+            expect_status={200, 204}, directory=directory,
+        )
+        resp.release()
+
+    async def session_diff(
+        self, session_id: str, *, message_id: Optional[str] = None,
+        directory: Optional[str] = None,
+    ) -> str:
+        """Get the diff for a session (or specific message). Returns diff text."""
+        params = f"?messageID={message_id}" if message_id else ""
+        resp = await self._request(
+            "GET", f"/session/{session_id}/diff{params}",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        if isinstance(data, list):
+            parts = []
+            for item in data:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(self._as_str(item, "diff", "content"))
+            return "\n".join(parts)
+        return self._as_str(data, "diff", "content")
+
+    async def session_messages(
+        self, session_id: str, *, limit: int = 20,
+        directory: Optional[str] = None,
+    ) -> list[dict]:
+        """Get messages for a session (GET /session/{id}/message)."""
+        resp = await self._request(
+            "GET", f"/session/{session_id}/message",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_list(data, "messages", "items")
+
+    async def list_sessions(
+        self, *, limit: int = 10, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """List recent sessions."""
+        resp = await self._request(
+            "GET", f"/session?limit={limit}",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_list(data, "sessions", "items")
+
+    async def fork_session(
+        self, session_id: str, *, message_id: Optional[str] = None,
+        directory: Optional[str] = None,
+    ) -> str:
+        """Fork a session at a specific message. Returns new session_id."""
+        body: dict[str, Any] = {}
+        if message_id:
+            body["messageID"] = message_id
+        resp = await self._request(
+            "POST", f"/session/{session_id}/fork",
+            json_body=body or None, directory=directory,
+        )
+        data = await self._safe_json(resp) or {}
+        return data.get("id", data.get("sessionID", ""))
+
+    async def summarize_session(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> str:
+        """Summarize a session. Returns summary text."""
+        resp = await self._request(
+            "POST", f"/session/{session_id}/summarize",
+            json_body={"auto": True}, directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_str(data, "summary")
+
+    async def session_todo(
+        self, session_id: str, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """Get todo list for a session."""
+        resp = await self._request(
+            "GET", f"/session/{session_id}/todo",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_list(data, "todos", "items")
+
+    # -- questions -----------------------------------------------------------
+
+    async def reply_question(
+        self, request_id: str, answers: list[dict],
+        *, directory: Optional[str] = None,
+    ) -> None:
+        """Reply to a question from the model."""
+        resp = await self._request(
+            "POST", f"/question/{request_id}/reply",
+            json_body={"answers": answers},
+            directory=directory,
+        )
+        resp.release()
+
+    async def reject_question(
+        self, request_id: str, *, directory: Optional[str] = None,
+    ) -> None:
+        """Reject a question from the model."""
+        resp = await self._request(
+            "POST", f"/question/{request_id}/reject",
+            expect_status={200, 204}, directory=directory,
+        )
+        resp.release()
+
+    # -- file / find ---------------------------------------------------------
+
+    async def file_list(
+        self, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """List files in the project."""
+        resp = await self._request("GET", "/file/list", directory=directory)
+        data = await self._safe_json(resp)
+        return self._as_list(data, "files", "items")
+
+    async def file_read(
+        self, path: str, *, directory: Optional[str] = None,
+    ) -> str:
+        """Read a file's contents."""
+        import urllib.parse
+        encoded = urllib.parse.quote(path, safe="")
+        resp = await self._request(
+            "GET", f"/file/read?path={encoded}",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_str(data, "content", "text")
+
+    async def file_status(
+        self, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """Get file modification status (like git status)."""
+        resp = await self._request("GET", "/file/status", directory=directory)
+        data = await self._safe_json(resp)
+        return self._as_list(data, "files", "items")
+
+    async def find_text(
+        self, pattern: str, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """Search for text in the project (ripgrep)."""
+        import urllib.parse
+        encoded = urllib.parse.quote(pattern, safe="")
+        resp = await self._request(
+            "GET", f"/find/text?pattern={encoded}",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_list(data, "results", "matches", "items")
+
+    async def find_files(
+        self, pattern: str, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """Find files by name pattern."""
+        import urllib.parse
+        encoded = urllib.parse.quote(pattern, safe="")
+        resp = await self._request(
+            "GET", f"/find/files?pattern={encoded}",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_list(data, "files", "items")
+
+    async def find_symbols(
+        self, query: str, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """Find symbols (LSP)."""
+        import urllib.parse
+        encoded = urllib.parse.quote(query, safe="")
+        resp = await self._request(
+            "GET", f"/find/symbols?query={encoded}",
+            directory=directory,
+        )
+        data = await self._safe_json(resp)
+        return self._as_list(data, "symbols", "items")
+
+    # -- VCS / worktree -------------------------------------------------------
+
+    async def vcs_get(
+        self, *, directory: Optional[str] = None,
+    ) -> dict:
+        """Get VCS (git) status: branch, changes, etc."""
+        resp = await self._request("GET", "/vcs", directory=directory)
+        return await self._safe_json(resp) or {}
+
+    async def worktree_list(
+        self, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """List git worktrees."""
+        resp = await self._request("GET", "/worktree", directory=directory)
+        data = await self._safe_json(resp)
+        return self._as_list(data, "worktrees", "items")
+
+    async def worktree_create(
+        self, *, branch: Optional[str] = None,
+        directory: Optional[str] = None,
+    ) -> dict:
+        """Create a git worktree."""
+        body: dict[str, Any] = {}
+        if branch:
+            body["branch"] = branch
+        resp = await self._request(
+            "POST", "/worktree", json_body=body, directory=directory,
+        )
+        return await self._safe_json(resp) or {}
+
+    async def worktree_remove(
+        self, worktree_id: str, *, directory: Optional[str] = None,
+    ) -> None:
+        """Remove a git worktree."""
+        resp = await self._request(
+            "DELETE", f"/worktree/{worktree_id}",
+            expect_status={200, 204}, directory=directory,
+        )
+        resp.release()
+
+    # -- tools / agents -------------------------------------------------------
+
+    async def tool_ids(
+        self, *, directory: Optional[str] = None,
+    ) -> list[str]:
+        """List available tool IDs."""
+        resp = await self._request("GET", "/tool/ids", directory=directory)
+        data = await self._safe_json(resp)
+        return self._as_list(data, "ids", "tools")
+
+    async def app_agents(
+        self, *, directory: Optional[str] = None,
+    ) -> list[dict]:
+        """List available agents."""
+        resp = await self._request("GET", "/app/agents", directory=directory)
+        data = await self._safe_json(resp)
+        return self._as_list(data, "agents", "items")
+
     # -- providers ----------------------------------------------------------
 
     async def list_providers(self) -> list[dict]:
         """GET /provider → list of provider dicts."""
         resp = await self._request("GET", "/provider")
         data = await resp.json(content_type=None)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            all_providers = data.get("all", data.get("providers", data.get("items", {})))
-            if isinstance(all_providers, dict):
-                return list(all_providers.values())
-            if isinstance(all_providers, list):
-                return all_providers
-        return []
+        return self._as_list(data, "all", "providers", "items")
 
     async def list_connected_providers(self) -> tuple[set[str], list[dict]]:
         """GET /provider → (connected provider IDs, all provider dicts)."""

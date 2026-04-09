@@ -14,7 +14,7 @@ import time
 from typing import Callable, Coroutine, Any, Optional
 
 from . import config
-from .formatter import split_chunks
+from .formatter import html_escape, split_chunks
 from .protocols import (
     AgentBackend,
     AgentEvent,
@@ -22,6 +22,7 @@ from .protocols import (
     Messenger,
     ModelRef,
     PermissionRequest,
+    QuestionRequest,
     ReasoningDelta,
     SessionError,
     SessionIdle,
@@ -35,9 +36,6 @@ log = logging.getLogger(__name__)
 
 STATES = ("warmup", "idle", "generating", "sleeping", "reconnecting", "error")
 
-
-def _html_escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 LongContentHandler = Callable[[str, str], Coroutine[Any, Any, str]]
 
@@ -164,7 +162,7 @@ class SessionRunner:
         try:
             async for event in self.agent.subscribe_events(self.session_id, directory=self.directory):
                 self.last_active = time.monotonic()
-                await self._handle_event(event)
+                await self.handle_event(event)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -175,108 +173,157 @@ class SessionRunner:
 
     _REASONING_TAIL = 600
 
-    async def _handle_event(self, event: AgentEvent) -> None:
-        if isinstance(event, ReasoningDelta):
-            if not self._in_reasoning:
-                self._reasoning_start = time.monotonic()
-            self._in_reasoning = True
-            self._reasoning_text += event.text
-            tail = self._reasoning_text[-self._REASONING_TAIL:]
-            if len(self._reasoning_text) > self._REASONING_TAIL:
-                tail = "\u2026" + tail
-            escaped = _html_escape(tail)
-            self._accumulated_text = f"\U0001f4ad <i>{escaped}</i>"
-            self._stream_parse_mode = "HTML"
-            await self._throttled_edit()
+    _EVENT_HANDLERS: dict[type, str] = {
+        ReasoningDelta: "_on_reasoning",
+        TextDelta: "_on_text",
+        ToolStart: "_on_tool_start",
+        ToolEnd: "_on_tool_end",
+        PermissionRequest: "_on_permission",
+        QuestionRequest: "_on_question",
+        SessionIdle: "_on_idle",
+        SessionError: "_on_error",
+        StatusUpdate: "_on_status",
+    }
 
-        elif isinstance(event, TextDelta):
-            if self._in_reasoning:
-                self._in_reasoning = False
-                self._accumulated_text = ""
-                self._last_sent_text = ""
-                self._stream_parse_mode = None
-            self._accumulated_text += event.text
-            await self._throttled_edit()
+    async def handle_event(self, event: AgentEvent) -> None:
+        handler_name = self._EVENT_HANDLERS.get(type(event))
+        if handler_name:
+            await getattr(self, handler_name)(event)
 
-        elif isinstance(event, ToolStart):
-            mid = await self.messenger.send_message(
-                self.chat_id, f"\U0001f527 `{event.name}`\u2026",
-                self.thread_id, parse_mode="Markdown",
+    async def _on_reasoning(self, event: ReasoningDelta) -> None:
+        if not self._in_reasoning:
+            self._reasoning_start = time.monotonic()
+        self._in_reasoning = True
+        self._reasoning_text += event.text
+        tail = self._reasoning_text[-self._REASONING_TAIL:]
+        if len(self._reasoning_text) > self._REASONING_TAIL:
+            tail = "\u2026" + tail
+        escaped = html_escape(tail)
+        self._accumulated_text = f"\U0001f4ad <i>{escaped}</i>"
+        self._stream_parse_mode = "HTML"
+        await self._throttled_edit()
+
+    async def _on_text(self, event: TextDelta) -> None:
+        if self._in_reasoning:
+            self._in_reasoning = False
+            self._accumulated_text = ""
+            self._last_sent_text = ""
+            self._stream_parse_mode = None
+        self._accumulated_text += event.text
+        await self._throttled_edit()
+
+    async def _on_tool_start(self, event: ToolStart) -> None:
+        mid = await self.messenger.send_message(
+            self.chat_id, f"\U0001f527 `{event.name}`\u2026",
+            self.thread_id, parse_mode="Markdown",
+        )
+        if event.call_id:
+            self.tool_msgs[event.call_id] = mid
+
+    async def _on_tool_end(self, event: ToolEnd) -> None:
+        mid = self.tool_msgs.pop(event.call_id, None)
+        if mid:
+            name_esc = html_escape(event.name)
+            if event.state == "completed":
+                label = f"\u2705 <b>{name_esc}</b>"
+                if event.title:
+                    label += f" \u2014 {html_escape(event.title)}"
+                if event.output:
+                    preview = event.output.strip()[:300]
+                    if len(event.output.strip()) > 300:
+                        preview += "\u2026"
+                    label += f"\n<pre>{html_escape(preview)}</pre>"
+            else:
+                label = f"\u274c <b>{name_esc}</b>"
+                if event.error:
+                    label += f" \u2014 {html_escape(event.error)}"
+            max_len = self.messenger.max_message_length
+            await self.messenger.edit_message(
+                self.chat_id, mid, label[:max_len], parse_mode="HTML",
             )
-            if event.call_id:
-                self.tool_msgs[event.call_id] = mid
+        if event.state == "completed" and event.name in ("write", "save"):
+            await self._try_deliver_file(event.title)
 
-        elif isinstance(event, ToolEnd):
-            mid = self.tool_msgs.pop(event.call_id, None)
-            if mid:
-                if event.state == "completed":
-                    label = f"\u2705 `{event.name}`"
-                    if event.title:
-                        label += f" \u2014 {event.title}"
-                else:
-                    label = f"\u274c `{event.name}`"
-                    if event.error:
-                        label += f" \u2014 {event.error}"
-                max_len = self.messenger.max_message_length
-                await self.messenger.edit_message(
-                    self.chat_id, mid, label[:max_len], parse_mode="Markdown",
-                )
-            if event.state == "completed" and event.name in ("write", "save"):
-                await self._try_deliver_file(event.title)
-
-        elif isinstance(event, PermissionRequest):
-            if event.info.id in self.pending_permissions:
-                log.debug("duplicate permission %s, skipping", event.info.id)
-                return
-            log.info("permission request %s: %s (%s)", event.info.id, event.info.title, event.info.pattern)
-            if self.auto_approve:
-                log.info("auto-approving permission %s", event.info.id)
-                await self.agent.respond_permission(
-                    self.session_id, event.info.id, "always",
-                    directory=self.directory,
-                )
-                return
-            mid = await self.messenger.send_permission_request(
-                self.chat_id, self.thread_id, event.info,
+    async def _on_permission(self, event: PermissionRequest) -> None:
+        if event.info.id in self.pending_permissions:
+            log.debug("duplicate permission %s, skipping", event.info.id)
+            return
+        log.info("permission request %s: %s (%s)", event.info.id, event.info.title, event.info.pattern)
+        if self.auto_approve:
+            log.info("auto-approving permission %s", event.info.id)
+            await self.agent.respond_permission(
+                self.session_id, event.info.id, "always",
+                directory=self.directory,
             )
-            self.pending_permissions[event.info.id] = mid
+            return
+        mid = await self.messenger.send_permission_request(
+            self.chat_id, self.thread_id, event.info,
+        )
+        self.pending_permissions[event.info.id] = mid
 
-        elif isinstance(event, SessionIdle):
-            if self.state != "idle":
-                log.info("SessionIdle for %s (accumulated %d chars)", self.session_id, len(self._accumulated_text))
-                self.pending_permissions.clear()
-                if self._success_callback and self._last_model:
-                    self._success_callback(
-                        self._last_model.provider_id, self._last_model.model_id,
-                    )
-                await self._finalize_response()
-
-        elif isinstance(event, SessionError):
-            if config.is_provider_error(event.error) and self._retry_callback:
-                log.warning("provider error detected: %s — triggering fallback", event.error[:120])
-                if self._msg_id:
-                    await self.messenger.edit_message(
-                        self.chat_id, self._msg_id,
-                        f"\u26a0\ufe0f Provider error, switching\u2026",
-                    )
-                await self._retry_callback(self, event.error)
+    async def _on_question(self, event: QuestionRequest) -> None:
+        log.info("question request %s: %d questions", event.request_id, len(event.questions))
+        if self.auto_approve and event.questions:
+            answers = []
+            for q in event.questions:
+                opts = q.get("options", [])
+                default = next((o for o in opts if o.get("default")), opts[0] if opts else None)
+                answers.append({"id": q.get("id", ""), "value": default.get("value", "") if default else ""})
+            try:
+                await self.agent.reply_question(event.request_id, answers, directory=self.directory)
                 return
-            self._stop_typing()
+            except Exception as exc:
+                log.warning("auto-reply question failed: %s", exc)
+        lines = ["\u2753 The model has a question:"]
+        for q in event.questions:
+            prompt_text = q.get("prompt", q.get("text", ""))
+            lines.append(f"\n{prompt_text}")
+            for i, opt in enumerate(q.get("options", []), 1):
+                label = opt.get("label", opt.get("value", f"Option {i}"))
+                lines.append(f"  {i}. {label}")
+        lines.append(f"\nReply with: `q:{event.request_id}:<answer>`")
+        await self.messenger.send_message(
+            self.chat_id, "\n".join(lines), self.thread_id, parse_mode="Markdown",
+        )
+        self.pending_questions = getattr(self, "pending_questions", {})
+        self.pending_questions[event.request_id] = event
+
+    async def _on_idle(self, event: SessionIdle) -> None:
+        if self.state != "idle":
+            log.info("SessionIdle for %s (accumulated %d chars)", self.session_id, len(self._accumulated_text))
+            self.pending_permissions.clear()
+            if self._success_callback and self._last_model:
+                self._success_callback(
+                    self._last_model.provider_id, self._last_model.model_id,
+                )
+            await self._finalize_response()
+
+    async def _on_error(self, event: SessionError) -> None:
+        if config.is_provider_error(event.error) and self._retry_callback:
+            log.warning("provider error detected: %s — triggering fallback", event.error[:120])
             if self._msg_id:
-                max_len = self.messenger.max_message_length
                 await self.messenger.edit_message(
                     self.chat_id, self._msg_id,
-                    f"\u274c {event.error}"[:max_len],
+                    f"\u26a0\ufe0f Provider error, switching\u2026",
                 )
-            self.state = "error"
+            await self._retry_callback(self, event.error)
+            return
+        self._stop_typing()
+        if self._msg_id:
+            max_len = self.messenger.max_message_length
+            await self.messenger.edit_message(
+                self.chat_id, self._msg_id,
+                f"\u274c {event.error}"[:max_len],
+            )
+        self.state = "error"
 
-        elif isinstance(event, StatusUpdate):
-            if event.status == "idle" and self.state != "idle":
-                await self._finalize_response()
-            elif event.status == "busy":
-                self.state = "generating"
-            elif event.status == "retry":
-                log.info("session %s: %s", self.session_id, event.message)
+    async def _on_status(self, event: StatusUpdate) -> None:
+        if event.status == "idle" and self.state != "idle":
+            await self._finalize_response()
+        elif event.status == "busy":
+            self.state = "generating"
+        elif event.status == "retry":
+            log.info("session %s: %s", self.session_id, event.message)
 
     # -- streaming edits (throttled) ----------------------------------------
 

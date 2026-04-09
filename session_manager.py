@@ -11,12 +11,11 @@ import time
 from typing import Callable, Coroutine, Any, Optional
 
 from . import config
-from .protocols import AgentBackend, MessagePart, Messenger, ModelRef
+from .protocols import AgentBackend, ChatKey, MessagePart, Messenger, ModelRef
 from .runners import SessionRunner, LongContentHandler
 from .sessions import SessionStore
 
-_PROVIDER_FAIL_TTL = 300.0  # seconds before a failed provider becomes eligible again
-_failed_providers: dict[str, float] = {}  # "provider/model" -> monotonic failure time
+_PROVIDER_FAIL_TTL = 300.0
 
 log = logging.getLogger(__name__)
 
@@ -38,12 +37,13 @@ class SessionManager:
         self._long_content = long_content_handler
         self._runners: dict[str, SessionRunner] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._failed_providers: dict[str, float] = {}
 
     # -- key helper ---------------------------------------------------------
 
     @staticmethod
     def _key(chat_id: str, thread_id: Optional[str]) -> str:
-        return f"{chat_id}:{thread_id}" if thread_id else chat_id
+        return str(ChatKey(chat_id, thread_id))
 
     def _get_lock(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -148,6 +148,18 @@ class SessionManager:
     def get_auto_approve(self, chat_id: str, thread_id: Optional[str]) -> bool:
         return self._store.get_auto_approve(chat_id, thread_id)
 
+    async def abort_session(self, chat_id: str, thread_id: Optional[str]) -> None:
+        """Abort the running session generation."""
+        key = self._key(chat_id, thread_id)
+        runner = self._runners.get(key)
+        session_id = self._store.get(chat_id, thread_id)
+        if session_id:
+            directory = self._get_directory(chat_id, thread_id)
+            await self._agent.abort_session(session_id, directory=directory)
+        if runner:
+            runner.state = "idle"
+            runner._stop_typing()
+
     def find_session_for_perm(self, perm_id: str) -> Optional[str]:
         """Look up session_id by perm_id across all runners."""
         for runner in self._runners.values():
@@ -155,17 +167,24 @@ class SessionManager:
                 return runner.session_id
         return None
 
+    def find_directory_for_session(self, session_id: str) -> Optional[str]:
+        """Return the working directory associated with *session_id*."""
+        ck = self._store.find_by_session_id(session_id)
+        if ck:
+            return self.get_directory(ck.chat_id, ck.thread_id)
+        return None
+
     # -- provider fallback ---------------------------------------------------
 
     async def _handle_provider_fallback(self, runner: SessionRunner, error: str) -> None:
         current = runner._last_model
         current_key = f"{current.provider_id}/{current.model_id}" if current else ""
-        _failed_providers[current_key] = time.monotonic()
+        self._failed_providers[current_key] = time.monotonic()
         log.warning("provider %s failed: %s", current_key or "(default)", error[:120])
 
-        fallback = self._pick_fallback(current_key)
+        fallback = self._pick_fallback(current_key, self._failed_providers)
         if not fallback:
-            log.error("no fallback provider available (tried: %s)", list(_failed_providers))
+            log.error("no fallback provider available (tried: %s)", list(self._failed_providers))
             if runner._msg_id:
                 await self._messenger.edit_message(
                     runner.chat_id, runner._msg_id,
@@ -184,22 +203,21 @@ class SessionManager:
         await runner.wake_and_prompt(runner._last_parts, fb_model)
 
     @staticmethod
-    def _pick_fallback(failed_key: str) -> Optional[tuple[str, str]]:
+    def _pick_fallback(failed_key: str, failed_providers: dict[str, float]) -> Optional[tuple[str, str]]:
         now = time.monotonic()
         for p, m in config.FALLBACK_MODELS:
             key = f"{p}/{m}"
             if key == failed_key:
                 continue
-            fail_time = _failed_providers.get(key)
+            fail_time = failed_providers.get(key)
             if fail_time is not None and now - fail_time < _PROVIDER_FAIL_TTL:
                 continue
             return (p, m)
         return None
 
-    @staticmethod
-    def clear_provider_failure(provider_id: str, model_id: str) -> None:
+    def clear_provider_failure(self, provider_id: str, model_id: str) -> None:
         key = f"{provider_id}/{model_id}"
-        _failed_providers.pop(key, None)
+        self._failed_providers.pop(key, None)
 
     # -- startup / reconnect ------------------------------------------------
 
@@ -228,10 +246,8 @@ class SessionManager:
 
     @staticmethod
     def _parse_key(key: str) -> tuple[str, Optional[str]]:
-        if ":" in key:
-            chat_id, thread_id = key.split(":", 1)
-            return chat_id, thread_id if thread_id != "None" else None
-        return key, None
+        ck = ChatKey.parse(key)
+        return ck.chat_id, ck.thread_id
 
     # -- idle sweep ---------------------------------------------------------
 

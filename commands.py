@@ -1,31 +1,82 @@
-"""Bot commands: /reset /new /model /models /id /project /approve /diff /undo /git — protocol-generic."""
+"""Bot commands — protocol-generic.
+
+Commands:
+  Session:  /reset /new /stop /undo /redo
+  Model:    /model /models
+  Project:  /project /approve /id
+  Code:     /diff /git /files /cat /grep /find
+  History:  /history /sessions /todo
+  Agent:    /agent /tools
+"""
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
 from collections import defaultdict
-from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from . import config
-from .protocols import AgentBackend, Messenger, MessagePart, ModelInfo, ModelRef
+from .formatter import html_escape
+from .protocols import AgentBackend, ChatKey, Messenger, MessagePart, ModelInfo, ModelRef
 
 if TYPE_CHECKING:
     from .session_manager import SessionManager
 
 log = logging.getLogger(__name__)
 
+
 _model_menus: dict[str, list[ModelInfo]] = {}
 
-_OPENCODE_STORAGE = Path.home() / ".local" / "share" / "opencode"
-_DIFF_DIR = _OPENCODE_STORAGE / "storage" / "session_diff"
-_SNAPSHOT_DIR = _OPENCODE_STORAGE / "snapshot"
+ALL_COMMANDS = (
+    "/reset /new /stop /undo /redo\n"
+    "/model /models /id /project /approve\n"
+    "/diff /git /files /cat /grep /find\n"
+    "/history /sessions /todo /agent /tools"
+)
 
 
-def _chat_key(chat_id: str, thread_id: Optional[str]) -> str:
-    return f"{chat_id}:{thread_id}" if thread_id else chat_id
+@dataclass
+class CommandContext:
+    """All values a command handler may need."""
+    args: str
+    chat_id: str
+    thread_id: Optional[str]
+    messenger: Messenger
+    manager: "SessionManager"
+    agent: AgentBackend
+    directory: Optional[str]
+
+
+CommandHandler = Callable[[CommandContext], Awaitable[bool]]
+
+_REGISTRY: dict[str, CommandHandler] = {}
+
+
+def command(*names: str):
+    """Register a handler for one or more slash command names."""
+    def decorator(fn: CommandHandler) -> CommandHandler:
+        for n in names:
+            _REGISTRY[n] = fn
+        return fn
+    return decorator
+
+
+async def _require_session(ctx: CommandContext) -> Optional[str]:
+    """Return session_id if active, else send 'No active session' and return None."""
+    sid = ctx.manager.get_session_id(ctx.chat_id, ctx.thread_id)
+    if not sid:
+        await ctx.messenger.send_message(ctx.chat_id, "No active session.", ctx.thread_id)
+    return sid
+
+
+async def _delegate_prompt(ctx: CommandContext, prompt_text: str) -> bool:
+    """Send a prompt to the agent on behalf of the user (for /git, /grep, /find)."""
+    parts = [MessagePart(type="text", text=prompt_text)]
+    model = ctx.manager.get_model(ctx.chat_id, ctx.thread_id)
+    await ctx.manager.handle_message(ctx.chat_id, ctx.thread_id, parts, model)
+    return True
 
 
 async def handle_command(
@@ -40,281 +91,429 @@ async def handle_command(
     parts = text.strip().split(None, 1)
     cmd = parts[0].lower().split("@")[0]
     args = parts[1].strip() if len(parts) > 1 else ""
+    directory = manager.get_directory(chat_id, thread_id)
 
-    if cmd in ("/reset", "/new"):
-        await manager.reset_session(chat_id, thread_id)
-        await messenger.send_message(chat_id, "\U0001f504 Session reset.", thread_id)
-        return True
-
-    if cmd == "/model":
-        if "/" in args:
-            provider_id, model_id = args.split("/", 1)
-            manager.set_model(chat_id, thread_id, provider_id.strip(), model_id.strip())
-            await messenger.send_message(
-                chat_id, f"\u2705 Model: `{args}`", thread_id, parse_mode="Markdown",
-            )
-        else:
-            await messenger.send_message(
-                chat_id, "Usage: `/model providerID/modelID`\nor use /models and reply with a number.",
-                thread_id, parse_mode="Markdown",
-            )
-        return True
-
-    if cmd == "/models":
-        try:
-            models = await agent.list_models()
-            current = manager.get_model(chat_id, thread_id)
-            key = _chat_key(chat_id, thread_id)
-            _model_menus[key] = models
-
-            grouped: dict[str, list[tuple[int, ModelInfo]]] = defaultdict(list)
-            for idx, m in enumerate(models, 1):
-                grouped[m.provider_id].append((idx, m))
-
-            lines = ["Models (+ = current):\n"]
-            for provider in sorted(grouped):
-                lines.append(provider)
-                for idx, m in grouped[provider]:
-                    marker = " +" if (current and current.provider_id == m.provider_id
-                                      and current.model_id == m.model_id) else ""
-                    lines.append(f"  {idx}. {m.name or m.model_id}{marker}")
-                lines.append("")
-            lines.append("Reply with a number to switch.")
-
-            await messenger.send_message(
-                chat_id, "\n".join(lines), thread_id,
-            )
-        except Exception as exc:
-            await messenger.send_message(chat_id, f"\u274c Error: {exc}", thread_id)
-        return True
-
-    if cmd == "/id":
-        key = f"{chat_id}:{thread_id}" if thread_id else chat_id
-        sid = manager.get_session_id(chat_id, thread_id)
-        cur_dir = manager.get_directory(chat_id, thread_id) or config.OC_DIRECTORY
-        approve = manager.get_auto_approve(chat_id, thread_id)
-        await messenger.send_message(
-            chat_id,
-            f"chat: `{chat_id}`\nthread: `{thread_id}`\nkey: `{key}`\n"
-            f"session: `{sid}`\ndir: `{cur_dir}`\napprove: `{approve}`",
-            thread_id,
-            parse_mode="Markdown",
-        )
-        return True
-
-    if cmd == "/project":
-        return await _handle_project(args, chat_id, thread_id, messenger, manager)
-
-    if cmd == "/approve":
-        return await _handle_approve(args, chat_id, thread_id, messenger, manager)
-
-    if cmd == "/diff":
-        return await _handle_diff(chat_id, thread_id, messenger, manager)
-
-    if cmd == "/undo":
-        return await _handle_undo(args, chat_id, thread_id, messenger, manager, agent)
-
-    if cmd == "/git":
-        return await _handle_git(args, chat_id, thread_id, messenger, manager, agent)
-
+    handler = _REGISTRY.get(cmd)
+    if handler:
+        ctx = CommandContext(args, chat_id, thread_id, messenger, manager, agent, directory)
+        return await handler(ctx)
     return False
 
 
 # ---------------------------------------------------------------------------
-# /project
+# Registered command handlers
 # ---------------------------------------------------------------------------
 
-async def _handle_project(
-    args: str,
-    chat_id: str,
-    thread_id: Optional[str],
-    messenger: Messenger,
-    manager: SessionManager,
-) -> bool:
-    if not args:
-        cur = manager.get_directory(chat_id, thread_id) or config.OC_DIRECTORY
-        await messenger.send_message(
-            chat_id,
-            f"\U0001f4c2 Current directory:\n`{cur}`\n\nUsage: `/project /path/to/dir`",
-            thread_id,
-            parse_mode="Markdown",
-        )
+
+@command("/reset", "/new")
+async def _handle_reset(ctx: CommandContext) -> bool:
+    await ctx.manager.reset_session(ctx.chat_id, ctx.thread_id)
+    await ctx.messenger.send_message(ctx.chat_id, "\U0001f504 Session reset.", ctx.thread_id)
+    return True
+
+
+@command("/stop")
+async def _handle_stop(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
         return True
+    try:
+        await ctx.agent.abort_session(session_id, directory=ctx.directory)
+        await ctx.messenger.send_message(ctx.chat_id, "\u23f9 Generation stopped.", ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Stop failed: {exc}", ctx.thread_id)
+    return True
 
-    target = os.path.expanduser(args)
-    if not os.path.isabs(target):
-        target = os.path.abspath(target)
 
-    if not os.path.isdir(target):
-        await messenger.send_message(
-            chat_id,
-            f"\u274c Directory not found: `{target}`",
-            thread_id,
-            parse_mode="Markdown",
+@command("/model")
+async def _handle_model(ctx: CommandContext) -> bool:
+    if "/" in ctx.args:
+        provider_id, model_id = ctx.args.split("/", 1)
+        ctx.manager.set_model(ctx.chat_id, ctx.thread_id, provider_id.strip(), model_id.strip())
+        await ctx.messenger.send_message(
+            ctx.chat_id, f"\u2705 Model: `{ctx.args}`", ctx.thread_id, parse_mode="Markdown",
         )
-        return True
+    else:
+        await ctx.messenger.send_message(
+            ctx.chat_id, "Usage: `/model providerID/modelID`\nor use /models and reply with a number.",
+            ctx.thread_id, parse_mode="Markdown",
+        )
+    return True
 
-    manager.set_directory(chat_id, thread_id, target)
-    await manager.reset_session(chat_id, thread_id)
-    await messenger.send_message(
-        chat_id,
-        f"\u2705 Project set to `{target}`\nSession reset for new context.",
-        thread_id,
+
+@command("/models")
+async def _handle_models(ctx: CommandContext) -> bool:
+    try:
+        models = await ctx.agent.list_models()
+        current = ctx.manager.get_model(ctx.chat_id, ctx.thread_id)
+        key = str(ChatKey(ctx.chat_id, ctx.thread_id))
+        _model_menus[key] = models
+
+        grouped: dict[str, list[tuple[int, ModelInfo]]] = defaultdict(list)
+        for idx, m in enumerate(models, 1):
+            grouped[m.provider_id].append((idx, m))
+
+        lines = ["Models (+ = current):\n"]
+        for provider in sorted(grouped):
+            lines.append(provider)
+            for idx, m in grouped[provider]:
+                marker = " +" if (current and current.provider_id == m.provider_id
+                                  and current.model_id == m.model_id) else ""
+                lines.append(f"  {idx}. {m.name or m.model_id}{marker}")
+            lines.append("")
+        lines.append("Reply with a number to switch.")
+
+        await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/id")
+async def _handle_id(ctx: CommandContext) -> bool:
+    key = str(ChatKey(ctx.chat_id, ctx.thread_id))
+    sid = ctx.manager.get_session_id(ctx.chat_id, ctx.thread_id)
+    cur_dir = ctx.directory or config.OC_DIRECTORY
+    approve = ctx.manager.get_auto_approve(ctx.chat_id, ctx.thread_id)
+    await ctx.messenger.send_message(
+        ctx.chat_id,
+        f"chat: `{ctx.chat_id}`\nthread: `{ctx.thread_id}`\nkey: `{key}`\n"
+        f"session: `{sid}`\ndir: `{cur_dir}`\napprove: `{approve}`",
+        ctx.thread_id,
         parse_mode="Markdown",
     )
     return True
 
 
-# ---------------------------------------------------------------------------
-# /approve
-# ---------------------------------------------------------------------------
-
-async def _handle_approve(
-    args: str,
-    chat_id: str,
-    thread_id: Optional[str],
-    messenger: Messenger,
-    manager: SessionManager,
-) -> bool:
-    low = args.lower().strip()
-    if low in ("on", "all", "yes", "true", "1"):
-        manager.set_auto_approve(chat_id, thread_id, True)
-        await messenger.send_message(
-            chat_id,
-            "\u26a0\ufe0f Auto-approve ON — all tool permissions will be granted automatically.",
-            thread_id,
-        )
-    elif low in ("off", "no", "false", "0"):
-        manager.set_auto_approve(chat_id, thread_id, False)
-        await messenger.send_message(
-            chat_id,
-            "\U0001f510 Auto-approve OFF — permissions require manual approval.",
-            thread_id,
-        )
-    else:
-        current = manager.get_auto_approve(chat_id, thread_id)
-        state = "ON" if current else "OFF"
-        await messenger.send_message(
-            chat_id,
-            f"\U0001f510 Auto-approve: {state}\n\nUsage: `/approve on` or `/approve off`",
-            thread_id,
+@command("/project")
+async def _handle_project(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        cur = ctx.manager.get_directory(ctx.chat_id, ctx.thread_id) or config.OC_DIRECTORY
+        await ctx.messenger.send_message(
+            ctx.chat_id,
+            f"\U0001f4c2 Current directory:\n`{cur}`\n\nUsage: `/project /path/to/dir`",
+            ctx.thread_id,
             parse_mode="Markdown",
         )
-    return True
-
-
-# ---------------------------------------------------------------------------
-# /diff
-# ---------------------------------------------------------------------------
-
-async def _handle_diff(
-    chat_id: str,
-    thread_id: Optional[str],
-    messenger: Messenger,
-    manager: SessionManager,
-) -> bool:
-    session_id = manager.get_session_id(chat_id, thread_id)
-    if not session_id:
-        await messenger.send_message(chat_id, "No active session.", thread_id)
         return True
 
-    diff_file = _DIFF_DIR / f"{session_id}.diff"
-    if not diff_file.exists():
-        pattern = str(_DIFF_DIR / f"{session_id}*")
-        candidates = sorted(glob.glob(pattern))
-        if candidates:
-            diff_file = Path(candidates[-1])
-        else:
-            await messenger.send_message(
-                chat_id, "\U0001f4ad No pending changes for this session.", thread_id,
-            )
-            return True
+    target = os.path.expanduser(ctx.args)
+    if not os.path.isabs(target):
+        target = os.path.abspath(target)
 
-    try:
-        content = diff_file.read_text(errors="replace")
-    except OSError as exc:
-        await messenger.send_message(chat_id, f"\u274c Error reading diff: {exc}", thread_id)
-        return True
-
-    if not content.strip():
-        await messenger.send_message(
-            chat_id, "\U0001f4ad No pending changes for this session.", thread_id,
+    if not os.path.isdir(target):
+        await ctx.messenger.send_message(
+            ctx.chat_id,
+            f"\u274c Directory not found: `{target}`",
+            ctx.thread_id,
+            parse_mode="Markdown",
         )
         return True
 
-    max_len = messenger.max_message_length - 20
-    if len(content) > max_len:
-        content = content[:max_len] + "\n\u2026(truncated)"
-    await messenger.send_message(
-        chat_id, f"```diff\n{content}\n```", thread_id, parse_mode="Markdown",
+    ctx.manager.set_directory(ctx.chat_id, ctx.thread_id, target)
+    await ctx.manager.reset_session(ctx.chat_id, ctx.thread_id)
+    await ctx.messenger.send_message(
+        ctx.chat_id,
+        f"\u2705 Project set to `{target}`\nSession reset for new context.",
+        ctx.thread_id,
+        parse_mode="Markdown",
     )
     return True
 
 
-# ---------------------------------------------------------------------------
-# /undo
-# ---------------------------------------------------------------------------
-
-async def _handle_undo(
-    args: str,
-    chat_id: str,
-    thread_id: Optional[str],
-    messenger: Messenger,
-    manager: SessionManager,
-    agent: AgentBackend,
-) -> bool:
-    session_id = manager.get_session_id(chat_id, thread_id)
-    if not session_id:
-        await messenger.send_message(chat_id, "No active session.", thread_id)
-        return True
-
-    snapshot_dir = _SNAPSHOT_DIR / session_id
-    if not snapshot_dir.exists():
-        await messenger.send_message(
-            chat_id, "\U0001f4ad No snapshots available for undo.", thread_id,
+@command("/approve")
+async def _handle_approve(ctx: CommandContext) -> bool:
+    low = ctx.args.lower().strip()
+    if low in ("on", "all", "yes", "true", "1"):
+        ctx.manager.set_auto_approve(ctx.chat_id, ctx.thread_id, True)
+        await ctx.messenger.send_message(
+            ctx.chat_id,
+            "\u26a0\ufe0f Auto-approve ON — all tool permissions will be granted automatically.",
+            ctx.thread_id,
         )
-        return True
-
-    snapshots = sorted(snapshot_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not snapshots:
-        await messenger.send_message(
-            chat_id, "\U0001f4ad No snapshots available for undo.", thread_id,
+    elif low in ("off", "no", "false", "0"):
+        ctx.manager.set_auto_approve(ctx.chat_id, ctx.thread_id, False)
+        await ctx.messenger.send_message(
+            ctx.chat_id,
+            "\U0001f510 Auto-approve OFF — permissions require manual approval.",
+            ctx.thread_id,
         )
-        return True
-
-    prompt_text = f"Revert the last changes. Use the most recent snapshot to undo."
-    directory = manager.get_directory(chat_id, thread_id)
-    model = manager.get_model(chat_id, thread_id)
-    parts = [MessagePart(type="text", text=prompt_text)]
-    await manager.handle_message(chat_id, thread_id, parts, model)
+    else:
+        current = ctx.manager.get_auto_approve(ctx.chat_id, ctx.thread_id)
+        state = "ON" if current else "OFF"
+        await ctx.messenger.send_message(
+            ctx.chat_id,
+            f"\U0001f510 Auto-approve: {state}\n\nUsage: `/approve on` or `/approve off`",
+            ctx.thread_id,
+            parse_mode="Markdown",
+        )
     return True
 
 
-# ---------------------------------------------------------------------------
-# /git
-# ---------------------------------------------------------------------------
+@command("/diff")
+async def _handle_diff(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        content = await ctx.agent.session_diff(session_id, directory=ctx.directory)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+        return True
+    if not content or not content.strip():
+        await ctx.messenger.send_message(
+            ctx.chat_id, "\U0001f4ad No pending changes for this session.", ctx.thread_id,
+        )
+        return True
+    max_len = ctx.messenger.max_message_length - 20
+    if len(content) > max_len:
+        content = content[:max_len] + "\n\u2026(truncated)"
+    await ctx.messenger.send_message(
+        ctx.chat_id, f"```diff\n{content}\n```", ctx.thread_id, parse_mode="Markdown",
+    )
+    return True
 
-async def _handle_git(
-    args: str,
-    chat_id: str,
-    thread_id: Optional[str],
-    messenger: Messenger,
-    manager: SessionManager,
-    agent: AgentBackend,
-) -> bool:
-    if not args:
-        await messenger.send_message(
-            chat_id,
+
+@command("/undo")
+async def _handle_undo(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        await ctx.agent.revert_session(session_id, directory=ctx.directory)
+        await ctx.messenger.send_message(ctx.chat_id, "\u21a9\ufe0f Changes reverted.", ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Revert failed: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/redo")
+async def _handle_redo(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        await ctx.agent.unrevert_session(session_id, directory=ctx.directory)
+        await ctx.messenger.send_message(ctx.chat_id, "\u21aa\ufe0f Changes restored.", ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Redo failed: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/git")
+async def _handle_git(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        await ctx.messenger.send_message(
+            ctx.chat_id,
             "Usage: `/git status`, `/git diff`, `/git log`, `/git commit -m \"msg\"`, `/git push`",
-            thread_id,
+            ctx.thread_id,
             parse_mode="Markdown",
         )
         return True
+    return await _delegate_prompt(ctx, f"Run this git command and show the output: git {ctx.args}")
 
-    prompt_text = f"Run this git command and show the output: git {args}"
-    parts = [MessagePart(type="text", text=prompt_text)]
-    model = manager.get_model(chat_id, thread_id)
-    await manager.handle_message(chat_id, thread_id, parts, model)
+
+@command("/files")
+async def _handle_files(ctx: CommandContext) -> bool:
+    try:
+        files = await ctx.agent.file_status(directory=ctx.directory)
+        if not files:
+            await ctx.messenger.send_message(ctx.chat_id, "No modified files.", ctx.thread_id)
+            return True
+        if ctx.args == "status":
+            lines = ["\U0001f4c4 Modified files:"]
+        else:
+            lines = [f"\U0001f4c4 Project files ({len(files)}):"]
+        for f in files[:50]:
+            status = f.get("status", "?")
+            path = f.get("path", f.get("file", "?"))
+            added = f.get("added", 0)
+            removed = f.get("removed", 0)
+            stat_str = f"+{added}/-{removed}" if added or removed else ""
+            lines.append(f"  {status:10s} {path} {stat_str}")
+        if len(files) > 50:
+            lines.append(f"  \u2026and {len(files) - 50} more")
+        await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/cat")
+async def _handle_cat(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        await ctx.messenger.send_message(
+            ctx.chat_id, "Usage: `/cat path/to/file`", ctx.thread_id, parse_mode="Markdown",
+        )
+        return True
+    path = ctx.args.strip()
+    if not os.path.isabs(path):
+        base = ctx.directory or "."
+        path = os.path.join(base, path)
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", errors="replace") as f:
+                content = f.read()
+        else:
+            await ctx.messenger.send_message(
+                ctx.chat_id, f"\u274c File not found: `{ctx.args.strip()}`",
+                ctx.thread_id, parse_mode="Markdown",
+            )
+            return True
+        if not content:
+            await ctx.messenger.send_message(ctx.chat_id, "(empty file)", ctx.thread_id)
+            return True
+        max_len = ctx.messenger.max_message_length - 40
+        if len(content) > max_len:
+            content = content[:max_len] + "\n\u2026(truncated)"
+        escaped = html_escape(content)
+        await ctx.messenger.send_message(
+            ctx.chat_id, f"<pre>{escaped}</pre>", ctx.thread_id, parse_mode="HTML",
+        )
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/grep")
+async def _handle_grep(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        await ctx.messenger.send_message(
+            ctx.chat_id, "Usage: `/grep pattern`", ctx.thread_id, parse_mode="Markdown",
+        )
+        return True
+    return await _delegate_prompt(
+        ctx, f"Search the codebase for: {ctx.args.strip()} — show file paths, line numbers, and matching lines. Limit to 30 results.",
+    )
+
+
+@command("/find")
+async def _handle_find(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        await ctx.messenger.send_message(
+            ctx.chat_id, "Usage: `/find pattern`", ctx.thread_id, parse_mode="Markdown",
+        )
+        return True
+    return await _delegate_prompt(
+        ctx, f"Find files matching pattern: {ctx.args.strip()} — list their paths. Limit to 50 results.",
+    )
+
+
+@command("/history")
+async def _handle_history(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        messages = await ctx.agent.session_messages(session_id, limit=10, directory=ctx.directory)
+        if not messages:
+            await ctx.messenger.send_message(ctx.chat_id, "No messages in session.", ctx.thread_id)
+            return True
+        lines = ["\U0001f4dc Recent messages:"]
+        for m in messages[-10:]:
+            info = m.get("info", m)
+            role = info.get("role", "?")
+            parts = m.get("parts", [])
+            text_parts = [
+                p.get("text", "") for p in parts
+                if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+            ]
+            content = " ".join(text_parts) if text_parts else m.get("content", m.get("text", ""))
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content if isinstance(p, dict) and p.get("text")
+                )
+            preview = str(content)[:100]
+            lines.append(f"  [{role}] {preview}")
+        await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/sessions")
+async def _handle_sessions(ctx: CommandContext) -> bool:
+    try:
+        sessions = await ctx.agent.list_sessions(limit=10, directory=ctx.directory)
+        if not sessions:
+            await ctx.messenger.send_message(ctx.chat_id, "No sessions found.", ctx.thread_id)
+            return True
+        lines = ["\U0001f4cb Sessions:"]
+        for s in sessions:
+            sid = s.get("id", "?")
+            title = s.get("title", "")
+            status = s.get("status", "?")
+            lines.append(f"  `{sid[:8]}` {title} ({status})")
+        await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id, parse_mode="Markdown")
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/todo")
+async def _handle_todo(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        todos = await ctx.agent.session_todo(session_id, directory=ctx.directory)
+        if not todos:
+            await ctx.messenger.send_message(ctx.chat_id, "No TODOs in session.", ctx.thread_id)
+            return True
+        lines = ["\u2611\ufe0f TODOs:"]
+        for t in todos:
+            status = t.get("status", "?")
+            content = t.get("content", t.get("text", "?"))
+            marker = "\u2705" if status in ("completed", "done") else "\u2b1c"
+            lines.append(f"  {marker} {content}")
+        await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/agent")
+async def _handle_agent(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        try:
+            agents = await ctx.agent.app_agents(directory=ctx.directory)
+            if not agents:
+                await ctx.messenger.send_message(ctx.chat_id, "No agents available.", ctx.thread_id)
+                return True
+            lines = ["\U0001f916 Available agents:"]
+            for i, a in enumerate(agents, 1):
+                name = a.get("name", a.get("id", f"Agent {i}"))
+                desc = a.get("description", "")
+                lines.append(f"  {i}. {name}" + (f" — {desc[:60]}" if desc else ""))
+            await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+        except Exception as exc:
+            await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
+        return True
+    return await _delegate_prompt(
+        ctx, f"[system:agent={ctx.args}] Use the agent named '{ctx.args}' for the next task.",
+    )
+
+
+@command("/tools")
+async def _handle_tools(ctx: CommandContext) -> bool:
+    try:
+        tools = await ctx.agent.tool_ids(directory=ctx.directory)
+        if tools:
+            lines = [f"\U0001f527 Available tools ({len(tools)}):"]
+            for t in tools:
+                lines.append(f"  \u2022 {t}")
+            await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+        else:
+            known_tools = [
+                "bash", "write", "read", "glob", "grep",
+                "fetch", "patch", "todo_read", "todo_write",
+            ]
+            lines = ["\U0001f527 Standard tools:"]
+            for t in known_tools:
+                lines.append(f"  \u2022 {t}")
+            await ctx.messenger.send_message(ctx.chat_id, "\n".join(lines), ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Error: {exc}", ctx.thread_id)
     return True
 
 
@@ -330,7 +529,7 @@ async def try_model_selection(
     if not stripped.isdigit():
         return False
 
-    key = _chat_key(chat_id, thread_id)
+    key = str(ChatKey(chat_id, thread_id))
     menu = _model_menus.get(key)
     if not menu:
         return False

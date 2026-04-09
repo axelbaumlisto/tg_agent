@@ -46,10 +46,10 @@ class TestModelRef(unittest.TestCase):
 
 
 class TestEventConversion(unittest.TestCase):
-    """Test OpenCodeBackend._convert for all event types."""
+    """Test OpenCodeBackend.convert_event for all event types."""
 
     def _convert(self, raw, session_id="s1"):
-        return OpenCodeBackend._convert(raw, session_id)
+        return OpenCodeBackend.convert_event(raw, session_id)
 
     def test_text_delta(self):
         raw = {"type": "message.part.delta", "properties": {"field": "text", "delta": "hello"}}

@@ -36,12 +36,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # Config
 # ---------------------------------------------------------------------------
 
-API_ID = 38309428
-API_HASH = "1f9a006d55531cfd387246cd0fff83f8"
-SESSION = "/home/spex/.zeroclaw/workspace/skills/telegram-reader/.session/research_session"
-BOT = "zGsR_bot"
-TOPIC_RU = 10542
-TOPIC_EN = 10545
+API_ID = int(os.environ.get("E2E_API_ID", "0"))
+API_HASH = os.environ.get("E2E_API_HASH", "")
+SESSION = os.environ.get(
+    "E2E_SESSION_PATH",
+    "/home/spex/.zeroclaw/workspace/skills/telegram-reader/.session/research_session",
+)
+BOT = os.environ.get("E2E_BOT_USERNAME", "zGsR_bot")
+TOPIC_RU = int(os.environ.get("E2E_TOPIC_RU", "10542"))
+TOPIC_EN = int(os.environ.get("E2E_TOPIC_EN", "10545"))
 
 ARTIFACT_PATHS = [
     "/tmp/keyboard_macro.py", "/tmp/mouse_macro.py",
@@ -662,6 +665,7 @@ FEATURE_STEPS: list[Step] = [
 ]
 
 
+@unittest.skipUnless(API_ID and API_HASH, "E2E_API_ID / E2E_API_HASH env vars not set")
 class TestMultiStepE2E(unittest.IsolatedAsyncioTestCase):
     client: TelegramClient
 

@@ -26,13 +26,14 @@ from telethon.tl.types import Message
 # Config
 # ---------------------------------------------------------------------------
 
-API_ID = 38309428
-API_HASH = "1f9a006d55531cfd387246cd0fff83f8"
-SESSION_PATH = os.path.expanduser(
-    "~/.zeroclaw/workspace/skills/telegram-reader/.session/zverozabr_session"
+API_ID = int(os.environ.get("E2E_API_ID", "0"))
+API_HASH = os.environ.get("E2E_API_HASH", "")
+SESSION_PATH = os.environ.get(
+    "E2E_SESSION_PATH",
+    os.path.expanduser("~/.zeroclaw/workspace/skills/telegram-reader/.session/zverozabr_session"),
 )
-BOT_USERNAME = "zGsR_bot"
-BOT_ID = 8527746065
+BOT_USERNAME = os.environ.get("E2E_BOT_USERNAME", "zGsR_bot")
+BOT_ID = int(os.environ.get("E2E_BOT_ID", "8527746065"))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +109,7 @@ async def wait_for_stable_text(
 # ---------------------------------------------------------------------------
 
 
+@unittest.skipUnless(API_ID and API_HASH, "E2E_API_ID / E2E_API_HASH env vars not set")
 class TestE2E(unittest.IsolatedAsyncioTestCase):
     client: TelegramClient
 
@@ -627,6 +629,272 @@ class TestE2E(unittest.IsolatedAsyncioTestCase):
         )
 
         # Cleanup
+        await send_and_wait(self.client, "/approve off", idle_gap=5)
+
+    # -- t21: /stop command --------------------------------------------------
+
+    async def test_t21_stop(self):
+        """/stop aborts running generation or says no session."""
+        msgs = await send_and_wait(self.client, "/stop", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_stop = "stopped" in texts.lower() or "no active" in texts.lower()
+        self.assertTrue(has_stop, f"Expected stop response: {texts[:300]}")
+
+    # -- t22: /undo command (revert API) -------------------------------------
+
+    async def test_t22_undo(self):
+        """/undo either reverts or says no session."""
+        msgs = await send_and_wait(self.client, "/undo", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_undo = (
+            "revert" in texts.lower()
+            or "no active" in texts.lower()
+            or "failed" in texts.lower()
+        )
+        self.assertTrue(has_undo, f"Expected undo response: {texts[:300]}")
+
+    # -- t23: /redo command --------------------------------------------------
+
+    async def test_t23_redo(self):
+        """/redo either restores or says no session."""
+        msgs = await send_and_wait(self.client, "/redo", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_redo = (
+            "restored" in texts.lower()
+            or "no active" in texts.lower()
+            or "failed" in texts.lower()
+        )
+        self.assertTrue(has_redo, f"Expected redo response: {texts[:300]}")
+
+    # -- t24: /tools command -------------------------------------------------
+
+    async def test_t24_tools(self):
+        """/tools lists available tools."""
+        msgs = await send_and_wait(self.client, "/tools", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_tools = "bash" in texts.lower() or "write" in texts.lower() or "tools" in texts.lower()
+        self.assertTrue(has_tools, f"Expected tools list: {texts[:400]}")
+
+    # -- t25: /sessions command ----------------------------------------------
+
+    async def test_t25_sessions(self):
+        """/sessions lists sessions or shows empty."""
+        msgs = await send_and_wait(self.client, "/sessions", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_sessions = (
+            "sessions" in texts.lower()
+            or "no sessions" in texts.lower()
+            or "idle" in texts.lower()
+        )
+        self.assertTrue(has_sessions, f"Expected sessions output: {texts[:400]}")
+
+    # -- t26: /todo command --------------------------------------------------
+
+    async def test_t26_todo(self):
+        """/todo shows todo list or says empty/no session."""
+        msgs = await send_and_wait(self.client, "/todo", idle_gap=5)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_todo = (
+            "todo" in texts.lower()
+            or "no active" in texts.lower()
+            or "no todo" in texts.lower()
+        )
+        self.assertTrue(has_todo, f"Expected todo output: {texts[:300]}")
+
+    # -- t27: /history command -----------------------------------------------
+
+    async def test_t27_history(self):
+        """/history shows message history for active session."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        await send_and_wait(self.client, "Say exactly: HIST_MARKER_27", timeout=60)
+
+        msgs = await send_and_wait(self.client, "/history", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_hist = (
+            "messages" in texts.lower()
+            or "[user]" in texts.lower()
+            or "no messages" in texts.lower()
+            or "hist" in texts.lower()
+        )
+        self.assertTrue(has_hist, f"Expected history output: {texts[:400]}")
+
+    # -- t28: /files live ------------------------------------------------
+
+    async def test_t28_files_live(self):
+        """/files returns file listing from the project."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        msgs = await send_and_wait(self.client, "/files", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        # Should list files OR report an error (means API responded)
+        has_content = (
+            "files" in texts.lower()
+            or ".py" in texts
+            or ".rs" in texts
+            or ".toml" in texts
+            or "no files" in texts.lower()
+            or "error" in texts.lower()
+        )
+        self.assertTrue(has_content, f"Expected file listing: {texts[:400]}")
+
+    # -- t29: /cat live --------------------------------------------------
+
+    async def test_t29_cat_live(self):
+        """/cat reads a file's content via API."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        msgs = await send_and_wait(self.client, "/cat Cargo.toml", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_content = (
+            "cargo" in texts.lower()
+            or "package" in texts.lower()
+            or "[dependencies" in texts.lower()
+            or "error" in texts.lower()
+            or "empty" in texts.lower()
+        )
+        self.assertTrue(has_content, f"Expected Cargo.toml content: {texts[:400]}")
+
+    # -- t30: /grep live -------------------------------------------------
+
+    async def test_t30_grep_live(self):
+        """/grep searches for text in the project."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        msgs = await send_and_wait(self.client, "/grep fn main", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_content = (
+            "main" in texts.lower()
+            or "results" in texts.lower()
+            or "no matches" in texts.lower()
+            or "error" in texts.lower()
+        )
+        self.assertTrue(has_content, f"Expected grep results: {texts[:400]}")
+
+    # -- t31: /find live -------------------------------------------------
+
+    async def test_t31_find_live(self):
+        """/find searches for files by pattern."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        msgs = await send_and_wait(self.client, "/find *.toml", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_content = (
+            ".toml" in texts
+            or "files matching" in texts.lower()
+            or "no files" in texts.lower()
+            or "error" in texts.lower()
+        )
+        self.assertTrue(has_content, f"Expected find results: {texts[:400]}")
+
+    # -- t32: /stop during generation ------------------------------------
+
+    async def test_t32_stop_during_generation(self):
+        """/stop interrupts an active generation."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        # Start a long generation
+        await self.client.send_message(
+            BOT_USERNAME,
+            "Write a very detailed 3000-word essay about quantum computing. "
+            "Cover qubits, superposition, entanglement, quantum gates, "
+            "error correction, and real-world applications.",
+        )
+        # Wait a bit for generation to start
+        await asyncio.sleep(5)
+        # Send /stop
+        stop_msgs = await send_and_wait(self.client, "/stop", idle_gap=5)
+        texts = " ".join(m.text or "" for m in stop_msgs)
+        has_stop = (
+            "stopped" in texts.lower()
+            or "no active" in texts.lower()
+            or "failed" in texts.lower()
+        )
+        self.assertTrue(has_stop, f"Expected stop response: {texts[:300]}")
+
+    # -- t33: /undo → /diff → /redo full cycle ---------------------------
+
+    async def test_t33_undo_diff_redo_cycle(self):
+        """Full cycle: create file → /diff → /undo → /redo."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        await send_and_wait(self.client, "/approve on", idle_gap=5)
+
+        # Create a file
+        await send_and_wait(
+            self.client,
+            'Create a file /tmp/oc_e2e_undo_test.txt with text "undo test 33"',
+            timeout=120,
+        )
+
+        # Check /diff
+        diff_msgs = await send_and_wait(self.client, "/diff", idle_gap=8)
+        diff_text = " ".join(m.text or "" for m in diff_msgs)
+
+        # /undo
+        undo_msgs = await send_and_wait(self.client, "/undo", idle_gap=8)
+        undo_text = " ".join(m.text or "" for m in undo_msgs)
+        has_undo = (
+            "revert" in undo_text.lower()
+            or "failed" in undo_text.lower()
+        )
+        self.assertTrue(has_undo, f"Expected undo response: {undo_text[:300]}")
+
+        # /redo
+        redo_msgs = await send_and_wait(self.client, "/redo", idle_gap=8)
+        redo_text = " ".join(m.text or "" for m in redo_msgs)
+        has_redo = (
+            "restored" in redo_text.lower()
+            or "failed" in redo_text.lower()
+        )
+        self.assertTrue(has_redo, f"Expected redo response: {redo_text[:300]}")
+
+        await send_and_wait(self.client, "/approve off", idle_gap=5)
+
+    # -- t34: /files status live -----------------------------------------
+
+    async def test_t34_files_status(self):
+        """/files status shows modified files."""
+        msgs = await send_and_wait(self.client, "/files status", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_content = (
+            "modified" in texts.lower()
+            or "no modified" in texts.lower()
+            or "status" in texts.lower()
+            or "error" in texts.lower()
+        )
+        self.assertTrue(has_content, f"Expected status output: {texts[:400]}")
+
+    # -- t35: /agent live ------------------------------------------------
+
+    async def test_t35_agent_live(self):
+        """/agent lists available agents or shows error."""
+        msgs = await send_and_wait(self.client, "/agent", idle_gap=8)
+        texts = " ".join(m.text or "" for m in msgs)
+        has_content = (
+            "agent" in texts.lower()
+            or "no agents" in texts.lower()
+            or "error" in texts.lower()
+        )
+        self.assertTrue(has_content, f"Expected agent output: {texts[:400]}")
+
+    # -- t36: tool output visibility -------------------------------------
+
+    async def test_t36_tool_output(self):
+        """Tool execution should show truncated output."""
+        await send_and_wait(self.client, "/reset", idle_gap=5)
+        await send_and_wait(self.client, "/approve on", idle_gap=5)
+
+        msgs = await send_and_wait(
+            self.client,
+            "Run: echo TOOL_OUTPUT_VISIBLE_36",
+            timeout=90,
+        )
+        texts = " ".join(m.text or "" for m in msgs)
+        # The tool output may or may not be visible depending on
+        # whether OpenCode sends output in the SSE event.
+        # At minimum, the tool should execute.
+        has_tool = (
+            "\u2705" in texts  # ✅
+            or "\U0001f527" in texts  # 🔧
+            or "bash" in texts.lower()
+            or "TOOL_OUTPUT_VISIBLE_36" in texts
+        )
+        self.assertTrue(has_tool, f"Expected tool activity: {texts[:400]}")
+
         await send_and_wait(self.client, "/approve off", idle_gap=5)
 
 

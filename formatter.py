@@ -1,6 +1,11 @@
-"""Text chunking for multi-message responses."""
+"""Text chunking and formatting helpers for multi-message responses."""
 
 from __future__ import annotations
+
+
+def html_escape(text: str) -> str:
+    """Escape HTML special characters for Telegram HTML parse mode."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def split_chunks(text: str, max_chars: int = 4000) -> list[str]:

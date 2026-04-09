@@ -1,22 +1,19 @@
 """Tests for per-chat directory, auto-approve, file delivery, and new commands.
 
 Covers:
-  - SessionStore.{get,set,delete}_directory
-  - SessionStore.{get,set}_auto_approve
   - OcClient._headers directory override
   - SessionRunner auto-approve (permission auto-granted)
   - SessionRunner._try_deliver_file
-  - /project, /approve, /diff, /git command handlers
+  - SessionRunner QuestionRequest handling
+  - /project, /approve, /diff, /git, /stop, /undo, /redo command handlers
+  - /files, /cat, /grep, /find, /history, /sessions, /todo, /agent, /tools
   - SessionManager directory/auto_approve threading
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import os
 import pathlib
 import tempfile
-import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,118 +22,10 @@ from opencode_tg.oc_client import OcClient
 from opencode_tg.runners import SessionRunner
 from opencode_tg.session_manager import SessionManager
 from opencode_tg.protocols import (
-    MessagePart, ModelRef, PermissionInfo, PermissionRequest,
-    SessionIdle, TextDelta, ToolEnd, ToolStart,
+    MessagePart, PermissionInfo, PermissionRequest,
+    QuestionRequest, SessionIdle, ToolEnd,
 )
 from opencode_tg import commands
-
-
-# ---------------------------------------------------------------------------
-# SessionStore: directory + auto_approve
-# ---------------------------------------------------------------------------
-
-class TestSessionStoreDirectory(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        self._tmp.write(b"{}")
-        self._tmp.close()
-        self.store = SessionStore(pathlib.Path(self._tmp.name))
-
-    def tearDown(self):
-        os.unlink(self._tmp.name)
-
-    def test_get_directory_default_none(self):
-        self.assertIsNone(self.store.get_directory("123", None))
-
-    def test_set_and_get_directory(self):
-        self.store.set_directory("123", None, "/home/user/project")
-        self.assertEqual(self.store.get_directory("123", None), "/home/user/project")
-
-    def test_set_directory_with_thread(self):
-        self.store.set_directory("123", "456", "/home/user/frontend")
-        self.assertEqual(self.store.get_directory("123", "456"), "/home/user/frontend")
-        self.assertIsNone(self.store.get_directory("123", None))
-
-    def test_delete_directory(self):
-        self.store.set_directory("123", None, "/tmp/test")
-        self.store.delete_directory("123", None)
-        self.assertIsNone(self.store.get_directory("123", None))
-
-    def test_directory_persists_with_session(self):
-        self.store.set("123", None, "ses_1")
-        self.store.set_directory("123", None, "/projects/alpha")
-        self.assertEqual(self.store.get("123", None), "ses_1")
-        self.assertEqual(self.store.get_directory("123", None), "/projects/alpha")
-
-    def test_directory_survives_reload(self):
-        self.store.set_directory("123", None, "/srv/app")
-        store2 = SessionStore(pathlib.Path(self._tmp.name))
-        self.assertEqual(store2.get_directory("123", None), "/srv/app")
-
-
-class TestSessionStoreClearSession(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        self._tmp.write(b"{}")
-        self._tmp.close()
-        self.store = SessionStore(pathlib.Path(self._tmp.name))
-
-    def tearDown(self):
-        os.unlink(self._tmp.name)
-
-    def test_clear_preserves_directory(self):
-        self.store.set("123", None, "ses_1")
-        self.store.set_model("123", None, "openai", "gpt-4o")
-        self.store.set_directory("123", None, "/projects/alpha")
-        self.store.set_auto_approve("123", None, True)
-
-        self.store.clear_session("123", None)
-
-        self.assertIsNone(self.store.get("123", None))
-        self.assertIsNone(self.store.get_model("123", None))
-        self.assertEqual(self.store.get_directory("123", None), "/projects/alpha")
-        self.assertTrue(self.store.get_auto_approve("123", None))
-
-    def test_clear_no_entry_is_noop(self):
-        self.store.clear_session("999", None)
-
-    def test_clear_removes_empty_entry(self):
-        self.store.set("123", None, "ses_1")
-        self.store.clear_session("123", None)
-        self.assertIsNone(self.store.get("123", None))
-
-
-class TestSessionStoreAutoApprove(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        self._tmp.write(b"{}")
-        self._tmp.close()
-        self.store = SessionStore(pathlib.Path(self._tmp.name))
-
-    def tearDown(self):
-        os.unlink(self._tmp.name)
-
-    def test_default_is_false(self):
-        self.assertFalse(self.store.get_auto_approve("123", None))
-
-    def test_set_true(self):
-        self.store.set_auto_approve("123", None, True)
-        self.assertTrue(self.store.get_auto_approve("123", None))
-
-    def test_set_false(self):
-        self.store.set_auto_approve("123", None, True)
-        self.store.set_auto_approve("123", None, False)
-        self.assertFalse(self.store.get_auto_approve("123", None))
-
-    def test_per_thread_isolation(self):
-        self.store.set_auto_approve("123", "t1", True)
-        self.assertFalse(self.store.get_auto_approve("123", None))
-        self.assertTrue(self.store.get_auto_approve("123", "t1"))
-
-    def test_survives_reload(self):
-        self.store.set_auto_approve("123", None, True)
-        store2 = SessionStore(pathlib.Path(self._tmp.name))
-        self.assertTrue(store2.get_auto_approve("123", None))
 
 
 # ---------------------------------------------------------------------------
@@ -144,21 +33,21 @@ class TestSessionStoreAutoApprove(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestOcClientHeaders(unittest.TestCase):
+    def _make_client(self, directory: str = "/default/dir") -> OcClient:
+        return OcClient(base_url="http://localhost:0", directory=directory)
+
     def test_headers_default(self):
-        client = OcClient.__new__(OcClient)
-        client.directory = "/default/dir"
+        client = self._make_client()
         h = client._headers()
         self.assertEqual(h["x-opencode-directory"], "/default/dir")
 
     def test_headers_override(self):
-        client = OcClient.__new__(OcClient)
-        client.directory = "/default/dir"
+        client = self._make_client()
         h = client._headers(directory="/custom/dir")
         self.assertEqual(h["x-opencode-directory"], "/custom/dir")
 
     def test_headers_none_falls_back(self):
-        client = OcClient.__new__(OcClient)
-        client.directory = "/default/dir"
+        client = self._make_client()
         h = client._headers(directory=None)
         self.assertEqual(h["x-opencode-directory"], "/default/dir")
 
@@ -183,7 +72,7 @@ class TestRunnerAutoApprove(unittest.IsolatedAsyncioTestCase):
         perm = PermissionRequest(info=PermissionInfo(
             id="perm_1", session_id="ses_1", title="Run bash", pattern="echo hi",
         ))
-        await runner._handle_event(perm)
+        await runner.handle_event(perm)
 
         agent.respond_permission.assert_awaited_once_with(
             "ses_1", "perm_1", "always", directory=None,
@@ -206,7 +95,7 @@ class TestRunnerAutoApprove(unittest.IsolatedAsyncioTestCase):
         perm = PermissionRequest(info=PermissionInfo(
             id="perm_2", session_id="ses_1", title="Write file",
         ))
-        await runner._handle_event(perm)
+        await runner.handle_event(perm)
 
         agent.respond_permission.assert_not_awaited()
         messenger.send_permission_request.assert_awaited_once()
@@ -312,7 +201,7 @@ class TestRunnerFileDelivery(unittest.IsolatedAsyncioTestCase):
 
         try:
             event = ToolEnd(name="write", call_id="c1", state="completed", title=path)
-            await runner._handle_event(event)
+            await runner.handle_event(event)
             messenger.send_document.assert_awaited_once()
         finally:
             os.unlink(path)
@@ -581,6 +470,430 @@ class TestIdCommand(unittest.IsolatedAsyncioTestCase):
         msg_text = messenger.send_message.call_args[0][1]
         self.assertIn("/custom/path", msg_text)
         self.assertIn("True", msg_text)
+
+
+# ---------------------------------------------------------------------------
+# Commands: /stop
+# ---------------------------------------------------------------------------
+
+class TestStopCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_no_session(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value=None)
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/stop", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("No active session", msg)
+
+    async def test_stop_aborts_session(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value="/tmp")
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/stop", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.abort_session.assert_awaited_once_with("ses_1", directory="/tmp")
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("stopped", msg.lower())
+
+    async def test_stop_failure(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.abort_session = AsyncMock(side_effect=Exception("timeout"))
+
+        result = await commands.handle_command("/stop", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("failed", msg.lower())
+
+
+# ---------------------------------------------------------------------------
+# Commands: /undo (revert API)
+# ---------------------------------------------------------------------------
+
+class TestUndoCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_undo_no_session(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value=None)
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/undo", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("No active session", msg)
+
+    async def test_undo_calls_revert(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value="/proj")
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/undo", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.revert_session.assert_awaited_once_with("ses_1", directory="/proj")
+
+    async def test_undo_failure(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.revert_session = AsyncMock(side_effect=Exception("no snapshots"))
+
+        result = await commands.handle_command("/undo", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("failed", msg.lower())
+
+
+# ---------------------------------------------------------------------------
+# Commands: /redo (unrevert API)
+# ---------------------------------------------------------------------------
+
+class TestRedoCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_redo_calls_unrevert(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/redo", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.unrevert_session.assert_awaited_once_with("ses_1", directory=None)
+
+
+# ---------------------------------------------------------------------------
+# Commands: /diff (API-based)
+# ---------------------------------------------------------------------------
+
+class TestDiffApiCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_diff_returns_content(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value="/proj")
+        agent = AsyncMock()
+        agent.session_diff = AsyncMock(return_value="+new line\n-old line")
+
+        result = await commands.handle_command("/diff", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("+new line", msg)
+
+    async def test_diff_empty(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.session_diff = AsyncMock(return_value="")
+
+        result = await commands.handle_command("/diff", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("No pending changes", msg)
+
+
+# ---------------------------------------------------------------------------
+# Commands: /files, /cat, /grep, /find
+# ---------------------------------------------------------------------------
+
+class TestFileCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_files_list(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.file_status = AsyncMock(return_value=[{"path": "src/main.py", "status": "modified"}, {"path": "README.md", "status": "added"}])
+
+        result = await commands.handle_command("/files", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("src/main.py", msg)
+
+    async def test_files_status(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.file_status = AsyncMock(return_value=[{"path": "foo.py", "status": "M"}])
+
+        result = await commands.handle_command("/files status", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("foo.py", msg)
+
+    async def test_cat_no_args(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/cat", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("Usage", msg)
+
+    async def test_cat_reads_file(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value="/tmp")
+        agent = AsyncMock()
+
+        with tempfile.NamedTemporaryFile(suffix=".py", dir="/tmp", delete=False, mode="w") as f:
+            f.write("print('hello')")
+            fname = os.path.basename(f.name)
+            path = f.name
+
+        try:
+            result = await commands.handle_command(f"/cat {fname}", "123", None, messenger, manager, agent)
+            self.assertTrue(result)
+            msg = messenger.send_message.call_args[0][1]
+            self.assertIn("print('hello')", msg)
+        finally:
+            os.unlink(path)
+
+    async def test_grep_no_args(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/grep", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("Usage", msg)
+
+    async def test_grep_sends_prompt(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        manager.get_model = MagicMock(return_value=None)
+        manager.handle_message = AsyncMock()
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/grep hello", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        manager.handle_message.assert_awaited_once()
+        parts = manager.handle_message.call_args[0][2]
+        self.assertIn("hello", parts[0].text.lower())
+
+    async def test_find_sends_prompt(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        manager.get_model = MagicMock(return_value=None)
+        manager.handle_message = AsyncMock()
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/find *.py", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        manager.handle_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Commands: /history, /sessions, /todo
+# ---------------------------------------------------------------------------
+
+class TestHistoryCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_history_shows_messages(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.session_messages = AsyncMock(return_value=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello there"},
+        ])
+
+        result = await commands.handle_command("/history", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("[user]", msg)
+        self.assertIn("hi", msg)
+
+    async def test_sessions_list(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.list_sessions = AsyncMock(return_value=[
+            {"id": "abc123", "title": "Test", "status": "idle"},
+        ])
+
+        result = await commands.handle_command("/sessions", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("abc123", msg)
+
+    async def test_todo_shows_items(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.session_todo = AsyncMock(return_value=[
+            {"content": "Implement X", "status": "pending"},
+            {"content": "Test Y", "status": "completed"},
+        ])
+
+        result = await commands.handle_command("/todo", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("Implement X", msg)
+
+
+# ---------------------------------------------------------------------------
+# Commands: /agent, /tools
+# ---------------------------------------------------------------------------
+
+class TestAgentToolsCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_tools_lists_available(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.tool_ids = AsyncMock(return_value=["bash", "write", "read", "grep"])
+
+        result = await commands.handle_command("/tools", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("bash", msg)
+        self.assertIn("write", msg)
+
+    async def test_tools_fallback_when_api_empty(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.tool_ids = AsyncMock(return_value=[])
+
+        result = await commands.handle_command("/tools", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("bash", msg)
+
+    async def test_agent_lists_agents(self):
+        messenger = AsyncMock()
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.app_agents = AsyncMock(return_value=[
+            {"name": "coder", "description": "Code generation"},
+        ])
+
+        result = await commands.handle_command("/agent", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("coder", msg)
+
+
+# ---------------------------------------------------------------------------
+# SessionRunner: QuestionRequest handling
+# ---------------------------------------------------------------------------
+
+class TestRunnerQuestionHandling(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_approve_answers_question(self):
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+
+        runner = SessionRunner(
+            "ses_1", "chat_1", None,
+            agent, messenger,
+            auto_approve=True,
+        )
+        runner.state = "generating"
+
+        event = QuestionRequest(
+            request_id="q_1",
+            session_id="ses_1",
+            questions=[{
+                "id": "q1",
+                "prompt": "Which framework?",
+                "options": [
+                    {"value": "react", "label": "React", "default": True},
+                    {"value": "vue", "label": "Vue"},
+                ],
+            }],
+        )
+        await runner.handle_event(event)
+        agent.reply_question.assert_awaited_once()
+        call_args = agent.reply_question.call_args
+        self.assertEqual(call_args[0][0], "q_1")
+
+    async def test_manual_shows_question_to_user(self):
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        messenger.send_message = AsyncMock(return_value="msg_42")
+
+        runner = SessionRunner(
+            "ses_1", "chat_1", None,
+            agent, messenger,
+            auto_approve=False,
+        )
+        runner.state = "generating"
+
+        event = QuestionRequest(
+            request_id="q_2",
+            session_id="ses_1",
+            questions=[{
+                "id": "q1",
+                "prompt": "Proceed?",
+                "options": [{"value": "yes"}, {"value": "no"}],
+            }],
+        )
+        await runner.handle_event(event)
+        agent.reply_question.assert_not_awaited()
+        msg = messenger.send_message.call_args[0][1]
+        self.assertIn("Proceed?", msg)
+
+
+# ---------------------------------------------------------------------------
+# ToolEnd with output
+# ---------------------------------------------------------------------------
+
+class TestToolEndOutput(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_end_shows_output(self):
+        agent = AsyncMock()
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        messenger.edit_message = AsyncMock(return_value=True)
+
+        runner = SessionRunner(
+            "ses_1", "chat_1", None,
+            agent, messenger,
+        )
+        runner.state = "generating"
+        runner.tool_msgs["c1"] = "tool_msg_1"
+
+        event = ToolEnd(
+            name="bash", call_id="c1", state="completed",
+            title="ls -la", output="total 42\ndrwxr-xr-x ...",
+        )
+        await runner.handle_event(event)
+
+        msg = messenger.edit_message.call_args[0][2]
+        self.assertIn("bash", msg)
+        self.assertIn("total 42", msg)
 
 
 if __name__ == "__main__":

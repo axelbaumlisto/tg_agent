@@ -1,4 +1,4 @@
-"""Test that OpenCodeBackend._convert correctly routes reasoning vs text deltas."""
+"""Test that OpenCodeBackend.convert_event correctly routes reasoning vs text deltas."""
 from opencode_tg.agents.opencode import OpenCodeBackend
 from opencode_tg.protocols import ReasoningDelta, TextDelta, SessionIdle
 
@@ -21,31 +21,31 @@ def _part_updated(part_type: str, text: str = "") -> dict:
 
 
 def test_delta_defaults_to_text():
-    events = OpenCodeBackend._convert(_delta_event("hello"), SID, current_part="text")
+    events = OpenCodeBackend.convert_event(_delta_event("hello"), SID, current_part="text")
     assert len(events) == 1
     assert isinstance(events[0], TextDelta)
     assert events[0].text == "hello"
 
 
 def test_delta_as_reasoning():
-    events = OpenCodeBackend._convert(_delta_event("thinking..."), SID, current_part="reasoning")
+    events = OpenCodeBackend.convert_event(_delta_event("thinking..."), SID, current_part="reasoning")
     assert len(events) == 1
     assert isinstance(events[0], ReasoningDelta)
     assert events[0].text == "thinking..."
 
 
 def test_empty_delta_ignored():
-    events = OpenCodeBackend._convert(_delta_event(""), SID, current_part="text")
+    events = OpenCodeBackend.convert_event(_delta_event(""), SID, current_part="text")
     assert events == []
 
 
 def test_part_updated_does_not_emit_text_events():
-    events = OpenCodeBackend._convert(_part_updated("reasoning"), SID)
+    events = OpenCodeBackend.convert_event(_part_updated("reasoning"), SID)
     assert all(not isinstance(e, (TextDelta, ReasoningDelta)) for e in events)
 
 
 def test_session_idle():
     raw = {"type": "session.idle", "properties": {}}
-    events = OpenCodeBackend._convert(raw, SID)
+    events = OpenCodeBackend.convert_event(raw, SID)
     assert len(events) == 1
     assert isinstance(events[0], SessionIdle)

@@ -18,6 +18,23 @@ from typing import Any, AsyncIterator, Optional, Protocol, Union, runtime_checka
 # Shared value types
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class ChatKey:
+    """Unique identifier for a chat/thread pair."""
+    chat_id: str
+    thread_id: Optional[str] = None
+
+    def __str__(self) -> str:
+        return f"{self.chat_id}:{self.thread_id}" if self.thread_id else self.chat_id
+
+    @classmethod
+    def parse(cls, key: str) -> "ChatKey":
+        if ":" in key:
+            chat_id, tid = key.split(":", 1)
+            return cls(chat_id, tid if tid != "None" else None)
+        return cls(key)
+
+
 @dataclass
 class Attachment:
     """A downloaded media file."""
@@ -109,6 +126,7 @@ class ToolEnd:
     state: str  # "completed" | "error"
     title: str = ""
     error: str = ""
+    output: str = ""
 
 
 @dataclass
@@ -130,13 +148,21 @@ class SessionError:
 
 
 @dataclass
+class QuestionRequest:
+    """The agent asks the user a clarifying question."""
+    request_id: str
+    session_id: str
+    questions: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class StatusUpdate:
     """Informational status change (busy, retry, …)."""
     status: str
     message: str = ""
 
 
-AgentEvent = Union[TextDelta, ReasoningDelta, ToolStart, ToolEnd, PermissionRequest, SessionIdle, SessionError, StatusUpdate]
+AgentEvent = Union[TextDelta, ReasoningDelta, ToolStart, ToolEnd, PermissionRequest, QuestionRequest, SessionIdle, SessionError, StatusUpdate]
 
 
 # ---------------------------------------------------------------------------
@@ -221,17 +247,24 @@ class Messenger(Protocol):
 # Agent backend protocol
 # ---------------------------------------------------------------------------
 
-@runtime_checkable
-class AgentBackend(Protocol):
-    """Any coding agent that can run sessions, accept prompts, and stream events."""
+class SessionLifecycle(Protocol):
+    """Create, delete, abort, and query sessions."""
 
-    async def create_session(self, title: str, *, directory: Optional[str] = None) -> str:
-        """Create a new agent session. Return session_id."""
-        ...
+    async def create_session(self, title: str, *, directory: Optional[str] = None) -> str: ...
 
     async def delete_session(self, session_id: str, *, directory: Optional[str] = None) -> None: ...
 
     async def get_session(self, session_id: str, *, directory: Optional[str] = None) -> Optional[dict]: ...
+
+    async def abort_session(self, session_id: str, *, directory: Optional[str] = None) -> None: ...
+
+    async def list_sessions(self, *, limit: int = 10, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def fork_session(self, session_id: str, *, message_id: Optional[str] = None, directory: Optional[str] = None) -> str: ...
+
+
+class PromptBackend(Protocol):
+    """Send prompts and stream agent events."""
 
     async def send_prompt(
         self,
@@ -240,20 +273,59 @@ class AgentBackend(Protocol):
         model: Optional[ModelRef] = None,
         *,
         directory: Optional[str] = None,
-    ) -> None:
-        """Fire-and-forget prompt submission."""
-        ...
+    ) -> None: ...
 
     async def subscribe_events(
         self, session_id: str, *, directory: Optional[str] = None,
-    ) -> AsyncIterator[AgentEvent]:
-        """Stream typed events from the agent for this session."""
-        ...
+    ) -> AsyncIterator[AgentEvent]: ...
 
     async def respond_permission(
         self, session_id: str, perm_id: str, response: str,
         *, directory: Optional[str] = None,
     ) -> None: ...
+
+    async def reply_question(self, request_id: str, answers: list[dict], *, directory: Optional[str] = None) -> None: ...
+
+    async def reject_question(self, request_id: str, *, directory: Optional[str] = None) -> None: ...
+
+
+class SessionHistory(Protocol):
+    """Query session messages, diffs, and todos."""
+
+    async def session_messages(self, session_id: str, *, limit: int = 20, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def session_diff(self, session_id: str, *, message_id: Optional[str] = None, directory: Optional[str] = None) -> str: ...
+
+    async def session_todo(self, session_id: str, *, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def revert_session(self, session_id: str, *, message_id: Optional[str] = None, directory: Optional[str] = None) -> None: ...
+
+    async def unrevert_session(self, session_id: str, *, directory: Optional[str] = None) -> None: ...
+
+
+class FileBackend(Protocol):
+    """File and code search operations."""
+
+    async def file_list(self, *, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def file_read(self, path: str, *, directory: Optional[str] = None) -> str: ...
+
+    async def file_status(self, *, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def find_text(self, pattern: str, *, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def find_files(self, pattern: str, *, directory: Optional[str] = None) -> list[dict]: ...
+
+    async def vcs_get(self, *, directory: Optional[str] = None) -> dict: ...
+
+
+@runtime_checkable
+class AgentBackend(SessionLifecycle, PromptBackend, SessionHistory, FileBackend, Protocol):
+    """Composed protocol: any coding agent that implements all sub-protocols."""
+
+    async def tool_ids(self, *, directory: Optional[str] = None) -> list[str]: ...
+
+    async def app_agents(self, *, directory: Optional[str] = None) -> list[dict]: ...
 
     async def list_models(self) -> list[ModelInfo]: ...
 

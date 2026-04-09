@@ -8,7 +8,7 @@ import sys
 
 from . import config
 from .agents.opencode import OpenCodeBackend
-from .commands import handle_command, try_model_selection
+from .commands import handle_command, try_model_selection, ALL_COMMANDS
 from .messengers.telegram import TelegramMessenger
 from .protocols import MessagePart
 from .session_manager import SessionManager
@@ -35,10 +35,7 @@ async def _handle_callback(msg, agent, messenger, manager):
     if not session_id:
         log.warning("no session found for perm %s", perm_id)
         return
-    chat_thread = manager._store.find_by_session_id(session_id)
-    perm_dir = None
-    if chat_thread:
-        perm_dir = manager.get_directory(chat_thread[0], chat_thread[1])
+    perm_dir = manager.find_directory_for_session(session_id)
     log.info("permission callback: %s %s (session %s)", response, perm_id, session_id)
     try:
         await agent.respond_permission(session_id, perm_id, response, directory=perm_dir)
@@ -55,9 +52,7 @@ async def _handle_command(msg, messenger, manager, agent):
     if not consumed:
         await messenger.send_message(
             msg.sender_id,
-            "Unknown command. Available:\n"
-            "/reset /new /model /models /id\n"
-            "/project /approve /diff /undo /git",
+            f"Unknown command. Available:\n{ALL_COMMANDS}",
             msg.thread_id,
         )
 

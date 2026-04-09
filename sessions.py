@@ -11,7 +11,7 @@ import threading
 from typing import Optional
 
 from . import config
-from .protocols import ModelRef
+from .protocols import ChatKey, ModelRef
 
 
 class SessionStore:
@@ -55,7 +55,7 @@ class SessionStore:
 
     @staticmethod
     def key(chat_id: str, thread_id: Optional[str]) -> str:
-        return f"{chat_id}:{thread_id}" if thread_id else str(chat_id)
+        return str(ChatKey(chat_id, thread_id))
 
     def get(self, chat_id: str, thread_id: Optional[str] = None) -> Optional[str]:
         with self._lock:
@@ -104,15 +104,12 @@ class SessionStore:
         with self._lock:
             return {k: v["session_id"] for k, v in self._data.items() if "session_id" in v}
 
-    def find_by_session_id(self, session_id: str) -> Optional[tuple[str, Optional[str]]]:
-        """Return (chat_id, thread_id) for a given session_id."""
+    def find_by_session_id(self, session_id: str) -> Optional[ChatKey]:
+        """Return ChatKey for a given session_id."""
         with self._lock:
             for k, v in self._data.items():
                 if v.get("session_id") == session_id:
-                    if ":" in k:
-                        chat_id, thread_id = k.split(":", 1)
-                        return chat_id, thread_id if thread_id != "None" else None
-                    return k, None
+                    return ChatKey.parse(k)
         return None
 
     # -- model preference ---------------------------------------------------
