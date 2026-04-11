@@ -272,19 +272,22 @@ class TelegramMessenger:
             data.add_field("caption", caption[:1024])
 
         file_p = Path(file_path)
-        data.add_field(
-            "document",
-            open(file_p, "rb"),
-            filename=file_p.name,
-        )
-
-        async with http.post(url, data=data) as resp:
-            result = await resp.json(content_type=None)
-            if not result.get("ok"):
-                log.warning("sendDocument failed: %s", result)
-                return ""
-            msg_id = result.get("result", {}).get("message_id")
-            return str(msg_id) if msg_id else ""
+        fh = open(file_p, "rb")
+        try:
+            data.add_field(
+                "document",
+                fh,
+                filename=file_p.name,
+            )
+            async with http.post(url, data=data) as resp:
+                result = await resp.json(content_type=None)
+                if not result.get("ok"):
+                    log.warning("sendDocument failed: %s", result)
+                    return ""
+                msg_id = result.get("result", {}).get("message_id")
+                return str(msg_id) if msg_id else ""
+        finally:
+            fh.close()
 
     # -- permissions ---------------------------------------------------------
 
@@ -321,10 +324,10 @@ class TelegramMessenger:
 
     # -- Telegraph (long content) --------------------------------------------
 
-    async def create_telegraph_page(self, title: str, text: str) -> str:
+    async def create_long_content_page(self, title: str, content: str) -> str:
         from ._telegraph import create_page
         http = await self._ensure_http()
-        return await create_page(http, title, text)
+        return await create_page(http, title, content)
 
     # -- cleanup -------------------------------------------------------------
 

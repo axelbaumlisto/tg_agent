@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import unittest
 
 from aiohttp import web
@@ -162,68 +160,12 @@ class TestEventConversion(unittest.TestCase):
 # OpenCodeBackend integration test against mock server
 # ---------------------------------------------------------------------------
 
-def _build_app() -> web.Application:
-    app = web.Application()
-
-    async def create_session(request: web.Request) -> web.Response:
-        body = await request.json()
-        return web.json_response({"id": "ses_1"})
-
-    async def get_session(request: web.Request) -> web.Response:
-        return web.json_response({"id": request.match_info["sid"]})
-
-    async def delete_session(request: web.Request) -> web.Response:
-        return web.Response(status=200)
-
-    async def prompt_async(request: web.Request) -> web.Response:
-        await request.json()
-        return web.Response(status=204)
-
-    async def respond_permission(request: web.Request) -> web.Response:
-        await request.json()
-        return web.json_response(True)
-
-    async def list_providers(request: web.Request) -> web.Response:
-        return web.json_response([
-            {"id": "openai", "models": {"gpt-4o": {"name": "GPT-4o"}}},
-            {"id": "anthropic", "models": [{"id": "claude-sonnet-4-20250514", "name": "Claude 4 Sonnet"}]},
-        ])
-
-    async def sse_events(request: web.Request) -> web.StreamResponse:
-        resp = web.StreamResponse(
-            status=200,
-            headers={"Content-Type": "text/event-stream"},
-        )
-        await resp.prepare(request)
-        events = [
-            {"type": "message.part.delta", "properties": {"sessionID": "ses_1", "field": "text", "delta": "hi"}},
-            {"type": "message.part.updated", "properties": {
-                "sessionID": "ses_1", "type": "tool-invocation",
-                "toolName": "bash", "callID": "c1", "state": "running",
-            }},
-            {"type": "message.part.updated", "properties": {
-                "sessionID": "ses_1", "type": "tool-invocation",
-                "toolName": "bash", "callID": "c1", "state": "completed", "title": "done",
-            }},
-            {"type": "session.idle", "properties": {"sessionID": "ses_1"}},
-        ]
-        for ev in events:
-            await resp.write(f"data: {json.dumps(ev)}\n\n".encode())
-        return resp
-
-    app.router.add_post("/session", create_session)
-    app.router.add_get("/session/{sid}", get_session)
-    app.router.add_delete("/session/{sid}", delete_session)
-    app.router.add_post("/session/{sid}/prompt_async", prompt_async)
-    app.router.add_post("/session/{sid}/permissions/{pid}", respond_permission)
-    app.router.add_get("/provider", list_providers)
-    app.router.add_get("/event", sse_events)
-    return app
+from .mock_oc_server import build_mock_app
 
 
 class TestOpenCodeBackend(AioHTTPTestCase):
     async def get_application(self) -> web.Application:
-        return _build_app()
+        return build_mock_app()
 
     def _make_backend(self) -> OpenCodeBackend:
         base = f"http://127.0.0.1:{self.server.port}"
@@ -234,16 +176,16 @@ class TestOpenCodeBackend(AioHTTPTestCase):
     async def test_create_session(self):
         b = self._make_backend()
         sid = await b.create_session("test")
-        self.assertEqual(sid, "ses_1")
+        self.assertEqual(sid, "ses_mock_1")
 
     async def test_send_prompt(self):
         b = self._make_backend()
-        await b.send_prompt("ses_1", [MessagePart(type="text", text="hi")])
+        await b.send_prompt("ses_mock_1", [MessagePart(type="text", text="hi")])
 
     async def test_send_prompt_with_model(self):
         b = self._make_backend()
         await b.send_prompt(
-            "ses_1",
+            "ses_mock_1",
             [MessagePart(type="text", text="hi")],
             model=ModelRef(provider_id="openai", model_id="gpt-4o"),
         )
@@ -258,7 +200,7 @@ class TestOpenCodeBackend(AioHTTPTestCase):
     async def test_subscribe_events_typed(self):
         b = self._make_backend()
         events = []
-        async for ev in b.subscribe_events("ses_1"):
+        async for ev in b.subscribe_events("ses_mock_1"):
             events.append(ev)
             if isinstance(ev, SessionIdle):
                 break
@@ -270,7 +212,7 @@ class TestOpenCodeBackend(AioHTTPTestCase):
 
     async def test_respond_permission(self):
         b = self._make_backend()
-        await b.respond_permission("ses_1", "p1", "once")
+        await b.respond_permission("ses_mock_1", "p1", "once")
 
 
 if __name__ == "__main__":

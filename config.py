@@ -1,4 +1,6 @@
 """Read configuration from zeroclaws .env and environment."""
+from __future__ import annotations
+
 import os
 import pathlib
 
@@ -13,7 +15,10 @@ def _load_env(path: pathlib.Path) -> dict:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, _, v = line.partition("=")
-            result[k.strip()] = v.strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            result[k.strip()] = v
     except OSError:
         pass
     return result
@@ -35,9 +40,17 @@ _raw_allowed = _get("ALLOWED_CHAT_IDS")
 ALLOWED_CHAT_IDS: set[str] = {s.strip() for s in _raw_allowed.split(",") if s.strip()} if _raw_allowed else set()
 
 # Telegram API for tests (Telethon)
-TG_API_ID: int = int(_get("TELEGRAM_API_ID", "0"))
+def _int(key: str, default: int = 0) -> int:
+    raw = _get(key, str(default))
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+TG_API_ID: int = _int("TELEGRAM_API_ID")
 TG_API_HASH: str = _get("TELEGRAM_API_HASH")
-OPERATOR_CHAT_ID: int = int(_get("TELEGRAM_OPERATOR_CHAT_ID", "0"))
+OPERATOR_CHAT_ID: int = _int("TELEGRAM_OPERATOR_CHAT_ID")
 
 # Sessions file — lives next to this package
 SESSIONS_FILE: pathlib.Path = pathlib.Path(__file__).parent / "sessions.json"

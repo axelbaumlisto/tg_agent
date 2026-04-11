@@ -13,13 +13,12 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from . import config
-from .formatter import html_escape
+from .formatter import html_escape, is_safe_path, send_temp_document
 from .protocols import AgentBackend, ChatKey, Messenger, MessagePart, ModelInfo, ModelRef
 
 if TYPE_CHECKING:
@@ -29,9 +28,10 @@ log = logging.getLogger(__name__)
 
 
 _model_menus: dict[str, list[ModelInfo]] = {}
+_MODEL_MENU_MAX = 50
 
 ALL_COMMANDS = (
-    "/reset /new /stop /undo /redo\n"
+    "/reset /new /stop /fork /reject /undo /redo\n"
     "/model /models /id /project /approve\n"
     "/diff /git /files /cat /grep /find\n"
     "/history /sessions /todo /summarize\n"
@@ -78,20 +78,12 @@ _DOC_THRESHOLD = 3500
 
 async def _send_as_document(ctx: CommandContext, content: str, filename: str, caption: str = "") -> None:
     """Write *content* to a temp file and send as a Telegram document."""
-    suffix = os.path.splitext(filename)[1] or ".txt"
-    with tempfile.NamedTemporaryFile(mode="w", suffix=suffix, prefix="oc-tg-", delete=False) as f:
-        f.write(content)
-        tmp_path = f.name
-    try:
-        await ctx.messenger.send_document(
-            ctx.chat_id, tmp_path, ctx.thread_id,
-            caption=caption or filename,
-        )
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    await send_temp_document(ctx.messenger, ctx.chat_id, ctx.thread_id, content, filename, caption)
+
+
+def _is_safe_path(path: str, base_dir: Optional[str]) -> bool:
+    """Check that *path* is within *base_dir* or config.OC_DIRECTORY."""
+    return is_safe_path(path, base_dir or config.OC_DIRECTORY)
 
 
 async def _delegate_prompt(ctx: CommandContext, prompt_text: str) -> bool:
@@ -148,6 +140,44 @@ async def _handle_stop(ctx: CommandContext) -> bool:
     return True
 
 
+@command("/fork")
+async def _handle_fork(ctx: CommandContext) -> bool:
+    session_id = await _require_session(ctx)
+    if not session_id:
+        return True
+    try:
+        new_id = await ctx.agent.fork_session(session_id, directory=ctx.directory)
+        if not new_id:
+            await ctx.messenger.send_message(ctx.chat_id, "\u274c Fork returned empty session.", ctx.thread_id)
+            return True
+        ctx.manager.bind_forked_session(ctx.chat_id, ctx.thread_id, new_id)
+        await ctx.messenger.send_message(
+            ctx.chat_id,
+            f"\U0001f500 Forked to new session <code>{html_escape(new_id[:12])}</code>",
+            ctx.thread_id,
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Fork failed: {exc}", ctx.thread_id)
+    return True
+
+
+@command("/reject")
+async def _handle_reject(ctx: CommandContext) -> bool:
+    if not ctx.args:
+        await ctx.messenger.send_message(
+            ctx.chat_id, "Usage: `/reject <request_id>`", ctx.thread_id, parse_mode="Markdown",
+        )
+        return True
+    request_id = ctx.args.strip()
+    try:
+        await ctx.agent.reject_question(request_id, directory=ctx.directory)
+        await ctx.messenger.send_message(ctx.chat_id, "\u2716 Question rejected.", ctx.thread_id)
+    except Exception as exc:
+        await ctx.messenger.send_message(ctx.chat_id, f"\u274c Reject failed: {exc}", ctx.thread_id)
+    return True
+
+
 @command("/model")
 async def _handle_model(ctx: CommandContext) -> bool:
     if "/" in ctx.args:
@@ -170,6 +200,9 @@ async def _handle_models(ctx: CommandContext) -> bool:
         models = await ctx.agent.list_models()
         current = ctx.manager.get_model(ctx.chat_id, ctx.thread_id)
         key = str(ChatKey(ctx.chat_id, ctx.thread_id))
+        if len(_model_menus) >= _MODEL_MENU_MAX:
+            oldest = next(iter(_model_menus))
+            del _model_menus[oldest]
         _model_menus[key] = models
 
         grouped: dict[str, list[tuple[int, ModelInfo]]] = defaultdict(list)
@@ -402,8 +435,14 @@ async def _handle_cat(ctx: CommandContext) -> bool:
         return True
     path = ctx.args.strip()
     if not os.path.isabs(path):
-        base = ctx.directory or "."
+        base = ctx.directory or config.OC_DIRECTORY or "."
         path = os.path.join(base, path)
+    if not _is_safe_path(path, ctx.directory):
+        await ctx.messenger.send_message(
+            ctx.chat_id, "\u274c Access denied: path outside project directory.",
+            ctx.thread_id,
+        )
+        return True
     try:
         if os.path.isfile(path):
             with open(path, "r", errors="replace") as f:
@@ -441,11 +480,11 @@ async def _handle_grep(ctx: CommandContext) -> bool:
         if not results:
             await ctx.messenger.send_message(ctx.chat_id, "No matches found.", ctx.thread_id)
             return True
-        lines = [f"\U0001f50d Results for `{html_escape(ctx.args.strip())}`:"]
+        lines = [f"\U0001f50d Results for <code>{html_escape(ctx.args.strip())}</code>:"]
         for r in results[:30]:
-            path = r.get("file", r.get("path", "?"))
+            path = html_escape(r.get("file", r.get("path", "?")))
             line_no = r.get("line", "")
-            text = r.get("text", r.get("content", ""))[:120]
+            text = html_escape(r.get("text", r.get("content", ""))[:120])
             entry = f"  {path}"
             if line_no:
                 entry += f":{line_no}"
@@ -476,9 +515,9 @@ async def _handle_find(ctx: CommandContext) -> bool:
         if not results:
             await ctx.messenger.send_message(ctx.chat_id, "No files found.", ctx.thread_id)
             return True
-        lines = [f"\U0001f4c2 Files matching `{html_escape(ctx.args.strip())}`:"]
+        lines = [f"\U0001f4c2 Files matching <code>{html_escape(ctx.args.strip())}</code>:"]
         for r in results[:50]:
-            path = r.get("file", r.get("path", str(r)))
+            path = html_escape(r.get("file", r.get("path", str(r))))
             lines.append(f"  {path}")
         if len(results) > 50:
             lines.append(f"  \u2026and {len(results) - 50} more")

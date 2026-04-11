@@ -963,19 +963,21 @@ class TestDocumentFallback(unittest.IsolatedAsyncioTestCase):
         messenger = AsyncMock()
         messenger.max_message_length = 4096
         manager = MagicMock()
-        manager.get_directory = MagicMock(return_value=None)
         agent = AsyncMock()
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        tmpdir = tempfile.mkdtemp()
+        manager.get_directory = MagicMock(return_value=tmpdir)
+        fpath = os.path.join(tmpdir, "big.txt")
+        with open(fpath, "w") as f:
             f.write("x" * 5000)
-            tmp_path = f.name
 
         try:
-            result = await commands.handle_command(f"/cat {tmp_path}", "123", None, messenger, manager, agent)
+            result = await commands.handle_command(f"/cat {fpath}", "123", None, messenger, manager, agent)
             self.assertTrue(result)
             messenger.send_document.assert_awaited_once()
         finally:
-            os.unlink(tmp_path)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def test_diff_long_sends_document(self):
         messenger = AsyncMock()
@@ -994,21 +996,23 @@ class TestDocumentFallback(unittest.IsolatedAsyncioTestCase):
         messenger = AsyncMock()
         messenger.max_message_length = 4096
         manager = MagicMock()
-        manager.get_directory = MagicMock(return_value=None)
         agent = AsyncMock()
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        tmpdir = tempfile.mkdtemp()
+        manager.get_directory = MagicMock(return_value=tmpdir)
+        fpath = os.path.join(tmpdir, "small.txt")
+        with open(fpath, "w") as f:
             f.write("short content")
-            tmp_path = f.name
 
         try:
-            result = await commands.handle_command(f"/cat {tmp_path}", "123", None, messenger, manager, agent)
+            result = await commands.handle_command(f"/cat {fpath}", "123", None, messenger, manager, agent)
             self.assertTrue(result)
             messenger.send_document.assert_not_awaited()
             sent_text = messenger.send_message.call_args[0][1]
             self.assertIn("short content", sent_text)
         finally:
-            os.unlink(tmp_path)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1286,6 +1290,359 @@ class TestFileUploadToProjectDir(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(os.path.isfile(os.path.join(project_dir, "test.py")))
 
             os.unlink(src.name)
+
+
+# ---------------------------------------------------------------------------
+# Path safety for /cat
+# ---------------------------------------------------------------------------
+
+class TestCatPathSafety(unittest.IsolatedAsyncioTestCase):
+    async def test_cat_rejects_path_traversal(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value="/home/test/project")
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/cat /etc/passwd", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        sent = messenger.send_message.call_args[0][1]
+        self.assertIn("Access denied", sent)
+
+    async def test_cat_allows_file_within_project(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        agent = AsyncMock()
+
+        tmpdir = tempfile.mkdtemp()
+        manager.get_directory = MagicMock(return_value=tmpdir)
+        fpath = os.path.join(tmpdir, "ok.txt")
+        with open(fpath, "w") as f:
+            f.write("allowed")
+
+        try:
+            result = await commands.handle_command(f"/cat {fpath}", "123", None, messenger, manager, agent)
+            self.assertTrue(result)
+            sent = messenger.send_message.call_args[0][1]
+            self.assertIn("allowed", sent)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# /fork and /reject commands
+# ---------------------------------------------------------------------------
+
+class TestForkCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_fork_creates_new_session(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        manager.bind_forked_session = MagicMock()
+        agent = AsyncMock()
+        agent.fork_session = AsyncMock(return_value="ses_forked_123")
+
+        result = await commands.handle_command("/fork", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.fork_session.assert_awaited_once_with("ses_1", directory=None)
+        manager.bind_forked_session.assert_called_once_with("123", None, "ses_forked_123")
+        sent = messenger.send_message.call_args[0][1]
+        self.assertIn("ses_forked_1", sent)
+
+    async def test_fork_empty_id_rejected(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value="ses_1")
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.fork_session = AsyncMock(return_value="")
+
+        result = await commands.handle_command("/fork", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        sent = messenger.send_message.call_args[0][1]
+        self.assertIn("empty", sent.lower())
+
+    async def test_fork_no_session(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_session_id = MagicMock(return_value=None)
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/fork", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.fork_session.assert_not_awaited()
+
+
+class TestRejectCommand(unittest.IsolatedAsyncioTestCase):
+    async def test_reject_sends_request(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+        agent.reject_question = AsyncMock()
+
+        result = await commands.handle_command("/reject req_abc", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.reject_question.assert_awaited_once_with("req_abc", directory=None)
+
+    async def test_reject_no_args(self):
+        messenger = AsyncMock()
+        messenger.max_message_length = 4096
+        manager = MagicMock()
+        manager.get_directory = MagicMock(return_value=None)
+        agent = AsyncMock()
+
+        result = await commands.handle_command("/reject", "123", None, messenger, manager, agent)
+        self.assertTrue(result)
+        agent.reject_question.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Multi-question reply
+# ---------------------------------------------------------------------------
+
+class TestMultiQuestionReply(unittest.IsolatedAsyncioTestCase):
+    async def test_multi_answer_splits_by_comma(self):
+        from opencode_tg.bot import _try_question_reply
+        from opencode_tg.protocols import QuestionRequest
+
+        q_event = QuestionRequest(
+            request_id="rq1",
+            session_id="ses_1",
+            questions=[{"id": "a"}, {"id": "b"}],
+        )
+
+        runner = MagicMock()
+        runner.pending_questions = {"rq1": q_event}
+        runner.directory = None
+
+        manager = MagicMock()
+        manager.find_runner_for_question = MagicMock(return_value=runner)
+
+        agent = AsyncMock()
+        messenger = AsyncMock()
+
+        msg = MagicMock()
+        msg.text = "q:rq1:yes, no"
+        msg.sender_id = "123"
+        msg.thread_id = None
+
+        consumed = await _try_question_reply(msg, manager, agent, messenger)
+        self.assertTrue(consumed)
+        call_args = agent.reply_question.call_args
+        answers = call_args[0][1]
+        self.assertEqual(len(answers), 2)
+        self.assertEqual(answers[0]["value"], "yes")
+        self.assertEqual(answers[1]["value"], "no")
+
+
+# ---------------------------------------------------------------------------
+# ChatKey parse edge case
+# ---------------------------------------------------------------------------
+
+class TestChatKeyParseEdge(unittest.TestCase):
+    def test_empty_thread_id_is_none(self):
+        from opencode_tg.protocols import ChatKey
+        ck = ChatKey.parse("123:")
+        self.assertEqual(ck.chat_id, "123")
+        self.assertIsNone(ck.thread_id)
+
+    def test_none_string_thread_id_is_none(self):
+        from opencode_tg.protocols import ChatKey
+        ck = ChatKey.parse("123:None")
+        self.assertEqual(ck.chat_id, "123")
+        self.assertIsNone(ck.thread_id)
+
+
+# ---------------------------------------------------------------------------
+# html_escape includes quotes
+# ---------------------------------------------------------------------------
+
+class TestHtmlEscapeQuotes(unittest.TestCase):
+    def test_quotes_escaped(self):
+        from opencode_tg.formatter import html_escape
+        self.assertIn("&quot;", html_escape('say "hello"'))
+
+
+# ---------------------------------------------------------------------------
+# _safe_task error handler
+# ---------------------------------------------------------------------------
+
+class TestSafeTask(unittest.IsolatedAsyncioTestCase):
+    async def test_safe_task_logs_exception(self):
+        from opencode_tg.bot import _safe_task
+
+        async def _boom():
+            raise ValueError("test boom")
+
+        with self.assertLogs("opencode_tg.bot", level="ERROR") as cm:
+            task = _safe_task(_boom())
+            await task
+        self.assertTrue(any("test boom" in msg for msg in cm.output))
+
+
+# ---------------------------------------------------------------------------
+# config .env quoting
+# ---------------------------------------------------------------------------
+
+class TestConfigEnvQuoting(unittest.TestCase):
+    def test_strips_quotes_from_env_values(self):
+        from opencode_tg.config import _load_env
+        import pathlib
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write('KEY1="quoted_val"\n')
+            f.write("KEY2='single_quoted'\n")
+            f.write("KEY3=plain\n")
+            tmp = f.name
+        try:
+            result = _load_env(pathlib.Path(tmp))
+            self.assertEqual(result["KEY1"], "quoted_val")
+            self.assertEqual(result["KEY2"], "single_quoted")
+            self.assertEqual(result["KEY3"], "plain")
+        finally:
+            os.unlink(tmp)
+
+
+# ---------------------------------------------------------------------------
+# Telegraph error handling
+# ---------------------------------------------------------------------------
+
+class TestTelegraphErrorHandling(unittest.IsolatedAsyncioTestCase):
+    async def test_create_page_raises_on_bad_result(self):
+        from opencode_tg.messengers._telegraph import create_page, get_or_create_account
+        import aiohttp
+        from unittest.mock import patch
+
+        async with aiohttp.ClientSession() as session:
+            with patch("opencode_tg.messengers._telegraph.get_or_create_account", return_value="tok"):
+                with patch("opencode_tg.messengers._telegraph._telegraph_call", return_value={"ok": False, "error": "bad"}):
+                    with self.assertRaises(RuntimeError):
+                        await create_page(session, "test", "content")
+
+
+# ---------------------------------------------------------------------------
+# create_session guards bad response
+# ---------------------------------------------------------------------------
+
+class TestCreateSessionGuard(unittest.IsolatedAsyncioTestCase):
+    async def test_create_session_bad_response_raises(self):
+        from opencode_tg.oc_client import OcClient, OcClientError
+        from unittest.mock import patch, AsyncMock as AM
+
+        oc = OcClient.__new__(OcClient)
+        oc._base = "http://localhost"
+        oc._http = None
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"status": "ok"})
+
+        with patch.object(oc, "_request", return_value=mock_resp):
+            with self.assertRaises(OcClientError):
+                await oc.create_session("test")
+
+
+# ---------------------------------------------------------------------------
+# _is_safe_path with no base
+# ---------------------------------------------------------------------------
+
+class TestSafePathNoBase(unittest.TestCase):
+    def test_denies_when_no_base(self):
+        from opencode_tg.commands import _is_safe_path
+        self.assertFalse(_is_safe_path("/etc/passwd", None))
+
+
+# ---------------------------------------------------------------------------
+# Attachment filename sanitization
+# ---------------------------------------------------------------------------
+
+class TestAttachmentSanitization(unittest.IsolatedAsyncioTestCase):
+    async def test_traversal_filename_sanitized(self):
+        from opencode_tg.bot import _handle_message
+        from opencode_tg.protocols import Attachment
+
+        with tempfile.TemporaryDirectory() as project_dir:
+            src = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+            src.write(b"print('pwn')")
+            src.close()
+
+            msg = MagicMock()
+            msg.text = "check"
+            msg.sender_id = "123"
+            msg.thread_id = None
+            msg.attachments = [Attachment(mime="text/x-python", filename="../../evil.py", local_path=src.name)]
+
+            manager = MagicMock()
+            manager.get_directory = MagicMock(return_value=project_dir)
+            manager.get_model = MagicMock(return_value=None)
+            manager.handle_message = AsyncMock()
+
+            messenger = AsyncMock()
+            messenger.cleanup_attachment = MagicMock()
+            agent = AsyncMock()
+
+            await _handle_message(msg, manager, messenger, agent)
+
+            parts = manager.handle_message.call_args[0][2]
+            file_part = [p for p in parts if p.type == "file"][0]
+            self.assertIn(project_dir, file_part.url)
+            self.assertTrue(os.path.isfile(os.path.join(project_dir, "evil.py")))
+            self.assertFalse(os.path.exists(os.path.join(project_dir, "..", "..", "evil.py")))
+
+            os.unlink(src.name)
+
+
+# ---------------------------------------------------------------------------
+# Question reply failure keeps question
+# ---------------------------------------------------------------------------
+
+class TestQuestionReplyRetry(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_reply_keeps_question(self):
+        from opencode_tg.bot import _try_question_reply
+        from opencode_tg.protocols import QuestionRequest
+
+        q_event = QuestionRequest(
+            request_id="rq1",
+            session_id="ses_1",
+            questions=[{"id": "a"}],
+        )
+
+        runner = MagicMock()
+        runner.pending_questions = {"rq1": q_event}
+        runner.directory = None
+
+        manager = MagicMock()
+        manager.find_runner_for_question = MagicMock(return_value=runner)
+
+        agent = AsyncMock()
+        agent.reply_question = AsyncMock(side_effect=RuntimeError("fail"))
+        messenger = AsyncMock()
+
+        msg = MagicMock()
+        msg.text = "q:rq1:answer"
+        msg.sender_id = "123"
+        msg.thread_id = None
+
+        await _try_question_reply(msg, manager, agent, messenger)
+        self.assertIn("rq1", runner.pending_questions)
+
+
+# ---------------------------------------------------------------------------
+# config safe int
+# ---------------------------------------------------------------------------
+
+class TestConfigSafeInt(unittest.TestCase):
+    def test_bad_value_returns_default(self):
+        from opencode_tg.config import _int
+        self.assertEqual(_int("NONEXISTENT_KEY_12345"), 0)
 
 
 if __name__ == "__main__":

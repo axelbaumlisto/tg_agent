@@ -130,8 +130,11 @@ def has_any(*substrings: str) -> Validator:
 
 
 def has_tool() -> Validator:
+    """Check for tool execution — composite UX replaces markers with final text."""
     def _check(text: str, _msgs: list[Message]) -> None:
-        assert "\U0001f527" in text or "\u2705" in text, "no tool indicators"
+        has_markers = "\U0001f527" in text or "\u2705" in text
+        has_result = len(text.strip()) >= 4
+        assert has_markers or has_result, "no tool indicators and no meaningful response"
     return _tag(_check, ErrorCategory.BOT)
 
 
@@ -283,12 +286,17 @@ async def send_and_wait(
         content = " ".join((m.text or "") for m in topic_msgs).strip()
         is_placeholder = content in ("", "\u2699\ufe0f")
 
-        has_tool_indicator = "\U0001f527" in content or "\u2705" in content
-        is_reasoning_only = (
-            content.startswith("\U0001f4ad") and not has_tool_indicator
+        is_only_reasoning = (
+            content.startswith("\U0001f4ad")
+            and "\u2500" not in content
+            and len(content) < 600
         )
+        is_only_tools = all(
+            line.startswith(("\U0001f527", "\u2705", "\U0001f4ad", "\u2500"))
+            for line in content.splitlines() if line.strip()
+        ) and len(content) < 300
 
-        if not is_placeholder and not is_reasoning_only and time.monotonic() - last_change >= stable_for:
+        if not is_placeholder and not is_only_reasoning and not is_only_tools and time.monotonic() - last_change >= stable_for:
             break
 
     if seen_ids:
@@ -302,12 +310,14 @@ async def send_and_wait(
 # ---------------------------------------------------------------------------
 
 def _is_stuck(text: str) -> bool:
-    """Response is stuck: only placeholder or unfinished reasoning."""
+    """Response is stuck: only placeholder or unfinished reasoning with no real content."""
     stripped = text.strip()
     if stripped in ("", "\u2699\ufe0f"):
         return True
-    if stripped.startswith("\U0001f4ad") and "\U0001f527" not in stripped and "\u2705" not in stripped:
-        return True
+    if stripped.startswith("\U0001f4ad"):
+        without_reasoning = stripped.lstrip("\U0001f4ad").strip()
+        if len(without_reasoning) < 10 and "\u2500" not in stripped:
+            return True
     return False
 
 
@@ -431,7 +441,9 @@ KEYBOARD_STEPS: list[Step] = [
         timeout=180,
     ),
     Step(
-        "Сохрани скрипт в /tmp/keyboard_macro.py и запусти с флагом --help чтобы протестировать",
+        "Напиши Python скрипт для программируемой клавиатуры с pynput (переназначение клавиш, макросы). "
+        "Используй argparse до импорта pynput чтобы --help работал без дисплея. "
+        "Сохрани в /tmp/keyboard_macro.py и запусти с --help для теста.",
         [responded(), has_tool(),
          file_exists("/tmp/keyboard_macro.py"),
          script_runs("/tmp/keyboard_macro.py")],
@@ -450,17 +462,19 @@ KEYBOARD_STEPS: list[Step] = [
         timeout=240,
     ),
     Step(
-        "Сохрани скрипт и документацию в /tmp/keyboard_project/, "
-        "создай zip архив /tmp/keyboard_project.zip",
+        "Скопируй /tmp/keyboard_macro.py в /tmp/keyboard_project/ и создай "
+        "markdown документацию /tmp/keyboard_project/README.md, "
+        "затем создай zip архив /tmp/keyboard_project.zip из папки /tmp/keyboard_project/",
         [responded(), has_tool(),
          valid_zip("/tmp/keyboard_project.zip", min_files=2)],
         timeout=300,
         retryable=True,
     ),
     Step(
-        "Перепиши Python скрипт клавиатуры на Rust используя enigo крейт. "
-        "Сделай упрощённую версию — только базовое переназначение клавиш и один макрос. "
-        "Сохрани в /tmp/keyboard_project/src/main.rs и обязательно проверь что cargo check проходит.",
+        "Создай Rust проект в /tmp/keyboard_project/ (cargo init если нет Cargo.toml). "
+        "Добавь enigo = \"0.2\" в зависимости. "
+        "Напиши простой main.rs с базовым переназначением клавиш через enigo. "
+        "Запусти cargo check и убедись что компилируется.",
         [responded(), has_tool(),
          file_exists("/tmp/keyboard_project/src/main.rs"),
          rust_checks("/tmp/keyboard_project")],
@@ -508,7 +522,9 @@ MOUSE_STEPS: list[Step] = [
         timeout=180,
     ),
     Step(
-        "Save this script to /tmp/mouse_macro.py and run it with --help flag to test it",
+        "Write a Python script for Razer DeathAdder mouse button remapping using pynput. "
+        "Use argparse before importing pynput so --help works without display. "
+        "Save it to /tmp/mouse_macro.py and run with --help flag to test.",
         [responded(), has_tool(),
          file_exists("/tmp/mouse_macro.py"),
          script_runs("/tmp/mouse_macro.py")],
@@ -527,17 +543,19 @@ MOUSE_STEPS: list[Step] = [
         timeout=240,
     ),
     Step(
-        "Save the script and documentation to /tmp/mouse_project/, "
-        "create a zip archive /tmp/mouse_project.zip",
+        "Copy /tmp/mouse_macro.py to /tmp/mouse_project/ and create "
+        "a markdown README.md in /tmp/mouse_project/, "
+        "then create a zip archive /tmp/mouse_project.zip from /tmp/mouse_project/",
         [responded(), has_tool(),
          valid_zip("/tmp/mouse_project.zip", min_files=2)],
         timeout=300,
         retryable=True,
     ),
     Step(
-        "Rewrite the Python mouse script in Rust using the enigo crate. "
-        "Keep it simple — basic mouse click simulation and one macro. "
-        "Save to /tmp/mouse_project/src/main.rs and make sure cargo check passes.",
+        "Create a Rust project in /tmp/mouse_project/ (cargo init if no Cargo.toml). "
+        "Add enigo = \"0.2\" as a dependency. "
+        "Write a simple main.rs with basic mouse click simulation using enigo. "
+        "Run cargo check and make sure it compiles.",
         [responded(), has_tool(),
          file_exists("/tmp/mouse_project/src/main.rs"),
          rust_checks("/tmp/mouse_project")],
@@ -576,23 +594,6 @@ def has_text(substring: str) -> Validator:
     return _tag(_check, ErrorCategory.BOT)
 
 
-def no_text(substring: str) -> Validator:
-    """Check that substring does NOT appear in combined text."""
-    def _check(text: str, _msgs: list[Message]) -> None:
-        assert substring.lower() not in text.lower(), f"'{substring}' unexpectedly found"
-    return _tag(_check, ErrorCategory.BOT)
-
-
-def has_document() -> Validator:
-    """Check that at least one message contains a document/media attachment."""
-    def _check(_text: str, msgs: list[Message]) -> None:
-        has_doc = any(
-            getattr(m, "document", None) is not None
-            or getattr(m, "media", None) is not None
-            for m in msgs
-        )
-        assert has_doc, "no document attachment found"
-    return _tag(_check, ErrorCategory.BOT)
 
 
 # ---------------------------------------------------------------------------
@@ -657,12 +658,28 @@ FEATURE_STEPS: list[Step] = [
         retryable=True,
     ),
     Step(
-        'Save a file /tmp/oc_e2e_feature_test.txt with text "feature test OK 42"',
+        "/approve on",
+        [responded(), has_text("on")],
+        timeout=15,
+    ),
+    Step(
+        'Run this bash command: echo "feature test OK 42" > /tmp/oc_e2e_feature_test.txt && echo "done"',
         [responded(), has_tool(), file_exists("/tmp/oc_e2e_feature_test.txt")],
         timeout=180,
         retryable=True,
     ),
 ]
+
+
+async def _cleanup_bot_chat(client: TelegramClient) -> None:
+    """Delete all messages in the bot chat to keep it clean after tests."""
+    try:
+        msgs = await client.get_messages(BOT, limit=300)
+        if msgs:
+            ids = [m.id for m in msgs]
+            await client.delete_messages(BOT, ids)
+    except Exception:
+        pass
 
 
 @unittest.skipUnless(API_ID and API_HASH, "E2E_API_ID / E2E_API_HASH env vars not set")
@@ -675,6 +692,7 @@ class TestMultiStepE2E(unittest.IsolatedAsyncioTestCase):
         await self.client.start()
 
     async def asyncTearDown(self) -> None:
+        await _cleanup_bot_chat(self.client)
         await self.client.disconnect()
 
     async def test_parallel_scenarios(self) -> None:

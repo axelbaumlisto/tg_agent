@@ -31,7 +31,7 @@ class ChatKey:
     def parse(cls, key: str) -> "ChatKey":
         if ":" in key:
             chat_id, tid = key.split(":", 1)
-            return cls(chat_id, tid if tid != "None" else None)
+            return cls(chat_id, tid if tid not in ("None", "") else None)
         return cls(key)
 
 
@@ -238,8 +238,28 @@ class Messenger(Protocol):
         """Send a file/document to the chat. Return msg_id."""
         ...
 
+    def cleanup_attachment(self, att: Attachment) -> None:
+        """Remove a downloaded attachment from local storage."""
+        ...
+
+    async def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        """Register slash commands with the platform (no-op if unsupported)."""
+        ...
+
     async def close(self) -> None:
         """Release resources."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Long content provider (optional capability)
+# ---------------------------------------------------------------------------
+
+class LongContentProvider(Protocol):
+    """Publish long text to an external page and return a URL."""
+
+    async def create_long_content_page(self, title: str, content: str) -> str:
+        """Create a page with *content* and return its public URL."""
         ...
 
 

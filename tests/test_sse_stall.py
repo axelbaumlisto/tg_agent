@@ -192,8 +192,8 @@ class TestStalledGeneratingWatchdog(unittest.IsolatedAsyncioTestCase):
         runner = MagicMock()
         runner.state = "generating"
         runner.last_active = time.monotonic() - 600
-        runner._in_reasoning = False
-        runner._reasoning_start = 0.0
+        runner.in_reasoning = False
+        runner.reasoning_start = 0.0
         runner.reconnect = AsyncMock()
 
         manager = self._make_manager({"chat:1": runner})
@@ -209,8 +209,8 @@ class TestStalledGeneratingWatchdog(unittest.IsolatedAsyncioTestCase):
         runner = MagicMock()
         runner.state = "generating"
         runner.last_active = time.monotonic()
-        runner._in_reasoning = False
-        runner._reasoning_start = 0.0
+        runner.in_reasoning = False
+        runner.reasoning_start = 0.0
         runner.reconnect = AsyncMock()
 
         manager = self._make_manager({"chat:1": runner})

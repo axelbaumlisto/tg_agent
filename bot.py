@@ -5,22 +5,36 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import shutil
 import sys
 
 from . import config
 from .agents.opencode import OpenCodeBackend
 from .commands import handle_command, try_model_selection, ALL_COMMANDS
 from .messengers.telegram import TelegramMessenger
-from .protocols import MessagePart
+from .protocols import AgentBackend, IncomingMessage, LongContentProvider, MessagePart, Messenger
 from .session_manager import SessionManager
 from .sessions import SessionStore
 from .watchdog import watchdog_loop
 
 log = logging.getLogger(__name__)
 
+
+def _safe_task(coro: object) -> asyncio.Task:
+    """Wrap a coroutine in a task that logs unhandled exceptions."""
+    async def _wrapper():
+        try:
+            await coro
+        except Exception as exc:
+            log.error("unhandled task error: %s", exc, exc_info=True)
+    return asyncio.create_task(_wrapper())
+
 BOT_COMMANDS: list[tuple[str, str]] = [
     ("reset", "Reset / start a new session"),
     ("stop", "Stop current generation"),
+    ("fork", "Fork current session"),
+    ("reject", "Reject a pending question"),
     ("undo", "Revert last change"),
     ("redo", "Restore reverted change"),
     ("model", "Set model: /model provider/model"),
@@ -49,7 +63,7 @@ def _is_allowed(chat_id: str) -> bool:
     return chat_id in config.ALLOWED_CHAT_IDS
 
 
-async def _handle_callback(msg, agent, messenger, manager):
+async def _handle_callback(msg: IncomingMessage, agent: AgentBackend, messenger: Messenger, manager: SessionManager) -> None:
     _RESPONSE_MAP = {"o": "once", "a": "always", "d": "reject"}
     parts = msg.callback_data.split(":", 2)
     if len(parts) != 3 or parts[0] != "p":
@@ -70,7 +84,7 @@ async def _handle_callback(msg, agent, messenger, manager):
     await messenger.resolve_permission_ui(msg.sender_id, perm_msg_id, response)
 
 
-async def _handle_command(msg, messenger, manager, agent):
+async def _handle_command(msg: IncomingMessage, messenger: Messenger, manager: SessionManager, agent: AgentBackend) -> None:
     consumed = await handle_command(
         msg.text, msg.sender_id, msg.thread_id, messenger, manager, agent,
     )
@@ -82,13 +96,10 @@ async def _handle_command(msg, messenger, manager, agent):
         )
 
 
-import re
-import shutil
-
 _QUESTION_RE = re.compile(r"^q:([^:]+):(.+)$", re.DOTALL)
 
 
-async def _try_question_reply(msg, manager, agent, messenger) -> bool:
+async def _try_question_reply(msg: IncomingMessage, manager: SessionManager, agent: AgentBackend, messenger: Messenger) -> bool:
     """Handle ``q:<request_id>:<answer>`` replies. Returns True if consumed."""
     if not msg.text:
         return False
@@ -100,20 +111,26 @@ async def _try_question_reply(msg, manager, agent, messenger) -> bool:
     if not runner:
         await messenger.send_message(msg.sender_id, "\u274c Question not found or expired.", msg.thread_id)
         return True
-    event = runner.pending_questions.pop(request_id)
+    event = runner.pending_questions.get(request_id)
+    if not event:
+        await messenger.send_message(msg.sender_id, "\u274c Question not found or expired.", msg.thread_id)
+        return True
+    answer_parts = [a.strip() for a in answer.split(",")]
     answers = []
-    for q in event.questions:
-        answers.append({"id": q.get("id", ""), "value": answer})
+    for i, q in enumerate(event.questions):
+        value = answer_parts[i] if i < len(answer_parts) else answer_parts[-1]
+        answers.append({"id": q.get("id", ""), "value": value})
     directory = runner.directory
     try:
         await agent.reply_question(request_id, answers, directory=directory)
+        runner.pending_questions.pop(request_id, None)
         await messenger.send_message(msg.sender_id, f"\u2705 Answer sent.", msg.thread_id)
     except Exception as exc:
         await messenger.send_message(msg.sender_id, f"\u274c Reply failed: {exc}", msg.thread_id)
     return True
 
 
-async def _handle_message(msg, manager, messenger, agent):
+async def _handle_message(msg: IncomingMessage, manager: SessionManager, messenger: Messenger, agent: AgentBackend) -> None:
     if msg.text and await _try_question_reply(msg, manager, agent, messenger):
         return
 
@@ -131,7 +148,8 @@ async def _handle_message(msg, manager, messenger, agent):
     for att in msg.attachments:
         local = str(att.local_path)
         if project_dir and os.path.isdir(project_dir):
-            dest = os.path.join(project_dir, att.filename)
+            safe_name = os.path.basename(att.filename)
+            dest = os.path.join(project_dir, safe_name)
             try:
                 shutil.copy2(local, dest)
                 copied_paths.append(dest)
@@ -172,7 +190,9 @@ async def main() -> None:
     messenger = TelegramMessenger(bot_token=config.BOT_TOKEN)
     store = SessionStore()
 
-    long_handler = getattr(messenger, "create_telegraph_page", None)
+    long_handler = None
+    if isinstance(messenger, LongContentProvider):
+        long_handler = messenger.create_long_content_page
     manager = SessionManager(
         store, agent, messenger,
         long_content_handler=long_handler,
@@ -194,11 +214,11 @@ async def main() -> None:
                 log.warning("blocked message from unauthorized chat %s", msg.sender_id)
                 continue
             if msg.callback_data:
-                asyncio.create_task(_handle_callback(msg, agent, messenger, manager))
+                _safe_task(_handle_callback(msg, agent, messenger, manager))
             elif msg.is_command:
-                asyncio.create_task(_handle_command(msg, messenger, manager, agent))
+                _safe_task(_handle_command(msg, messenger, manager, agent))
             else:
-                asyncio.create_task(_handle_message(msg, manager, messenger, agent))
+                _safe_task(_handle_message(msg, manager, messenger, agent))
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("shutting down...")
     finally:

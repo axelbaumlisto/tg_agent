@@ -15,9 +15,8 @@ async def watchdog_loop(manager: SessionManager) -> None:
     """Run forever: periodically sweep idle sessions and reconnect dead SSE."""
     while True:
         await asyncio.sleep(config.WATCHDOG_INTERVAL_SECONDS)
-        try:
-            await manager.idle_sweep()
-            await manager.check_dead_sse()
-            await manager.check_stalled_generating()
-        except Exception as exc:
-            log.error("watchdog error: %s", exc)
+        for check in (manager.idle_sweep, manager.check_dead_sse, manager.check_stalled_generating):
+            try:
+                await check()
+            except Exception as exc:
+                log.error("watchdog %s error: %s", check.__name__, exc)

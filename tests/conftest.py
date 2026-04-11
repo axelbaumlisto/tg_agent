@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pathlib
-import tempfile
 from unittest.mock import AsyncMock
 
 import pytest

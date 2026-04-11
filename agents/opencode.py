@@ -8,7 +8,6 @@ from typing import AsyncIterator, Callable, Optional
 
 from ..oc_client import OcClient
 from ..protocols import (
-    AgentBackend,
     AgentEvent,
     MessagePart,
     ModelInfo,

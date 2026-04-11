@@ -52,6 +52,24 @@ class SessionManager:
             self._locks[key] = lock
         return lock
 
+    def _create_runner(
+        self,
+        session_id: str,
+        chat_id: str,
+        thread_id: Optional[str],
+        directory: Optional[str],
+        auto_approve: bool,
+    ) -> SessionRunner:
+        return SessionRunner(
+            session_id, chat_id, thread_id,
+            self._agent, self._messenger,
+            directory=directory,
+            auto_approve=auto_approve,
+            long_content_handler=self._long_content,
+            on_provider_error=self._handle_provider_fallback,
+            on_provider_success=self.clear_provider_failure,
+        )
+
     # -- message dispatch ---------------------------------------------------
 
     def _get_directory(self, chat_id: str, thread_id: Optional[str]) -> Optional[str]:
@@ -83,15 +101,7 @@ class SessionManager:
 
             runner = self._runners.get(key)
             if runner is None:
-                runner = SessionRunner(
-                    session_id, chat_id, thread_id,
-                    self._agent, self._messenger,
-                    directory=directory,
-                    auto_approve=auto_approve,
-                    long_content_handler=self._long_content,
-                )
-                runner._retry_callback = self._handle_provider_fallback
-                runner._success_callback = self.clear_provider_failure
+                runner = self._create_runner(session_id, chat_id, thread_id, directory, auto_approve)
                 self._runners[key] = runner
                 log.info("created runner for key %s (dir=%s)", key, directory or "(default)")
             else:
@@ -118,6 +128,15 @@ class SessionManager:
                     log.warning("delete session failed: %s", exc)
             self._store.clear_session(chat_id, thread_id)
             log.info("reset session for key %s", key)
+
+    def bind_forked_session(self, chat_id: str, thread_id: Optional[str], new_session_id: str) -> None:
+        """Replace the current session with a forked one without deleting the old."""
+        key = self._key(chat_id, thread_id)
+        runner = self._runners.pop(key, None)
+        if runner:
+            asyncio.get_running_loop().create_task(runner.shutdown())
+        self._store.set(chat_id, thread_id, new_session_id)
+        log.info("bound forked session %s for key %s", new_session_id, key)
 
     def get_session_id(self, chat_id: str, thread_id: Optional[str]) -> Optional[str]:
         return self._store.get(chat_id, thread_id)
@@ -158,7 +177,7 @@ class SessionManager:
             await self._agent.abort_session(session_id, directory=directory)
         if runner:
             runner.state = "idle"
-            runner._stop_typing()
+            runner.stop_typing()
 
     def find_session_for_perm(self, perm_id: str) -> Optional[str]:
         """Look up session_id by perm_id across all runners."""
@@ -184,7 +203,7 @@ class SessionManager:
     # -- provider fallback ---------------------------------------------------
 
     async def _handle_provider_fallback(self, runner: SessionRunner, error: str) -> None:
-        current = runner._last_model
+        current = runner.last_model
         current_key = f"{current.provider_id}/{current.model_id}" if current else ""
         self._failed_providers[current_key] = time.monotonic()
         log.warning("provider %s failed: %s", current_key or "(default)", error[:120])
@@ -192,22 +211,15 @@ class SessionManager:
         fallback = self._pick_fallback(current_key, self._failed_providers)
         if not fallback:
             log.error("no fallback provider available (tried: %s)", list(self._failed_providers))
-            if runner._msg_id:
-                await self._messenger.edit_message(
-                    runner.chat_id, runner._msg_id,
-                    f"\u274c All providers exhausted. Last error: {error[:200]}",
-                )
-            runner.state = "error"
+            await runner.show_error(f"\u274c All providers exhausted. Last error: {error[:200]}")
             return
 
         fb_model = ModelRef(provider_id=fallback[0], model_id=fallback[1])
         log.info("falling back to %s/%s", fallback[0], fallback[1])
-        if runner._msg_id:
-            await self._messenger.edit_message(
-                runner.chat_id, runner._msg_id,
-                f"\u26a0\ufe0f Switching to {fallback[0]}/{fallback[1]}\u2026",
-            )
-        await runner.wake_and_prompt(runner._last_parts, fb_model)
+        await runner.retry_with_model(
+            fb_model,
+            f"\u26a0\ufe0f Switching to {fallback[0]}/{fallback[1]}\u2026",
+        )
 
     @staticmethod
     def _pick_fallback(failed_key: str, failed_providers: dict[str, float]) -> Optional[tuple[str, str]]:
@@ -234,19 +246,17 @@ class SessionManager:
         for key, session_id in entries.items():
             chat_id, thread_id = self._parse_key(key)
             directory = self._get_directory(chat_id, thread_id)
-            info = await self._agent.get_session(session_id, directory=directory)
+            try:
+                info = await self._agent.get_session(session_id, directory=directory)
+            except Exception as exc:
+                log.warning("startup: cannot fetch session %s: %s", session_id, exc)
+                continue
             if info is None:
                 log.info("startup: session %s gone (404), removing", session_id)
                 self._store.delete(chat_id, thread_id)
                 continue
             auto_approve = self._get_auto_approve(chat_id, thread_id)
-            runner = SessionRunner(
-                session_id, chat_id, thread_id,
-                self._agent, self._messenger,
-                directory=directory,
-                auto_approve=auto_approve,
-                long_content_handler=self._long_content,
-            )
+            runner = self._create_runner(session_id, chat_id, thread_id, directory, auto_approve)
             runner.state = "sleeping"
             self._runners[key] = runner
             log.info("startup: restored runner for %s (session %s, dir=%s)", key, session_id, directory or "(default)")
@@ -291,9 +301,9 @@ class SessionManager:
                     )
                     await runner.reconnect()
                 elif (
-                    runner._in_reasoning
-                    and runner._reasoning_start > 0
-                    and now - runner._reasoning_start > config.REASONING_STALL_SECONDS
+                    runner.in_reasoning
+                    and runner.reasoning_start > 0
+                    and now - runner.reasoning_start > config.REASONING_STALL_SECONDS
                 ):
                     log.warning(
                         "reasoning stall for %s (%.0fs), reconnecting SSE",

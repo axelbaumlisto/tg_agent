@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import unittest
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase
 
-from opencode_tg.oc_client import OcClient, OcClientError, parse_sse_line
+from opencode_tg.oc_client import OcClient, parse_sse_line
+from .mock_oc_server import build_mock_app
 
 
 # ---------------------------------------------------------------------------
@@ -38,81 +37,6 @@ class TestParseSseLine(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _build_app() -> web.Application:
-    app = web.Application()
-
-    async def create_session(request: web.Request) -> web.Response:
-        body = await request.json()
-        directory = request.headers.get("x-opencode-directory", "")
-        return web.json_response({"id": "ses_mock_1", "directory": directory})
-
-    async def get_session(request: web.Request) -> web.Response:
-        sid = request.match_info["sid"]
-        if sid == "ses_missing":
-            return web.Response(status=404)
-        return web.json_response({"id": sid, "title": "mock"})
-
-    async def delete_session(request: web.Request) -> web.Response:
-        sid = request.match_info["sid"]
-        if sid == "ses_gone":
-            return web.Response(status=404)
-        return web.Response(status=200)
-
-    async def prompt_async(request: web.Request) -> web.Response:
-        await request.json()
-        return web.Response(status=204)
-
-    async def respond_permission(request: web.Request) -> web.Response:
-        await request.json()
-        return web.json_response(True)
-
-    async def list_providers(request: web.Request) -> web.Response:
-        return web.json_response([
-            {"id": "openai", "models": [{"id": "gpt-4o"}]},
-            {"id": "anthropic", "models": [{"id": "claude-sonnet-4-20250514"}]},
-        ])
-
-    async def sse_events(request: web.Request) -> web.StreamResponse:
-        resp = web.StreamResponse(
-            status=200,
-            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
-        )
-        await resp.prepare(request)
-        events = [
-            {"type": "server.connected", "properties": {}},
-            {
-                "type": "message.part.delta",
-                "properties": {"sessionID": "ses_mock_1", "field": "text", "delta": "Hello"},
-            },
-            {
-                "type": "message.part.updated",
-                "properties": {
-                    "sessionID": "ses_mock_1",
-                    "type": "tool-invocation",
-                    "toolName": "bash",
-                    "state": "running",
-                },
-            },
-            {
-                "type": "session.idle",
-                "properties": {"sessionID": "ses_mock_1"},
-            },
-        ]
-        for ev in events:
-            line = f"data: {json.dumps(ev)}\n\n"
-            await resp.write(line.encode())
-        return resp
-
-    app.router.add_post("/session", create_session)
-    app.router.add_get("/session/{sid}", get_session)
-    app.router.add_delete("/session/{sid}", delete_session)
-    app.router.add_post("/session/{sid}/prompt_async", prompt_async)
-    app.router.add_post("/session/{sid}/permissions/{pid}", respond_permission)
-    app.router.add_get("/provider", list_providers)
-    app.router.add_get("/event", sse_events)
-    return app
-
-
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
@@ -120,7 +44,7 @@ def _build_app() -> web.Application:
 
 class TestOcClient(AioHTTPTestCase):
     async def get_application(self) -> web.Application:
-        return _build_app()
+        return build_mock_app()
 
     def _make_client(self) -> OcClient:
         base = f"http://127.0.0.1:{self.server.port}"
@@ -153,6 +77,7 @@ class TestOcClient(AioHTTPTestCase):
 
     async def test_delete_session_ok(self):
         oc = self._make_client()
+        # succeeds without raising — the mock doesn't remove server-side state
         await oc.delete_session("ses_abc")
 
     async def test_delete_session_not_found_ok(self):
@@ -163,24 +88,27 @@ class TestOcClient(AioHTTPTestCase):
 
     async def test_prompt_async(self):
         oc = self._make_client()
-        await oc.prompt_async(
+        result = await oc.prompt_async(
             "ses_mock_1",
             [{"type": "text", "text": "Hello"}],
         )
+        self.assertTrue(result is None or isinstance(result, dict))
 
     async def test_prompt_async_with_model(self):
         oc = self._make_client()
-        await oc.prompt_async(
+        result = await oc.prompt_async(
             "ses_mock_1",
             [{"type": "text", "text": "Hello"}],
             model={"providerID": "openai", "modelID": "gpt-4o"},
         )
+        self.assertTrue(result is None or isinstance(result, dict))
 
     # -- respond_permission -------------------------------------------------
 
     async def test_respond_permission(self):
         oc = self._make_client()
-        await oc.respond_permission("ses_mock_1", "perm_1", "once")
+        result = await oc.respond_permission("ses_mock_1", "perm_1", "once")
+        self.assertTrue(result is None or isinstance(result, dict))
 
     # -- list_providers -----------------------------------------------------
 
@@ -220,6 +148,59 @@ class TestOcClient(AioHTTPTestCase):
             if e.get("properties", {}).get("sessionID", "") == "ses_mock_1"
         ]
         self.assertEqual(len(session_events), 0)
+
+
+class TestOcClientExtraEndpoints(AioHTTPTestCase):
+    """Cover previously untested OcClient methods."""
+
+    async def get_application(self) -> web.Application:
+        return build_mock_app()
+
+    def _make_client(self) -> OcClient:
+        base = f"http://127.0.0.1:{self.server.port}"
+        oc = OcClient(base_url=base)
+        oc._session = self.client.session
+        return oc
+
+    async def test_abort_session(self):
+        oc = self._make_client()
+        await oc.abort_session("ses_mock_1")
+
+    async def test_list_sessions(self):
+        oc = self._make_client()
+        sessions = await oc.list_sessions()
+        self.assertIsInstance(sessions, list)
+        self.assertTrue(len(sessions) >= 1)
+
+    async def test_session_messages(self):
+        oc = self._make_client()
+        msgs = await oc.session_messages("ses_mock_1")
+        self.assertIsInstance(msgs, list)
+
+    async def test_session_diff(self):
+        oc = self._make_client()
+        diff = await oc.session_diff("ses_mock_1")
+        self.assertIsInstance(diff, str)
+
+    async def test_fork_session(self):
+        oc = self._make_client()
+        new_id = await oc.fork_session("ses_mock_1")
+        self.assertTrue(len(new_id) > 0)
+
+    async def test_file_status(self):
+        oc = self._make_client()
+        files = await oc.file_status()
+        self.assertIsInstance(files, list)
+
+    async def test_find_text(self):
+        oc = self._make_client()
+        results = await oc.find_text("match")
+        self.assertIsInstance(results, list)
+
+    async def test_find_files(self):
+        oc = self._make_client()
+        results = await oc.find_files("main")
+        self.assertIsInstance(results, list)
 
 
 if __name__ == "__main__":

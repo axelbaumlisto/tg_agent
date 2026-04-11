@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
@@ -43,7 +42,10 @@ async def get_or_create_account(session: aiohttp.ClientSession) -> str:
         short_name="AgentBridge-Bot",
         author_name="Agent Bridge Bot",
     )
-    token = data["result"]["access_token"]
+    result = data.get("result")
+    if not result or "access_token" not in result:
+        raise RuntimeError(f"Telegraph createAccount failed: {data}")
+    token = result["access_token"]
     config.TELEGRAPH_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     config.TELEGRAPH_TOKEN_FILE.write_text(token)
     log.info("created Telegraph account, token saved")
@@ -86,6 +88,9 @@ async def create_page(
         content=nodes,
         author_name="Agent Bridge Bot",
     )
-    url: str = data["result"]["url"]
+    result = data.get("result")
+    if not result or "url" not in result:
+        raise RuntimeError(f"Telegraph createPage failed: {data}")
+    url: str = result["url"]
     log.info("created Telegraph page: %s", url)
     return url

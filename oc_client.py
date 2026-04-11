@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import quote as _url_quote
 
 import aiohttp
 
@@ -171,6 +172,8 @@ class OcClient:
             body["title"] = title
         resp = await self._request("POST", "/session", json_body=body, directory=directory)
         data = await resp.json(content_type=None)
+        if not isinstance(data, dict) or "id" not in data:
+            raise OcClientError(0, f"create_session: unexpected response: {data!r}")
         session_id: str = data["id"]
         log.info("created OC session %s (title=%r)", session_id, title)
         return session_id
@@ -304,7 +307,7 @@ class OcClient:
         directory: Optional[str] = None,
     ) -> str:
         """Get the diff for a session (or specific message). Returns diff text."""
-        params = f"?messageID={message_id}" if message_id else ""
+        params = f"?messageID={_url_quote(message_id, safe='')}" if message_id else ""
         resp = await self._request(
             "GET", f"/session/{session_id}/diff{params}",
             directory=directory,
@@ -418,8 +421,7 @@ class OcClient:
         self, path: str, *, directory: Optional[str] = None,
     ) -> str:
         """Read a file's contents."""
-        import urllib.parse
-        encoded = urllib.parse.quote(path, safe="")
+        encoded = _url_quote(path, safe="")
         resp = await self._request(
             "GET", f"/file/read?path={encoded}",
             directory=directory,
@@ -439,8 +441,7 @@ class OcClient:
         self, pattern: str, *, directory: Optional[str] = None,
     ) -> list[dict]:
         """Search for text in the project (ripgrep)."""
-        import urllib.parse
-        encoded = urllib.parse.quote(pattern, safe="")
+        encoded = _url_quote(pattern, safe="")
         resp = await self._request(
             "GET", f"/find/text?pattern={encoded}",
             directory=directory,
@@ -452,8 +453,7 @@ class OcClient:
         self, pattern: str, *, directory: Optional[str] = None,
     ) -> list[dict]:
         """Find files by name pattern."""
-        import urllib.parse
-        encoded = urllib.parse.quote(pattern, safe="")
+        encoded = _url_quote(pattern, safe="")
         resp = await self._request(
             "GET", f"/find/files?pattern={encoded}",
             directory=directory,
@@ -465,8 +465,7 @@ class OcClient:
         self, query: str, *, directory: Optional[str] = None,
     ) -> list[dict]:
         """Find symbols (LSP)."""
-        import urllib.parse
-        encoded = urllib.parse.quote(query, safe="")
+        encoded = _url_quote(query, safe="")
         resp = await self._request(
             "GET", f"/find/symbols?query={encoded}",
             directory=directory,
@@ -585,8 +584,8 @@ class OcClient:
                     yield event
             except (aiohttp.ClientError, asyncio.TimeoutError, SseStallError) as exc:
                 log.warning("SSE stream error (%s), reconnecting in %.1fs", exc, backoff)
-            except StopAsyncIteration:
-                log.info("SSE stream ended for %s, reconnecting in %.1fs", session_id, backoff)
+            except GeneratorExit:
+                return
 
             if not first_connect:
                 yield {"type": "__sse_reconnected", "properties": {"sessionID": session_id}}
@@ -647,7 +646,7 @@ class OcClient:
                         continue
                     props = event.get("properties", {})
                     evt_session = props.get("sessionID", "")
-                    if evt_session and evt_session != session_id:
+                    if evt_session != session_id:
                         continue
                     last_useful = time.monotonic()
                     yield event

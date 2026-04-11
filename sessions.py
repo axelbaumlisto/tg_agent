@@ -1,8 +1,10 @@
-"""Persistent mapping: chat_id:thread_id → agent session_id + model prefs.
+"""Persistent mapping: chat_id:thread_id -> agent session_id + model prefs.
 
 All conversation state lives in the agent backend. We only store the
 session ID and model preference so we can restore them after a bot restart.
 """
+from __future__ import annotations
+
 import json
 import os
 import pathlib
