@@ -161,7 +161,6 @@ class TestOcClientExtraEndpoints(AioHTTPTestCase):
         oc = OcClient(base_url=base)
         oc._session = self.client.session
         return oc
-
     async def test_abort_session(self):
         oc = self._make_client()
         await oc.abort_session("ses_mock_1")
