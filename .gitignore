@@ -6,3 +6,12 @@ sessions.json
 .env
 *.session
 .telegraph_token
+
+# Local agent / session caches
+.naked/
+
+# Stray result dumps (real results live in naked/results/)
+/results/
+
+# Stray stdout redirects from ad-hoc shell sessions
+/[0-9]
