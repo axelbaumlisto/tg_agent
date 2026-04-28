@@ -1,12 +1,13 @@
-"""E2E tests — Telethon user sends messages to @zGsR_bot, asserts responses.
+"""E2E tests — Telethon user sends messages to a configured bot.
 
 Requires:
-  - Bot running: python3 -m opencode_tg.bot
+  - Bot running from python_bridge/: python3 -m opencode_tg.bot
   - OpenCode server running on :14096
-  - Telethon session: ~/.zeroclaw/workspace/skills/telegram-reader/.session/zverozabr_session
+  - Telethon session path supplied via E2E_SESSION_PATH
+  - Bot username supplied via E2E_BOT_USERNAME
 
 Run:
-  python3 -m pytest opencode_tg/tests/test_e2e.py -v -s --timeout=600
+  cd python_bridge && python3 -m pytest tests/test_e2e.py -v -s --timeout=600
 """
 
 from __future__ import annotations
@@ -29,9 +30,10 @@ API_ID = int(os.environ.get("E2E_API_ID", "0"))
 API_HASH = os.environ.get("E2E_API_HASH", "")
 SESSION_PATH = os.environ.get(
     "E2E_SESSION_PATH",
-    os.path.expanduser("~/.zeroclaw/workspace/skills/telegram-reader/.session/zverozabr_session"),
+    os.path.expanduser("~/.local/share/opencode_tg/e2e.session"),
 )
-BOT_USERNAME = os.environ.get("E2E_BOT_USERNAME", "zGsR_bot")
+BOT_USERNAME = os.environ.get("E2E_BOT_USERNAME", "")
+PROJECT_DIR = os.environ.get("E2E_PROJECT_DIR", os.getcwd())
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +120,7 @@ async def _cleanup_chat(client: TelegramClient, entity: str) -> None:
         pass
 
 
-@unittest.skipUnless(API_ID and API_HASH, "E2E_API_ID / E2E_API_HASH env vars not set")
+@unittest.skipUnless(API_ID and API_HASH and BOT_USERNAME, "E2E_API_ID / E2E_API_HASH / E2E_BOT_USERNAME env vars not set")
 class TestE2E(unittest.IsolatedAsyncioTestCase):
     client: TelegramClient
 
@@ -326,14 +328,12 @@ class TestE2E(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(1)
 
         # Restart bot using venv python
-        venv_py = os.path.join(
-            os.path.expanduser("~/work/erp/zeroclaws"),
-            "opencode_tg", ".venv", "bin", "python",
-        )
+        bridge_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        venv_py = os.path.join(bridge_dir, ".venv", "bin", "python")
         bot_py = venv_py if os.path.exists(venv_py) else sys.executable
         bot_proc = subprocess.Popen(
             [bot_py, "-m", "opencode_tg.bot"],
-            cwd=os.path.expanduser("~/work/erp/zeroclaws"),
+            cwd=bridge_dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -357,7 +357,7 @@ class TestE2E(unittest.IsolatedAsyncioTestCase):
             bot_proc.wait(timeout=5)
             self._bot_proc = subprocess.Popen(
                 [bot_py, "-m", "opencode_tg.bot"],
-                cwd=os.path.expanduser("~/work/erp/zeroclaws"),
+                cwd=bridge_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -539,7 +539,7 @@ class TestE2E(unittest.IsolatedAsyncioTestCase):
         # Reset back to default
         await send_and_wait(
             self.client,
-            "/project /home/spex/work/erp/zeroclaws",
+            f"/project {PROJECT_DIR}",
             idle_gap=8,
         )
 

@@ -1,10 +1,21 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
+
+# Local/private repo material not published on source-only branches
+/naked/
+/AGENTS.md
+/OPERATIONS.md
+/.env.shared.example
+
 sessions.json
 .env
+.env.local
+.env.*.local
 *.session
+.session/
 .telegraph_token
 
 # Local agent / session caches

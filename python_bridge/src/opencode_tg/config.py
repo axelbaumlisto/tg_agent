@@ -1,10 +1,23 @@
-"""Read configuration from zeroclaws .env and environment."""
+"""Read configuration from the repository .env and environment."""
 from __future__ import annotations
 
 import os
 import pathlib
 
-_ENV_FILE = pathlib.Path(__file__).parent.parent / ".env"
+_PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
+
+
+def _find_repo_root() -> pathlib.Path:
+    for candidate in _PACKAGE_DIR.parents:
+        if (candidate / ".env").exists() or (candidate / ".git").exists():
+            return candidate
+    return _PACKAGE_DIR.parent.parent.parent
+
+
+_repo_root_override = os.environ.get("OPENCODE_TG_REPO_ROOT")
+_REPO_ROOT = pathlib.Path(_repo_root_override).expanduser() if _repo_root_override else _find_repo_root()
+_env_file_override = os.environ.get("OPENCODE_TG_ENV_FILE")
+_ENV_FILE = pathlib.Path(_env_file_override).expanduser() if _env_file_override else _REPO_ROOT / ".env"
 
 
 def _load_env(path: pathlib.Path) -> dict:
@@ -33,7 +46,7 @@ def _get(key: str, default: str = "") -> str:
 
 BOT_TOKEN: str = _get("TELEGRAM_BOT_TOKEN")
 OC_BASE_URL: str = _get("OC_BASE_URL", "http://127.0.0.1:14096")
-OC_DIRECTORY: str = _get("OC_DIRECTORY", str(pathlib.Path(__file__).parent.parent))
+OC_DIRECTORY: str = _get("OC_DIRECTORY", str(_REPO_ROOT))
 
 # Access control — comma-separated chat IDs; empty = allow all
 _raw_allowed = _get("ALLOWED_CHAT_IDS")
@@ -52,11 +65,12 @@ TG_API_ID: int = _int("TELEGRAM_API_ID")
 TG_API_HASH: str = _get("TELEGRAM_API_HASH")
 OPERATOR_CHAT_ID: int = _int("TELEGRAM_OPERATOR_CHAT_ID")
 
-# Sessions file — lives next to this package
-SESSIONS_FILE: pathlib.Path = pathlib.Path(__file__).parent / "sessions.json"
+# Runtime state defaults to the repository root so moving the Python package
+# does not orphan existing bridge sessions.
+SESSIONS_FILE: pathlib.Path = pathlib.Path(_get("OC_TG_SESSIONS_FILE", str(_REPO_ROOT / "sessions.json")))
 
 # Telegraph
-TELEGRAPH_TOKEN_FILE: pathlib.Path = pathlib.Path(__file__).parent / ".telegraph_token"
+TELEGRAPH_TOKEN_FILE: pathlib.Path = pathlib.Path(_get("OC_TG_TELEGRAPH_TOKEN_FILE", str(_REPO_ROOT / ".telegraph_token")))
 
 # Runner config
 IDLE_TIMEOUT_SECONDS: int = int(_get("OC_TG_IDLE_TIMEOUT", str(60 * 60)))  # 1 hour

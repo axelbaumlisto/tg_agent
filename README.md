@@ -1,20 +1,32 @@
-# Agent Bridge — Telegram ↔ OpenCode
+# Agent Bridge
 
-A pluggable bridge between messaging platforms and coding agents. Ships with **Telegram** (Bot API) and **OpenCode** backends.
+A source-only Python bridge between Telegram and an OpenCode-compatible
+agent backend.
 
-## Quick start
+## Layout
+
+```text
+.
+├── README.md
+└── python_bridge/
+    ├── pyproject.toml
+    ├── src/opencode_tg/
+    ├── scripts/
+    └── tests/
+```
+
+## Run
 
 ```bash
-cp .env.example ../.env   # config lives one level up (zeroclaws/.env)
-# edit ../.env — set TELEGRAM_BOT_TOKEN, OC_BASE_URL, etc.
-
-uv sync                   # install dependencies
+cd python_bridge
+uv sync --extra test
 uv run python -m opencode_tg.bot
 ```
 
-## Architecture
+The bridge is a pluggable reference implementation with Telegram and
+OpenCode backends:
 
-```
+```text
 Messenger (Protocol)        AgentBackend (Protocol)
   └─ TelegramMessenger        └─ OpenCodeBackend
          │                           │
@@ -23,7 +35,8 @@ Messenger (Protocol)        AgentBackend (Protocol)
               SessionRunner (per chat)
 ```
 
-Add your own messenger or agent by implementing the corresponding protocol in `protocols.py`.
+Add your own messenger or agent by implementing the corresponding protocol
+in `python_bridge/src/opencode_tg/protocols.py`.
 
 ## Commands
 
@@ -36,18 +49,19 @@ Add your own messenger or agent by implementing the corresponding protocol in `p
 
 ## Configuration
 
-All settings are read from environment variables (or `../.env`). See `.env.example` for the full list.
-
-Key variables:
+Configuration is provided by environment variables. Key variables:
 
 - `TELEGRAM_BOT_TOKEN` — Telegram bot token (required)
 - `OC_BASE_URL` — OpenCode server URL (default: `http://127.0.0.1:14096`)
+- `OC_DIRECTORY` — default workspace directory
 - `ALLOWED_CHAT_IDS` — comma-separated allowlist; empty = open access
 
 ## Tests
 
 ```bash
 # Unit tests (no external services)
+cd python_bridge
+uv sync --extra test
 uv run python -m pytest tests/test_oc_client.py tests/test_protocols.py -v
 
 # E2E tests (requires running bot + OpenCode + Telethon session)

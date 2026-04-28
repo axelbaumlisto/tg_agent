@@ -1,13 +1,14 @@
 """Verify that subscribe_events correctly splits reasoning/text deltas."""
 import asyncio
+import os
 from opencode_tg.agents.opencode import OpenCodeBackend
 from opencode_tg.protocols import ReasoningDelta, TextDelta, SessionIdle
 
 
 async def main():
     backend = OpenCodeBackend(
-        base_url="http://127.0.0.1:14096",
-        directory="/home/spex/work/erp/zeroclaws",
+        base_url=os.environ.get("OC_BASE_URL", "http://127.0.0.1:14096"),
+        directory=os.environ.get("OC_DIRECTORY", os.getcwd()),
     )
     sid = await backend.create_session("verify-reasoning-split")
     print(f"session: {sid}")

@@ -1,18 +1,20 @@
 """Parallel multi-step E2E: two 10-step conversations in bot-chat topics.
 
-Scenario A (RU, topic 10542): programmable keyboards
-Scenario B (EN, topic 10545): programmable mice
+Scenario A (RU, topic from E2E_TOPIC_RU): programmable keyboards
+Scenario B (EN, topic from E2E_TOPIC_EN): programmable mice
 
 Each scenario starts with /reset to ensure clean context.
 Both run concurrently via asyncio.gather.
 
 Requires:
-  - Bot running: python3 -m opencode_tg.bot
+  - Bot running from python_bridge/: python3 -m opencode_tg.bot
   - OpenCode server on :14096
-  - Telethon session: research_session (user 6196099449)
+  - Telethon session path supplied via E2E_SESSION_PATH
+  - Bot username supplied via E2E_BOT_USERNAME
+  - Topic IDs supplied via E2E_TOPIC_RU / E2E_TOPIC_EN
 
 Run:
-  python3 -m pytest opencode_tg/tests/test_e2e_multistep.py -v -s --timeout=1200
+  cd python_bridge && python3 -m pytest tests/test_e2e_multistep.py -v -s --timeout=1200
 """
 from __future__ import annotations
 
@@ -40,11 +42,13 @@ API_ID = int(os.environ.get("E2E_API_ID", "0"))
 API_HASH = os.environ.get("E2E_API_HASH", "")
 SESSION = os.environ.get(
     "E2E_SESSION_PATH",
-    "/home/spex/.zeroclaw/workspace/skills/telegram-reader/.session/research_session",
+    os.path.expanduser("~/.local/share/opencode_tg/e2e.session"),
 )
-BOT = os.environ.get("E2E_BOT_USERNAME", "zGsR_bot")
-TOPIC_RU = int(os.environ.get("E2E_TOPIC_RU", "10542"))
-TOPIC_EN = int(os.environ.get("E2E_TOPIC_EN", "10545"))
+BOT = os.environ.get("E2E_BOT_USERNAME", "")
+TOPIC_RU = int(os.environ.get("E2E_TOPIC_RU", "0"))
+TOPIC_EN = int(os.environ.get("E2E_TOPIC_EN", "0"))
+PROJECT_DIR = os.environ.get("E2E_PROJECT_DIR", os.getcwd())
+PROJECT_NAME = os.path.basename(PROJECT_DIR.rstrip(os.sep)) or PROJECT_DIR
 
 ARTIFACT_PATHS = [
     "/tmp/keyboard_macro.py", "/tmp/mouse_macro.py",
@@ -617,8 +621,8 @@ FEATURE_STEPS: list[Step] = [
         timeout=15,
     ),
     Step(
-        "/project /home/spex/work/erp/zeroclaws",
-        [responded(), has_text("zeroclaws")],
+        f"/project {PROJECT_DIR}",
+        [responded(), has_text(PROJECT_NAME)],
         timeout=20,
     ),
     Step(
@@ -682,7 +686,10 @@ async def _cleanup_bot_chat(client: TelegramClient) -> None:
         pass
 
 
-@unittest.skipUnless(API_ID and API_HASH, "E2E_API_ID / E2E_API_HASH env vars not set")
+@unittest.skipUnless(
+    API_ID and API_HASH and BOT and TOPIC_RU and TOPIC_EN,
+    "E2E_API_ID / E2E_API_HASH / E2E_BOT_USERNAME / E2E_TOPIC_RU / E2E_TOPIC_EN env vars not set",
+)
 class TestMultiStepE2E(unittest.IsolatedAsyncioTestCase):
     client: TelegramClient
 
