@@ -1,0 +1,315 @@
+use std::collections::VecDeque;
+use std::pin::Pin;
+
+use async_trait::async_trait;
+use tokio::sync::Mutex;
+use tokio_stream::Stream;
+
+use crate::error::Result;
+use crate::types::{ModelInfo, StreamChunk};
+
+use super::{ChatRequest, Provider};
+
+/// Wraps multiple providers with automatic failover.
+///
+/// Failed providers move to the back of the queue so that
+/// healthy keys/providers stay at the front. The successful
+/// provider stays at the head for subsequent calls.
+pub struct ResilientProvider {
+    providers: Vec<Box<dyn Provider>>,
+    /// Mutable ordering of indices into `providers`.
+    /// Front = preferred; failed indices are pushed to back.
+    order: Mutex<VecDeque<usize>>,
+}
+
+impl ResilientProvider {
+    pub fn new(providers: Vec<Box<dyn Provider>>) -> Self {
+        assert!(
+            !providers.is_empty(),
+            "ResilientProvider requires at least one provider"
+        );
+        let order: VecDeque<usize> = (0..providers.len()).collect();
+        Self {
+            providers,
+            order: Mutex::new(order),
+        }
+    }
+
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Current ordering snapshot (for testing / diagnostics).
+    pub async fn current_order(&self) -> Vec<usize> {
+        self.order.lock().await.iter().copied().collect()
+    }
+}
+
+#[async_trait]
+impl Provider for ResilientProvider {
+    fn name(&self) -> &str {
+        // Synchronous access needed — use try_lock fallback
+        if let Ok(order) = self.order.try_lock() {
+            let idx = order.front().copied().unwrap_or(0);
+            return self.providers[idx].name();
+        }
+        self.providers[0].name()
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        self.providers.iter().flat_map(|p| p.models()).collect()
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        let snapshot: Vec<usize> = { self.order.lock().await.iter().copied().collect() };
+
+        let mut failed_indices = Vec::new();
+        let mut last_err = None;
+
+        for (pos, &idx) in snapshot.iter().enumerate() {
+            let provider = &self.providers[idx];
+
+            match provider.stream_chat(request.clone()).await {
+                Ok(stream) => {
+                    if !failed_indices.is_empty() {
+                        tracing::info!(
+                            "Provider '{}' failed, fell back to '{}' ({} demoted)",
+                            self.providers[snapshot[0]].name(),
+                            provider.name(),
+                            failed_indices.len(),
+                        );
+                        let mut order = self.order.lock().await;
+                        if pos > 0
+                            && let Some(p) = order.iter().position(|&i| i == idx)
+                        {
+                            order.remove(p);
+                            order.push_front(idx);
+                        }
+                        for &fi in &failed_indices {
+                            if let Some(p) = order.iter().position(|&i| i == fi) {
+                                order.remove(p);
+                                order.push_back(fi);
+                            }
+                        }
+                    }
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    tracing::warn!("Provider '{}' error: {e}, demoting", provider.name());
+                    failed_indices.push(idx);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        {
+            let mut order = self.order.lock().await;
+            for &fi in &failed_indices {
+                if let Some(p) = order.iter().position(|&i| i == fi) {
+                    order.remove(p);
+                    order.push_back(fi);
+                }
+            }
+        }
+
+        Err(last_err.expect("at least one provider must be configured"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::AgentError;
+
+    struct SuccessProvider {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Provider for SuccessProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                provider: self.name.clone(),
+                model_id: "test".into(),
+                display_name: "Test".into(),
+            }]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                StreamChunk::Text("ok".into()),
+                StreamChunk::Done,
+            ])))
+        }
+    }
+
+    struct FailProvider {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Provider for FailProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            Err(AgentError::Provider(format!("{} failed", self.name)))
+        }
+    }
+
+    fn test_request() -> ChatRequest {
+        ChatRequest {
+            model: "test".into(),
+            system: String::new(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: None,
+            reasoning: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn single_provider_success() {
+        let p = ResilientProvider::new(vec![Box::new(SuccessProvider { name: "a".into() })]);
+        let _stream = p.stream_chat(test_request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_on_first_failure() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "bad".into() }),
+            Box::new(SuccessProvider {
+                name: "good".into(),
+            }),
+        ]);
+        let _stream = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.name(), "good");
+    }
+
+    #[tokio::test]
+    async fn all_fail_returns_last_error() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "a".into() }),
+            Box::new(FailProvider { name: "b".into() }),
+        ]);
+        let result = p.stream_chat(test_request()).await;
+        let err = result.err().expect("should fail");
+        assert!(err.to_string().contains("b failed"));
+    }
+
+    #[tokio::test]
+    async fn remembers_successful_provider() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "bad".into() }),
+            Box::new(SuccessProvider {
+                name: "good".into(),
+            }),
+        ]);
+        let _s1 = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.name(), "good");
+        let _s2 = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.name(), "good");
+    }
+
+    #[tokio::test]
+    async fn models_aggregates_all() {
+        let p = ResilientProvider::new(vec![
+            Box::new(SuccessProvider { name: "a".into() }),
+            Box::new(SuccessProvider { name: "b".into() }),
+        ]);
+        assert_eq!(p.models().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_count() {
+        let p = ResilientProvider::new(vec![Box::new(SuccessProvider { name: "x".into() })]);
+        assert_eq!(p.provider_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_order_is_sequential() {
+        let p = ResilientProvider::new(vec![
+            Box::new(SuccessProvider { name: "a".into() }),
+            Box::new(SuccessProvider { name: "b".into() }),
+            Box::new(SuccessProvider { name: "c".into() }),
+        ]);
+        assert_eq!(p.current_order().await, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn failed_provider_moves_to_back() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "k0".into() }),
+            Box::new(SuccessProvider { name: "k1".into() }),
+            Box::new(SuccessProvider { name: "k2".into() }),
+        ]);
+        assert_eq!(p.current_order().await, vec![0, 1, 2]);
+
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.name(), "k1");
+        assert_eq!(p.current_order().await, vec![1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn multiple_failures_all_move_to_back() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "k0".into() }),
+            Box::new(FailProvider { name: "k1".into() }),
+            Box::new(SuccessProvider { name: "k2".into() }),
+        ]);
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.name(), "k2");
+        assert_eq!(p.current_order().await, vec![2, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn all_fail_demotes_in_order() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "k0".into() }),
+            Box::new(FailProvider { name: "k1".into() }),
+            Box::new(FailProvider { name: "k2".into() }),
+        ]);
+        let _ = p.stream_chat(test_request()).await;
+        assert_eq!(p.current_order().await, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn successive_failures_accumulate_at_back() {
+        let p = ResilientProvider::new(vec![
+            Box::new(FailProvider { name: "k0".into() }),
+            Box::new(SuccessProvider { name: "k1".into() }),
+            Box::new(SuccessProvider { name: "k2".into() }),
+            Box::new(SuccessProvider { name: "k3".into() }),
+            Box::new(SuccessProvider { name: "k4".into() }),
+        ]);
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.current_order().await, vec![1, 2, 3, 4, 0]);
+        assert_eq!(p.name(), "k1");
+    }
+
+    #[tokio::test]
+    async fn successful_first_doesnt_change_order() {
+        let p = ResilientProvider::new(vec![
+            Box::new(SuccessProvider { name: "k0".into() }),
+            Box::new(SuccessProvider { name: "k1".into() }),
+            Box::new(SuccessProvider { name: "k2".into() }),
+        ]);
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.current_order().await, vec![0, 1, 2]);
+    }
+}

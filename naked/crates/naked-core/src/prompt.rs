@@ -1,0 +1,383 @@
+use std::path::{Path, PathBuf};
+
+const DEFAULT_PROMPT_FILENAME: &str = "system_prompt.md";
+const MAX_INSTRUCTION_FILE_CHARS: usize = 16_000;
+
+/// Resolves the system prompt by checking project-local override first,
+/// then falling back to the global default.
+///
+/// Resolution order:
+/// 1. `{workspace}/.naked/system_prompt.md` (project override)
+/// 2. `{global_path}` (from config or `~/.naked/system_prompt.md`)
+/// 3. Built-in default prompt
+pub fn resolve_system_prompt(workspace: &Path, global_path: Option<&Path>) -> String {
+    let project_prompt = workspace.join(".naked").join(DEFAULT_PROMPT_FILENAME);
+    if let Some(content) = try_read_prompt(&project_prompt) {
+        return content;
+    }
+
+    if let Some(global) = global_path
+        && let Some(content) = try_read_prompt(global)
+    {
+        return content;
+    }
+
+    let home_prompt = dirs_home().join(".naked").join(DEFAULT_PROMPT_FILENAME);
+    if let Some(content) = try_read_prompt(&home_prompt) {
+        return content;
+    }
+
+    default_system_prompt(workspace)
+}
+
+/// Resolve the live effective system prompt for a session, giving priority
+/// to the per-workspace persona override (`<workspace>/.naked/system_prompt.md`)
+/// even when the `session_meta` snapshot still carries the original prompt
+/// from session creation.
+///
+/// Background: Telegram personas (Income group, DMs) can have their own
+/// workspace with `.naked/system_prompt.md`. If this file changes, existing
+/// long-lived sessions would silently keep using the stale snapshot captured
+/// in `SessionMetadata` at creation. This helper reads the override every
+/// turn so persona authoring stays live.
+///
+/// Returns `Ok(prompt)` where `prompt` is:
+/// 1. `<workspace>/.naked/system_prompt.md` if present and non-empty,
+/// 2. else `meta_snapshot` (what's already persisted on disk).
+pub fn effective_system_prompt(
+    workspace: &Path,
+    meta_snapshot: &str,
+) -> std::io::Result<String> {
+    let project_prompt = workspace.join(".naked").join(DEFAULT_PROMPT_FILENAME);
+    if let Some(content) = try_read_prompt(&project_prompt) {
+        return Ok(content);
+    }
+    Ok(meta_snapshot.to_string())
+}
+
+fn try_read_prompt(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() > MAX_INSTRUCTION_FILE_CHARS {
+        Some(trimmed[..MAX_INSTRUCTION_FILE_CHARS].to_string())
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Build the environment section appended to the system prompt.
+pub fn environment_section(workspace: &Path) -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let cwd = workspace.display();
+
+    let mut section = format!(
+        "---\n\
+         Environment:\n\
+         - OS: {os} ({arch})\n\
+         - Date: {date}\n\
+         - Working directory: {cwd}"
+    );
+
+    if let Some(git) = git_context(workspace) {
+        section.push_str("\n\n");
+        section.push_str(&git);
+    }
+
+    if let Some(instructions) = load_project_instructions(workspace) {
+        section.push_str("\n\n---\nProject instructions:\n");
+        section.push_str(&instructions);
+    }
+
+    section
+}
+
+const MAX_GIT_CONTEXT: usize = 2048;
+
+fn git_context(workspace: &Path) -> Option<String> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        }
+    };
+
+    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let mut lines = vec![format!("Git: branch={branch}")];
+
+    if let Some(status) = run(&["status", "--porcelain"]) {
+        let status_lines: Vec<&str> = status.lines().collect();
+        let shown = if status_lines.len() > 20 {
+            format!(
+                "{}\n  ... and {} more files",
+                status_lines[..20].join("\n"),
+                status_lines.len() - 20
+            )
+        } else {
+            status_lines.join("\n")
+        };
+        lines.push(format!("Changed files:\n{shown}"));
+    }
+
+    if let Some(diff_stat) = run(&["diff", "--stat", "--stat-width=60"]) {
+        // Walk char boundaries — non-ASCII paths in `git diff --stat` are
+        // rare but possible (e.g. unicode filenames), and a byte slice
+        // would panic inside a codepoint.
+        let truncated = if diff_stat.chars().count() > MAX_GIT_CONTEXT {
+            let mut t: String = diff_stat.chars().take(MAX_GIT_CONTEXT).collect();
+            t.push_str("...");
+            t
+        } else {
+            diff_stat
+        };
+        lines.push(format!("Diff summary:\n{truncated}"));
+    }
+
+    Some(lines.join("\n"))
+}
+
+const MAX_PER_FILE_CHARS: usize = 4_000;
+const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+
+const INSTRUCTION_FILENAMES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".naked/instructions.md",
+    ".cursor/rules/instructions.md",
+];
+
+/// Walk from workspace upward, collecting instruction files with dedup and budgets.
+fn load_project_instructions(workspace: &Path) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut parts = Vec::new();
+    let mut remaining = MAX_TOTAL_INSTRUCTION_CHARS;
+
+    let mut dir = Some(workspace);
+    while let Some(current) = dir {
+        for name in INSTRUCTION_FILENAMES {
+            let path = current.join(name);
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !seen.insert(canonical) {
+                continue;
+            }
+            if remaining == 0 {
+                break;
+            }
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let limit = MAX_PER_FILE_CHARS.min(remaining);
+                // Char-boundary safe truncation — instruction files may
+                // contain non-ASCII (Russian/Cyrillic AGENTS.md sections,
+                // Vietnamese examples, etc.); a byte slice would panic.
+                let content = if trimmed.chars().count() > limit {
+                    let mut t: String = trimmed.chars().take(limit).collect();
+                    t.push_str("\n\n[truncated]");
+                    t
+                } else {
+                    trimmed.to_string()
+                };
+                remaining = remaining.saturating_sub(content.len());
+                parts.push(format!(
+                    "# {}\n{}",
+                    path.strip_prefix(workspace).unwrap_or(&path).display(),
+                    content
+                ));
+            }
+        }
+        dir = current.parent();
+        if dir == Some(Path::new("")) || dir == Some(Path::new("/")) {
+            break;
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+fn default_system_prompt(_workspace: &Path) -> String {
+    "You are a coding assistant. You help the user with software engineering tasks.\n\
+     You have access to tools for reading/writing files, running commands, and searching code.\n\
+     \n\
+     Read code before editing. Make minimal, targeted changes. Validate your work."
+        .to_string()
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prompt_is_base_text_only() {
+        let prompt = default_system_prompt(Path::new("/tmp/test"));
+        assert!(prompt.contains("coding assistant"));
+        assert!(
+            !prompt.contains("Working directory"),
+            "environment_section must not be in default_system_prompt"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_when_no_overrides() {
+        let prompt = resolve_system_prompt(Path::new("/nonexistent"), None);
+        assert!(
+            !prompt.is_empty(),
+            "should return some prompt even without overrides"
+        );
+    }
+
+    #[test]
+    fn resolve_uses_project_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let naked_dir = dir.path().join(".naked");
+        std::fs::create_dir(&naked_dir).unwrap();
+        std::fs::write(naked_dir.join("system_prompt.md"), "custom project prompt").unwrap();
+
+        let prompt = resolve_system_prompt(dir.path(), None);
+        assert_eq!(prompt, "custom project prompt");
+    }
+
+    #[test]
+    fn resolve_uses_global_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_file = dir.path().join("global_prompt.md");
+        std::fs::write(&global_file, "global prompt text").unwrap();
+
+        let prompt = resolve_system_prompt(Path::new("/nonexistent"), Some(&global_file));
+        assert_eq!(prompt, "global prompt text");
+    }
+
+    #[test]
+    fn resolve_project_overrides_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let naked_dir = dir.path().join(".naked");
+        std::fs::create_dir(&naked_dir).unwrap();
+        std::fs::write(naked_dir.join("system_prompt.md"), "project wins").unwrap();
+
+        let global_file = dir.path().join("global.md");
+        std::fs::write(&global_file, "global loses").unwrap();
+
+        let prompt = resolve_system_prompt(dir.path(), Some(&global_file));
+        assert_eq!(prompt, "project wins");
+    }
+
+    #[test]
+    fn environment_section_contains_os_info() {
+        let section = environment_section(Path::new("/tmp/ws"));
+        assert!(section.contains("OS:"));
+        assert!(section.contains("Working directory: /tmp/ws"));
+        assert!(section.contains("Date:"));
+    }
+
+    #[test]
+    fn environment_section_loads_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Project Rules\nDo good.").unwrap();
+
+        let section = environment_section(dir.path());
+        assert!(section.contains("Project instructions"));
+        assert!(section.contains("Do good"));
+    }
+
+    #[test]
+    fn instruction_discovery_respects_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(MAX_TOTAL_INSTRUCTION_CHARS + 500);
+        std::fs::write(dir.path().join("AGENTS.md"), &big).unwrap();
+
+        let result = load_project_instructions(dir.path()).unwrap();
+        assert!(result.len() <= MAX_TOTAL_INSTRUCTION_CHARS + 200);
+        assert!(result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn instruction_discovery_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "unique content").unwrap();
+
+        let result = load_project_instructions(dir.path()).unwrap();
+        assert_eq!(result.matches("unique content").count(), 1);
+    }
+
+    #[test]
+    fn git_context_returns_none_for_non_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(git_context(dir.path()).is_none());
+    }
+
+    #[test]
+    fn git_context_returns_branch_for_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let ctx = git_context(dir.path());
+        assert!(ctx.is_some());
+        let ctx = ctx.unwrap();
+        assert!(ctx.contains("Git: branch="));
+    }
+
+    #[test]
+    fn environment_section_includes_git_for_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let section = environment_section(dir.path());
+        assert!(section.contains("Git: branch="));
+    }
+
+    #[test]
+    fn try_read_prompt_skips_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.md");
+        std::fs::write(&empty, "   \n  ").unwrap();
+        assert!(try_read_prompt(&empty).is_none());
+    }
+
+    #[test]
+    fn try_read_prompt_truncates_long_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("long.md");
+        let content = "x".repeat(MAX_INSTRUCTION_FILE_CHARS + 100);
+        std::fs::write(&long, &content).unwrap();
+        let result = try_read_prompt(&long).unwrap();
+        assert_eq!(result.len(), MAX_INSTRUCTION_FILE_CHARS);
+    }
+}

@@ -1,13 +1,22 @@
-# Agent Bridge
+# tg_agent Source
 
-A source-only Python bridge between Telegram and an OpenCode-compatible
-agent backend.
+Source-only export of the Telegram/OpenCode bridge and Rust `naked`
+agent daemon. Runtime data, private operations docs, skills, local
+configs, sessions, results, and deployment files are intentionally not
+included.
 
 ## Layout
 
 ```text
 .
 ├── README.md
+├── naked/
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   └── crates/
+│       ├── naked-core/
+│       ├── naked-cli/
+│       └── naked-tg/
 └── python_bridge/
     ├── pyproject.toml
     ├── src/opencode_tg/
@@ -15,7 +24,7 @@ agent backend.
     └── tests/
 ```
 
-## Run
+## Python Bridge
 
 ```bash
 cd python_bridge
@@ -37,6 +46,17 @@ Messenger (Protocol)        AgentBackend (Protocol)
 
 Add your own messenger or agent by implementing the corresponding protocol
 in `python_bridge/src/opencode_tg/protocols.py`.
+
+## Rust Agent
+
+```bash
+cd naked
+cargo test --workspace
+cargo build --release
+```
+
+The Telegram daemon source lives in `naked/crates/naked-tg`; the shared
+agent core lives in `naked/crates/naked-core`.
 
 ## Commands
 
