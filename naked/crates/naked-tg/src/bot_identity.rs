@@ -338,7 +338,7 @@ mod tests {
     fn identity() -> BotIdentity {
         BotIdentity {
             id: 8527746065,
-            username: "example_bot".to_string(),
+            username: "zGsR_bot".to_string(),
         }
     }
 
@@ -346,8 +346,8 @@ mod tests {
         json!({
             "message_id": 1,
             "date": 0,
-            "chat": { "id": 123456789, "type": "private", "first_name": "u" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "chat": { "id": 105928336, "type": "private", "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "text": text,
         })
     }
@@ -357,7 +357,7 @@ mod tests {
             "message_id": 2,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "text": text,
             "entities": entities,
         })
@@ -368,7 +368,7 @@ mod tests {
             "message_id": 3,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "text": text,
         })
     }
@@ -418,8 +418,8 @@ mod tests {
 
     #[test]
     fn group_at_mention_addresses_us() {
-        let text = "@example_bot do the thing";
-        // entity covers exactly "@example_bot" (9 UTF-16 code units).
+        let text = "@zGsR_bot do the thing";
+        // entity covers exactly "@zGsR_bot" (9 UTF-16 code units).
         let msg = make_msg(group_envelope_with_entities(
             text,
             json!([{ "type": "mention", "offset": 0, "length": 9 }]),
@@ -452,7 +452,7 @@ mod tests {
                     "id": 8527746065_i64,
                     "is_bot": true,
                     "first_name": "Друся",
-                    "username": "example_bot"
+                    "username": "zGsR_bot"
                 }
             }]),
         ));
@@ -483,7 +483,7 @@ mod tests {
             "message_id": 10,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "text": "ок, понял",
             "reply_to_message": {
                 "message_id": 9,
@@ -493,7 +493,7 @@ mod tests {
                     "id": 8527746065_i64,
                     "is_bot": true,
                     "first_name": "Друся",
-                    "username": "example_bot"
+                    "username": "zGsR_bot"
                 },
                 "text": "что нужно сделать?"
             }
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn group_reply_to_user_message_mentioning_bot_is_not_addressed() {
-        // User A wrote: "@example_bot посмотри X" (message 8). User B does
+        // User A wrote: "@zGsR_bot посмотри X" (message 8). User B does
         // Reply on that message with "ага согласен" (message 9) — meant
         // for User A, not for us. The bot must stay silent: our own
         // message's text has no mention of us, and the reply target is
@@ -520,7 +520,7 @@ mod tests {
                 "date": 0,
                 "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
                 "from": { "id": 123, "is_bot": false, "first_name": "A" },
-                "text": "@example_bot посмотри X",
+                "text": "@zGsR_bot посмотри X",
                 "entities": [{ "type": "mention", "offset": 0, "length": 9 }]
             }
         });
@@ -534,7 +534,7 @@ mod tests {
             "message_id": 10,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "text": "agree",
             "reply_to_message": {
                 "message_id": 9,
@@ -554,7 +554,7 @@ mod tests {
             "message_id": 10,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "text": "thanks",
             "reply_to_message": {
                 "message_id": 9,
@@ -580,7 +580,7 @@ mod tests {
             "message_id": 11,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "photo": [{
                 "file_id": "AgACAgX",
                 "file_unique_id": "AAA",
@@ -588,7 +588,7 @@ mod tests {
                 "height": 240,
                 "file_size": 1024
             }],
-            "caption": "@example_bot опиши",
+            "caption": "@zGsR_bot опиши",
             "caption_entities": [{ "type": "mention", "offset": 0, "length": 9 }]
         });
         let msg = make_msg(json);
@@ -609,7 +609,7 @@ mod tests {
     // This test is intentionally RED: the current impl does not look at
     // `forward_origin` at all, and doesn't distinguish "forwarded from
     // elsewhere" from "addressed here". A user-crafted forward of a
-    // message whose text starts with `@example_bot …` would wake us
+    // message whose text starts with `@zGsR_bot …` would wake us
     // inappropriately. We want forwards to require a FRESH reply or a
     // FRESH mention outside the forwarded body.
     #[test]
@@ -618,7 +618,7 @@ mod tests {
             "message_id": 50,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "forward_origin": {
                 "type": "user",
                 "date": 0,
@@ -647,13 +647,13 @@ mod tests {
             "message_id": 51,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "forward_origin": {
                 "type": "user",
                 "date": 0,
                 "sender_user": { "id": 777, "is_bot": false, "first_name": "elsewhere" }
             },
-            "text": "@example_bot — это цитата из другого чата",
+            "text": "@zGsR_bot — это цитата из другого чата",
             "entities": [{ "type": "mention", "offset": 0, "length": 9 }]
         });
         let msg = make_msg(json);
@@ -675,11 +675,11 @@ mod tests {
     #[test]
     fn strip_removes_our_at_suffix_preserving_args() {
         assert_eq!(
-            strip_bot_command_suffix("/start@example_bot", &identity()).as_deref(),
+            strip_bot_command_suffix("/start@zGsR_bot", &identity()).as_deref(),
             Some("/start")
         );
         assert_eq!(
-            strip_bot_command_suffix("/research@example_bot ls", &identity()).as_deref(),
+            strip_bot_command_suffix("/research@zGsR_bot ls", &identity()).as_deref(),
             Some("/research ls")
         );
         // case-insensitive
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn strip_handles_leading_whitespace() {
         assert_eq!(
-            strip_bot_command_suffix("  /go@example_bot now", &identity()).as_deref(),
+            strip_bot_command_suffix("  /go@zGsR_bot now", &identity()).as_deref(),
             Some("/go now")
         );
     }
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn other_bot_cmd_classifier_works() {
         assert!(is_command_for_other_bot("/start@OtherBot", &identity()));
-        assert!(!is_command_for_other_bot("/start@example_bot", &identity()));
+        assert!(!is_command_for_other_bot("/start@zGsR_bot", &identity()));
         assert!(!is_command_for_other_bot("/start", &identity()));
         assert!(!is_command_for_other_bot("plain", &identity()));
         assert!(!is_command_for_other_bot("/start@", &identity()));

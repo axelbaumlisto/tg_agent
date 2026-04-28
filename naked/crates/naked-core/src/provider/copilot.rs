@@ -303,7 +303,7 @@ mod tests {
     fn copilot_provider_sets_headers() {
         let config = ProviderConfig {
             provider_type: "copilot".into(),
-            api_key: "test-copilot-token".into(),
+            api_key: "gho_test_token".into(),
             api_keys: Vec::new(),
             base_url: None,
             models: vec!["gpt-4.1".into()],

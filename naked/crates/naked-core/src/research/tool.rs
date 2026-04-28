@@ -1198,14 +1198,14 @@ mod tests {
 
     #[test]
     fn redact_strips_api_key_and_bearer() {
-        let s = "log: api_key=TESTSECRET123 done; Authorization: Bearer TESTBEARER OK";
+        let s = "log: api_key=sk-abc123 done; Authorization: Bearer eyJhbGci OK";
         let out = scan_and_redact(s);
         assert!(out.contains("api_key=[redacted]"), "got: {out}");
         assert!(
             out.contains("Bearer [redacted]") || out.contains("bearer [redacted]"),
             "got: {out}"
         );
-        assert!(!out.contains("TESTSECRET123"), "got: {out}");
+        assert!(!out.contains("sk-abc123"), "got: {out}");
         assert!(!out.contains("eyJhbGci"), "got: {out}");
     }
 

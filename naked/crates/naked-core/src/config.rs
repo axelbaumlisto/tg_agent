@@ -2151,7 +2151,7 @@ mod tests {
             "providers": {
                 "claude": {
                     "type": "anthropic",
-                    "api_key": "test-api-key",
+                    "api_key": "sk-test",
                     "models": ["claude-sonnet-4"]
                 },
                 "groq": {
@@ -2200,10 +2200,10 @@ mod tests {
 
     #[test]
     fn provider_resolved_direct_key() {
-        let mut pc = test_pc("test-direct-key");
+        let mut pc = test_pc("sk-direct-key");
         pc.provider_type = "anthropic".into();
         let resolved = pc.resolved().unwrap();
-        assert_eq!(resolved.api_key, "test-direct-key");
+        assert_eq!(resolved.api_key, "sk-direct-key");
     }
 
     #[test]

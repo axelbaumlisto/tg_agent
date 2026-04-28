@@ -1,6 +1,6 @@
 //! Red-test matrix for `naked-tg` — observed-bug regressions that must
 //! stay failing until each category is driven green per the plan at
-//! `/home/example/.cursor/plans/naked-tg_red-test_matrix.plan.md`.
+//! `/home/spex/.cursor/plans/naked-tg_red-test_matrix_eb5c5662.plan.md`.
 //!
 //! Every test name starts with `red_<id>_` so we can filter:
 //!
@@ -266,7 +266,7 @@ fn red_f2_slash_in_callback_data_is_dropped_when_persona_disallows() {
 /// first user message shaped like:
 ///
 /// ```text
-/// > @example_bot [your previous message]:
+/// > @zGsR_bot [your previous message]:
 /// > ...
 /// ```
 ///
@@ -279,7 +279,7 @@ fn red_f2_slash_in_callback_data_is_dropped_when_persona_disallows() {
 fn red_f3_session_handover_quote_is_ignored_by_addressing_gate() {
     use naked_tg::bot_identity::classify_handover;
 
-    let raw = "> @example_bot [your previous message]:\n> Вот таблица…\n> строка 2\n\nчто дальше?";
+    let raw = "> @zGsR_bot [your previous message]:\n> Вот таблица…\n> строка 2\n\nчто дальше?";
     let cls = classify_handover(raw);
     assert!(
         cls.is_handover_resume,

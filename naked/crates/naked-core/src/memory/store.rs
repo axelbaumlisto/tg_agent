@@ -31,7 +31,7 @@ pub fn content_hash(content: &str) -> u64 {
 pub struct MarkdownMemoryStore;
 
 impl MarkdownMemoryStore {
-    /// Convert a workspace path to a slug: `/home/example/work` -> `-home-spex-work`
+    /// Convert a workspace path to a slug: `/home/spex/work` -> `-home-spex-work`
     pub fn project_slug(workspace: &Path) -> String {
         let s = workspace.to_string_lossy();
         let slug = s.replace('/', "-");
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn project_slug_conversion() {
         assert_eq!(
-            MarkdownMemoryStore::project_slug(Path::new("/home/example/work/project")),
+            MarkdownMemoryStore::project_slug(Path::new("/home/spex/work/erp")),
             "-home-spex-work-erp"
         );
         assert_eq!(

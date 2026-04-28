@@ -1889,7 +1889,7 @@ async fn handle_message(
         if drop_slash_for_persona(&bot, chat_id_raw, &msg, &config).await {
             return Ok(());
         }
-        // `/start@example_bot args` → `/start args` so command parsing
+        // `/start@zGsR_bot args` → `/start args` so command parsing
         // doesn't have to know about the @-suffix Telegram appends in
         // groups. `/start@OtherBot` is already filtered out by the
         // addressing gate above (returned as not-addressed), so any
@@ -5674,7 +5674,7 @@ mod tests {
             "message_id": 99,
             "date": 0,
             "chat": { "id": -5084292206_i64, "type": "group", "title": "income" },
-            "from": { "id": 123456789, "is_bot": false, "first_name": "u" },
+            "from": { "id": 105928336, "is_bot": false, "first_name": "u" },
             "photo": [
                 {"file_id":"reply-small","file_unique_id":"a","width":90,"height":90,"file_size":1000},
                 {"file_id":"reply-big","file_unique_id":"b","width":1280,"height":720,"file_size":200000}

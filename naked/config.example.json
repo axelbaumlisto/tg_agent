@@ -1,0 +1,452 @@
+{
+  "_comment": "All providers from OpenCode/ZeroClaw. api_key: $ENV_VAR or direct string. type: anthropic | openai_compat",
+
+  "providers": {
+    "anthropic": {
+      "type": "anthropic",
+      "api_key": "$ANTHROPIC_API_KEY",
+      "models": [
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-sonnet-20241022"
+      ],
+      "_supports_vision_doc": "Optional. Forces vision-capable classification for ALL models under this provider (overrides the built-in needle list). Use Some(true) to opt-in new vision models without recompiling, or Some(false) to disable native multimodal routing for cost reasons. Omit (or null) to fall back to BUILTIN_VISION_MODEL_NEEDLES.",
+      "supports_vision": null
+    },
+    "openai": {
+      "type": "openai_compat",
+      "api_key": "$OPENAI_API_KEY",
+      "base_url": "https://api.openai.com/v1",
+      "models": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "o3",
+        "o3-mini",
+        "o4-mini"
+      ]
+    },
+    "groq": {
+      "type": "openai_compat",
+      "api_key": "$GROQ_API_KEY",
+      "base_url": "https://api.groq.com/openai/v1",
+      "models": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama-3.1-70b-versatile",
+        "gemma2-9b-it",
+        "mixtral-8x7b-32768"
+      ]
+    },
+    "fireworks": {
+      "type": "openai_compat",
+      "api_key": "$FIREWORKS_API_KEY",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "models": [
+        "accounts/fireworks/models/llama-v3p1-70b-instruct",
+        "accounts/fireworks/models/llama-v3p1-8b-instruct"
+      ]
+    },
+    "deepseek": {
+      "type": "openai_compat",
+      "api_key": "$DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com",
+      "models": [
+        "deepseek-chat",
+        "deepseek-coder",
+        "deepseek-reasoner"
+      ]
+    },
+    "mistral": {
+      "type": "openai_compat",
+      "api_key": "$MISTRAL_API_KEY",
+      "base_url": "https://api.mistral.ai/v1",
+      "models": [
+        "mistral-large-latest",
+        "mistral-small-latest",
+        "codestral-latest",
+        "mistral-medium-latest"
+      ]
+    },
+    "xai": {
+      "type": "openai_compat",
+      "api_key": "$XAI_API_KEY",
+      "base_url": "https://api.x.ai",
+      "models": [
+        "grok-2",
+        "grok-2-mini",
+        "grok-3",
+        "grok-3-mini"
+      ]
+    },
+    "together": {
+      "type": "openai_compat",
+      "api_key": "$TOGETHER_API_KEY",
+      "base_url": "https://api.together.xyz",
+      "models": [
+        "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+        "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        "mistralai/Mixtral-8x22B-Instruct-v0.1",
+        "Qwen/Qwen2.5-72B-Instruct-Turbo"
+      ]
+    },
+    "openrouter": {
+      "type": "openai_compat",
+      "api_key": "$OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1",
+      "models": [
+        "anthropic/claude-sonnet-4",
+        "openai/gpt-4o",
+        "google/gemini-2.5-flash",
+        "meta-llama/llama-3.3-70b-instruct"
+      ]
+    },
+    "gemini": {
+      "type": "openai_compat",
+      "api_key": "$GEMINI_API_KEY",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "models": [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro"
+      ]
+    },
+    "minimax": {
+      "type": "openai_compat",
+      "api_key": "$MINIMAX_API_KEY",
+      "base_url": "https://api.minimax.io/v1",
+      "models": [
+        "MiniMax-M2.7-highspeed",
+        "MiniMax-Text-01"
+      ]
+    },
+    "minimax-cn": {
+      "type": "openai_compat",
+      "api_key": "$MINIMAX_API_KEY",
+      "base_url": "https://api.minimaxi.com/v1",
+      "models": [
+        "MiniMax-M2.7-highspeed",
+        "MiniMax-Text-01"
+      ]
+    },
+    "glm": {
+      "type": "openai_compat",
+      "api_key": "$GLM_API_KEY",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "models": [
+        "glm-5.1",
+        "glm-4.7",
+        "glm-4-plus"
+      ]
+    },
+    "glm-cn": {
+      "type": "openai_compat",
+      "api_key": "$GLM_API_KEY",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "models": [
+        "glm-5.1",
+        "glm-4.7"
+      ]
+    },
+    "moonshot": {
+      "type": "openai_compat",
+      "api_key": "$MOONSHOT_API_KEY",
+      "base_url": "https://api.moonshot.cn/v1",
+      "models": [
+        "moonshot-v1-128k",
+        "moonshot-v1-32k",
+        "moonshot-v1-8k"
+      ]
+    },
+    "moonshot-intl": {
+      "type": "openai_compat",
+      "api_key": "$MOONSHOT_API_KEY",
+      "base_url": "https://api.moonshot.ai/v1",
+      "models": [
+        "moonshot-v1-128k"
+      ]
+    },
+    "kimi-code": {
+      "type": "openai_compat",
+      "api_key": "$KIMI_CODE_API_KEY",
+      "base_url": "https://api.kimi.com/coding/v1",
+      "models": [
+        "k2p5",
+        "kimi-k2.5"
+      ]
+    },
+    "qwen": {
+      "type": "openai_compat",
+      "api_key": "$DASHSCOPE_API_KEY",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "models": [
+        "qwen-plus",
+        "qwen-turbo",
+        "qwen-max",
+        "qwen3-235b-a22b",
+        "qwen3-72b",
+        "qwen-coder-plus"
+      ]
+    },
+    "qwen-intl": {
+      "type": "openai_compat",
+      "api_key": "$DASHSCOPE_API_KEY",
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "models": [
+        "qwen-plus",
+        "qwen-max"
+      ]
+    },
+    "qianfan": {
+      "type": "openai_compat",
+      "api_key": "$QIANFAN_API_KEY",
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "models": [
+        "ernie-4.0-turbo",
+        "ernie-4.0"
+      ]
+    },
+    "doubao": {
+      "type": "openai_compat",
+      "api_key": "$ARK_API_KEY",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "models": []
+    },
+    "ollama": {
+      "type": "openai_compat",
+      "api_key": "ollama",
+      "base_url": "http://localhost:11434/v1",
+      "models": [
+        "qwen3",
+        "llama3",
+        "codellama",
+        "deepseek-coder-v2"
+      ]
+    },
+    "lmstudio": {
+      "type": "openai_compat",
+      "api_key": "lm-studio",
+      "base_url": "http://localhost:1234/v1",
+      "models": []
+    },
+    "vllm": {
+      "type": "openai_compat",
+      "api_key": "$VLLM_API_KEY",
+      "base_url": "http://localhost:8000/v1",
+      "models": []
+    },
+    "llamacpp": {
+      "type": "openai_compat",
+      "api_key": "llama.cpp",
+      "base_url": "http://localhost:8080/v1",
+      "models": []
+    },
+    "telnyx": {
+      "type": "openai_compat",
+      "api_key": "$TELNYX_API_KEY",
+      "base_url": "https://api.telnyx.com/v2/ai",
+      "models": [
+        "openai/gpt-4o",
+        "openai/gpt-4o-mini",
+        "anthropic/claude-3.5-sonnet",
+        "meta-llama/llama-3.1-70b-instruct"
+      ]
+    },
+    "azure-openai": {
+      "type": "openai_compat",
+      "api_key": "$AZURE_OPENAI_API_KEY",
+      "base_url": "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT",
+      "models": [
+        "gpt-4o"
+      ]
+    },
+    "nvidia": {
+      "type": "openai_compat",
+      "api_key": "$NVIDIA_API_KEY",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "models": [
+        "meta/llama-3.1-70b-instruct",
+        "nvidia/llama-3.1-nemotron-70b-instruct"
+      ]
+    },
+    "perplexity": {
+      "type": "openai_compat",
+      "api_key": "$PERPLEXITY_API_KEY",
+      "base_url": "https://api.perplexity.ai",
+      "models": [
+        "sonar-pro",
+        "sonar"
+      ]
+    },
+    "cohere": {
+      "type": "openai_compat",
+      "api_key": "$COHERE_API_KEY",
+      "base_url": "https://api.cohere.com/compatibility",
+      "models": [
+        "command-r-plus",
+        "command-r"
+      ]
+    },
+    "novita": {
+      "type": "openai_compat",
+      "api_key": "$NOVITA_API_KEY",
+      "base_url": "https://api.novita.ai/openai",
+      "models": []
+    },
+    "cerebras": {
+      "type": "openai_compat",
+      "api_key": "$CEREBRAS_API_KEY",
+      "base_url": "https://api.cerebras.ai/v1",
+      "models": [
+        "llama-3.3-70b"
+      ]
+    },
+    "sambanova": {
+      "type": "openai_compat",
+      "api_key": "$SAMBANOVA_API_KEY",
+      "base_url": "https://api.sambanova.ai/v1",
+      "models": [
+        "Meta-Llama-3.1-70B-Instruct"
+      ]
+    },
+    "deepinfra": {
+      "type": "openai_compat",
+      "api_key": "$DEEPINFRA_API_KEY",
+      "base_url": "https://api.deepinfra.com/v1/openai",
+      "models": [
+        "meta-llama/Meta-Llama-3.1-70B-Instruct"
+      ]
+    },
+    "huggingface": {
+      "type": "openai_compat",
+      "api_key": "$HF_TOKEN",
+      "base_url": "https://router.huggingface.co/v1",
+      "models": []
+    },
+    "siliconflow": {
+      "type": "openai_compat",
+      "api_key": "$SILICONFLOW_API_KEY",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "models": [
+        "Qwen/Qwen2.5-72B-Instruct"
+      ]
+    },
+    "cloudflare": {
+      "type": "openai_compat",
+      "api_key": "$CLOUDFLARE_API_KEY",
+      "base_url": "https://gateway.ai.cloudflare.com/v1",
+      "models": []
+    },
+    "vercel": {
+      "type": "openai_compat",
+      "api_key": "$VERCEL_API_KEY",
+      "base_url": "https://ai-gateway.vercel.sh/v1",
+      "models": []
+    },
+    "venice": {
+      "type": "openai_compat",
+      "api_key": "$VENICE_API_KEY",
+      "base_url": "https://api.venice.ai",
+      "models": []
+    },
+    "hyperbolic": {
+      "type": "openai_compat",
+      "api_key": "$HYPERBOLIC_API_KEY",
+      "base_url": "https://api.hyperbolic.xyz/v1",
+      "models": []
+    },
+    "synthetic": {
+      "type": "openai_compat",
+      "api_key": "$SYNTHETIC_API_KEY",
+      "base_url": "https://api.synthetic.new/openai/v1",
+      "models": []
+    },
+    "stepfun": {
+      "type": "openai_compat",
+      "api_key": "$STEPFUN_API_KEY",
+      "base_url": "https://api.stepfun.com/v1",
+      "models": []
+    },
+    "baichuan": {
+      "type": "openai_compat",
+      "api_key": "$BAICHUAN_API_KEY",
+      "base_url": "https://api.baichuan-ai.com/v1",
+      "models": []
+    },
+    "yi": {
+      "type": "openai_compat",
+      "api_key": "$YI_API_KEY",
+      "base_url": "https://api.lingyiwanwu.com/v1",
+      "models": []
+    },
+    "hunyuan": {
+      "type": "openai_compat",
+      "api_key": "$HUNYUAN_API_KEY",
+      "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+      "models": []
+    }
+  },
+
+  "default_provider": "anthropic",
+  "default_model": "claude-sonnet-4-20250514",
+
+  "fallback": [
+    "groq/llama-3.3-70b-versatile",
+    "deepseek/deepseek-chat",
+    "openai/gpt-4o-mini"
+  ],
+
+  "max_iterations": 50,
+  "tool_timeout_secs": 120,
+  "session_dir": ".naked/sessions",
+  "skill_roots": ["~/.naked/skills"],
+
+  "_tg_media_doc": "Telegram media handling. Controls how images/audio/video/files attached in TG chats are routed into the conversation.",
+  "tg_media": {
+    "_native_image_context_doc": "When true, photos and static stickers are attached as native ContentBlock::Image to the chat request (raw base64 to vision-capable models like Claude 3+, GPT-4o, llama-4-scout). When false, every image goes through the legacy describer path (separate vision provider summarises the image into text). Default: true.",
+    "native_image_context": true,
+
+    "_native_image_max_bytes_doc": "Hard upper bound on per-image bytes for the native multimodal path. Images above this limit (whether from Telegram metadata pre-check or from the actual download) are downgraded to the describer path to avoid provider 'image too large' errors. Default: 4 MiB (matches Groq's hard cap).",
+    "native_image_max_bytes": 4194304,
+
+    "_vision_model_extras_doc": "Substring needles added to the built-in vision-capable model allowlist. Use this to opt-in new vision model IDs (e.g. 'qwen3-vl', 'internlm-xcomposer2.5') without code changes. Each entry is a case-insensitive substring matched against model IDs.",
+    "vision_model_extras": [],
+
+    "_vision_doc": "Optional fallback describer (OpenAI-compatible chat-completions with image_url). Used when the active model is NOT vision-capable OR when native_image_context is false. Set api_key to a literal token or '$ENV_VAR'.",
+    "vision": {
+      "api_url": "https://api.openai.com/v1/chat/completions",
+      "api_key": "$OPENAI_API_KEY",
+      "model": "gpt-4o-mini",
+      "max_tokens": 400,
+      "prompt_override": null
+    },
+
+    "_audio_doc": "Optional voice / audio transcription endpoint (OpenAI-compatible Whisper). Required for transcripts of TG voice messages and audio files. Recommended: Groq whisper-large-v3 (free tier, fast).",
+    "audio": {
+      "api_url": "https://api.groq.com/openai/v1/audio/transcriptions",
+      "api_key": "$GROQ_API_KEY",
+      "model": "whisper-large-v3",
+      "language": null
+    },
+
+    "_limits_doc": "Hard per-kind byte caps applied AFTER Telegram's 20 MB upload limit. Defaults: photo 5 MB, audio 20 MB, doc 10 MB.",
+    "limits": {
+      "photo_max_bytes": 5242880,
+      "audio_max_bytes": 20971520,
+      "doc_max_bytes": 10485760
+    },
+
+    "_artifact_retention_days_doc": "Days to keep downloaded TG files in workspace/.naked/artifacts/. 0 disables sweeping. Default: 7.",
+    "artifact_retention_days": 7,
+
+    "_docs_inline_max_bytes_doc": "Inline documents up to this size into the prompt; larger ones are saved to disk and only the path is relayed. Default: 128 KiB.",
+    "docs_inline_max_bytes": 131072
+  },
+
+  "mcpServers": {}
+}

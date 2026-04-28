@@ -305,7 +305,7 @@ pub async fn download_to_artifacts(
     // occasionally returns 502/504 or truncates the body, and a single
     // flake shouldn't end up as "скачай сам, я не могу" to the operator
     // (that exact complaint is what drove this retry loop — see the
-    // auto-captured `user:123456789` correction "When media download
+    // auto-captured `user:105928336` correction "When media download
     // fails (e.g. 0 bytes timeout), don't just give up").
     let mut body: Option<Vec<u8>> = None;
     let mut last_err: Option<anyhow::Error> = None;

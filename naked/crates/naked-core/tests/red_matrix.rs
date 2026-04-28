@@ -1,6 +1,6 @@
 //! Red-test matrix for `naked-core` — observed-bug regressions that
 //! must stay failing until each category is driven green per the plan at
-//! `/home/example/.cursor/plans/naked-tg_red-test_matrix.plan.md`.
+//! `/home/spex/.cursor/plans/naked-tg_red-test_matrix_eb5c5662.plan.md`.
 //!
 //! Run:
 //!

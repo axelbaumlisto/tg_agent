@@ -772,7 +772,7 @@ mod tests {
     fn provider_name_and_models() {
         let config = ProviderConfig {
             provider_type: "openai_compat".into(),
-            api_key: "test-api-key".into(),
+            api_key: "sk-test".into(),
             api_keys: Vec::new(),
             base_url: None,
             models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
@@ -798,7 +798,7 @@ mod tests {
         aliases.insert("k2.6".to_string(), "kimi-for-coding".to_string());
         let config = ProviderConfig {
             provider_type: "openai_compat".into(),
-            api_key: "test-api-key".into(),
+            api_key: "sk-test".into(),
             api_keys: Vec::new(),
             base_url: Some("https://api.kimi.com/coding/v1".into()),
             models: vec!["kimi-for-coding".into()],
@@ -824,7 +824,7 @@ mod tests {
         aliases.insert("kimi-k2.6".to_string(), "kimi-for-coding".to_string());
         let config = ProviderConfig {
             provider_type: "openai_compat".into(),
-            api_key: "test-api-key".into(),
+            api_key: "sk-test".into(),
             api_keys: Vec::new(),
             base_url: None,
             models: vec!["kimi-for-coding".into()],
@@ -920,7 +920,7 @@ mod tests {
     fn provider_empty_models_list() {
         let config = ProviderConfig {
             provider_type: "openai_compat".into(),
-            api_key: "test-api-key".into(),
+            api_key: "sk-test".into(),
             api_keys: Vec::new(),
             base_url: None,
             models: Vec::new(),
