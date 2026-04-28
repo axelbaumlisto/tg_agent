@@ -352,39 +352,53 @@ fn replace_delim(input: &str, delim: &str, open: &str, close: &str) -> String {
 /// Convert `[label](url)` and bare `https://...` into `<a>` tags.
 fn linkify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
+    while i < s.len() {
+        // Safety: always ensure i is on a char boundary.
+        if !s.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
         // [label](url)
-        if bytes[i] == b'['
-            && let Some((consumed, html)) = try_parse_md_link(&s[i..])
+        if rest.starts_with('[')
+            && let Some((consumed, html)) = try_parse_md_link(rest)
         {
             out.push_str(&html);
             i += consumed;
             continue;
         }
         // bare URL
-        if s[i..].starts_with("http://") || s[i..].starts_with("https://") {
-            let end = s[i..]
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            let end = rest
                 .find(|c: char| c.is_whitespace() || "<>\"'".contains(c))
-                .map(|p| i + p)
-                .unwrap_or(s.len());
-            // Strip trailing punctuation that's likely not part of URL
+                .unwrap_or(rest.len());
             let mut url_end = end;
-            while url_end > i && matches!(s.as_bytes()[url_end - 1], b'.' | b',' | b')' | b';') {
-                url_end -= 1;
+            // Strip trailing ASCII punctuation
+            while url_end > 0 {
+                let b = rest.as_bytes()[url_end - 1];
+                if matches!(b, b'.' | b',' | b')' | b';') {
+                    url_end -= 1;
+                } else {
+                    break;
+                }
             }
-            let url = &s[i..url_end];
+            if url_end == 0 {
+                url_end = end;
+            }
+            let url = &rest[..url_end];
             out.push_str("<a href=\"");
             out.push_str(url);
             out.push_str("\">");
             out.push_str(url);
             out.push_str("</a>");
-            i = url_end;
+            i += url_end;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Regular character (may be multi-byte)
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -428,39 +442,81 @@ pub fn split_html(html: &str, max_bytes: usize) -> Vec<String> {
     let mut current = String::new();
     let mut open_tags: Vec<String> = Vec::new();
 
-    for line in html.split_inclusive('\n') {
-        let prefix_len: usize = open_tags.iter().map(|t| t.len()).sum();
-        let suffix_len: usize = open_tags.iter().map(|t| close_tag_for(t).len()).sum();
-        let overhead = prefix_len + suffix_len;
+    // Split into lines, then feed each line to the accumulator.
+    // When a line itself exceeds the budget, force-split it at space
+    // or char boundaries.
+    let lines: Vec<&str> = html.split_inclusive('\n').collect();
 
-        if current.len() + line.len() + overhead > max_bytes && !current.is_empty() {
-            // Close open tags, push chunk
-            let mut chunk = current.clone();
-            for tag in open_tags.iter().rev() {
-                chunk.push_str(&close_tag_for(tag));
+    for line in lines {
+        let parts = if line.len() > max_bytes / 2 {
+            // Large line — split at spaces to produce manageable parts
+            split_long_line(line, max_bytes / 2)
+        } else {
+            vec![line.to_string()]
+        };
+
+        for part in &parts {
+            let suffix_len: usize = open_tags.iter().map(|t| close_tag_for(t).len()).sum();
+            let reopener_len: usize = open_tags.iter().map(|t| t.len()).sum();
+
+            if !current.is_empty() && current.len() + part.len() + suffix_len > max_bytes {
+                // Flush current chunk with closing tags
+                for tag in open_tags.iter().rev() {
+                    current.push_str(&close_tag_for(tag));
+                }
+                chunks.push(current);
+                // Start new chunk with re-opened tags
+                current = String::with_capacity(reopener_len + part.len());
+                for tag in &open_tags {
+                    current.push_str(tag);
+                }
             }
-            chunks.push(chunk);
-            // Start new chunk with re-opened tags
-            current = String::new();
-            for tag in &open_tags {
-                current.push_str(tag);
-            }
+
+            track_tags(part, &mut open_tags);
+            current.push_str(part);
         }
-
-        // Track tags
-        track_tags(line, &mut open_tags);
-        current.push_str(line);
     }
 
     if !current.is_empty() {
-        let mut chunk = current;
         for tag in open_tags.iter().rev() {
-            chunk.push_str(&close_tag_for(tag));
+            current.push_str(&close_tag_for(tag));
         }
-        chunks.push(chunk);
+        chunks.push(current);
     }
 
     chunks
+}
+
+/// Split a long line at spaces to produce parts ≤ `max` bytes.
+fn split_long_line(line: &str, max: usize) -> Vec<String> {
+    if line.len() <= max {
+        return vec![line.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        let end = (start + max).min(line.len());
+        // Snap to char boundary
+        let mut boundary = end;
+        while boundary > start && !line.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        // Try to split at a space
+        if boundary < line.len()
+            && let Some(sp) = line[start..boundary].rfind(' ')
+        {
+            boundary = start + sp + 1;
+        }
+        if boundary <= start {
+            boundary = end.min(line.len());
+            while boundary < line.len() && !line.is_char_boundary(boundary) {
+                boundary += 1;
+            }
+        }
+        parts.push(line[start..boundary].to_string());
+        start = boundary;
+    }
+    parts
 }
 
 fn close_tag_for(open: &str) -> String {
@@ -843,5 +899,26 @@ See [docs](https://docs.rs) for details.";
     #[test]
     fn close_tag_with_attr() {
         assert_eq!(close_tag_for("<a href=\"x\">"), "</a>");
+    }
+
+    #[test]
+    fn unicode_em_dash_does_not_panic() {
+        // Regression: em-dash — is 3 bytes, old byte-indexing panicked.
+        let html = md_to_tg_html("hello — world");
+        assert!(html.contains("—"), "em-dash must survive: {html}");
+    }
+
+    #[test]
+    fn unicode_mixed_with_links() {
+        let html = md_to_tg_html("Привет https://example.com мир");
+        assert!(html.contains("<a href"), "link must render: {html}");
+        assert!(html.contains("Привет"), "cyrillic must survive: {html}");
+    }
+
+    #[test]
+    fn unicode_emoji_in_text() {
+        let html = md_to_tg_html("🚀 **launch** the 🌍");
+        assert!(html.contains("🚀"));
+        assert!(html.contains("<b>launch</b>"));
     }
 }
