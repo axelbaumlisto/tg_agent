@@ -45,19 +45,43 @@ mod tests {
 
     #[test]
     fn disallowed_persona_drops_slash_in_message_and_callback() {
-        assert!(!is_slash_dispatchable(false, "/reset", DispatchChannel::Message));
-        assert!(!is_slash_dispatchable(false, "/reset", DispatchChannel::Callback));
+        assert!(!is_slash_dispatchable(
+            false,
+            "/reset",
+            DispatchChannel::Message
+        ));
+        assert!(!is_slash_dispatchable(
+            false,
+            "/reset",
+            DispatchChannel::Callback
+        ));
     }
 
     #[test]
     fn allowing_persona_accepts_slash() {
-        assert!(is_slash_dispatchable(true, "/reset", DispatchChannel::Message));
-        assert!(is_slash_dispatchable(true, "/reset", DispatchChannel::Callback));
+        assert!(is_slash_dispatchable(
+            true,
+            "/reset",
+            DispatchChannel::Message
+        ));
+        assert!(is_slash_dispatchable(
+            true,
+            "/reset",
+            DispatchChannel::Callback
+        ));
     }
 
     #[test]
     fn non_slash_text_always_passes() {
-        assert!(is_slash_dispatchable(false, "hello", DispatchChannel::Message));
-        assert!(is_slash_dispatchable(false, "привет", DispatchChannel::Callback));
+        assert!(is_slash_dispatchable(
+            false,
+            "hello",
+            DispatchChannel::Message
+        ));
+        assert!(is_slash_dispatchable(
+            false,
+            "привет",
+            DispatchChannel::Callback
+        ));
     }
 }

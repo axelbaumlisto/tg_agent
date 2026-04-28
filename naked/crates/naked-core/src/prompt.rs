@@ -44,10 +44,7 @@ pub fn resolve_system_prompt(workspace: &Path, global_path: Option<&Path>) -> St
 /// Returns `Ok(prompt)` where `prompt` is:
 /// 1. `<workspace>/.naked/system_prompt.md` if present and non-empty,
 /// 2. else `meta_snapshot` (what's already persisted on disk).
-pub fn effective_system_prompt(
-    workspace: &Path,
-    meta_snapshot: &str,
-) -> std::io::Result<String> {
+pub fn effective_system_prompt(workspace: &Path, meta_snapshot: &str) -> std::io::Result<String> {
     let project_prompt = workspace.join(".naked").join(DEFAULT_PROMPT_FILENAME);
     if let Some(content) = try_read_prompt(&project_prompt) {
         return Ok(content);

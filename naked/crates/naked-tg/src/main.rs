@@ -8,8 +8,8 @@ use naked_tg::memory_scheduler;
 use naked_tg::research_html::{ReportMeta, render_report_html};
 use naked_tg::research_scheduler;
 use naked_tg::research_ui::{
-    HeartbeatProgress, PendingClarification, keyboard_after_complete, keyboard_paused_awaiting_clarification,
-    keyboard_stop, render_waterfall,
+    HeartbeatProgress, PendingClarification, keyboard_after_complete,
+    keyboard_paused_awaiting_clarification, keyboard_stop, render_waterfall,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -306,7 +306,9 @@ async fn main() {
     // for the lifetime of the bot process; drop on exit releases it.
     // We keep an `Option` so test or future tooling can run without a
     // research subsystem at all.
-    let _scheduler_lock: Option<naked_tg::scheduler_lock::SchedulerLock> = if config.research.enabled
+    let _scheduler_lock: Option<naked_tg::scheduler_lock::SchedulerLock> = if config
+        .research
+        .enabled
     {
         let research_root = config
             .research
@@ -343,9 +345,7 @@ async fn main() {
             verify_by_default: config.research.verify_by_default,
             max_verification_rounds: config.research.gatekeeper.max_rounds,
             max_concurrent_runs: config.research.max_concurrent_runs.max(1),
-            task_timeout: std::time::Duration::from_secs(
-                config.research.task_timeout_seconds,
-            ),
+            task_timeout: std::time::Duration::from_secs(config.research.task_timeout_seconds),
             max_retries_before_alert: config.research.max_retries_before_alert,
             ..Default::default()
         };
@@ -383,9 +383,7 @@ async fn main() {
     let channel_map = match ChannelSessionMap::open(&naked_dir).await {
         Ok(m) => Arc::new(m),
         Err(e) => {
-            tracing::warn!(
-                "channel_map snapshot open failed ({e:#}); using in-memory only"
-            );
+            tracing::warn!("channel_map snapshot open failed ({e:#}); using in-memory only");
             Arc::new(ChannelSessionMap::new())
         }
     };
@@ -533,7 +531,9 @@ async fn main() {
                 Arc::new(naked_tg::bot_identity::BotIdentity { id, username })
             }
             Err(e) => {
-                tracing::error!("getMe parse error: {e} — using zero identity (group filter will reject everything)");
+                tracing::error!(
+                    "getMe parse error: {e} — using zero identity (group filter will reject everything)"
+                );
                 Arc::new(naked_tg::bot_identity::BotIdentity {
                     id: 0,
                     username: String::new(),
@@ -541,7 +541,9 @@ async fn main() {
             }
         },
         Err(e) => {
-            tracing::error!("getMe request failed: {e} — using zero identity (group filter will reject everything)");
+            tracing::error!(
+                "getMe request failed: {e} — using zero identity (group filter will reject everything)"
+            );
             Arc::new(naked_tg::bot_identity::BotIdentity {
                 id: 0,
                 username: String::new(),
@@ -593,8 +595,7 @@ async fn main() {
     let watchdog_notifier: Arc<dyn naked_tg::watchdog::WatchdogNotifier> =
         match naked_tg::watchdog::SystemdWatchdog::detect_from_env() {
             Some(wd) => {
-                let interval_secs =
-                    wd.interval().map(|d| d.as_secs()).unwrap_or(0);
+                let interval_secs = wd.interval().map(|d| d.as_secs()).unwrap_or(0);
                 tracing::info!(interval_secs, "systemd watchdog enabled");
                 Arc::new(wd)
             }
@@ -1677,7 +1678,10 @@ async fn handle_message(
     // We intercept before the addressing gate because DMs are the normal
     // research delivery surface and we don't want to force a bot mention
     // in private chats just to reply to an inline button.
-    if let Some(text) = text_direct.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    if let Some(text) = text_direct
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         && !text.starts_with('/')
     {
         let key = (chat_id_raw, ctx.raw_thread_id());
@@ -1691,8 +1695,7 @@ async fn handle_message(
                     if !spec.topic.trim_end().ends_with('\n') && !spec.topic.is_empty() {
                         spec.topic.push('\n');
                     }
-                    spec.topic
-                        .push_str(&format!("\nUPDATE {stamp}: {text}"));
+                    spec.topic.push_str(&format!("\nUPDATE {stamp}: {text}"));
                     store.save_spec(&spec).await
                 }
                 Err(e) => Err(e),
@@ -2271,7 +2274,9 @@ async fn handle_callback(
                         .write()
                         .await
                         .remove(&(cid_raw, tid_raw));
-                    bot.answer_callback_query(q.id.clone()).text("Restarting…").await?;
+                    bot.answer_callback_query(q.id.clone())
+                        .text("Restarting…")
+                        .await?;
                     let reply = launch_research_run_with_ui(
                         bot.clone(),
                         agent.clone(),
@@ -2512,11 +2517,7 @@ impl CompositeView {
     /// payload is tail-preserved (the conclusion is at the end of the
     /// CoT) and capped by the lower of `MAX_FINAL_THINKING_BYTES` and
     /// the caller-provided budget.
-    fn render_thinking_block_budgeted(
-        &self,
-        trimmed: &str,
-        budget: usize,
-    ) -> Option<String> {
+    fn render_thinking_block_budgeted(&self, trimmed: &str, budget: usize) -> Option<String> {
         if trimmed.is_empty() {
             return None;
         }
@@ -2702,6 +2703,7 @@ hr {{
     doc.into_bytes()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     bot: Bot,
     ctx: ChatCtx,
@@ -3230,6 +3232,7 @@ fn is_allowed(chat_id: i64, config: &Config) -> bool {
 
 /// Returns `Ok(true)` if the command was handled, `Ok(false)` if unrecognized
 /// (caller should pass the message to the agent).
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     bot: &Bot,
     _msg: &Message,

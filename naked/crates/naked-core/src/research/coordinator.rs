@@ -1086,11 +1086,7 @@ impl ResearchCoordinator {
             if let Some(h) = &self.config.model_health {
                 selector = selector.with_health(h.clone());
             }
-            let default_provider = self
-                .config
-                .default_provider
-                .as_deref()
-                .unwrap_or("");
+            let default_provider = self.config.default_provider.as_deref().unwrap_or("");
             let filtered = selector.filter_chain(
                 &self.config.fallback_models,
                 default_provider,
@@ -1534,6 +1530,7 @@ impl ResearchCoordinator {
         self.store.write_agent_brief(&spec.id, &md).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_record(
         &self,
         spec: &ResearchSpec,
@@ -2045,19 +2042,13 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "zai".into(),
-            cap_provider(
-                &["glm-5", "dead-model"],
-                &[("dead-model", dead_caps)],
-            ),
+            cap_provider(&["glm-5", "dead-model"], &[("dead-model", dead_caps)]),
         );
 
         let coord_cfg = CoordinatorConfig {
             default_provider: Some("zai".into()),
             default_model: Some("glm-5".into()),
-            fallback_models: vec![
-                "zai/dead-model".into(),
-                "zai/glm-5".into(),
-            ],
+            fallback_models: vec!["zai/dead-model".into(), "zai/glm-5".into()],
             provider_capabilities: providers,
             enforce_model_capabilities: false,
             ..CoordinatorConfig::default()
@@ -2067,7 +2058,11 @@ mod tests {
 
         let seen = seen.lock().await.clone();
         // Primary + 2 fallbacks = 3 attempts. Deprecated stays in soft mode.
-        assert_eq!(seen.len(), 3, "soft mode must try every entry, got {seen:?}");
+        assert_eq!(
+            seen.len(),
+            3,
+            "soft mode must try every entry, got {seen:?}"
+        );
         assert!(seen.iter().any(|m| m.ends_with("dead-model")));
     }
 
@@ -2416,7 +2411,10 @@ mod tests {
             .run_verified_with_cancel("verif-cancel", 5, cancel)
             .await;
         let elapsed = started.elapsed();
-        assert!(result.is_ok(), "should still produce a report, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "should still produce a report, got {result:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(3),
             "cancelled verified loop should finish quickly, took {elapsed:?}"

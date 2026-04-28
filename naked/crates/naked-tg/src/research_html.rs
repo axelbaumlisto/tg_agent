@@ -428,9 +428,11 @@ mod tests {
     fn autolink_bare_url_gets_wrapped() {
         let md = "See https://alonhadat.com.vn/foo for details.";
         let html = md_to_html(md);
-        assert!(html.contains(
-            "<a href=\"https://alonhadat.com.vn/foo\">https://alonhadat.com.vn/foo</a>"
-        ));
+        assert!(
+            html.contains(
+                "<a href=\"https://alonhadat.com.vn/foo\">https://alonhadat.com.vn/foo</a>"
+            )
+        );
     }
 
     #[test]

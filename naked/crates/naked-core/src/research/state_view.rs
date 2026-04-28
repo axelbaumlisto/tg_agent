@@ -435,8 +435,7 @@ mod tests {
     fn render_includes_pause_reason_when_present() {
         let mut spec = base_spec("auto-paused");
         spec.paused = true;
-        spec.pause_reason =
-            Some("auto: 5 consecutive failures — last error: stream closed".into());
+        spec.pause_reason = Some("auto: 5 consecutive failures — last error: stream closed".into());
         let view = StateView {
             spec: &spec,
             inflight: None,
@@ -472,10 +471,7 @@ mod tests {
         };
         let s = render_state(&view);
         assert!(s.contains("paused: yes"));
-        assert!(
-            !s.contains("paused: yes ("),
-            "no parens without a reason"
-        );
+        assert!(!s.contains("paused: yes ("), "no parens without a reason");
     }
 
     #[test]

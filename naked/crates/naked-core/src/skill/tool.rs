@@ -155,7 +155,10 @@ impl SkillTool {
         };
         let Some(manifest) = super::toml_legacy::TomlSkillManifest::parse(&raw) else {
             return ToolResult {
-                output: format!("Failed to parse {} as legacy SKILL.toml", hit.path.display()),
+                output: format!(
+                    "Failed to parse {} as legacy SKILL.toml",
+                    hit.path.display()
+                ),
                 is_error: true,
             };
         };
@@ -599,7 +602,10 @@ x = "A required param"
     async fn json_form_wins_over_toml_in_same_dir() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().join("dual");
-        write(&dir.join("SKILL.toml"), "[skill]\nname=\"dual\"\ndescription=\"toml desc\"");
+        write(
+            &dir.join("SKILL.toml"),
+            "[skill]\nname=\"dual\"\ndescription=\"toml desc\"",
+        );
         write(
             &dir.join("SKILL.json"),
             r#"{"name":"dual","description":"json desc","mode":"advisory","advisory_body":"json body"}"#,

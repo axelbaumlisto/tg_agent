@@ -130,9 +130,11 @@ fn format_dreams(entries: &[DreamEntry]) -> String {
         out.push_str(&format!("\nRejected ({}):\n", e.rejected.len()));
         for r in &e.rejected {
             match &r.reason {
-                Some(reason) => {
-                    out.push_str(&format!("- {} — reason: {}\n", r.content.trim(), reason.trim()))
-                }
+                Some(reason) => out.push_str(&format!(
+                    "- {} — reason: {}\n",
+                    r.content.trim(),
+                    reason.trim()
+                )),
                 None => out.push_str(&format!("- {}\n", r.content.trim())),
             }
         }
@@ -263,7 +265,10 @@ mod tests {
         assert_eq!(parsed[0].promoted, vec!["use tabs", "no unwrap"]);
         assert_eq!(parsed[0].rejected.len(), 1);
         assert_eq!(parsed[0].rejected[0].content, "vague hunch");
-        assert_eq!(parsed[0].rejected[0].reason.as_deref(), Some("not actionable"));
+        assert_eq!(
+            parsed[0].rejected[0].reason.as_deref(),
+            Some("not actionable")
+        );
     }
 
     #[test]

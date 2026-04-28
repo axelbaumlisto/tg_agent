@@ -118,9 +118,9 @@ fn reacquire_after_external_lock_release() {
             // expected — the external process owns the lock
         }
         Err(other) => panic!("unexpected error: {other}"),
-        Ok(_) => panic!(
-            "SchedulerLock::try_acquire must fail while external flock(1) holds the lock"
-        ),
+        Ok(_) => {
+            panic!("SchedulerLock::try_acquire must fail while external flock(1) holds the lock")
+        }
     }
 
     // Wait for the child to exit naturally (`sleep 0.5`), then

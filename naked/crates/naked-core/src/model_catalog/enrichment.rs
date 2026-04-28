@@ -260,8 +260,9 @@ pub fn promote_observations(
     known_pairs: &BTreeSet<(String, String)>,
 ) -> CatalogSuggestions {
     // Group observations by (provider, model, kind) -> distinct days + details.
-    let mut buckets: HashMap<(String, String, ObservationKind), (BTreeSet<NaiveDate>, Vec<String>)> =
-        HashMap::new();
+    type BucketKey = (String, String, ObservationKind);
+    type BucketVal = (BTreeSet<NaiveDate>, Vec<String>);
+    let mut buckets: HashMap<BucketKey, BucketVal> = HashMap::new();
     for obs in observations {
         let day = obs.ts.date_naive();
         let entry = buckets
@@ -318,9 +319,8 @@ pub fn promote_observations(
                         model,
                         known_failure_modes: details,
                         evidence_days: days_sorted,
-                        rationale:
-                            "observed repeated new failure mode across ≥ 2 distinct days"
-                                .to_string(),
+                        rationale: "observed repeated new failure mode across ≥ 2 distinct days"
+                            .to_string(),
                     });
                 }
             }

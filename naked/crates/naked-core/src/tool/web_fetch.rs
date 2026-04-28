@@ -187,9 +187,7 @@ impl WebFetchTool {
             }
         }
 
-        let client = builder
-            .build()
-            .expect("web_fetch: reqwest client init");
+        let client = builder.build().expect("web_fetch: reqwest client init");
         Self {
             client,
             cloud,
@@ -203,10 +201,10 @@ impl WebFetchTool {
 fn sanitize_proxy_url(raw: &str) -> String {
     // Split once on "://" to preserve the scheme, then on the last "@" in
     // the authority to drop credentials.
-    if let Some((scheme, rest)) = raw.split_once("://") {
-        if let Some((_creds, hostport)) = rest.rsplit_once('@') {
-            return format!("{scheme}://{hostport}");
-        }
+    if let Some((scheme, rest)) = raw.split_once("://")
+        && let Some((_creds, hostport)) = rest.rsplit_once('@')
+    {
+        return format!("{scheme}://{hostport}");
     }
     raw.to_string()
 }
@@ -317,57 +315,48 @@ impl Tool for WebFetchTool {
         // primary path clearly failed (transport error, anti-bot wall, or
         // non-success HTTP status). Successful 200-with-body is returned
         // immediately — no point burning a second round-trip.
-        if primary.is_degraded() && start_tier <= Tier::UrlPrefix {
-            if let Some(prefix) = resolve_url_prefix() {
-                if !is_already_prefixed(&url, &prefix) {
-                    let wrapped = format!("{prefix}/{url}");
-                    tracing::info!(
-                        target = %url,
-                        via = %prefix,
-                        primary_status = primary.status,
-                        primary_error = %primary.transport_error.as_deref().unwrap_or(""),
-                        "web_fetch: primary degraded, retrying via URL-prefix proxy",
-                    );
-                    match self.fetch_once(&wrapped).await {
-                        Ok(mut fallback) => {
-                            // The CORS proxy may itself return 5xx when the
-                            // upstream target is bad; in that case we still
-                            // prefer the primary result (it's at least
-                            // authoritative about what the origin said).
-                            if !fallback.is_degraded() {
-                                // Rewrite final_url back to the original
-                                // target so downstream dedup/memory doesn't
-                                // treat `ws-xxx.onrender.com/...` as a new
-                                // canonical URL for this content.
-                                fallback.final_url = url.clone();
-                                primary = fallback;
-                                self.host_policy.record(
-                                    &url,
-                                    Tier::UrlPrefix,
-                                    TierOutcome::Ok,
-                                );
-                            } else {
-                                tracing::info!(
-                                    fallback_status = fallback.status,
-                                    fallback_error = %fallback.transport_error.as_deref().unwrap_or(""),
-                                    "web_fetch: URL-prefix fallback also degraded; keeping primary result",
-                                );
-                                self.host_policy.record(
-                                    &url,
-                                    Tier::UrlPrefix,
-                                    TierOutcome::Blocked,
-                                );
-                            }
-                        }
-                        Err(msg) => {
-                            tracing::warn!(error = %msg, "web_fetch: URL-prefix fallback failed");
-                            self.host_policy.record(
-                                &url,
-                                Tier::UrlPrefix,
-                                TierOutcome::Blocked,
-                            );
-                        }
+        if primary.is_degraded()
+            && start_tier <= Tier::UrlPrefix
+            && let Some(prefix) = resolve_url_prefix()
+            && !is_already_prefixed(&url, &prefix)
+        {
+            let wrapped = format!("{prefix}/{url}");
+            tracing::info!(
+                target = %url,
+                via = %prefix,
+                primary_status = primary.status,
+                primary_error = %primary.transport_error.as_deref().unwrap_or(""),
+                "web_fetch: primary degraded, retrying via URL-prefix proxy",
+            );
+            match self.fetch_once(&wrapped).await {
+                Ok(mut fallback) => {
+                    // The CORS proxy may itself return 5xx when the
+                    // upstream target is bad; in that case we still
+                    // prefer the primary result (it's at least
+                    // authoritative about what the origin said).
+                    if !fallback.is_degraded() {
+                        // Rewrite final_url back to the original
+                        // target so downstream dedup/memory doesn't
+                        // treat `ws-xxx.onrender.com/...` as a new
+                        // canonical URL for this content.
+                        fallback.final_url = url.clone();
+                        primary = fallback;
+                        self.host_policy
+                            .record(&url, Tier::UrlPrefix, TierOutcome::Ok);
+                    } else {
+                        tracing::info!(
+                            fallback_status = fallback.status,
+                            fallback_error = %fallback.transport_error.as_deref().unwrap_or(""),
+                            "web_fetch: URL-prefix fallback also degraded; keeping primary result",
+                        );
+                        self.host_policy
+                            .record(&url, Tier::UrlPrefix, TierOutcome::Blocked);
                     }
+                }
+                Err(msg) => {
+                    tracing::warn!(error = %msg, "web_fetch: URL-prefix fallback failed");
+                    self.host_policy
+                        .record(&url, Tier::UrlPrefix, TierOutcome::Blocked);
                 }
             }
         }
@@ -400,8 +389,7 @@ impl Tool for WebFetchTool {
             match fetch_via_tls_subprocess(&url).await {
                 Ok(tls_body) => {
                     if let Some(kind) = detect_block(tls_body.status, &tls_body.text) {
-                        cascade_notes
-                            .push(format!("tls: HTTP {} ({:?})", tls_body.status, kind));
+                        cascade_notes.push(format!("tls: HTTP {} ({:?})", tls_body.status, kind));
                         self.host_policy
                             .record(&url, Tier::Tls, TierOutcome::Blocked);
                     } else if !(200..400).contains(&tls_body.status) {
@@ -467,8 +455,7 @@ impl Tool for WebFetchTool {
                             transport_error: None,
                         };
                         cascade_notes.push(format!("{}: OK (used)", cloud_body.provider));
-                        self.host_policy
-                            .record(&url, Tier::Cloud, TierOutcome::Ok);
+                        self.host_policy.record(&url, Tier::Cloud, TierOutcome::Ok);
                     }
                 }
                 Err(msg) => {
@@ -619,8 +606,8 @@ async fn fetch_via_tls_subprocess(url: &str) -> Result<FetchOutcome, String> {
         return Err(format!("tls no stdout (stderr: {tail})"));
     }
 
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("tls json parse: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("tls json parse: {e}"))?;
 
     if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         let err_msg = parsed
@@ -717,7 +704,10 @@ async fn fetch_wayback_snapshot(
     if !snap.status().is_success() {
         return Err(format!("snapshot HTTP {}", snap.status()));
     }
-    let body = snap.text().await.map_err(|e| format!("snapshot body: {e}"))?;
+    let body = snap
+        .text()
+        .await
+        .map_err(|e| format!("snapshot body: {e}"))?;
     Ok((body, timestamp, snapshot_url))
 }
 
@@ -789,12 +779,12 @@ impl WebFetchTool {
             .unwrap_or("")
             .to_string();
 
-        if let Some(len_hint) = resp.content_length() {
-            if len_hint > DEFAULT_MAX_BYTES {
-                return Err(format!(
-                    "response too large ({len_hint} bytes, limit {DEFAULT_MAX_BYTES})"
-                ));
-            }
+        if let Some(len_hint) = resp.content_length()
+            && len_hint > DEFAULT_MAX_BYTES
+        {
+            return Err(format!(
+                "response too large ({len_hint} bytes, limit {DEFAULT_MAX_BYTES})"
+            ));
         }
 
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;

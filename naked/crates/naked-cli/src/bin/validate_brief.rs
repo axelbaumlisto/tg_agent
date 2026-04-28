@@ -202,10 +202,7 @@ fn run(args: Args) -> Result<()> {
         .brief
         .as_ref()
         .context("--brief is required (try --help)")?;
-    let out_dir = args
-        .out_dir
-        .as_ref()
-        .context("--out-dir is required")?;
+    let out_dir = args.out_dir.as_ref().context("--out-dir is required")?;
     if args.findings.is_empty() {
         bail!("--findings is required (one or more JSONL paths)");
     }
@@ -222,7 +219,10 @@ fn run(args: Args) -> Result<()> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let thresholds = filters.get("score_thresholds").cloned().unwrap_or(json!({}));
+    let thresholds = filters
+        .get("score_thresholds")
+        .cloned()
+        .unwrap_or(json!({}));
     let shortlist_min = thresholds
         .get("shortlist_min")
         .and_then(Value::as_f64)
@@ -256,10 +256,7 @@ fn run(args: Args) -> Result<()> {
             flat_paths.push(p.clone());
         }
     }
-    let mut findings: Vec<Value> = flat_paths
-        .iter()
-        .flat_map(|p| read_jsonl(p))
-        .collect();
+    let mut findings: Vec<Value> = flat_paths.iter().flat_map(|p| read_jsonl(p)).collect();
     let n_raw = findings.len();
     findings = reconcile(&findings, None, false);
     let n_dedup = findings.len();
@@ -302,8 +299,7 @@ fn run(args: Args) -> Result<()> {
         ("rejected", out_dir.join("rejected.jsonl"), &rejected),
     ];
     for (_label, p, items) in &paths {
-        let mut fh = fs::File::create(p)
-            .with_context(|| format!("creating {}", p.display()))?;
+        let mut fh = fs::File::create(p).with_context(|| format!("creating {}", p.display()))?;
         for f in items.iter() {
             let line = serde_json::to_string(f)?;
             fh.write_all(line.as_bytes())?;

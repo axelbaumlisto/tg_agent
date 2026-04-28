@@ -51,11 +51,11 @@
 //! `discover` — and dedup must be schema-tolerant). The function is
 //! still pure: input slice in, owned `Vec` out, no I/O, no globals.
 
+use regex::Regex;
+use serde_json::{Map, Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use regex::Regex;
-use serde_json::{Map, Value, json};
 use unicode_normalization::UnicodeNormalization;
 
 // ── B5-1: URL canonicalisation ──────────────────────────────────────
@@ -64,14 +64,33 @@ use unicode_normalization::UnicodeNormalization;
 /// Mirrors Python `_TRACKING_PARAMS`. Keep in sync — drift here
 /// breaks differential tests.
 const TRACKING_PARAMS: &[&str] = &[
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "utm_id", "utm_name", "utm_referrer",
-    "fbclid", "gclid", "yclid", "msclkid", "dclid", "twclid",
-    "mc_cid", "mc_eid",
-    "_ga", "_gl",
-    "ref", "ref_", "referer", "referrer",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "utm_id",
+    "utm_name",
+    "utm_referrer",
+    "fbclid",
+    "gclid",
+    "yclid",
+    "msclkid",
+    "dclid",
+    "twclid",
+    "mc_cid",
+    "mc_eid",
+    "_ga",
+    "_gl",
+    "ref",
+    "ref_",
+    "referer",
+    "referrer",
     "phpsessid",
-    "sid", "ssid", "session", "sessionid",
+    "sid",
+    "ssid",
+    "session",
+    "sessionid",
     "spm",
     "from",
 ];
@@ -105,11 +124,18 @@ fn urlsplit(url: &str) -> UrlParts<'_> {
     let mut scheme_end: Option<usize> = None;
     for (i, c) in url.char_indices() {
         if i == 0 {
-            if !c.is_ascii_alphabetic() { break; }
+            if !c.is_ascii_alphabetic() {
+                break;
+            }
             continue;
         }
-        if c == ':' { scheme_end = Some(i); break; }
-        if c == '/' || c == '?' || c == '#' { break; }
+        if c == ':' {
+            scheme_end = Some(i);
+            break;
+        }
+        if c == '/' || c == '?' || c == '#' {
+            break;
+        }
         if !(c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
             break;
         }
@@ -138,18 +164,22 @@ fn urlsplit(url: &str) -> UrlParts<'_> {
         None => (after_path, ""),
     };
 
-    UrlParts { scheme, netloc, path, query, fragment }
+    UrlParts {
+        scheme,
+        netloc,
+        path,
+        query,
+        fragment,
+    }
 }
 
 /// Pythonic `urlunsplit` — emits `scheme://netloc/path?query#fragment`
 /// with the same semantics as `urllib.parse.urlunsplit`. The "//"
 /// authority marker is emitted iff `netloc` is non-empty (matches
 /// Python's behavior on schemes like mailto:).
-fn urlunsplit(scheme: &str, netloc: &str, path: &str,
-              query: &str, fragment: &str) -> String {
+fn urlunsplit(scheme: &str, netloc: &str, path: &str, query: &str, fragment: &str) -> String {
     let mut s = String::with_capacity(
-        scheme.len() + netloc.len() + path.len()
-        + query.len() + fragment.len() + 6
+        scheme.len() + netloc.len() + path.len() + query.len() + fragment.len() + 6,
     );
     if !scheme.is_empty() {
         s.push_str(scheme);
@@ -198,9 +228,7 @@ pub fn canonicalize_url(url: &str) -> String {
     let netloc_lc = parts.netloc.to_ascii_lowercase();
 
     // 1. Fragment policy.
-    let fragment = if !parts.fragment.is_empty()
-        && (parts.path.is_empty() || parts.path == "/")
-    {
+    let fragment = if !parts.fragment.is_empty() && (parts.path.is_empty() || parts.path == "/") {
         parts.fragment
     } else {
         ""
@@ -221,10 +249,13 @@ pub fn canonicalize_url(url: &str) -> String {
     let query_out = if parts.query.is_empty() {
         String::new()
     } else {
-        let mut kept: Vec<(&str, &str)> = parts.query
+        let mut kept: Vec<(&str, &str)> = parts
+            .query
             .split('&')
             .filter_map(|kv| {
-                if kv.is_empty() { return None; }
+                if kv.is_empty() {
+                    return None;
+                }
                 let (k, v) = match kv.find('=') {
                     Some(idx) => (&kv[..idx], &kv[idx + 1..]),
                     None => (kv, ""),
@@ -235,7 +266,9 @@ pub fn canonicalize_url(url: &str) -> String {
         kept.sort_unstable();
         let mut q = String::with_capacity(parts.query.len());
         for (i, (k, v)) in kept.iter().enumerate() {
-            if i > 0 { q.push('&'); }
+            if i > 0 {
+                q.push('&');
+            }
             q.push_str(k);
             q.push('=');
             q.push_str(v);
@@ -345,7 +378,8 @@ const FX_TO_USD: &[(&str, f64)] = &[
 
 fn lookup_rate(table: &[(&str, f64)], iso: &str) -> Option<f64> {
     let upper = iso.to_ascii_uppercase();
-    table.iter()
+    table
+        .iter()
         .find(|(c, _)| c.eq_ignore_ascii_case(&upper))
         .map(|(_, r)| *r)
 }
@@ -356,43 +390,76 @@ fn lookup_rate(table: &[(&str, f64)], iso: &str) -> Option<f64> {
 /// descending so longer matches (e.g. `руб.`) win over shorter
 /// (`руб`).
 const SUFFIX_TOKENS: &[(&str, &str)] = &[
-    ("₽", "RUB"), ("руб", "RUB"), ("руб.", "RUB"), ("рубль", "RUB"),
-    ("рубля", "RUB"), ("рублей", "RUB"),
-    ("₸", "KZT"), ("тг", "KZT"), ("тг.", "KZT"), ("тенге", "KZT"),
-    ("฿", "THB"), ("baht", "THB"), ("бат", "THB"),
-    ("֏", "AMD"), ("драм", "AMD"), ("dram", "AMD"),
-    ("₫", "VND"), ("đồng", "VND"),
-    ("Rp", "IDR"), ("rp", "IDR"),
-    ("RM", "MYR"), ("ringgit", "MYR"),
-    ("₾", "GEL"), ("lari", "GEL"), ("лари", "GEL"),
-    ("₴", "UAH"), ("грн", "UAH"),
+    ("₽", "RUB"),
+    ("руб", "RUB"),
+    ("руб.", "RUB"),
+    ("рубль", "RUB"),
+    ("рубля", "RUB"),
+    ("рублей", "RUB"),
+    ("₸", "KZT"),
+    ("тг", "KZT"),
+    ("тг.", "KZT"),
+    ("тенге", "KZT"),
+    ("฿", "THB"),
+    ("baht", "THB"),
+    ("бат", "THB"),
+    ("֏", "AMD"),
+    ("драм", "AMD"),
+    ("dram", "AMD"),
+    ("₫", "VND"),
+    ("đồng", "VND"),
+    ("Rp", "IDR"),
+    ("rp", "IDR"),
+    ("RM", "MYR"),
+    ("ringgit", "MYR"),
+    ("₾", "GEL"),
+    ("lari", "GEL"),
+    ("лари", "GEL"),
+    ("₴", "UAH"),
+    ("грн", "UAH"),
     // ISO codes also valid as bare suffixes after a number.
-    ("USD", "USD"), ("EUR", "EUR"), ("GBP", "GBP"), ("JPY", "JPY"),
+    ("USD", "USD"),
+    ("EUR", "EUR"),
+    ("GBP", "GBP"),
+    ("JPY", "JPY"),
     ("CNY", "CNY"),
-    ("RUB", "RUB"), ("KZT", "KZT"), ("THB", "THB"), ("AMD", "AMD"),
+    ("RUB", "RUB"),
+    ("KZT", "KZT"),
+    ("THB", "THB"),
+    ("AMD", "AMD"),
     ("VND", "VND"),
-    ("IDR", "IDR"), ("MYR", "MYR"), ("BYN", "BYN"), ("UZS", "UZS"),
-    ("GEL", "GEL"), ("UAH", "UAH"),
+    ("IDR", "IDR"),
+    ("MYR", "MYR"),
+    ("BYN", "BYN"),
+    ("UZS", "UZS"),
+    ("GEL", "GEL"),
+    ("UAH", "UAH"),
 ];
 
 /// Currency-prefix symbols (token appears BEFORE the number).
-const PREFIX_TOKENS: &[(&str, &str)] = &[
-    ("$", "USD"),
-    ("€", "EUR"),
-    ("£", "GBP"),
-    ("¥", "JPY"),
-];
+const PREFIX_TOKENS: &[(&str, &str)] = &[("$", "USD"), ("€", "EUR"), ("£", "GBP"), ("¥", "JPY")];
 
 /// Multiplier tokens. Sorted by length desc by `build_alternation`
 /// so `миллиард` beats `миллион` etc.
 const MULTIPLIERS: &[(&str, f64)] = &[
-    ("млрд", 1e9), ("миллиард", 1e9), ("миллиардов", 1e9),
-    ("млн", 1e6),  ("миллион", 1e6),  ("миллионов", 1e6),
-    ("тыс", 1e3),  ("тысяч", 1e3),    ("тысячи", 1e3),
-    ("billion", 1e9), ("million", 1e6), ("thousand", 1e3),
-    ("tỷ", 1e9), ("ty", 1e9),
-    ("triệu", 1e6), ("trieu", 1e6),
-    ("nghìn", 1e3), ("nghin", 1e3),
+    ("млрд", 1e9),
+    ("миллиард", 1e9),
+    ("миллиардов", 1e9),
+    ("млн", 1e6),
+    ("миллион", 1e6),
+    ("миллионов", 1e6),
+    ("тыс", 1e3),
+    ("тысяч", 1e3),
+    ("тысячи", 1e3),
+    ("billion", 1e9),
+    ("million", 1e6),
+    ("thousand", 1e3),
+    ("tỷ", 1e9),
+    ("ty", 1e9),
+    ("triệu", 1e6),
+    ("trieu", 1e6),
+    ("nghìn", 1e3),
+    ("nghin", 1e3),
 ];
 
 /// Number pattern: optional thousand-grouping with space/NBSP/comma/dot,
@@ -410,7 +477,11 @@ where
 {
     let mut sorted: Vec<&str> = tokens.into_iter().collect();
     sorted.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
-    sorted.iter().map(|t| regex::escape(t)).collect::<Vec<_>>().join("|")
+    sorted
+        .iter()
+        .map(|t| regex::escape(t))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// `(amount [mult] curr)` regex — mirrors Python `_RE_SUFFIX` minus
@@ -418,7 +489,7 @@ where
 /// we emulate it post-match in [`extract_price`]).
 static RE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
     let suffix_alt = build_alternation(SUFFIX_TOKENS.iter().map(|(t, _)| *t));
-    let mult_alt   = build_alternation(MULTIPLIERS.iter().map(|(t, _)| *t));
+    let mult_alt = build_alternation(MULTIPLIERS.iter().map(|(t, _)| *t));
     let pat = format!(
         r"(?i)(?P<amount>{NUMBER_RE})(?:\s*(?P<mult>{mult_alt}))?\s*(?P<curr>{suffix_alt})"
     );
@@ -428,7 +499,7 @@ static RE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 /// `(curr amount [mult])` regex — mirrors Python `_RE_PREFIX`.
 static RE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     let prefix_alt = build_alternation(PREFIX_TOKENS.iter().map(|(t, _)| *t));
-    let mult_alt   = build_alternation(MULTIPLIERS.iter().map(|(t, _)| *t));
+    let mult_alt = build_alternation(MULTIPLIERS.iter().map(|(t, _)| *t));
     let pat = format!(
         r"(?i)(?P<curr>{prefix_alt})\s*(?P<amount>{NUMBER_RE})(?:\s*(?P<mult>{mult_alt}))?"
     );
@@ -439,9 +510,7 @@ static RE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
 /// only when the caller passes `default_currency`.
 static RE_BARE: LazyLock<Regex> = LazyLock::new(|| {
     let mult_alt = build_alternation(MULTIPLIERS.iter().map(|(t, _)| *t));
-    let pat = format!(
-        r"(?i)(?P<amount>{NUMBER_RE})(?:\s*(?P<mult>{mult_alt}))?"
-    );
+    let pat = format!(r"(?i)(?P<amount>{NUMBER_RE})(?:\s*(?P<mult>{mult_alt}))?");
     Regex::new(&pat).expect("RE_BARE compile")
 });
 
@@ -454,19 +523,21 @@ static RE_BARE: LazyLock<Regex> = LazyLock::new(|| {
 /// * if only `.`: 1-2-digit tail = decimal, else thousand sep
 /// * otherwise plain `parse::<f64>()`
 fn parse_amount(s: &str) -> Option<f64> {
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     // Strip ASCII whitespace and U+00A0 NBSP.
-    let stripped: String = s.chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if stripped.is_empty() { return None; }
+    let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if stripped.is_empty() {
+        return None;
+    }
 
     let has_comma = stripped.contains(',');
-    let has_dot   = stripped.contains('.');
+    let has_dot = stripped.contains('.');
 
     let normalised: String = if has_comma && has_dot {
         let last_comma = stripped.rfind(',').unwrap();
-        let last_dot   = stripped.rfind('.').unwrap();
+        let last_dot = stripped.rfind('.').unwrap();
         if last_comma > last_dot {
             stripped.replace('.', "").replace(',', ".")
         } else {
@@ -482,7 +553,7 @@ fn parse_amount(s: &str) -> Option<f64> {
         }
     } else if has_dot {
         let dot_count = stripped.matches('.').count();
-        let tail_len  = stripped.rsplit_once('.').map(|(_, t)| t.len()).unwrap_or(0);
+        let tail_len = stripped.rsplit_once('.').map(|(_, t)| t.len()).unwrap_or(0);
         if dot_count == 1 && (1..=2).contains(&tail_len) {
             stripped
         } else {
@@ -496,10 +567,15 @@ fn parse_amount(s: &str) -> Option<f64> {
 }
 
 fn resolve_multiplier(mult: Option<&str>) -> f64 {
-    let Some(m) = mult else { return 1.0; };
-    if m.is_empty() { return 1.0; }
+    let Some(m) = mult else {
+        return 1.0;
+    };
+    if m.is_empty() {
+        return 1.0;
+    }
     let lower = m.to_lowercase();
-    MULTIPLIERS.iter()
+    MULTIPLIERS
+        .iter()
         .find(|(t, _)| *t == lower.as_str())
         .map(|(_, v)| *v)
         .unwrap_or(1.0)
@@ -512,7 +588,8 @@ fn resolve_multiplier(mult: Option<&str>) -> f64 {
 ///   3. lowercase
 fn resolve_suffix_currency(token: &str) -> Option<&'static str> {
     let lookup = |needle: &str| -> Option<&'static str> {
-        SUFFIX_TOKENS.iter()
+        SUFFIX_TOKENS
+            .iter()
             .find(|(t, _)| *t == needle)
             .map(|(_, iso)| *iso)
     };
@@ -522,7 +599,8 @@ fn resolve_suffix_currency(token: &str) -> Option<&'static str> {
 }
 
 fn resolve_prefix_currency(token: &str) -> Option<&'static str> {
-    PREFIX_TOKENS.iter()
+    PREFIX_TOKENS
+        .iter()
         .find(|(t, _)| *t == token)
         .map(|(_, iso)| *iso)
 }
@@ -562,22 +640,24 @@ pub struct ExtractedPrice {
 /// The amount is multiplied by the resolved multiplier (`млн`,
 /// `tỷ`, `million`, …) so the returned `amount` is always in unit
 /// currency.
-pub fn extract_price(text: &str, default_currency: Option<&str>)
-    -> Option<ExtractedPrice>
-{
-    if text.is_empty() { return None; }
+pub fn extract_price(text: &str, default_currency: Option<&str>) -> Option<ExtractedPrice> {
+    if text.is_empty() {
+        return None;
+    }
 
     // Helper that scans `re` for the first match whose `curr` group
     // isn't followed by an alphabetic char. Returns (raw, amount,
     // currency-token).
-    fn scan<'t>(re: &Regex, text: &'t str, is_prefix: bool)
-        -> Option<(&'t str, f64, &'static str)>
-    {
+    fn scan<'t>(
+        re: &Regex,
+        text: &'t str,
+        is_prefix: bool,
+    ) -> Option<(&'t str, f64, &'static str)> {
         for caps in re.captures_iter(text) {
-            let m_full  = caps.get(0)?;
+            let m_full = caps.get(0)?;
             let amt_grp = caps.name("amount")?;
-            let mult    = caps.name("mult").map(|m| m.as_str());
-            let curr_g  = caps.name("curr")?;
+            let mult = caps.name("mult").map(|m| m.as_str());
+            let curr_g = caps.name("curr")?;
 
             // Defensive negative-lookahead emulation: the `curr`
             // token must NOT be a prefix of a longer alpha word.
@@ -641,7 +721,8 @@ pub fn extract_price(text: &str, default_currency: Option<&str>)
         // matches Python's `default_currency.upper()` semantics
         // close enough — they then fail the `to_usd` lookup the
         // same way).
-        let iso_static: &'static str = FX_TO_USD.iter()
+        let iso_static: &'static str = FX_TO_USD
+            .iter()
             .find(|(c, _)| c.eq_ignore_ascii_case(&upper))
             .map(|(c, _)| *c)
             .unwrap_or("XXX");
@@ -662,9 +743,10 @@ pub fn extract_price(text: &str, default_currency: Option<&str>)
 /// Mirrors Python `to_usd(price: dict, fx_rates=None) -> float|None`
 /// with the dict-input flattened into an explicit `(amount, currency)`
 /// pair — no `Option` keys to second-guess.
-pub fn to_usd(amount: f64, currency: &str,
-              fx_rates: Option<&[(&str, f64)]>) -> Option<f64> {
-    if !amount.is_finite() { return None; }
+pub fn to_usd(amount: f64, currency: &str, fx_rates: Option<&[(&str, f64)]>) -> Option<f64> {
+    if !amount.is_finite() {
+        return None;
+    }
     let table = fx_rates.unwrap_or(FX_TO_USD);
     let rate = lookup_rate(table, currency)?;
     Some(((amount * rate) * 100.0).round() / 100.0)
@@ -771,7 +853,11 @@ pub fn reconcile(
         .filter(|f| f.is_object())
         .map(|f| {
             let link = finding_str(f, "link");
-            let url = if link.is_empty() { finding_str(f, "url") } else { link };
+            let url = if link.is_empty() {
+                finding_str(f, "url")
+            } else {
+                link
+            };
             Item {
                 src: f,
                 url_key: canonicalize_url(url),
@@ -849,8 +935,10 @@ pub fn reconcile(
             .unwrap_or(0);
 
         // Clone the winner so we can mutate without poisoning input.
-        let mut winner: Map<String, Value> =
-            bucket[winner_local].as_object().cloned().unwrap_or_default();
+        let mut winner: Map<String, Value> = bucket[winner_local]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
 
         // Recompute canonical fields from the winner — Python
         // explicitly recomputes here (rather than using the
@@ -863,9 +951,8 @@ pub fn reconcile(
             .or_else(|| winner.get("url").and_then(Value::as_str))
             .unwrap_or("");
         let canonical_url = canonicalize_url(winner_url);
-        let normalised_title = normalize_title(
-            winner.get("title").and_then(Value::as_str).unwrap_or(""),
-        );
+        let normalised_title =
+            normalize_title(winner.get("title").and_then(Value::as_str).unwrap_or(""));
 
         // _sources: one entry per group member, sorted by _source_id.
         // Missing or non-string _source_id sorts as empty string —
@@ -874,9 +961,18 @@ pub fn reconcile(
             .iter()
             .map(|f| {
                 let mut m = Map::with_capacity(3);
-                m.insert("_source_id".into(), f.get("_source_id").cloned().unwrap_or(Value::Null));
-                m.insert("_score".into(), f.get("_score").cloned().unwrap_or(Value::Null));
-                m.insert("_relevance".into(), f.get("_relevance").cloned().unwrap_or(Value::Null));
+                m.insert(
+                    "_source_id".into(),
+                    f.get("_source_id").cloned().unwrap_or(Value::Null),
+                );
+                m.insert(
+                    "_score".into(),
+                    f.get("_score").cloned().unwrap_or(Value::Null),
+                );
+                m.insert(
+                    "_relevance".into(),
+                    f.get("_relevance").cloned().unwrap_or(Value::Null),
+                );
                 Value::Object(m)
             })
             .collect();
@@ -944,21 +1040,24 @@ mod tests {
         p
     }
 
-    fn url_title_fixture_path() -> PathBuf { fixture_path("url_title.json") }
-    fn price_fixture_path() -> PathBuf { fixture_path("price.json") }
+    fn url_title_fixture_path() -> PathBuf {
+        fixture_path("url_title.json")
+    }
+    fn price_fixture_path() -> PathBuf {
+        fixture_path("price.json")
+    }
 
     #[test]
     fn canonicalize_url_matches_python_fixture() {
-        let raw = std::fs::read_to_string(url_title_fixture_path())
-            .expect("read fixture");
+        let raw = std::fs::read_to_string(url_title_fixture_path()).expect("read fixture");
         let v: Value = serde_json::from_str(&raw).expect("parse fixture");
 
         let mut failures: Vec<String> = Vec::new();
         for case in v["url_cases"].as_array().expect("url_cases array") {
-            let name  = case["name"].as_str().unwrap_or("?");
+            let name = case["name"].as_str().unwrap_or("?");
             let input = case["input"].as_str().unwrap_or("");
-            let exp   = case["expected"].as_str().unwrap_or("");
-            let got   = canonicalize_url(input);
+            let exp = case["expected"].as_str().unwrap_or("");
+            let got = canonicalize_url(input);
             if got != exp {
                 failures.push(format!(
                     "[{name}] input={input:?}\n  got={got:?}\n  exp={exp:?}"
@@ -977,14 +1076,13 @@ mod tests {
 
     #[test]
     fn normalize_title_matches_python_fixture() {
-        let raw = std::fs::read_to_string(url_title_fixture_path())
-            .expect("read fixture");
+        let raw = std::fs::read_to_string(url_title_fixture_path()).expect("read fixture");
         let v: Value = serde_json::from_str(&raw).expect("parse fixture");
 
         let mut failures = 0usize;
         for case in v["title_cases"].as_array().expect("title_cases array") {
             let name = case["name"].as_str().unwrap_or("?");
-            let exp  = case["expected"].as_str().unwrap_or("");
+            let exp = case["expected"].as_str().unwrap_or("");
 
             // Python's contract: non-string input → empty string.
             // Rust signature is `&str` already so a JSON `null` is
@@ -992,7 +1090,7 @@ mod tests {
             // — pass empty &str instead".
             let input_owned: String = match &case["input"] {
                 Value::String(s) => s.clone(),
-                Value::Null      => String::new(),
+                Value::Null => String::new(),
                 other => panic!(
                     "[{name}] non-string non-null input not supported in Rust impl: {other:?}"
                 ),
@@ -1005,7 +1103,8 @@ mod tests {
                 failures += 1;
             }
         }
-        assert_eq!(failures, 0,
+        assert_eq!(
+            failures, 0,
             "{failures} title-normalisation case(s) drift from Python contract"
         );
     }
@@ -1017,7 +1116,8 @@ mod tests {
     /// stable across rate refreshes. Keeps the test independent of
     /// any drift in the in-code [`FX_TO_USD`] table.
     fn fixture_fx(v: &Value) -> Vec<(String, f64)> {
-        v["_fx_pin"].as_object()
+        v["_fx_pin"]
+            .as_object()
             .expect("_fx_pin object")
             .iter()
             .filter(|(k, _)| !k.starts_with('_'))
@@ -1027,16 +1127,14 @@ mod tests {
 
     #[test]
     fn extract_price_matches_python_fixture() {
-        let raw = std::fs::read_to_string(price_fixture_path())
-            .expect("read price fixture");
+        let raw = std::fs::read_to_string(price_fixture_path()).expect("read price fixture");
         let v: Value = serde_json::from_str(&raw).expect("parse fixture");
 
         let mut failures = 0usize;
         for case in v["extract_cases"].as_array().expect("extract_cases array") {
-            let name  = case["name"].as_str().unwrap_or("?");
+            let name = case["name"].as_str().unwrap_or("?");
             let input = case["input"].as_str().unwrap_or("");
-            let default_currency = case.get("default_currency")
-                .and_then(|v| v.as_str());
+            let default_currency = case.get("default_currency").and_then(|v| v.as_str());
             let got = extract_price(input, default_currency);
             let exp = &case["expected"];
 
@@ -1044,20 +1142,16 @@ mod tests {
             match (exp, &got) {
                 (Value::Null, None) => continue,
                 (Value::Null, Some(g)) => {
-                    eprintln!(
-                        "[FAIL] {name}: expected None, got {g:?}\n  input = {input:?}"
-                    );
+                    eprintln!("[FAIL] {name}: expected None, got {g:?}\n  input = {input:?}");
                     failures += 1;
                 }
                 (_, None) => {
-                    eprintln!(
-                        "[FAIL] {name}: expected {exp}, got None\n  input = {input:?}"
-                    );
+                    eprintln!("[FAIL] {name}: expected {exp}, got None\n  input = {input:?}");
                     failures += 1;
                 }
                 (exp_obj, Some(g)) => {
                     let exp_amount = exp_obj["amount"].as_f64().unwrap_or(f64::NAN);
-                    let exp_curr   = exp_obj["currency"].as_str().unwrap_or("");
+                    let exp_curr = exp_obj["currency"].as_str().unwrap_or("");
                     if (g.amount - exp_amount).abs() > 1e-6 {
                         eprintln!(
                             "[FAIL] {name}: amount {} ≠ expected {}\n  input = {input:?}",
@@ -1087,21 +1181,20 @@ mod tests {
                 }
             }
         }
-        assert_eq!(failures, 0,
+        assert_eq!(
+            failures, 0,
             "{failures} extract_price case(s) drift from Python contract"
         );
     }
 
     #[test]
     fn to_usd_matches_python_fixture() {
-        let raw = std::fs::read_to_string(price_fixture_path())
-            .expect("read price fixture");
+        let raw = std::fs::read_to_string(price_fixture_path()).expect("read price fixture");
         let v: Value = serde_json::from_str(&raw).expect("parse fixture");
 
         let fx_pinned = fixture_fx(&v);
-        let fx_borrowed: Vec<(&str, f64)> = fx_pinned.iter()
-            .map(|(k, v)| (k.as_str(), *v))
-            .collect();
+        let fx_borrowed: Vec<(&str, f64)> =
+            fx_pinned.iter().map(|(k, v)| (k.as_str(), *v)).collect();
 
         let mut failures = 0usize;
         for case in v["to_usd_cases"].as_array().expect("to_usd_cases array") {
@@ -1129,15 +1222,14 @@ mod tests {
                 (exp_v, Some(v)) => {
                     let exp_f = exp_v.as_f64().unwrap_or(f64::NAN);
                     if (v - exp_f).abs() > 0.01 {
-                        eprintln!(
-                            "[FAIL] {name}: got {v}, expected {exp_f} (±0.01)"
-                        );
+                        eprintln!("[FAIL] {name}: got {v}, expected {exp_f} (±0.01)");
                         failures += 1;
                     }
                 }
             }
         }
-        assert_eq!(failures, 0,
+        assert_eq!(
+            failures, 0,
             "{failures} to_usd case(s) drift from Python contract"
         );
     }
@@ -1169,10 +1261,8 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default();
-            let fx_borrowed: Vec<(&str, f64)> = fx_pairs
-                .iter()
-                .map(|(k, v)| (k.as_str(), *v))
-                .collect();
+            let fx_borrowed: Vec<(&str, f64)> =
+                fx_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
             let fx_arg: Option<&[(&str, f64)]> = if fx_pairs.is_empty() {
                 None
             } else {
@@ -1184,10 +1274,7 @@ mod tests {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-            let input: Vec<Value> = case["input"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let input: Vec<Value> = case["input"].as_array().cloned().unwrap_or_default();
             let out = reconcile(&input, fx_arg, merge_by_title);
 
             let exp_count = case["expected_count"].as_u64().unwrap_or(0) as usize;
@@ -1205,9 +1292,7 @@ mod tests {
                 let got = first.get("_source_id").and_then(Value::as_str);
                 let exp = exp_winner.as_str();
                 if got != exp {
-                    failures.push(format!(
-                        "[{name}] winner: got {got:?}, expected {exp:?}"
-                    ));
+                    failures.push(format!("[{name}] winner: got {got:?}, expected {exp:?}"));
                 }
             }
 
@@ -1290,12 +1375,10 @@ mod tests {
                     for (i, (g, e)) in got_prices.iter().zip(exp_arr.iter()).enumerate() {
                         match (e, g) {
                             (Value::Null, None) => {}
-                            (Value::Null, Some(v)) => failures.push(format!(
-                                "[{name}] price[{i}]: got {v:?}, expected None"
-                            )),
-                            (_, None) => failures.push(format!(
-                                "[{name}] price[{i}]: got None, expected {e}"
-                            )),
+                            (Value::Null, Some(v)) => failures
+                                .push(format!("[{name}] price[{i}]: got {v:?}, expected None")),
+                            (_, None) => failures
+                                .push(format!("[{name}] price[{i}]: got None, expected {e}")),
                             (ev, Some(v)) => {
                                 let exp_f = ev.as_f64().unwrap_or(f64::NAN);
                                 if (v - exp_f).abs() > 0.01 {

@@ -100,10 +100,7 @@ mod tests {
         };
         let b = DummyEngine {
             name: "b",
-            hits: vec![
-                hit("https://x.com/1", "b"),
-                hit("https://x.com/2", "b"),
-            ],
+            hits: vec![hit("https://x.com/1", "b"), hit("https://x.com/2", "b")],
         };
         let multi = MultiEngineSearch::new(vec![Box::new(a), Box::new(b)]);
         let hits = multi.search("q", 10).await;

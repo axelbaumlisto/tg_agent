@@ -10,16 +10,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use naked_core::keys::KeyProvider;
 use naked_core::keys::fs::FilesystemKeyProvider;
 use naked_core::keys::pool::KeyPool;
-use naked_core::keys::KeyProvider;
+use naked_core::search::SearchEngine;
 use naked_core::search::ddg::DdgEngine;
 use naked_core::search::exa::ExaEngine;
 use naked_core::search::multi::MultiEngineSearch;
 use naked_core::search::serpapi::SerpApiEngine;
 use naked_core::search::snippet::SnippetExtractor;
 use naked_core::search::tavily::TavilyEngine;
-use naked_core::search::SearchEngine;
 
 #[tokio::main]
 async fn main() {
@@ -35,8 +35,9 @@ async fn main() {
         .nth(1)
         .unwrap_or_else(|| "cho thuê mặt bằng An Thượng Đà Nẵng".into());
 
-    let fs_provider: Arc<dyn KeyProvider> =
-        Arc::new(FilesystemKeyProvider::new(FilesystemKeyProvider::default_path()));
+    let fs_provider: Arc<dyn KeyProvider> = Arc::new(FilesystemKeyProvider::new(
+        FilesystemKeyProvider::default_path(),
+    ));
     let ttl = Duration::from_secs(3600);
 
     let exa_pool = Arc::new(KeyPool::new(vec![fs_provider.clone()], "exa", ttl));
@@ -106,5 +107,8 @@ async fn main() {
             );
         }
     }
-    println!("  {fast}/{} hits fully-extractable from snippet", hits.len());
+    println!(
+        "  {fast}/{} hits fully-extractable from snippet",
+        hits.len()
+    );
 }

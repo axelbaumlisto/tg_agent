@@ -341,10 +341,7 @@ mod tests {
         let hit = resolver.resolve("legacy").unwrap();
         assert!(hit.path.ends_with("SKILL.toml"));
         assert_eq!(hit.kind, SkillFile::Toml);
-        assert_eq!(
-            read_skill_description(&hit).as_deref(),
-            Some("legacy desc")
-        );
+        assert_eq!(read_skill_description(&hit).as_deref(), Some("legacy desc"));
     }
 
     #[test]

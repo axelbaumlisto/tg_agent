@@ -105,14 +105,20 @@ impl FirecrawlEngine {
         }
         let envelope: serde_json::Value =
             resp.json().await.map_err(|e| format!("firecrawl: {e}"))?;
-        if !envelope.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if !envelope
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             let err_msg = envelope
                 .get("error")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             return Err(format!("firecrawl: payload not successful — {err_msg}"));
         }
-        let data = envelope.get("data").ok_or("firecrawl: missing data field")?;
+        let data = envelope
+            .get("data")
+            .ok_or("firecrawl: missing data field")?;
         let body = data
             .get("html")
             .and_then(|v| v.as_str())

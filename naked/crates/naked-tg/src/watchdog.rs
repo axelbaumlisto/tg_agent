@@ -394,7 +394,11 @@ mod tests {
     #[test]
     fn detect_from_returns_none_when_socket_empty() {
         let env = |k: &str| -> Option<String> {
-            if k == "NOTIFY_SOCKET" { Some(String::new()) } else { None }
+            if k == "NOTIFY_SOCKET" {
+                Some(String::new())
+            } else {
+                None
+            }
         };
         assert!(SystemdWatchdog::detect_from(env).is_none());
     }

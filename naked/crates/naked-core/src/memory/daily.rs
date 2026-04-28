@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use chrono::{NaiveDate, Utc};
 
@@ -71,9 +71,11 @@ pub fn should_run_today(workspace: &Path, scope: &MemoryScope) -> bool {
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return true;
     };
-    let Some(last) = raw.lines().next().and_then(|s| {
-        NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
-    }) else {
+    let Some(last) = raw
+        .lines()
+        .next()
+        .and_then(|s| NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
+    else {
         return true;
     };
     last < Utc::now().date_naive()
@@ -153,20 +155,13 @@ pub async fn run_daily(
                         content: v.content.clone(),
                         reason: Some(format!(
                             "compacted into {}",
-                            r.summary
-                                .as_ref()
-                                .map(|s| s.id.clone())
-                                .unwrap_or_default()
+                            r.summary.as_ref().map(|s| s.id.clone()).unwrap_or_default()
                         )),
                     })
                 })
                 .collect();
-            let dream = dreams::build_entry(
-                scope.clone(),
-                &summary_text,
-                promoted_text,
-                rejected_items,
-            );
+            let dream =
+                dreams::build_entry(scope.clone(), &summary_text, promoted_text, rejected_items);
             if let Err(e) = dreams::append_dream(workspace, &dream, cfg.dreams_retention_days) {
                 tracing::warn!(scope = %scope, "compaction dream append failed: {e:#}");
             }
@@ -205,7 +200,11 @@ pub async fn run_daily(
 /// of the last `cfg.recent_shift_days` daily-draft files for `scope`,
 /// trimmed to `cfg.recent_shift_max_chars`. Returns `None` when there
 /// is nothing recent to show.
-pub fn recent_shift_block(workspace: &Path, scope: &MemoryScope, cfg: &MemoryConfig) -> Option<String> {
+pub fn recent_shift_block(
+    workspace: &Path,
+    scope: &MemoryScope,
+    cfg: &MemoryConfig,
+) -> Option<String> {
     let today = Utc::now().date_naive();
     let mut out = String::from("[Memory — recent shift]\n");
     let mut wrote_any = false;

@@ -143,9 +143,7 @@ async fn ask_research_packages_findings_into_prompt_and_returns_llm_reply() {
         listing_date: Some("18/04/2026".into()),
         source_content: Some("S".repeat(200)),
         dedup_hash: naked_core::research::dedup_hash("https://ex.com/listing-a"),
-        host_path_hash: naked_core::research::spec::host_path_hash(
-            "https://ex.com/listing-a",
-        ),
+        host_path_hash: naked_core::research::spec::host_path_hash("https://ex.com/listing-a"),
         content_hash: naked_core::research::spec::content_hash(
             "Spacious apartment, fully furnished, contact 0900111222.",
         ),
@@ -160,9 +158,8 @@ async fn ask_research_packages_findings_into_prompt_and_returns_llm_reply() {
     b.price = Some("$900/mo".into());
     b.dedup_hash = naked_core::research::dedup_hash(&b.url);
     b.host_path_hash = naked_core::research::spec::host_path_hash(&b.url);
-    b.content_hash = naked_core::research::spec::content_hash(
-        "Different content for the second listing here.",
-    );
+    b.content_hash =
+        naked_core::research::spec::content_hash("Different content for the second listing here.");
     store.upsert_finding(&a).await.expect("append a");
     store.upsert_finding(&b).await.expect("append b");
 

@@ -247,15 +247,35 @@ fn red_f2_slash_in_callback_data_is_dropped_when_persona_disallows() {
 
     // Income persona: `allow_slash_commands = false` must block slash
     // in BOTH message and callback paths.
-    assert!(!is_slash_dispatchable(false, "/reset", DispatchChannel::Message));
-    assert!(!is_slash_dispatchable(false, "/reset", DispatchChannel::Callback));
+    assert!(!is_slash_dispatchable(
+        false,
+        "/reset",
+        DispatchChannel::Message
+    ));
+    assert!(!is_slash_dispatchable(
+        false,
+        "/reset",
+        DispatchChannel::Callback
+    ));
 
     // Default persona: allowed.
-    assert!(is_slash_dispatchable(true, "/reset", DispatchChannel::Message));
-    assert!(is_slash_dispatchable(true, "/reset", DispatchChannel::Callback));
+    assert!(is_slash_dispatchable(
+        true,
+        "/reset",
+        DispatchChannel::Message
+    ));
+    assert!(is_slash_dispatchable(
+        true,
+        "/reset",
+        DispatchChannel::Callback
+    ));
 
     // Non-slash text is not the gate's concern.
-    assert!(is_slash_dispatchable(false, "hello", DispatchChannel::Callback));
+    assert!(is_slash_dispatchable(
+        false,
+        "hello",
+        DispatchChannel::Callback
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

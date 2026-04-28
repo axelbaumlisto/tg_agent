@@ -107,11 +107,7 @@ impl MarkdownMemoryStore {
     ///
     /// When `dedup=false`, the entry is always appended (useful for
     /// daily-draft files where we want to count repetitions).
-    pub fn append_dedup(
-        path: &Path,
-        entry: &MemoryEntry,
-        dedup: bool,
-    ) -> std::io::Result<bool> {
+    pub fn append_dedup(path: &Path, entry: &MemoryEntry, dedup: bool) -> std::io::Result<bool> {
         let mut entries = Self::load(path, entry.scope.clone());
 
         if dedup {
@@ -169,11 +165,7 @@ impl MarkdownMemoryStore {
 
     /// Read a single daily file. Returns `Vec::new()` if the file is
     /// missing.
-    pub fn read_daily(
-        workspace: &Path,
-        scope: &MemoryScope,
-        date: NaiveDate,
-    ) -> Vec<MemoryEntry> {
+    pub fn read_daily(workspace: &Path, scope: &MemoryScope, date: NaiveDate) -> Vec<MemoryEntry> {
         Self::load(&Self::daily_path(workspace, scope, date), scope.clone())
     }
 
@@ -224,11 +216,7 @@ impl MarkdownMemoryStore {
 
     /// Most-recent N daily-draft dates for `scope` (newest first).
     /// Convenience wrapper around `list_daily` that caps the result.
-    pub fn recent_daily_dates(
-        workspace: &Path,
-        scope: &MemoryScope,
-        n: usize,
-    ) -> Vec<NaiveDate> {
+    pub fn recent_daily_dates(workspace: &Path, scope: &MemoryScope, n: usize) -> Vec<NaiveDate> {
         let mut v = Self::list_daily(workspace, scope);
         v.truncate(n);
         v
@@ -237,10 +225,7 @@ impl MarkdownMemoryStore {
     /// `created_at` of the newest entry across all daily-draft files
     /// for `scope`. Used by the daily-digest scheduler to decide
     /// whether anything happened "today" worth digesting.
-    pub fn last_daily_activity(
-        workspace: &Path,
-        scope: &MemoryScope,
-    ) -> Option<DateTime<Utc>> {
+    pub fn last_daily_activity(workspace: &Path, scope: &MemoryScope) -> Option<DateTime<Utc>> {
         let mut latest: Option<DateTime<Utc>> = None;
         for date in Self::list_daily(workspace, scope) {
             for e in Self::read_daily(workspace, scope, date) {
@@ -652,7 +637,10 @@ mod tests {
         let loaded = MarkdownMemoryStore::load(&path, MemoryScope::Project);
         assert_eq!(loaded.len(), 1);
         let age_days = (Utc::now() - loaded[0].created_at).num_days();
-        assert!(age_days < 2, "expected refreshed timestamp, got {age_days}d old");
+        assert!(
+            age_days < 2,
+            "expected refreshed timestamp, got {age_days}d old"
+        );
     }
 
     #[test]
@@ -668,7 +656,10 @@ mod tests {
         );
         assert!(MarkdownMemoryStore::append_dedup(&path, &e, false).unwrap());
         assert!(MarkdownMemoryStore::append_dedup(&path, &e, false).unwrap());
-        assert_eq!(MarkdownMemoryStore::load(&path, MemoryScope::Project).len(), 2);
+        assert_eq!(
+            MarkdownMemoryStore::load(&path, MemoryScope::Project).len(),
+            2
+        );
     }
 
     /// Daily-file format round trip directly via the underlying

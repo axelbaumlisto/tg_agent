@@ -195,6 +195,11 @@ impl RunEventRegistry {
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }
+
+    #[cfg(test)]
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -206,8 +211,11 @@ mod tests {
         let reg = RunEventRegistry::new();
         reg.push("run-a", RunEvent::new(EventKind::IterationStart, "1/30"))
             .await;
-        reg.push("run-a", RunEvent::new(EventKind::ToolCallStart, "web_fetch"))
-            .await;
+        reg.push(
+            "run-a",
+            RunEvent::new(EventKind::ToolCallStart, "web_fetch"),
+        )
+        .await;
         let tail = reg.snapshot("run-a", 10).await;
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].kind, EventKind::IterationStart);

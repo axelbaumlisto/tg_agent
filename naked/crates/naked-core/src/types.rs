@@ -45,8 +45,7 @@ pub static TURN_COMPLETED_COUNT: std::sync::atomic::AtomicU64 =
 /// lockstep. The error reason is logged via `tracing::error!` for
 /// distribution analysis (the in-process counter is intentionally
 /// unlabelled to keep the renderer dead-simple).
-pub static TURN_ERROR_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static TURN_ERROR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Strip every embedded `@@NAKED_IMG_REF@@…` segment (sentinel + the
 /// optional `/<hash>` or `{...json}` tail that follows it on the same line)

@@ -11,9 +11,9 @@
 
 pub mod briefing;
 pub mod coordinator;
+pub mod filter_rules;
 pub mod inflight;
 pub mod launch;
-pub mod filter_rules;
 pub mod memory_diff;
 pub mod ops_tool;
 pub mod quality_assessor;
@@ -26,23 +26,23 @@ pub mod store;
 pub mod tool;
 pub mod validators;
 
-pub use inflight::{Inflight, RunState};
-pub use run_events::{EventKind, RunEvent, RunEventRegistry};
-pub use state_view::{StateView, render_state};
 pub use coordinator::{
     AgentRunner, CoordinatorConfig, ResearchCoordinator, RunReport, StopReason, VerifiedRunReport,
     parse_provider_model_pair,
 };
+pub use inflight::{Inflight, RunState};
 pub use ops_tool::{
     ResearchCreateTool, ResearchFindingsTool, ResearchHelpTool, ResearchLaunchTool,
     ResearchListSpecsTool, ResearchMetricsTool, ResearchPauseTool, ResearchResumeTool,
     ResearchSetScheduleTool, ResearchSetTargetTool, ResearchUpdateSpecTool,
 };
+pub use run_events::{EventKind, RunEvent, RunEventRegistry};
 pub use scheduler_hook::{NoopSchedulerHook, SchedulerEvent, SchedulerHook, noop_hook};
 pub use spec::{
     Cursor, Finding, ResearchSpec, RunRecord, canonicalize_url, dedup_hash, new_research_id,
     normalize_title_for_similarity, titles_are_similar,
 };
+pub use state_view::{StateView, render_state};
 pub use store::{FsResearchStore, ResearchStore, research_root};
 pub use tool::{
     ResearchContext, ResearchListTool, ResearchSaveCursorTool, ResearchSaveTool,

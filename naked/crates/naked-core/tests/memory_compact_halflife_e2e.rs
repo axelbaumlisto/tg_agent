@@ -78,9 +78,27 @@ async fn halflife_decay_protects_recently_recalled_old_entry() {
     let path = tmp.path().join("MEMORY.md");
 
     let entries = vec![
-        make_entry(MemoryType::Preference, "P-stale-A: prefer tabs", 180, 0, None),
-        make_entry(MemoryType::Preference, "P-stale-B: no trailing ws", 180, 0, None),
-        make_entry(MemoryType::Preference, "P-stale-C: 4-space tabs", 180, 0, None),
+        make_entry(
+            MemoryType::Preference,
+            "P-stale-A: prefer tabs",
+            180,
+            0,
+            None,
+        ),
+        make_entry(
+            MemoryType::Preference,
+            "P-stale-B: no trailing ws",
+            180,
+            0,
+            None,
+        ),
+        make_entry(
+            MemoryType::Preference,
+            "P-stale-C: 4-space tabs",
+            180,
+            0,
+            None,
+        ),
         make_entry(
             MemoryType::Preference,
             "P-FRESH: always run tests before commit",
@@ -142,8 +160,20 @@ async fn halflife_decay_disabled_falls_back_to_raw_recall_count() {
 
     let entries = vec![
         make_entry(MemoryType::Correction, "C-A: fix null check", 180, 0, None),
-        make_entry(MemoryType::Correction, "C-B: await before log", 180, 0, None),
-        make_entry(MemoryType::Correction, "C-C: trim before compare", 180, 0, None),
+        make_entry(
+            MemoryType::Correction,
+            "C-B: await before log",
+            180,
+            0,
+            None,
+        ),
+        make_entry(
+            MemoryType::Correction,
+            "C-C: trim before compare",
+            180,
+            0,
+            None,
+        ),
         make_entry(
             MemoryType::Correction,
             "C-ONCE: recalled-once yesterday",
@@ -195,9 +225,27 @@ async fn halflife_decay_demotes_old_recall_below_threshold() {
     let path = tmp.path().join("MEMORY.md");
 
     let entries = vec![
-        make_entry(MemoryType::ProjectKnowledge, "K-A: module layout", 200, 0, None),
-        make_entry(MemoryType::ProjectKnowledge, "K-B: build profile", 200, 0, None),
-        make_entry(MemoryType::ProjectKnowledge, "K-C: test topology", 200, 0, None),
+        make_entry(
+            MemoryType::ProjectKnowledge,
+            "K-A: module layout",
+            200,
+            0,
+            None,
+        ),
+        make_entry(
+            MemoryType::ProjectKnowledge,
+            "K-B: build profile",
+            200,
+            0,
+            None,
+        ),
+        make_entry(
+            MemoryType::ProjectKnowledge,
+            "K-C: test topology",
+            200,
+            0,
+            None,
+        ),
         make_entry(
             MemoryType::ProjectKnowledge,
             "K-DECAYED: once-hot, now-cold ritual",
@@ -261,10 +309,7 @@ async fn compaction_no_op_when_below_threshold() {
     assert!(results.is_empty(), "below threshold ⇒ no results");
 
     let after = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(
-        before, after,
-        "no-op compaction must not rewrite the file"
-    );
+    assert_eq!(before, after, "no-op compaction must not rewrite the file");
 }
 
 #[tokio::test]
@@ -290,10 +335,22 @@ async fn compaction_isolates_sections() {
     let path = tmp.path().join("MEMORY.md");
 
     let entries = vec![
-        make_entry(MemoryType::Preference, "P-A: tabs over spaces", 200, 0, None),
+        make_entry(
+            MemoryType::Preference,
+            "P-A: tabs over spaces",
+            200,
+            0,
+            None,
+        ),
         make_entry(MemoryType::Preference, "P-B: semis optional", 200, 0, None),
         make_entry(MemoryType::Preference, "P-C: trailing commas", 200, 0, None),
-        make_entry(MemoryType::Preference, "P-D: lowercase imports", 200, 0, None),
+        make_entry(
+            MemoryType::Preference,
+            "P-D: lowercase imports",
+            200,
+            0,
+            None,
+        ),
         make_entry(MemoryType::Correction, "C-A: handle nulls", 200, 0, None),
         make_entry(MemoryType::Correction, "C-B: avoid globals", 200, 0, None),
     ];
@@ -313,7 +370,10 @@ async fn compaction_isolates_sections() {
         assert!(
             reloaded.iter().any(|e| e.content.contains(survivor)),
             "Correction entry {survivor} must be untouched, got: {:?}",
-            reloaded.iter().map(|e| e.content.as_str()).collect::<Vec<_>>()
+            reloaded
+                .iter()
+                .map(|e| e.content.as_str())
+                .collect::<Vec<_>>()
         );
     }
     // Three of four preferences compacted into one summary +
@@ -323,7 +383,8 @@ async fn compaction_isolates_sections() {
         .filter(|e| e.memory_type == MemoryType::Preference)
         .count();
     assert_eq!(
-        pref_count, 2,
+        pref_count,
+        2,
         "4 prefs → 1 survivor + 1 summary = 2, got {pref_count}: {:?}",
         reloaded
             .iter()

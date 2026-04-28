@@ -49,12 +49,23 @@ use serde_json::{Map, Value, json};
 /// drop the negative-score rule and "Sign Up | LinkedIn" cards will
 /// resurface in `maybe.jsonl` (regression group 23 catches it).
 pub const NOISE_TOKENS: &[&str] = &[
-    "sign up", "sign in", "log in", "login", "register",
-    "subscribe", "newsletter", "cookie", "cookies",
-    "privacy policy", "terms of", "terms and",
-    "404", "page not found",
+    "sign up",
+    "sign in",
+    "log in",
+    "login",
+    "register",
+    "subscribe",
+    "newsletter",
+    "cookie",
+    "cookies",
+    "privacy policy",
+    "terms of",
+    "terms and",
+    "404",
+    "page not found",
     "all rights reserved",
-    "skip to main", "skip to content",
+    "skip to main",
+    "skip to content",
 ];
 
 // ── B4.5-1: keyword stemming (Russian + English plural-s) ────────────
@@ -94,10 +105,7 @@ pub fn stem_keyword(kw: &str) -> String {
         }
         return kw.to_string();
     }
-    if has_ascii_alpha_lower(&lower)
-        && lower.ends_with('s')
-        && len > 3
-    {
+    if has_ascii_alpha_lower(&lower) && lower.ends_with('s') && len > 3 {
         return chars_take(kw, len - 1);
     }
     kw.to_string()
@@ -232,9 +240,7 @@ pub fn rules_for_intent(intent: &Value) -> Vec<Value> {
     }
 
     // ── marketplace-only price gate ────────────────────────────────
-    if intent.get("kind_hint").and_then(Value::as_str)
-        == Some("marketplace_listing")
-    {
+    if intent.get("kind_hint").and_then(Value::as_str) == Some("marketplace_listing") {
         rules.push(json!({
             "name": "price present (marketplace)",
             "type": "regex_match",
@@ -302,8 +308,14 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
         // Python `str(field_value)` for any non-string value. Numbers,
         // bools, etc. get stringified for matching purposes.
         Value::Number(n) => n.to_string(),
-        Value::Bool(b)   => if *b { "True".into() } else { "False".into() },
-        _                => raw_field.to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "True".into()
+            } else {
+                "False".into()
+            }
+        }
+        _ => raw_field.to_string(),
     };
     let text = raw_str.to_lowercase();
 
@@ -354,7 +366,9 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
         }
         "range_number" => {
             let pattern_default = "([\\d.,]+)";
-            let pattern = rule.get("regex").and_then(Value::as_str)
+            let pattern = rule
+                .get("regex")
+                .and_then(Value::as_str)
                 .unwrap_or(pattern_default);
             let Ok(re) = Regex::new(pattern) else {
                 return (0.0, false);
@@ -375,7 +389,9 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
 
             // Side-effect: store extracted number on the finding.
             // Python: `finding.setdefault("_extracted", {})[name] = num`.
-            let name = rule.get("name").and_then(Value::as_str)
+            let name = rule
+                .get("name")
+                .and_then(Value::as_str)
                 .unwrap_or("range_number")
                 .to_string();
             if let Some(obj) = finding.as_object_mut() {
@@ -399,7 +415,11 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
                 in_range = false;
             }
 
-            let score_key = if in_range { "score_in_range" } else { "score_out_range" };
+            let score_key = if in_range {
+                "score_in_range"
+            } else {
+                "score_out_range"
+            };
             let delta = rule_score(rule, score_key);
 
             // Python: `return delta, in_range or rule.get("score_out_range") is not None`.
@@ -441,7 +461,9 @@ pub fn score_finding(rules: &[Value], finding: &mut Value) {
                 r.get("type").and_then(Value::as_str).unwrap_or(""),
                 r.get("field").and_then(Value::as_str).unwrap_or(""),
             );
-            let name = r.get("name").and_then(Value::as_str)
+            let name = r
+                .get("name")
+                .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or(default_name);
@@ -497,8 +519,7 @@ mod tests {
     /// trips both CI runs.
     #[test]
     fn score_finding_matches_python_fixture() {
-        let raw = std::fs::read_to_string(fixture_path())
-            .expect("read filter_rules fixture");
+        let raw = std::fs::read_to_string(fixture_path()).expect("read filter_rules fixture");
         let v: Value = serde_json::from_str(&raw).expect("parse fixture");
 
         let shortlist_min = v["shortlist_min"].as_f64().unwrap_or(70.0);
@@ -518,17 +539,16 @@ mod tests {
 
                 // Strip private/expected-* keys; keep only real finding fields.
                 let mut finding = Value::Object(
-                    f.as_object().expect("finding object")
+                    f.as_object()
+                        .expect("finding object")
                         .iter()
                         .filter(|(k, _)| !k.starts_with('_') && k.as_str() != "expected_bucket")
                         .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
+                        .collect(),
                 );
 
                 score_finding(&rules, &mut finding);
-                let score = finding.get("_score")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
+                let score = finding.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
                 let bucket = if score >= shortlist_min {
                     "shortlist"
                 } else if score >= maybe_min {
@@ -539,7 +559,8 @@ mod tests {
 
                 checked += 1;
                 if bucket != bucket_expected {
-                    let matched = finding.get("matched_rules")
+                    let matched = finding
+                        .get("matched_rules")
                         .map(|v| v.to_string())
                         .unwrap_or_default();
                     failures.push(format!(
@@ -594,10 +615,12 @@ mod tests {
             "slots": {"location": "Алматы", "keywords": ["квартиру"]},
         });
         let rules = rules_for_intent(&intent);
-        assert!(rules.iter().any(|r|
-            r.get("name").and_then(Value::as_str)
-                == Some("price present (marketplace)")
-        ));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.get("name").and_then(Value::as_str)
+                    == Some("price present (marketplace)"))
+        );
     }
 
     #[test]
@@ -607,10 +630,12 @@ mod tests {
             "slots": {"location": "Yerevan", "keywords": ["java"]},
         });
         let rules = rules_for_intent(&intent);
-        assert!(!rules.iter().any(|r|
-            r.get("name").and_then(Value::as_str)
-                == Some("price present (marketplace)")
-        ));
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.get("name").and_then(Value::as_str)
+                    == Some("price present (marketplace)"))
+        );
     }
 
     #[test]
@@ -627,9 +652,6 @@ mod tests {
         let (delta, matched) = apply_rule(&rule, &mut finding);
         assert!(matched);
         assert!((delta - 30.0).abs() < 1e-9);
-        assert_eq!(
-            finding["_extracted"]["price band"].as_f64(),
-            Some(500.0)
-        );
+        assert_eq!(finding["_extracted"]["price band"].as_f64(), Some(500.0));
     }
 }

@@ -330,8 +330,8 @@ impl AgentLoop {
                     empty_content_attempts += 1;
                     crate::types::EMPTY_CONTENT_RETRY_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let delay = EMPTY_CONTENT_BASE_DELAY_MS
-                        * 2u64.pow((empty_content_attempts - 1) as u32);
+                    let delay =
+                        EMPTY_CONTENT_BASE_DELAY_MS * 2u64.pow((empty_content_attempts - 1) as u32);
                     tracing::warn!(
                         "provider returned empty content (retry {}/{}, backoff {delay}ms)",
                         empty_content_attempts,
@@ -738,7 +738,10 @@ mod tests {
         let provider = MockProvider::new(vec![
             vec![StreamChunk::Done],
             vec![StreamChunk::Done],
-            vec![StreamChunk::Text("third time lucky".into()), StreamChunk::Done],
+            vec![
+                StreamChunk::Text("third time lucky".into()),
+                StreamChunk::Done,
+            ],
         ]);
         let agent_loop = make_loop(provider, vec![]);
         let mut history = ConversationHistory::new("sys".into());

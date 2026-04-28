@@ -124,10 +124,7 @@ mod tests {
             name: "second",
             calls: AtomicUsize::new(0),
         });
-        let cascade = MultiCloudScraper::new(vec![
-            Arc::new(AlwaysOk("first")),
-            counter.clone(),
-        ]);
+        let cascade = MultiCloudScraper::new(vec![Arc::new(AlwaysOk("first")), counter.clone()]);
         let res = cascade.scrape("https://x").await.unwrap();
         assert_eq!(res.provider, "first");
         // The second engine must NOT be called when the first succeeded.

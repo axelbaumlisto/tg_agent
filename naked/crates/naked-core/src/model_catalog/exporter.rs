@@ -96,11 +96,7 @@ impl RenderedSections {
     }
 }
 
-fn splice_region(
-    src: &str,
-    region: &Region,
-    body: &str,
-) -> Result<String, String> {
+fn splice_region(src: &str, region: &Region, body: &str) -> Result<String, String> {
     let start_idx = src
         .find(region.start)
         .ok_or_else(|| format!("missing marker `{}`", region.start))?;
@@ -128,7 +124,11 @@ fn splice_region(
 fn render_quick_decision(providers: &BTreeMap<String, ProviderConfig>) -> String {
     let all_pairs: Vec<(&str, &str, &ModelCapabilities)> = providers
         .iter()
-        .flat_map(|(p, cfg)| cfg.capabilities.iter().map(move |(m, c)| (p.as_str(), m.as_str(), c)))
+        .flat_map(|(p, cfg)| {
+            cfg.capabilities
+                .iter()
+                .map(move |(m, c)| (p.as_str(), m.as_str(), c))
+        })
         .collect();
 
     let mut out = String::new();
@@ -146,9 +146,7 @@ fn render_quick_decision(providers: &BTreeMap<String, ProviderConfig>) -> String
         let mut candidates: Vec<(&str, &str, &ModelCapabilities)> = all_pairs
             .iter()
             .copied()
-            .filter(|(_, _, c)| {
-                matches!(c.status, ModelStatus::Active) && c.fits(task)
-            })
+            .filter(|(_, _, c)| matches!(c.status, ModelStatus::Active) && c.fits(task))
             .collect();
         candidates.sort_by(|a, b| rank_key(a.2).cmp(&rank_key(b.2)));
         let first = candidates.first().copied();
@@ -278,8 +276,7 @@ fn render_provider_details(providers: &BTreeMap<String, ProviderConfig>) -> Stri
                 if let Some(ctx) = caps.context_window {
                     facts.push(format!("ctx={ctx}"));
                 }
-                let fits: Vec<String> =
-                    caps.task_fit.iter().map(|t| t.to_string()).collect();
+                let fits: Vec<String> = caps.task_fit.iter().map(|t| t.to_string()).collect();
                 if !fits.is_empty() {
                     facts.push(format!("fit=[{}]", fits.join(",")));
                 }
@@ -288,9 +285,7 @@ fn render_provider_details(providers: &BTreeMap<String, ProviderConfig>) -> Stri
                 } else {
                     format!(" — {}", facts.join(", "))
                 };
-                out.push_str(&format!(
-                    "- `{model}`{status_note}{fact_str}\n"
-                ));
+                out.push_str(&format!("- `{model}`{status_note}{fact_str}\n"));
             }
         }
         out.push('\n');
@@ -321,12 +316,7 @@ fn render_failure_modes(providers: &BTreeMap<String, ProviderConfig>) -> String 
                 .clone()
                 .unwrap_or_else(|| format!("status: {:?}", caps.status));
             let fix = suggest_fix(caps);
-            rows.push((
-                format!("`{provider}` / `{model}`"),
-                symptom,
-                cause,
-                fix,
-            ));
+            rows.push((format!("`{provider}` / `{model}`"), symptom, cause, fix));
         }
     }
     rows.sort();
@@ -365,10 +355,7 @@ fn suggest_fix(caps: &ModelCapabilities) -> String {
 
 /// Rewrite an existing SKILL.md file in place. Returns `Ok(true)` if
 /// the file changed, `Ok(false)` if it was already byte-identical.
-pub fn export_to_file(
-    config: &Config,
-    skill_path: &Path,
-) -> std::io::Result<bool> {
+pub fn export_to_file(config: &Config, skill_path: &Path) -> std::io::Result<bool> {
     let src = std::fs::read_to_string(skill_path)?;
     let rendered = render_sections(config);
     let new_body = rendered

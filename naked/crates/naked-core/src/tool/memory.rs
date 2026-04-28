@@ -326,11 +326,7 @@ impl Tool for MemoryTool {
                     scope
                 ));
                 for d in recent {
-                    lines.push(format!(
-                        "\n## {} ({})",
-                        d.date.format("%Y-%m-%d"),
-                        d.scope
-                    ));
+                    lines.push(format!("\n## {} ({})", d.date.format("%Y-%m-%d"), d.scope));
                     lines.push(format!("Summary: {}", d.summary));
                     if !d.promoted.is_empty() {
                         lines.push(format!("Promoted ({}):", d.promoted.len()));

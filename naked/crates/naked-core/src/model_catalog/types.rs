@@ -181,7 +181,7 @@ pub enum LatencyTier {
     /// 1-3 s TTFT (typical chat models).
     Medium,
     /// >3 s TTFT or very variable (thinking models, long-ctx on cold
-    /// infra, OpenRouter routing hops).
+    /// > infra, OpenRouter routing hops).
     Slow,
 }
 
@@ -316,9 +316,7 @@ impl ModelCapabilities {
                 // fallback chains.
                 false
             }
-            ModelStatus::Active | ModelStatus::Degraded => {
-                self.task_fit.iter().any(|t| *t == task)
-            }
+            ModelStatus::Active | ModelStatus::Degraded => self.task_fit.contains(&task),
         }
     }
 

@@ -1049,14 +1049,12 @@ impl Tool for ResearchSetTargetTool {
                         &active_id,
                         super::run_events::RunEvent::new(
                             super::run_events::EventKind::Note,
-                            "research_set_target(clear) refused: zero saves so far"
-                                .to_string(),
+                            "research_set_target(clear) refused: zero saves so far".to_string(),
                         ),
                     )
                     .await;
                 }
-                return err(
-                    "Cannot clear research context with 0 findings saved. \
+                return err("Cannot clear research context with 0 findings saved. \
                      You browsed pages but never called `research_save`. \
                      Save findings now from the pages you've already opened: \
                      for each qualifying listing call \
@@ -1065,8 +1063,7 @@ impl Tool for ResearchSetTargetTool {
                      If you genuinely found nothing qualifying (rare — re-check), \
                      retry with `{\"spec_id\":\"\", \"force\": true, \
                      \"note\": \"why nothing matched\"}`."
-                        .to_string(),
-                );
+                    .to_string());
             }
             // Mirror the explicit empty-clear into the waterfall so the
             // operator can see WHY a run produced no findings.
@@ -1079,10 +1076,7 @@ impl Tool for ResearchSetTargetTool {
                 };
                 reg.push(
                     &active_id,
-                    super::run_events::RunEvent::new(
-                        super::run_events::EventKind::Note,
-                        label,
-                    ),
+                    super::run_events::RunEvent::new(super::run_events::EventKind::Note, label),
                 )
                 .await;
             }

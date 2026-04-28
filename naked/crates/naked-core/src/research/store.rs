@@ -394,8 +394,7 @@ impl ResearchStore for FsResearchStore {
                     );
                     return Ok(false);
                 }
-                if !finding.content_hash.is_empty()
-                    && existing.content_hash == finding.content_hash
+                if !finding.content_hash.is_empty() && existing.content_hash == finding.content_hash
                 {
                     tracing::info!(
                         research_id = %finding.research_id,
@@ -836,7 +835,10 @@ mod tests {
         store.create_spec(&spec).await.unwrap();
 
         let f1 = make_finding("id-hp", "https://batdongsan.com.vn/ad/42?sort=newest");
-        let f2 = make_finding("id-hp", "https://batdongsan.com.vn/ad/42?sort=oldest&page=3");
+        let f2 = make_finding(
+            "id-hp",
+            "https://batdongsan.com.vn/ad/42?sort=oldest&page=3",
+        );
         // Sanity: they pass the URL-canon dedup (different canonical URLs).
         assert_ne!(
             f1.dedup_hash, f2.dedup_hash,
@@ -960,34 +962,49 @@ mod tests {
         let now = Utc::now();
 
         // Spec A: terminal Completed, finished_at = 30 days ago → must purge.
-        store.create_spec(&make_spec("a-old-completed", "t")).await.unwrap();
+        store
+            .create_spec(&make_spec("a-old-completed", "t"))
+            .await
+            .unwrap();
         let mut a = Inflight::scheduled("a-old-completed", 1);
         a.state = RunState::Completed;
         a.finished_at = Some(now - chrono::Duration::days(30));
         store.save_inflight("a-old-completed", &a).await.unwrap();
 
         // Spec B: terminal Failed, finished_at = 1 hour ago → must keep.
-        store.create_spec(&make_spec("b-recent-failed", "t")).await.unwrap();
+        store
+            .create_spec(&make_spec("b-recent-failed", "t"))
+            .await
+            .unwrap();
         let mut b = Inflight::scheduled("b-recent-failed", 1);
         b.state = RunState::Failed;
         b.finished_at = Some(now - chrono::Duration::hours(1));
         store.save_inflight("b-recent-failed", &b).await.unwrap();
 
         // Spec C: Running → must keep regardless of age.
-        store.create_spec(&make_spec("c-running", "t")).await.unwrap();
+        store
+            .create_spec(&make_spec("c-running", "t"))
+            .await
+            .unwrap();
         let mut c = Inflight::scheduled("c-running", 1);
         c.state = RunState::Running;
         c.started_at = Some(now - chrono::Duration::days(99));
         store.save_inflight("c-running", &c).await.unwrap();
 
         // Spec D: Scheduled → must keep regardless of age.
-        store.create_spec(&make_spec("d-scheduled", "t")).await.unwrap();
+        store
+            .create_spec(&make_spec("d-scheduled", "t"))
+            .await
+            .unwrap();
         let mut d = Inflight::scheduled("d-scheduled", 1);
         d.scheduled_at = now - chrono::Duration::days(99);
         store.save_inflight("d-scheduled", &d).await.unwrap();
 
         // Spec E: Completed but no finished_at → must keep (defensive).
-        store.create_spec(&make_spec("e-no-finished-at", "t")).await.unwrap();
+        store
+            .create_spec(&make_spec("e-no-finished-at", "t"))
+            .await
+            .unwrap();
         let mut e = Inflight::scheduled("e-no-finished-at", 1);
         e.state = RunState::Completed;
         e.finished_at = None;
@@ -999,11 +1016,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(removed, 1, "only the 30-day-old Completed should be purged");
-        assert!(store.load_inflight("a-old-completed").await.unwrap().is_none());
-        assert!(store.load_inflight("b-recent-failed").await.unwrap().is_some());
+        assert!(
+            store
+                .load_inflight("a-old-completed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_inflight("b-recent-failed")
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(store.load_inflight("c-running").await.unwrap().is_some());
         assert!(store.load_inflight("d-scheduled").await.unwrap().is_some());
-        assert!(store.load_inflight("e-no-finished-at").await.unwrap().is_some());
+        assert!(
+            store
+                .load_inflight("e-no-finished-at")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -1014,10 +1049,7 @@ mod tests {
         let store = FsResearchStore::new(tmp.path().to_path_buf());
         let now = Utc::now();
 
-        for (id, state) in [
-            ("c1", RunState::Completed),
-            ("c2", RunState::Failed),
-        ] {
+        for (id, state) in [("c1", RunState::Completed), ("c2", RunState::Failed)] {
             store.create_spec(&make_spec(id, "t")).await.unwrap();
             let mut i = Inflight::scheduled(id, 1);
             i.state = state;
@@ -1049,26 +1081,68 @@ mod tests {
         struct NoopStore;
         #[async_trait::async_trait]
         impl ResearchStore for NoopStore {
-            async fn create_spec(&self, _spec: &ResearchSpec) -> Result<()> { Ok(()) }
+            async fn create_spec(&self, _spec: &ResearchSpec) -> Result<()> {
+                Ok(())
+            }
             async fn load_spec(&self, _id: &str) -> Result<ResearchSpec> {
                 Err(AgentError::Provider("unused".into()))
             }
-            async fn save_spec(&self, _spec: &ResearchSpec) -> Result<()> { Ok(()) }
-            async fn list_specs(&self) -> Result<Vec<ResearchSpec>> { Ok(vec![]) }
-            async fn delete_spec(&self, _id: &str) -> Result<()> { Ok(()) }
-            async fn try_append_finding(&self, _finding: &Finding) -> Result<bool> { Ok(false) }
-            async fn upsert_finding(&self, _finding: &Finding) -> Result<bool> { Ok(false) }
-            async fn list_findings(&self, _id: &str, _limit: Option<usize>) -> Result<Vec<Finding>> { Ok(vec![]) }
-            async fn count_findings(&self, _id: &str) -> Result<u32> { Ok(0) }
-            async fn remove_findings_by_hash(&self, _id: &str, _hashes: &HashSet<String>) -> Result<u32> { Ok(0) }
-            async fn append_run(&self, _run: &RunRecord) -> Result<()> { Ok(()) }
-            async fn list_runs(&self, _id: &str, _limit: Option<usize>) -> Result<Vec<RunRecord>> { Ok(vec![]) }
-            async fn load_cursor(&self, _id: &str) -> Result<Cursor> { Ok(Cursor::default()) }
-            async fn save_cursor(&self, _id: &str, _cursor: &Cursor) -> Result<()> { Ok(()) }
-            async fn write_report(&self, _id: &str, _report: &str) -> Result<()> { Ok(()) }
-            async fn read_report(&self, _id: &str) -> Result<Option<String>> { Ok(None) }
-            async fn write_agent_brief(&self, _id: &str, _brief: &str) -> Result<()> { Ok(()) }
-            async fn read_agent_brief(&self, _id: &str) -> Result<Option<String>> { Ok(None) }
+            async fn save_spec(&self, _spec: &ResearchSpec) -> Result<()> {
+                Ok(())
+            }
+            async fn list_specs(&self) -> Result<Vec<ResearchSpec>> {
+                Ok(vec![])
+            }
+            async fn delete_spec(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn try_append_finding(&self, _finding: &Finding) -> Result<bool> {
+                Ok(false)
+            }
+            async fn upsert_finding(&self, _finding: &Finding) -> Result<bool> {
+                Ok(false)
+            }
+            async fn list_findings(
+                &self,
+                _id: &str,
+                _limit: Option<usize>,
+            ) -> Result<Vec<Finding>> {
+                Ok(vec![])
+            }
+            async fn count_findings(&self, _id: &str) -> Result<u32> {
+                Ok(0)
+            }
+            async fn remove_findings_by_hash(
+                &self,
+                _id: &str,
+                _hashes: &HashSet<String>,
+            ) -> Result<u32> {
+                Ok(0)
+            }
+            async fn append_run(&self, _run: &RunRecord) -> Result<()> {
+                Ok(())
+            }
+            async fn list_runs(&self, _id: &str, _limit: Option<usize>) -> Result<Vec<RunRecord>> {
+                Ok(vec![])
+            }
+            async fn load_cursor(&self, _id: &str) -> Result<Cursor> {
+                Ok(Cursor::default())
+            }
+            async fn save_cursor(&self, _id: &str, _cursor: &Cursor) -> Result<()> {
+                Ok(())
+            }
+            async fn write_report(&self, _id: &str, _report: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn read_report(&self, _id: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn write_agent_brief(&self, _id: &str, _brief: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn read_agent_brief(&self, _id: &str) -> Result<Option<String>> {
+                Ok(None)
+            }
         }
         let store = NoopStore;
         let removed = store

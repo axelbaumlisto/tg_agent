@@ -387,7 +387,11 @@ pub async fn download_to_artifacts(
     };
     std::fs::write(&path, &body).context("write artifact")?;
 
-    Ok(Downloaded { path, bytes: body, mime })
+    Ok(Downloaded {
+        path,
+        bytes: body,
+        mime,
+    })
 }
 
 // ─────────────────────────── Whisper transcription ───────────────────────
@@ -1031,10 +1035,7 @@ mod tests {
             "unexpected eof during decode",
             "file download returned empty body",
         ] {
-            assert!(
-                is_transient_download_error(&err(s)),
-                "should retry: {s}"
-            );
+            assert!(is_transient_download_error(&err(s)), "should retry: {s}");
         }
     }
 

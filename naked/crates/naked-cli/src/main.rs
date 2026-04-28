@@ -1768,7 +1768,11 @@ async fn skills_cmd(args: &[String]) -> Result<()> {
                     };
                     let desc = read_skill_description(hit).unwrap_or_default();
                     let desc_trimmed: String = desc.chars().take(100).collect();
-                    let ellipsis = if desc.chars().count() > 100 { "…" } else { "" };
+                    let ellipsis = if desc.chars().count() > 100 {
+                        "…"
+                    } else {
+                        ""
+                    };
                     println!(
                         "  [{kind}] {name:<28} {}",
                         if desc_trimmed.is_empty() {
@@ -1803,9 +1807,9 @@ async fn skills_cmd(args: &[String]) -> Result<()> {
             }
         }
         "show" => {
-            let name = args.get(1).ok_or_else(|| {
-                anyhow::anyhow!("usage: naked skills show <name>")
-            })?;
+            let name = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("usage: naked skills show <name>"))?;
             let hit = resolver.resolve(name).ok_or_else(|| {
                 anyhow::anyhow!("skill `{name}` not found — try `naked skills list`")
             })?;

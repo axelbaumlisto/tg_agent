@@ -55,14 +55,11 @@ impl SkillResultEnvelope {
     /// metadata is on the first few lines so the prompt rule
     /// "источник в первой строке" is structurally satisfied.
     pub fn render_for_prompt(&self) -> String {
-        let pretty = serde_json::to_string_pretty(&self.data)
-            .unwrap_or_else(|_| self.data.to_string());
+        let pretty =
+            serde_json::to_string_pretty(&self.data).unwrap_or_else(|_| self.data.to_string());
         format!(
             "chat_id={}\nchat_title={}\nsession={}\nskill={}\n---\n{pretty}",
-            self.source.chat_id,
-            self.source.chat_title,
-            self.source.session,
-            self.source.skill,
+            self.source.chat_id, self.source.chat_title, self.source.session, self.source.skill,
         )
     }
 

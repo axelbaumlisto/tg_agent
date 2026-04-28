@@ -290,8 +290,7 @@ impl ModelHealth {
             tracing::debug!(path = %path.display(), "model_health: log not present yet");
             return tracker;
         };
-        let horizon = Utc::now()
-            - ChronoDuration::hours(i64::from(config.window_hours.max(1)));
+        let horizon = Utc::now() - ChronoDuration::hours(i64::from(config.window_hours.max(1)));
         let mut replayed = 0usize;
         let mut rings = tracker.rings.write().expect("rings poisoned");
         for (lineno, line) in contents.lines().enumerate() {
@@ -306,9 +305,8 @@ impl ModelHealth {
                         .or_default();
                     ring.events.push((ev.ts, ev.kind));
                     if ev.kind == HealthEventKind::Success {
-                        ring.last_success_at = Some(
-                            ring.last_success_at.map_or(ev.ts, |e| e.max(ev.ts)),
-                        );
+                        ring.last_success_at =
+                            Some(ring.last_success_at.map_or(ev.ts, |e| e.max(ev.ts)));
                         ring.ever_succeeded = true;
                     }
                     replayed += 1;
@@ -380,9 +378,7 @@ impl ModelHealth {
                 if let Some(until) = ring.quarantine_until
                     && until > now
                 {
-                    let recovery = ChronoDuration::seconds(
-                        self.config.recovery_window_secs as i64,
-                    );
+                    let recovery = ChronoDuration::seconds(self.config.recovery_window_secs as i64);
                     // If the success came within the configured
                     // recovery window from the quarantine start,
                     // clear it. The start time is approximated as
@@ -402,8 +398,8 @@ impl ModelHealth {
             }
             self.trim_ring(ring, now);
             self.maybe_quarantine(ring, provider, model, now);
-            let newly_quarantined = !was_quarantined
-                && ring.quarantine_until.map(|u| u > now).unwrap_or(false);
+            let newly_quarantined =
+                !was_quarantined && ring.quarantine_until.map(|u| u > now).unwrap_or(false);
             // Observe a "new failure mode" when a non-success event
             // carries a detail string. Deduplication happens in the
             // promoter — this only dispatches the raw signal.
@@ -413,7 +409,12 @@ impl ModelHealth {
                 }
                 HealthEventKind::Success => None,
             };
-            (first_success, resurrected, newly_quarantined, new_failure_detail)
+            (
+                first_success,
+                resurrected,
+                newly_quarantined,
+                new_failure_detail,
+            )
         };
 
         if first_success {
@@ -439,12 +440,7 @@ impl ModelHealth {
     }
 
     /// Convenience form: record with no latency/detail info.
-    pub fn record_event(
-        &self,
-        provider: &str,
-        model: &str,
-        kind: HealthEventKind,
-    ) {
+    pub fn record_event(&self, provider: &str, model: &str, kind: HealthEventKind) {
         self.record(provider, model, kind, None, None);
     }
 
@@ -452,11 +448,7 @@ impl ModelHealth {
     /// quarantined. `None` means "fine to use" from the health tracker's
     /// perspective (the selector may still reject it on status / fit
     /// grounds).
-    pub fn quarantined_until(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> Option<DateTime<Utc>> {
+    pub fn quarantined_until(&self, provider: &str, model: &str) -> Option<DateTime<Utc>> {
         let now = Utc::now();
         let rings = self.rings.read().ok()?;
         let ring = rings.get(&(provider.to_string(), model.to_string()))?;
@@ -477,27 +469,20 @@ impl ModelHealth {
         let now = Utc::now();
         rings
             .iter()
-            .map(|((p, m), ring)| {
-                ((p.clone(), m.clone()), self.ring_to_window(ring, now))
-            })
+            .map(|((p, m), ring)| ((p.clone(), m.clone()), self.ring_to_window(ring, now)))
             .collect()
     }
 
     /// Current health window for a single pair. `None` if the pair has
     /// no recorded events yet.
-    pub fn window_for(
-        &self,
-        provider: &str,
-        model: &str,
-    ) -> Option<HealthWindow> {
+    pub fn window_for(&self, provider: &str, model: &str) -> Option<HealthWindow> {
         let rings = self.rings.read().ok()?;
         let ring = rings.get(&(provider.to_string(), model.to_string()))?;
         Some(self.ring_to_window(ring, Utc::now()))
     }
 
     fn ring_to_window(&self, ring: &PairRing, now: DateTime<Utc>) -> HealthWindow {
-        let horizon = now
-            - ChronoDuration::hours(i64::from(self.config.window_hours.max(1)));
+        let horizon = now - ChronoDuration::hours(i64::from(self.config.window_hours.max(1)));
         let mut w = HealthWindow {
             last_success_at: ring.last_success_at,
             quarantine_until: ring.quarantine_until,
@@ -519,8 +504,7 @@ impl ModelHealth {
     }
 
     fn trim_ring(&self, ring: &mut PairRing, now: DateTime<Utc>) {
-        let horizon = now
-            - ChronoDuration::hours(i64::from(self.config.window_hours.max(1)));
+        let horizon = now - ChronoDuration::hours(i64::from(self.config.window_hours.max(1)));
         ring.events.retain(|(ts, _)| *ts >= horizon);
     }
 
@@ -543,16 +527,13 @@ impl ModelHealth {
                 _ => {}
             }
         }
-        let trigger = empties >= self.config.empty_threshold
-            || errors >= self.config.error_threshold;
+        let trigger =
+            empties >= self.config.empty_threshold || errors >= self.config.error_threshold;
         if trigger {
-            let already_quarantined =
-                ring.quarantine_until.map(|u| u > now).unwrap_or(false);
+            let already_quarantined = ring.quarantine_until.map(|u| u > now).unwrap_or(false);
             if !already_quarantined {
-                let until = now
-                    + ChronoDuration::seconds(
-                        self.config.quarantine_duration_secs as i64,
-                    );
+                let until =
+                    now + ChronoDuration::seconds(self.config.quarantine_duration_secs as i64);
                 ring.quarantine_until = Some(until);
                 tracing::warn!(
                     provider = provider,
@@ -573,7 +554,11 @@ impl ModelHealth {
         // Default: ~/.naked/model_health.jsonl. Use `HOME` env for
         // cross-platform; falls back to current dir if unset.
         let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".naked").join("model_health.jsonl"))
+        Some(
+            PathBuf::from(home)
+                .join(".naked")
+                .join("model_health.jsonl"),
+        )
     }
 
     fn append_log(&self, event: &HealthEvent) {
@@ -594,9 +579,8 @@ fn append_jsonl(path: &Path, event: &HealthEvent) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let line = serde_json::to_string(event).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let line = serde_json::to_string(event)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -783,7 +767,9 @@ mod tests {
         let raw = std::fs::read_to_string(&obs_log).unwrap();
         let kinds: Vec<ObservationKind> = raw
             .lines()
-            .filter_map(|l| serde_json::from_str::<super::super::enrichment::ModelObservation>(l).ok())
+            .filter_map(|l| {
+                serde_json::from_str::<super::super::enrichment::ModelObservation>(l).ok()
+            })
             .map(|o| o.kind)
             .collect();
         let first_success_count = kinds

@@ -12,12 +12,12 @@ use std::sync::Arc;
 use chrono::Utc;
 use naked_core::config::ResearchConfig;
 use naked_core::error::Result as NakedResult;
+use naked_core::memory::store::MarkdownMemoryStore;
 use naked_core::research::coordinator::{AgentRunner, CoordinatorConfig, ResearchCoordinator};
 use naked_core::research::ops_tool::{
     ResearchHelpTool, ResearchListSpecsTool, ResearchMetricsTool, ResearchSetScheduleTool,
 };
 use naked_core::research::spec::{Finding, ResearchSpec, RunRecord, dedup_hash};
-use naked_core::memory::store::MarkdownMemoryStore;
 use naked_core::research::store::{FsResearchStore, ResearchStore, research_runlog_path};
 use naked_core::tool::Tool;
 use naked_core::types::{AgentEvent, AgentHandle, PermissionResponse};
@@ -256,7 +256,8 @@ async fn t_research_run_does_not_pollute_global_memory() {
     let global = MarkdownMemoryStore::global_memory_path();
 
     assert_ne!(
-        runlog, global,
+        runlog,
+        global,
         "research run-log must not be the global MEMORY.md (got {})",
         runlog.display(),
     );

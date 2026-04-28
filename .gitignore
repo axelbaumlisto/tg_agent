@@ -1,22 +1,4 @@
-.venv/
-__pycache__/
-*.pyc
-*.egg-info/
-.pytest_cache/
-
-# Local/private repo material not published on source-only branches
-/naked/
-/AGENTS.md
-/OPERATIONS.md
-/.env.shared.example
-
-sessions.json
 .env
-.env.local
-.env.*.local
-*.session
-.session/
-.telegraph_token
 
 # Local agent / session caches
 .naked/
@@ -26,3 +8,14 @@ sessions.json
 
 # Stray stdout redirects from ad-hoc shell sessions
 /[0-9]
+
+# Rust agent local/runtime state
+/naked/target/
+/naked/.secrets/
+/naked/.naked/
+/naked/.local/
+/naked/.playwright-mcp/
+/naked/tmp/
+/naked/data/research_runs/
+/naked/results/autopilot/_logs/
+*.runlog

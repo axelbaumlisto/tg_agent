@@ -30,10 +30,7 @@ pub enum ProviderError {
     },
     /// Origin responded with a Cloudflare challenge (403 + `cf-browser-verification`,
     /// or similar). Body is effectively empty / unusable from an HTTP client.
-    CloudflareBlocked {
-        url: String,
-        hint: FallbackHint,
-    },
+    CloudflareBlocked { url: String, hint: FallbackHint },
     /// Non-classified upstream error — keep the raw body so the caller can log it.
     Other { status: u16, body: String },
 }
@@ -83,10 +80,7 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProviderError::QuotaExhausted { provider, hint, .. } => {
-                write!(
-                    f,
-                    "provider `{provider}` quota exhausted (hint: {hint:?})"
-                )
+                write!(f, "provider `{provider}` quota exhausted (hint: {hint:?})")
             }
             ProviderError::CloudflareBlocked { url, hint } => {
                 write!(f, "cloudflare challenge at `{url}` (hint: {hint:?})")

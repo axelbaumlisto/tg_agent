@@ -11,9 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use naked_core::config::Config;
-use naked_core::model_catalog::{
-    ModelStatus, TaskKind, ToolUseLevel,
-};
+use naked_core::model_catalog::{ModelStatus, TaskKind, ToolUseLevel};
 
 fn workspace_naked_json() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -28,10 +26,10 @@ fn workspace_naked_json() -> PathBuf {
 #[test]
 fn seeded_naked_json_parses() {
     let path = workspace_naked_json();
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    let _: Config = serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let _: Config =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()));
 }
 
 #[test]
@@ -64,15 +62,15 @@ fn glm_turbo_is_marked_degraded_with_empty_content() {
 }
 
 #[test]
-fn qwen_3_6_plus_is_deprecated() {
+fn qwen_3_6_plus_is_active() {
     let text = fs::read_to_string(workspace_naked_json()).unwrap();
     let cfg: Config = serde_json::from_str(&text).unwrap();
     let qwen = cfg.providers.get("qwen").unwrap();
     let caps = qwen.capabilities_for("qwen3.6-plus");
-    assert_eq!(caps.status, ModelStatus::Deprecated);
-    // Deprecated models must not fit any task kind automatically.
-    assert!(!caps.fits(TaskKind::Chat));
-    assert!(!caps.fits(TaskKind::Research));
+    assert_eq!(caps.status, ModelStatus::Active);
+    // Revived 2026-04-26: fits chat + research.
+    assert!(caps.fits(TaskKind::Chat));
+    assert!(caps.fits(TaskKind::Research));
 }
 
 #[test]

@@ -73,13 +73,14 @@ pub fn check_assistant_blocks(blocks: &[ContentBlock]) -> TurnInvariantReport {
 
     // Only consider thinking bodies with a meaningful minimum length;
     // otherwise a one-word match would produce false positives.
-    let thinking_leaked_into_text = thinking_blocks
-        .iter()
-        .filter(|t| t.trim().len() >= 12)
-        .any(|thought| {
-            let needle = thought.trim();
-            text_blocks.iter().any(|out| out.contains(needle))
-        });
+    let thinking_leaked_into_text =
+        thinking_blocks
+            .iter()
+            .filter(|t| t.trim().len() >= 12)
+            .any(|thought| {
+                let needle = thought.trim();
+                text_blocks.iter().any(|out| out.contains(needle))
+            });
 
     let orphan_tool_use = tool_uses
         .iter()
@@ -144,7 +145,10 @@ mod tests {
             },
         ];
         let r = check_assistant_blocks(&blocks);
-        assert!(r.thinking_leaked_into_text, "thinking body must not be echoed into text");
+        assert!(
+            r.thinking_leaked_into_text,
+            "thinking body must not be echoed into text"
+        );
     }
 
     #[test]

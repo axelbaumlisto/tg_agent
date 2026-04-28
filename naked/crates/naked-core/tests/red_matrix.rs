@@ -123,7 +123,11 @@ async fn red_b2_tool_result_content_round_trips() {
     session.history.push_tool_result("call-1", "hi\n", false);
 
     store.save(&session).await.expect("save");
-    let loaded = store.load(&session.id).await.expect("load").expect("exists");
+    let loaded = store
+        .load(&session.id)
+        .await
+        .expect("load")
+        .expect("exists");
     let blocks: Vec<ContentBlock> = loaded
         .history
         .messages()
@@ -227,9 +231,7 @@ async fn red_c2_save_rejects_category_url_pre_validation() {
         "category URL should be rejected, got {verdict:?}"
     );
 
-    let ok = UrlSpecificity::classify(
-        "https://mogi.vn/quan-ngu-hanh-son/thue-can-ho-id22092735",
-    );
+    let ok = UrlSpecificity::classify("https://mogi.vn/quan-ngu-hanh-son/thue-can-ho-id22092735");
     assert!(
         matches!(ok, UrlSpecificity::ConcreteListing),
         "concrete listing should be accepted, got {ok:?}"

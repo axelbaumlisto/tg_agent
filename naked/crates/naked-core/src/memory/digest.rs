@@ -134,9 +134,9 @@ pub fn collect_window(
         let date = today - chrono::Duration::days(delta as i64);
         for entry in MarkdownMemoryStore::read_daily(workspace, scope, date) {
             let hash = content_hash(&entry.content);
-            let bucket = by_hash.entry(hash).or_insert_with(|| {
-                (entry.clone(), Vec::new(), Vec::new())
-            });
+            let bucket = by_hash
+                .entry(hash)
+                .or_insert_with(|| (entry.clone(), Vec::new(), Vec::new()));
             // Keep the oldest occurrence as the canonical entry so
             // `age_days` reflects when the rule first appeared.
             if entry.created_at < bucket.0.created_at {
@@ -183,9 +183,7 @@ pub fn partition_candidates(
                 hints.repeat_days, cfg.promote_min_repeat_days
             ));
         }
-        if cfg.promote_min_recall_count > 0
-            && hints.recall_count < cfg.promote_min_recall_count
-        {
+        if cfg.promote_min_recall_count > 0 && hints.recall_count < cfg.promote_min_recall_count {
             reasons.push(format!(
                 "recalled only {} time(s) (need ≥{})",
                 hints.recall_count, cfg.promote_min_recall_count
@@ -206,10 +204,7 @@ pub fn partition_candidates(
 
 /// Build a deterministic one-paragraph summary of the day's activity
 /// — used as fallback when the LLM call fails or is disabled.
-pub fn deterministic_summary(
-    promoted: &[PromoteEntry],
-    rejected: &[RejectedEntry],
-) -> String {
+pub fn deterministic_summary(promoted: &[PromoteEntry], rejected: &[RejectedEntry]) -> String {
     format!(
         "Digest: {} promoted, {} rejected, {} total candidates seen this window.",
         promoted.len(),
@@ -230,10 +225,7 @@ fn build_summary_prompt(
     for p in promoted {
         s.push_str(&format!(
             "- [{}] {} (repeat_days={}, sources={})\n",
-            p.entry.memory_type,
-            p.entry.content,
-            p.hints.repeat_days,
-            p.hints.source_diversity
+            p.entry.memory_type, p.entry.content, p.hints.repeat_days, p.hints.source_diversity
         ));
     }
     s.push_str("\nRejected entries:\n");
@@ -342,8 +334,12 @@ pub fn apply_plan(
         .iter()
         .map(|p| p.entry.content.clone())
         .collect();
-    let dream =
-        dreams::build_entry(plan.scope.clone(), &plan.summary, promoted_text, rejected_items);
+    let dream = dreams::build_entry(
+        plan.scope.clone(),
+        &plan.summary,
+        promoted_text,
+        rejected_items,
+    );
     if dreams::append_dream(workspace, &dream, cfg.dreams_retention_days).is_ok() {
         outcome.dreams_appended = true;
     }
@@ -407,8 +403,7 @@ pub struct CompactionResult {
     pub summary: Option<MemoryEntry>,
 }
 
-const COMPACT_PROMPT: &str =
-    "You will receive a JSON array of memory rules from the same project section. \
+const COMPACT_PROMPT: &str = "You will receive a JSON array of memory rules from the same project section. \
      Merge them into ONE single-sentence rule that preserves the operational meaning \
      of all of them. Strict rules: \n\
      - Output exactly one sentence, plain text, no bullets, no numbering, no markdown.\n\
@@ -554,8 +549,7 @@ pub async fn compact_memory_at(
         if section.is_empty() {
             continue;
         }
-        let section_entries: Vec<MemoryEntry> =
-            section.iter().map(|&i| all[i].clone()).collect();
+        let section_entries: Vec<MemoryEntry> = section.iter().map(|&i| all[i].clone()).collect();
 
         let local_victims = pick_compaction_victims(&section_entries, cfg, today);
         if local_victims.is_empty() {
@@ -695,15 +689,17 @@ pub async fn build_plan(
     let (promoted, rejected) = partition_candidates(candidates, cfg);
 
     let summary = match llm {
-        Some((provider, model)) => match summarize_with_llm(provider, model, &promoted, &rejected, cfg)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("digest LLM summary failed: {e:#}; using deterministic fallback");
-                deterministic_summary(&promoted, &rejected)
+        Some((provider, model)) => {
+            match summarize_with_llm(provider, model, &promoted, &rejected, cfg).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "digest LLM summary failed: {e:#}; using deterministic fallback"
+                    );
+                    deterministic_summary(&promoted, &rejected)
+                }
             }
-        },
+        }
         None => deterministic_summary(&promoted, &rejected),
     };
 
@@ -727,8 +723,7 @@ pub async fn build_plan(
 // session-close happens on `/new` and pre-compaction happens inside the
 // hot path.
 
-const FLUSH_PROMPT: &str =
-    "From the conversation excerpt below, extract up to 5 SHORT, ACTIONABLE rules-of-thumb \
+const FLUSH_PROMPT: &str = "From the conversation excerpt below, extract up to 5 SHORT, ACTIONABLE rules-of-thumb \
      that would be useful to remember next time. Each rule must be a single sentence ≤140 chars. \
      Skip narrative summary, skip personal asides. \
      Output one rule per line, plain text, no numbering, no bullets, no markdown. \
@@ -828,7 +823,15 @@ pub async fn session_close(
     scope: &MemoryScope,
     transcript: &str,
 ) {
-    extract_and_append(provider, model, workspace, scope, transcript, "session_close").await;
+    extract_and_append(
+        provider,
+        model,
+        workspace,
+        scope,
+        transcript,
+        "session_close",
+    )
+    .await;
 }
 
 /// Convenience wrapper: pre-compaction flush. Called from the
@@ -878,12 +881,7 @@ mod tests {
     }
 
     fn entry(content: &str, source: &str, age_days: i64) -> (MemoryEntry, ScoringHints) {
-        let mut e = MemoryEntry::new(
-            MemoryType::Preference,
-            content.into(),
-            source,
-            proj(),
-        );
+        let mut e = MemoryEntry::new(MemoryType::Preference, content.into(), source, proj());
         e.created_at = Utc::now() - ChronoDuration::days(age_days);
         let hints = ScoringHints {
             repeat_days: 1,
@@ -1041,7 +1039,9 @@ mod tests {
 
     #[test]
     fn pick_compaction_skips_when_below_threshold() {
-        let entries: Vec<MemoryEntry> = (0..4).map(|i| entry_aged(&format!("r{i}"), 30, 0)).collect();
+        let entries: Vec<MemoryEntry> = (0..4)
+            .map(|i| entry_aged(&format!("r{i}"), 30, 0))
+            .collect();
         let cfg = cfg_with_compact(5, 5, 14, 2);
         let today = Utc::now().date_naive();
         assert!(pick_compaction_victims(&entries, &cfg, today).is_empty());
@@ -1049,7 +1049,9 @@ mod tests {
 
     #[test]
     fn pick_compaction_disabled_when_threshold_zero() {
-        let entries: Vec<MemoryEntry> = (0..20).map(|i| entry_aged(&format!("r{i}"), 30, 0)).collect();
+        let entries: Vec<MemoryEntry> = (0..20)
+            .map(|i| entry_aged(&format!("r{i}"), 30, 0))
+            .collect();
         let cfg = cfg_with_compact(0, 5, 14, 2);
         let today = Utc::now().date_naive();
         assert!(pick_compaction_victims(&entries, &cfg, today).is_empty());
@@ -1080,10 +1082,7 @@ mod tests {
         let picks = pick_compaction_victims(&entries, &cfg, today);
         assert_eq!(picks.len(), 5);
         // The 5 oldest unused are r0..r3 + r6.
-        let picked: Vec<&str> = picks
-            .iter()
-            .map(|&i| entries[i].content.as_str())
-            .collect();
+        let picked: Vec<&str> = picks.iter().map(|&i| entries[i].content.as_str()).collect();
         assert!(picked.contains(&"r0_old_unused"));
         assert!(picked.contains(&"r1_old_unused"));
         assert!(picked.contains(&"r2_old_unused"));
@@ -1099,7 +1098,8 @@ mod tests {
         let cfg = cfg_with_compact(5, 5, 14, 2);
         let today = Utc::now().date_naive();
         // 6 fresh entries, all younger than min_age_days.
-        let entries: Vec<MemoryEntry> = (0..6).map(|i| entry_aged(&format!("r{i}"), 3, 0)).collect();
+        let entries: Vec<MemoryEntry> =
+            (0..6).map(|i| entry_aged(&format!("r{i}"), 3, 0)).collect();
         assert!(pick_compaction_victims(&entries, &cfg, today).is_empty());
     }
 

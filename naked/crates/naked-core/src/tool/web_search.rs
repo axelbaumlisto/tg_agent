@@ -10,13 +10,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::keys::pool::KeyPool;
+use crate::search::SearchEngine;
 use crate::search::ddg::DdgEngine;
 use crate::search::exa::ExaEngine;
 use crate::search::multi::MultiEngineSearch;
 use crate::search::serpapi::SerpApiEngine;
 use crate::search::snippet::SnippetExtractor;
 use crate::search::tavily::TavilyEngine;
-use crate::search::SearchEngine;
 use crate::types::{Permission, ToolResult, ToolSpec};
 
 use super::Tool;

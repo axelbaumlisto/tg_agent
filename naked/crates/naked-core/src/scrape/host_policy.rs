@@ -119,10 +119,7 @@ impl HostPolicy {
     /// URL is malformed (matches `canonicalize_url`'s permissive style).
     pub fn host_of(url: &str) -> String {
         let trimmed = url.trim();
-        let rest = trimmed
-            .split_once("://")
-            .map(|(_, r)| r)
-            .unwrap_or(trimmed);
+        let rest = trimmed.split_once("://").map(|(_, r)| r).unwrap_or(trimmed);
         let host = rest.split('/').next().unwrap_or("");
         host.to_ascii_lowercase()
     }
@@ -173,9 +170,7 @@ impl HostPolicy {
             let doomed = state
                 .tiers
                 .get(&t)
-                .map(|s| {
-                    s.successes == 0 && s.failures >= self.min_attempts_before_skip
-                })
+                .map(|s| s.successes == 0 && s.failures >= self.min_attempts_before_skip)
                 .unwrap_or(false);
             if !doomed {
                 return t;

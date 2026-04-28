@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 use crate::config::{Config, ProviderConfig};
 
+use super::ModelRef;
 use super::health::ModelHealth;
 use super::types::{ModelCapabilities, ModelStatus, TaskKind};
-use super::ModelRef;
 
 /// Structured reason a pair failed validation. Stringified into
 /// `tracing::warn!` fields by callers so operators can grep per class.
@@ -68,9 +68,16 @@ impl std::fmt::Display for CapError {
         match self {
             CapError::UnknownProvider(p) => write!(f, "unknown provider {p:?}"),
             CapError::UnknownModel { provider, model } => {
-                write!(f, "model {model:?} not declared under provider {provider:?}")
+                write!(
+                    f,
+                    "model {model:?} not declared under provider {provider:?}"
+                )
             }
-            CapError::StatusBlocks { provider, model, status } => write!(
+            CapError::StatusBlocks {
+                provider,
+                model,
+                status,
+            } => write!(
                 f,
                 "{provider}/{model} status={status:?} blocks automatic selection",
             ),
@@ -83,10 +90,11 @@ impl std::fmt::Display for CapError {
                 f,
                 "{provider}/{model} not task-fit for {task}; declared {task_fit:?}"
             ),
-            CapError::Quarantined { provider, model, until } => write!(
-                f,
-                "{provider}/{model} quarantined until {until}"
-            ),
+            CapError::Quarantined {
+                provider,
+                model,
+                until,
+            } => write!(f, "{provider}/{model} quarantined until {until}"),
         }
     }
 }
@@ -133,10 +141,7 @@ impl<'a> ModelSelector<'a> {
     /// where the full [`Config`] isn't in scope (the coordinator only
     /// carries the capability subset it needs, to keep
     /// `CoordinatorConfig` cloneable).
-    pub fn from_providers(
-        providers: &'a HashMap<String, ProviderConfig>,
-        enforce: bool,
-    ) -> Self {
+    pub fn from_providers(providers: &'a HashMap<String, ProviderConfig>, enforce: bool) -> Self {
         Self {
             providers,
             enforce,
@@ -176,12 +181,7 @@ impl<'a> ModelSelector<'a> {
     /// — pinned validation always speaks truth. Callers that want
     /// advisory-only behaviour should demote the error to a `warn!`
     /// themselves.
-    pub fn validate(
-        &self,
-        provider: &str,
-        model: &str,
-        task: TaskKind,
-    ) -> Result<(), CapError> {
+    pub fn validate(&self, provider: &str, model: &str, task: TaskKind) -> Result<(), CapError> {
         let Some(pc) = self.providers.get(provider) else {
             return Err(CapError::UnknownProvider(provider.to_string()));
         };
@@ -239,12 +239,7 @@ impl<'a> ModelSelector<'a> {
     /// When enforcement is on, returns `false` for any
     /// `validate(..)` failure, and additionally for
     /// `status=Degraded` unless `budget.allow_degraded` is `true`.
-    pub fn is_available(
-        &self,
-        r: &ModelRef,
-        task: TaskKind,
-        budget: &Budget,
-    ) -> bool {
+    pub fn is_available(&self, r: &ModelRef, task: TaskKind, budget: &Budget) -> bool {
         if !self.enforce {
             return true;
         }
@@ -278,7 +273,8 @@ impl<'a> ModelSelector<'a> {
     pub fn rank_for(&self, task: TaskKind, budget: &Budget) -> Vec<ModelRef> {
         use super::types::{CostTier, LatencyTier, QualityTier};
 
-        let mut scored: Vec<(ModelRef, (u8, u8, u8, u8, String))> = Vec::new();
+        type ScoreTuple = (u8, u8, u8, u8, String);
+        let mut scored: Vec<(ModelRef, ScoreTuple)> = Vec::new();
         for (pname, pc) in self.providers {
             for model in &pc.models {
                 let r = ModelRef::new(pname.clone(), model.clone());
@@ -314,7 +310,13 @@ impl<'a> ModelSelector<'a> {
                 let tiebreak = format!("{}/{}", pname, model);
                 scored.push((
                     r,
-                    (status_score, quality_score, latency_score, cost_score, tiebreak),
+                    (
+                        status_score,
+                        quality_score,
+                        latency_score,
+                        cost_score,
+                        tiebreak,
+                    ),
                 ));
             }
         }
@@ -344,20 +346,19 @@ impl<'a> ModelSelector<'a> {
     ) -> Vec<(String, String)> {
         let mut out = Vec::with_capacity(chain.len());
         for raw in chain {
-            let (provider, model) =
-                match crate::research::parse_provider_model_pair(raw) {
-                    Some(pair) => pair,
-                    None => {
-                        if default_provider.is_empty() {
-                            tracing::warn!(
-                                entry = %raw,
-                                "fallback entry has no provider prefix and no default_provider; skipping"
-                            );
-                            continue;
-                        }
-                        (default_provider.to_string(), raw.clone())
+            let (provider, model) = match crate::research::parse_provider_model_pair(raw) {
+                Some(pair) => pair,
+                None => {
+                    if default_provider.is_empty() {
+                        tracing::warn!(
+                            entry = %raw,
+                            "fallback entry has no provider prefix and no default_provider; skipping"
+                        );
+                        continue;
                     }
-                };
+                    (default_provider.to_string(), raw.clone())
+                }
+            };
             if !self.enforce {
                 out.push((provider, model));
                 continue;
@@ -366,9 +367,7 @@ impl<'a> ModelSelector<'a> {
                 Ok(()) => {
                     let r = ModelRef::new(provider.clone(), model.clone());
                     let caps = self.caps(&r);
-                    if matches!(caps.status, ModelStatus::Degraded)
-                        && !budget.allow_degraded
-                    {
+                    if matches!(caps.status, ModelStatus::Degraded) && !budget.allow_degraded {
                         tracing::info!(
                             provider = %provider,
                             model = %model,
@@ -399,8 +398,7 @@ mod tests {
     use super::*;
     use crate::config::ProviderConfig;
     use crate::model_catalog::{
-        CostTier, LatencyTier, ModelCapabilities, ModelStatus, QualityTier, TaskKind,
-        ToolUseLevel,
+        CostTier, LatencyTier, ModelCapabilities, ModelStatus, QualityTier, TaskKind, ToolUseLevel,
     };
 
     fn pc(models: &[&str], caps: &[(&str, ModelCapabilities)]) -> ProviderConfig {
@@ -514,8 +512,9 @@ mod tests {
         // Default budget: degraded filtered.
         assert!(!s.is_available(&r, TaskKind::Research, &Budget::default()));
         // Opt-in: degraded allowed.
-        let mut budget = Budget::default();
-        budget.allow_degraded = true;
+        let budget = Budget {
+            allow_degraded: true,
+        };
         assert!(s.is_available(&r, TaskKind::Research, &budget));
     }
 
@@ -542,11 +541,7 @@ mod tests {
         };
         let p = pc(
             &["top", "mid", "chatonly"],
-            &[
-                ("top", top),
-                ("mid", mid),
-                ("chatonly", cheap_bad),
-            ],
+            &[("top", top), ("mid", mid), ("chatonly", cheap_bad)],
         );
         let c = cfg(vec![("p", p)], true);
         let s = ModelSelector::new(&c);
@@ -570,11 +565,7 @@ mod tests {
         };
         let p = pc(
             &["live", "dead", "chatonly"],
-            &[
-                ("live", live),
-                ("dead", dead),
-                ("chatonly", chat_only),
-            ],
+            &[("live", live), ("dead", dead), ("chatonly", chat_only)],
         );
         let c = cfg(vec![("p", p)], true);
         let s = ModelSelector::new(&c);
@@ -625,8 +616,10 @@ mod tests {
         let p = pc(&["m"], &[("m", caps)]);
         let c = cfg(vec![("zai", p)], true);
         let dir = tempfile::tempdir().unwrap();
-        let mut hc = ModelHealthConfig::default();
-        hc.log_path = Some(dir.path().join("mh.jsonl"));
+        let hc = ModelHealthConfig {
+            log_path: Some(dir.path().join("mh.jsonl")),
+            ..Default::default()
+        };
         let h = std::sync::Arc::new(ModelHealth::new(hc));
         // Force quarantine: 3 empties.
         for _ in 0..3 {

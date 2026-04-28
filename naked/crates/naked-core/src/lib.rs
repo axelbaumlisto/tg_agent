@@ -817,12 +817,10 @@ impl AgentCore {
                             "memory auto-captured to drafts: {}",
                             result.content
                         ),
-                        Ok(false) => tracing::debug!(
-                            "memory auto-capture (drafts): duplicate skipped"
-                        ),
-                        Err(e) => tracing::warn!(
-                            "memory auto-capture (drafts) write failed: {e}"
-                        ),
+                        Ok(false) => {
+                            tracing::debug!("memory auto-capture (drafts): duplicate skipped")
+                        }
+                        Err(e) => tracing::warn!("memory auto-capture (drafts) write failed: {e}"),
                     }
                 } else {
                     match memory::service::MemoryService::store(
@@ -2473,7 +2471,9 @@ pub async fn write_research_memory_link_for(
             rem = vr.remaining_issues.len(),
         ));
     }
-    body.push_str(&format!(" | elapsed={elapsed_secs}s | report={report_path}"));
+    body.push_str(&format!(
+        " | elapsed={elapsed_secs}s | report={report_path}"
+    ));
 
     // UTF-8 safe truncation: `MAX_ENTRY_CHARS` is named in chars, not bytes,
     // and a plain byte slice (`&body[..max - 3]`) panics inside multi-byte
@@ -2527,14 +2527,13 @@ pub async fn write_research_memory_link_for(
 fn build_search_key_pools(
     legacy_exa_keys: &[String],
 ) -> (Arc<KeyPool>, Arc<KeyPool>, Arc<KeyPool>) {
+    use keys::KeyProvider;
     use keys::env::EnvKeyProvider;
     use keys::fs::FilesystemKeyProvider;
-    use keys::KeyProvider;
     use std::time::Duration;
 
     let fs_path = FilesystemKeyProvider::default_path();
-    let fs_provider: Arc<dyn KeyProvider> =
-        Arc::new(FilesystemKeyProvider::new(fs_path.clone()));
+    let fs_provider: Arc<dyn KeyProvider> = Arc::new(FilesystemKeyProvider::new(fs_path.clone()));
     let env_provider: Arc<dyn KeyProvider> = Arc::new(EnvKeyProvider::defaults());
 
     // Bridge legacy `Config::exa_api_keys` (set from `.env` at startup) into
@@ -2588,17 +2587,18 @@ fn build_search_key_pools(
 /// silently skips the tier — the existing 4-tier path still works on
 /// hosts that haven't provisioned cloud-scrape credentials.
 fn build_cloud_scraper() -> Option<Arc<crate::scrape::multi::MultiCloudScraper>> {
+    use crate::scrape::CloudScraper;
     use crate::scrape::firecrawl::FirecrawlEngine;
     use crate::scrape::multi::MultiCloudScraper;
     use crate::scrape::scrapingbee::ScrapingBeeEngine;
-    use crate::scrape::CloudScraper;
+    use keys::KeyProvider;
     use keys::env::EnvKeyProvider;
     use keys::fs::FilesystemKeyProvider;
-    use keys::KeyProvider;
     use std::time::Duration;
 
-    let fs_provider: Arc<dyn KeyProvider> =
-        Arc::new(FilesystemKeyProvider::new(FilesystemKeyProvider::default_path()));
+    let fs_provider: Arc<dyn KeyProvider> = Arc::new(FilesystemKeyProvider::new(
+        FilesystemKeyProvider::default_path(),
+    ));
     let env_provider: Arc<dyn KeyProvider> = Arc::new(EnvKeyProvider::defaults());
     let ttl = Duration::from_secs(6 * 3600);
 

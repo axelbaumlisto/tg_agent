@@ -1094,8 +1094,7 @@ pub struct ProviderConfig {
     /// permissive so legacy configs keep booting unchanged. See the
     /// [`crate::model_catalog`] module for the schema.
     #[serde(default)]
-    pub capabilities:
-        HashMap<String, crate::model_catalog::ModelCapabilities>,
+    pub capabilities: HashMap<String, crate::model_catalog::ModelCapabilities>,
 }
 
 impl ProviderConfig {
@@ -1157,18 +1156,15 @@ impl ProviderConfig {
     /// wasn't registered. Returns a cloned permissive default
     /// ([`crate::model_catalog::ModelCapabilities::unknown`]) when neither
     /// is present — callers never need to special-case `Option`.
-    pub fn capabilities_for(
-        &self,
-        model: &str,
-    ) -> crate::model_catalog::ModelCapabilities {
+    pub fn capabilities_for(&self, model: &str) -> crate::model_catalog::ModelCapabilities {
         if let Some(caps) = self.capabilities.get(model) {
             return caps.clone();
         }
         let resolved = self.resolve_model_alias(model);
-        if resolved != model {
-            if let Some(caps) = self.capabilities.get(resolved) {
-                return caps.clone();
-            }
+        if resolved != model
+            && let Some(caps) = self.capabilities.get(resolved)
+        {
+            return caps.clone();
         }
         crate::model_catalog::ModelCapabilities::unknown()
     }
@@ -1323,8 +1319,7 @@ fn warn_capability_mismatch(
     if matches!(caps.status, ModelStatus::Degraded)
         && matches!(
             task,
-            crate::model_catalog::TaskKind::Research
-                | crate::model_catalog::TaskKind::Coding
+            crate::model_catalog::TaskKind::Research | crate::model_catalog::TaskKind::Coding
         )
     {
         tracing::warn!(
@@ -1544,18 +1539,11 @@ impl Config {
         // them when the primary provider fails (see
         // `AgentConfig::fallback_providers`).
         for entry in &self.fallback {
-            let Some((p, m)) = crate::research::parse_provider_model_pair(entry)
-            else {
+            let Some((p, m)) = crate::research::parse_provider_model_pair(entry) else {
                 continue;
             };
             if let Some(pc) = self.providers.get(&p) {
-                warn_capability_mismatch(
-                    &p,
-                    &m,
-                    TaskKind::Chat,
-                    "config.fallback[]",
-                    pc,
-                );
+                warn_capability_mismatch(&p, &m, TaskKind::Chat, "config.fallback[]", pc);
             }
         }
 
@@ -1566,7 +1554,7 @@ impl Config {
                 .provider
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .or_else(|| {
+                .or({
                     if self.default_provider.is_empty() {
                         None
                     } else {
@@ -1579,7 +1567,7 @@ impl Config {
                 .model
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .or_else(|| {
+                .or({
                     if self.default_model.is_empty() {
                         None
                     } else {
@@ -2878,10 +2866,7 @@ mod tests {
     ) -> ProviderConfig {
         let mut pc = test_pc(api_key);
         pc.models = models.into_iter().map(String::from).collect();
-        pc.capabilities = caps
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
+        pc.capabilities = caps.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         pc
     }
 
@@ -2951,11 +2936,7 @@ mod tests {
         use crate::model_catalog::{ModelCapabilities, ModelStatus};
         let mut dead = ModelCapabilities::unknown();
         dead.status = ModelStatus::Deprecated;
-        let pc = pc_with_caps(
-            "k",
-            vec!["live", "zombie"],
-            vec![("zombie", dead)],
-        );
+        let pc = pc_with_caps("k", vec!["live", "zombie"], vec![("zombie", dead)]);
         let mut providers = HashMap::new();
         providers.insert("myprov".into(), pc);
         let cfg = Config {
@@ -2987,11 +2968,7 @@ mod tests {
             known_failure_modes: vec!["empty_content".into()],
             ..ModelCapabilities::unknown()
         };
-        let pc = pc_with_caps(
-            "k",
-            vec!["glm-5-turbo"],
-            vec![("glm-5-turbo", caps)],
-        );
+        let pc = pc_with_caps("k", vec!["glm-5-turbo"], vec![("glm-5-turbo", caps)]);
         let mut providers = HashMap::new();
         providers.insert("zai".into(), pc);
         let cfg = Config {
@@ -3014,11 +2991,7 @@ mod tests {
         use crate::model_catalog::{ModelCapabilities, ModelStatus};
         let mut dead = ModelCapabilities::unknown();
         dead.status = ModelStatus::Deprecated;
-        let pc = pc_with_caps(
-            "k",
-            vec!["gpt-3.5"],
-            vec![("gpt-3.5", dead)],
-        );
+        let pc = pc_with_caps("k", vec!["gpt-3.5"], vec![("gpt-3.5", dead)]);
         let mut providers = HashMap::new();
         providers.insert("openai".into(), pc);
         let cfg = Config {

@@ -30,11 +30,7 @@ use tokio::sync::Notify;
 
 /// Drain `buf.len()`-worth of datagrams until either `expected`
 /// messages have arrived or `deadline` elapses.
-async fn drain_up_to(
-    server: &UnixDatagram,
-    expected: usize,
-    deadline: Instant,
-) -> Vec<String> {
+async fn drain_up_to(server: &UnixDatagram, expected: usize, deadline: Instant) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut buf = [0u8; 512];
     while out.len() < expected && Instant::now() < deadline {
@@ -92,7 +88,9 @@ async fn full_lifecycle_ready_alive_stopping_roundtrips_over_unix_socket() {
     // 6. Invariants: READY came first, STOPPING came last, at least
     //    2 WATCHDOG=1s in between.
     assert!(
-        msgs.first().map(|m| m.starts_with("READY=1")).unwrap_or(false),
+        msgs.first()
+            .map(|m| m.starts_with("READY=1"))
+            .unwrap_or(false),
         "first message must be READY=1, got: {msgs:?}"
     );
     assert!(

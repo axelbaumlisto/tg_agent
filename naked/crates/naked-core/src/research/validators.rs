@@ -57,11 +57,11 @@ impl UrlSpecificity {
                     return UrlSpecificity::ConcreteListing;
                 }
             }
-            if last.starts_with("id") {
-                let tail = &last[2..];
-                if tail.chars().all(|c| c.is_ascii_digit()) && tail.len() >= 4 {
-                    return UrlSpecificity::ConcreteListing;
-                }
+            if let Some(tail) = last.strip_prefix("id")
+                && tail.chars().all(|c| c.is_ascii_digit())
+                && tail.len() >= 4
+            {
+                return UrlSpecificity::ConcreteListing;
             }
             // long numeric run in the slug
             let mut run = 0;
@@ -76,10 +76,11 @@ impl UrlSpecificity {
                 }
             }
             // .html with numeric filename
-            if let Some(stem) = last.strip_suffix(".html") {
-                if stem.chars().all(|c| c.is_ascii_digit()) && stem.len() >= 5 {
-                    return UrlSpecificity::ConcreteListing;
-                }
+            if let Some(stem) = last.strip_suffix(".html")
+                && stem.chars().all(|c| c.is_ascii_digit())
+                && stem.len() >= 5
+            {
+                return UrlSpecificity::ConcreteListing;
             }
         }
         UrlSpecificity::CategoryPage {

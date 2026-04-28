@@ -68,16 +68,16 @@ pub struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            shortlist_min:           70.0,
-            maybe_min:               35.0,
-            green_shortlist_rate:    0.30,
-            green_top_relevance:     80,
-            green_mean_relevance:    50.0,
-            yellow_shortlist_rate:   0.10,
-            yellow_top_relevance:    50,
-            low_relevance_max:       35,
-            thin_sample_max:         5,
-            min_graded_for_verdict:  3,
+            shortlist_min: 70.0,
+            maybe_min: 35.0,
+            green_shortlist_rate: 0.30,
+            green_top_relevance: 80,
+            green_mean_relevance: 50.0,
+            yellow_shortlist_rate: 0.10,
+            yellow_top_relevance: 50,
+            low_relevance_max: 35,
+            thin_sample_max: 5,
+            min_graded_for_verdict: 3,
         }
     }
 }
@@ -106,15 +106,15 @@ impl Thresholds {
                 .unwrap_or(fallback)
         };
         Self {
-            shortlist_min:          f("shortlist_min",          d.shortlist_min),
-            maybe_min:              f("maybe_min",              d.maybe_min),
-            green_shortlist_rate:   f("green_shortlist_rate",   d.green_shortlist_rate),
-            green_top_relevance:    i("green_top_relevance",    d.green_top_relevance),
-            green_mean_relevance:   f("green_mean_relevance",   d.green_mean_relevance),
-            yellow_shortlist_rate:  f("yellow_shortlist_rate",  d.yellow_shortlist_rate),
-            yellow_top_relevance:   i("yellow_top_relevance",   d.yellow_top_relevance),
-            low_relevance_max:      i("low_relevance_max",      d.low_relevance_max),
-            thin_sample_max:        u("thin_sample_max",        d.thin_sample_max),
+            shortlist_min: f("shortlist_min", d.shortlist_min),
+            maybe_min: f("maybe_min", d.maybe_min),
+            green_shortlist_rate: f("green_shortlist_rate", d.green_shortlist_rate),
+            green_top_relevance: i("green_top_relevance", d.green_top_relevance),
+            green_mean_relevance: f("green_mean_relevance", d.green_mean_relevance),
+            yellow_shortlist_rate: f("yellow_shortlist_rate", d.yellow_shortlist_rate),
+            yellow_top_relevance: i("yellow_top_relevance", d.yellow_top_relevance),
+            low_relevance_max: i("low_relevance_max", d.low_relevance_max),
+            thin_sample_max: u("thin_sample_max", d.thin_sample_max),
             min_graded_for_verdict: u("min_graded_for_verdict", d.min_graded_for_verdict),
         }
     }
@@ -215,7 +215,8 @@ pub fn assess_quality(findings: &[Value], thresholds: Option<&Thresholds>) -> Ve
             dominant_reject_reasons: Vec::new(),
             advice: "Findings пустой. Скорее всего scraper'ы упали или \
                      discovery не нашёл ни одного источника. Проверьте \
-                     логи playwright_tick.sh и discover_sources.".to_string(),
+                     логи playwright_tick.sh и discover_sources."
+                .to_string(),
         };
     }
 
@@ -232,24 +233,24 @@ pub fn assess_quality(findings: &[Value], thresholds: Option<&Thresholds>) -> Ve
         .collect();
     let n_graded = graded.len();
 
-    let (mean_relevance, top_relevance, dominant_reasons) =
-        if n_graded >= th.min_graded_for_verdict {
-            let rels: Vec<f64> = graded
-                .iter()
-                .map(|f| f.get("_relevance").and_then(Value::as_f64).unwrap_or(0.0))
-                .collect();
-            let sum: f64 = rels.iter().sum();
-            let mean = sum / rels.len() as f64;
-            // Python: `int(max(rels))` — floor on positive values; we
-            // match by casting f64 → i64 (truncation toward zero,
-            // identical to `int()` on non-negative reals).
-            let top_f = rels.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let top = top_f as i64;
-            let reasons = dominant_reasons(&graded, th.low_relevance_max);
-            (Some(mean), Some(top), reasons)
-        } else {
-            (None, None, Vec::new())
-        };
+    let (mean_relevance, top_relevance, dominant_reasons) = if n_graded >= th.min_graded_for_verdict
+    {
+        let rels: Vec<f64> = graded
+            .iter()
+            .map(|f| f.get("_relevance").and_then(Value::as_f64).unwrap_or(0.0))
+            .collect();
+        let sum: f64 = rels.iter().sum();
+        let mean = sum / rels.len() as f64;
+        // Python: `int(max(rels))` — floor on positive values; we
+        // match by casting f64 → i64 (truncation toward zero,
+        // identical to `int()` on non-negative reals).
+        let top_f = rels.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let top = top_f as i64;
+        let reasons = dominant_reasons(&graded, th.low_relevance_max);
+        (Some(mean), Some(top), reasons)
+    } else {
+        (None, None, Vec::new())
+    };
 
     let verdict = decide_verdict(shortlist_rate, mean_relevance, top_relevance, th);
 
@@ -280,12 +281,10 @@ pub fn assess_quality(findings: &[Value], thresholds: Option<&Thresholds>) -> Ve
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-fn bucket_counts(findings: &[Value], shortlist_min: f64, maybe_min: f64)
-    -> (usize, usize, usize)
-{
+fn bucket_counts(findings: &[Value], shortlist_min: f64, maybe_min: f64) -> (usize, usize, usize) {
     let mut n_short = 0usize;
     let mut n_maybe = 0usize;
-    let mut n_rej   = 0usize;
+    let mut n_rej = 0usize;
     for f in findings {
         let score = f.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
         if score >= shortlist_min {
@@ -317,7 +316,8 @@ fn dominant_reasons(graded: &[&Value], low_relevance_max: i64) -> Vec<ReasonCoun
         if rel > cap {
             continue;
         }
-        let reason = f.get("_relevance_reason")
+        let reason = f
+            .get("_relevance_reason")
             .and_then(Value::as_str)
             .map(|s| s.trim())
             .unwrap_or("");
@@ -332,9 +332,13 @@ fn dominant_reasons(graded: &[&Value], low_relevance_max: i64) -> Vec<ReasonCoun
     // Stable sort by count desc — ties preserve insertion order
     // (this is what makes the differential output byte-stable).
     counts.sort_by(|a, b| b.1.cmp(&a.1));
-    counts.into_iter()
+    counts
+        .into_iter()
         .take(3)
-        .map(|(r, c)| ReasonCount { reason: r, count: c })
+        .map(|(r, c)| ReasonCount {
+            reason: r,
+            count: c,
+        })
         .collect()
 }
 
@@ -411,7 +415,8 @@ fn advice_for(
     let reasons_str = if dominant_reasons.is_empty() {
         "—".to_string()
     } else {
-        dominant_reasons.iter()
+        dominant_reasons
+            .iter()
             .take(2)
             .map(|r| format!("«{}» ({})", r.reason, r.count))
             .collect::<Vec<_>>()
@@ -424,7 +429,10 @@ fn advice_for(
              top-карточка получила relevance {}/100. Доминирующие \
              причины отказа: {}. Малая выборка ({} карточек) — \
              попробуйте увеличить дискавери: --coordinator-max-iters 8.",
-            pct(shortlist_rate), top_str, reasons_str, n_total,
+            pct(shortlist_rate),
+            top_str,
+            reasons_str,
+            n_total,
         )
     } else {
         format!(
@@ -433,7 +441,9 @@ fn advice_for(
              причины отказа: {}. Скорее всего scraper выловил \
              нерелевантный блок — selector_synthesizer требует \
              переобучения для этих источников.",
-            pct(shortlist_rate), top_str, reasons_str,
+            pct(shortlist_rate),
+            top_str,
+            reasons_str,
         )
     }
 }
@@ -466,8 +476,7 @@ mod tests {
     /// downstream HTML / MCP / autopilot consume it verbatim.
     #[test]
     fn assess_quality_matches_python_fixture() {
-        let raw = std::fs::read_to_string(fixture_path())
-            .expect("read quality_assessor fixture");
+        let raw = std::fs::read_to_string(fixture_path()).expect("read quality_assessor fixture");
         let v: Value = serde_json::from_str(&raw).expect("parse fixture");
 
         let th = Thresholds::from_json(&v["_thresholds"]);
@@ -476,10 +485,7 @@ mod tests {
 
         for case in v["cases"].as_array().expect("cases array") {
             let name = case["name"].as_str().unwrap_or("?").to_string();
-            let findings: Vec<Value> = case["findings"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let findings: Vec<Value> = case["findings"].as_array().cloned().unwrap_or_default();
             let expected = &case["expected"];
 
             let got = assess_quality(&findings, Some(&th)).to_json();
@@ -491,9 +497,7 @@ mod tests {
                     continue;
                 };
                 if !json_eq(got_v, exp_v) {
-                    failures.push(format!(
-                        "[{name}] {k}: got {got_v}, expected {exp_v}"
-                    ));
+                    failures.push(format!("[{name}] {k}: got {got_v}, expected {exp_v}"));
                 }
             }
         }
@@ -516,19 +520,16 @@ mod tests {
     /// could cost a ULP.
     fn json_eq(a: &Value, b: &Value) -> bool {
         match (a, b) {
-            (Value::Number(x), Value::Number(y)) => {
-                match (x.as_f64(), y.as_f64()) {
-                    (Some(xf), Some(yf)) => (xf - yf).abs() <= 1e-9,
-                    _ => x == y,
-                }
-            }
+            (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+                (Some(xf), Some(yf)) => (xf - yf).abs() <= 1e-9,
+                _ => x == y,
+            },
             (Value::Array(xs), Value::Array(ys)) if xs.len() == ys.len() => {
                 xs.iter().zip(ys.iter()).all(|(p, q)| json_eq(p, q))
             }
-            (Value::Object(xm), Value::Object(ym)) if xm.len() == ym.len() => {
-                xm.iter().all(|(k, v)|
-                    ym.get(k).is_some_and(|w| json_eq(v, w)))
-            }
+            (Value::Object(xm), Value::Object(ym)) if xm.len() == ym.len() => xm
+                .iter()
+                .all(|(k, v)| ym.get(k).is_some_and(|w| json_eq(v, w))),
             _ => a == b,
         }
     }

@@ -285,12 +285,16 @@ pub fn host_path_hash(url: &str) -> String {
     let trimmed = url.trim();
     let (_scheme, rest) = match trimmed.split_once("://") {
         Some(v) => v,
-        None => return blake3::hash(trimmed.to_ascii_lowercase().as_bytes())
-            .to_hex()
-            .to_string(),
+        None => {
+            return blake3::hash(trimmed.to_ascii_lowercase().as_bytes())
+                .to_hex()
+                .to_string();
+        }
     };
     let (authority_path, _) = rest.split_once('#').unwrap_or((rest, ""));
-    let (authority_path, _) = authority_path.split_once('?').unwrap_or((authority_path, ""));
+    let (authority_path, _) = authority_path
+        .split_once('?')
+        .unwrap_or((authority_path, ""));
     let (host, path) = authority_path
         .split_once('/')
         .map(|(h, p)| (h.to_ascii_lowercase(), format!("/{p}")))
@@ -322,8 +326,6 @@ pub fn content_hash(excerpt: &str) -> String {
         .map(|c| {
             if c.is_alphabetic() {
                 c.to_lowercase().next().unwrap_or(c)
-            } else if c.is_whitespace() {
-                ' '
             } else {
                 ' '
             }
@@ -455,10 +457,9 @@ pub fn slugify(topic: &str) -> String {
 /// `commercial-realty-a3f2`, not `the-best-list-of-a3f2`.
 const SHORT_SLUG_STOP: &[&str] = &[
     // English
-    "the", "a", "an", "and", "or", "of", "for", "in", "on", "at", "to", "by",
-    "with", "is", "are", "was", "were", "be", "been", "being", "this", "that",
-    "these", "those", "it", "its", "from", "as", "but", "if", "then", "than",
-    "so", "into", "over", "under", "near",
+    "the", "a", "an", "and", "or", "of", "for", "in", "on", "at", "to", "by", "with", "is", "are",
+    "was", "were", "be", "been", "being", "this", "that", "these", "those", "it", "its", "from",
+    "as", "but", "if", "then", "than", "so", "into", "over", "under", "near",
     // Number / currency / unit noise common in research topics
     "vnd", "usd", "eur", "rub", "sqm", "m2", "m²", "k", "m", "mln", "bln",
 ];
@@ -677,12 +678,17 @@ mod tests {
         // Cap = 3 meaningful tokens + 1 hex suffix = 4 segments total.
         assert_eq!(parts.len(), 4, "got id={id}, parts={parts:?}");
         assert!(
-            !parts[..3].iter().any(|p| p.chars().all(|c| c.is_ascii_digit())),
+            !parts[..3]
+                .iter()
+                .any(|p| p.chars().all(|c| c.is_ascii_digit())),
             "numeric-only tokens must not survive: id={id}"
         );
         assert!(
-            !parts[..3].iter().any(|p| *p == "the" || *p == "real"
-                || *p == "estate" || *p == "vnd" || *p == "usd"),
+            !parts[..3].iter().any(|p| *p == "the"
+                || *p == "real"
+                || *p == "estate"
+                || *p == "vnd"
+                || *p == "usd"),
             "stopwords/currency must be filtered: id={id}"
         );
     }
@@ -700,7 +706,10 @@ mod tests {
         // All-stopword topic → `slugify` produces non-empty ASCII slug,
         // so we still get something readable.
         let id2 = new_research_id("the of and");
-        assert!(id2.split('-').next_back().unwrap().len() == 4, "got id={id2}");
+        assert!(
+            id2.split('-').next_back().unwrap().len() == 4,
+            "got id={id2}"
+        );
     }
 
     #[test]

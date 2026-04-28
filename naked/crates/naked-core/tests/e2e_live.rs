@@ -1834,7 +1834,10 @@ struct ChatStats {
     rate_limited: usize,
     tools_used: usize,
     tool_set: std::collections::HashSet<String>,
+    /// Sum of individual turn latencies (excludes inter-turn delays).
     total_ms: u128,
+    /// Wall-clock time for the entire session (includes inter-turn delays).
+    session_wall_ms: u128,
     latencies: Vec<u128>,
 }
 
@@ -2028,6 +2031,7 @@ async fn run_load_session(
     let mut tool_set = std::collections::HashSet::new();
     let mut latencies = Vec::with_capacity(num_turns);
     let mut turn_delay_ms = 3000u64; // adaptive: increases on 429
+    let session_t0 = std::time::Instant::now();
 
     eprintln!("  [{tag}] START {provider_name}/{model} — {num_turns} turns");
 
@@ -2051,8 +2055,8 @@ async fn run_load_session(
             max_tokens: 1024,
             temperature: None,
             reasoning: None,
-        provider: String::new(),
-        health: None,
+            provider: String::new(),
+            health: None,
         };
         let prov_box = provider_arc_to_box(&provider);
         let agent = AgentLoop::new(prov_box, tools, lc);
@@ -2184,6 +2188,7 @@ async fn run_load_session(
     }
 
     let total_ms: u128 = latencies.iter().sum();
+    let session_wall_ms = session_t0.elapsed().as_millis();
 
     eprintln!(
         "  [{tag}] DONE: {ok}/{num_turns} ok, {content_ok} content-verified, {errors} err, {rate_limited} rate-limited, {} tools ({} unique: {:?})",
@@ -2202,6 +2207,7 @@ async fn run_load_session(
         tools_used,
         tool_set,
         total_ms,
+        session_wall_ms,
         latencies,
     })
 }
@@ -2321,7 +2327,10 @@ async fn t38_parallel_load_2x50() {
         }
     };
 
-    let sequential_ms = a.total_ms + b.total_ms;
+    // Use session wall times (including delays) for the parallelism metric.
+    // If both sessions ran sequentially, total time = session_wall_A + session_wall_B.
+    // Running in parallel, wall time ≈ max(session_wall_A, session_wall_B).
+    let sequential_ms = a.session_wall_ms + b.session_wall_ms;
     let parallelism = if wall_ms > 0 {
         sequential_ms as f64 / wall_ms as f64
     } else {
@@ -5266,8 +5275,8 @@ async fn t84_web_search_ddg_fallback() {
 /// #37 — WebSearch: key rotation works across calls
 #[tokio::test]
 async fn t85_web_search_key_rotation() {
-    use naked_core::keys::pool::KeyPool;
     use naked_core::keys::KeyProvider;
+    use naked_core::keys::pool::KeyPool;
     use std::sync::Arc;
     use std::time::Duration;
 

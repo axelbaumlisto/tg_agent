@@ -9,6 +9,7 @@
 //!   * nhatot.com         (refreshed roughly monthly, ok for price/count trends)
 //!   * batdongsan.com.vn  (monthly, stale but listings survive)
 //!   * dotproperty.com.vn (sparse)
+//!
 //! Snapshots ARE stale (typically 2-8 weeks) — the caller/agent must
 //! clearly label any extracted data with the `timestamp` returned here.
 //!
@@ -138,9 +139,7 @@ impl Tool for WebFetchWaybackTool {
         let avail_status = avail_resp.status();
         if !avail_status.is_success() {
             return ToolResult {
-                output: format!(
-                    "web_fetch_wayback: availability API returned HTTP {avail_status}"
-                ),
+                output: format!("web_fetch_wayback: availability API returned HTTP {avail_status}"),
                 is_error: true,
             };
         }
@@ -194,7 +193,9 @@ impl Tool for WebFetchWaybackTool {
 
         if snapshot_url.is_empty() {
             return ToolResult {
-                output: format!("web_fetch_wayback: Wayback API returned empty snapshot URL for {url}"),
+                output: format!(
+                    "web_fetch_wayback: Wayback API returned empty snapshot URL for {url}"
+                ),
                 is_error: true,
             };
         }
@@ -230,15 +231,15 @@ impl Tool for WebFetchWaybackTool {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        if let Some(len_hint) = resp.content_length() {
-            if len_hint > WAYBACK_MAX_BYTES {
-                return ToolResult {
-                    output: format!(
-                        "web_fetch_wayback: snapshot body too large ({len_hint} bytes, limit {WAYBACK_MAX_BYTES})"
-                    ),
-                    is_error: true,
-                };
-            }
+        if let Some(len_hint) = resp.content_length()
+            && len_hint > WAYBACK_MAX_BYTES
+        {
+            return ToolResult {
+                output: format!(
+                    "web_fetch_wayback: snapshot body too large ({len_hint} bytes, limit {WAYBACK_MAX_BYTES})"
+                ),
+                is_error: true,
+            };
         }
         let bytes = match resp.bytes().await {
             Ok(b) => b,
@@ -343,7 +344,10 @@ mod tests {
 
     #[test]
     fn format_timestamp_renders_human_readable() {
-        assert_eq!(format_timestamp("20260325202740"), "2026-03-25 20:27:40 UTC");
+        assert_eq!(
+            format_timestamp("20260325202740"),
+            "2026-03-25 20:27:40 UTC"
+        );
         assert_eq!(format_timestamp("20260101"), "2026-01-01 00:00:00 UTC");
         assert_eq!(format_timestamp("bad"), "bad");
     }

@@ -105,9 +105,7 @@ impl ChannelSessionMap {
                 let v: Value = match serde_json::from_str(line) {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(
-                            "channel_map: skipping malformed snapshot line: {e}"
-                        );
+                        tracing::warn!("channel_map: skipping malformed snapshot line: {e}");
                         continue;
                     }
                 };
@@ -125,10 +123,10 @@ impl ChannelSessionMap {
                         }
                     }
                     "yolo" => {
-                        if let Some(enabled_at) = v.get("enabled_at").and_then(Value::as_i64) {
-                            if now_secs() - enabled_at < YOLO_TTL_SECS {
-                                yolo.insert(key, enabled_at);
-                            }
+                        if let Some(enabled_at) = v.get("enabled_at").and_then(Value::as_i64)
+                            && now_secs() - enabled_at < YOLO_TTL_SECS
+                        {
+                            yolo.insert(key, enabled_at);
                         }
                     }
                     "allow" => {
@@ -194,9 +192,13 @@ impl ChannelSessionMap {
         fs::write(&tmp, buf)
             .await
             .with_context(|| format!("channel_map: write {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .await
-            .with_context(|| format!("channel_map: rename {} -> {}", tmp.display(), path.display()))?;
+        fs::rename(&tmp, &path).await.with_context(|| {
+            format!(
+                "channel_map: rename {} -> {}",
+                tmp.display(),
+                path.display()
+            )
+        })?;
         Ok(())
     }
 

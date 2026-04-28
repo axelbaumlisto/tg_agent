@@ -35,7 +35,9 @@ mod tests {
             ContentBlock::Thinking {
                 text: "user wants summary; rough plan: a, b, c".into(),
             },
-            ContentBlock::Text { text: "Вот ответ".into() },
+            ContentBlock::Text {
+                text: "Вот ответ".into(),
+            },
             ContentBlock::ToolUse {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -56,9 +58,15 @@ mod tests {
     #[test]
     fn concatenates_multiple_text_blocks() {
         let rendered = render_live_user_text(&[
-            ContentBlock::Text { text: "Hello ".into() },
-            ContentBlock::Thinking { text: "pondering".into() },
-            ContentBlock::Text { text: "world".into() },
+            ContentBlock::Text {
+                text: "Hello ".into(),
+            },
+            ContentBlock::Thinking {
+                text: "pondering".into(),
+            },
+            ContentBlock::Text {
+                text: "world".into(),
+            },
         ]);
         assert_eq!(rendered, "Hello world");
     }

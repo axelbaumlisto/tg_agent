@@ -320,10 +320,7 @@ pub fn diff_reports(report_dir: &Path, since: Option<&str>) -> Value {
         old_path = Some(snaps[snaps.len() - 2].clone());
     }
 
-    let old_findings = old_path
-        .as_deref()
-        .map(load_snapshot)
-        .unwrap_or_default();
+    let old_findings = old_path.as_deref().map(load_snapshot).unwrap_or_default();
     let new_findings = load_snapshot(&new_path);
 
     let mut out = diff_findings(&old_findings, &new_findings);
@@ -411,9 +408,7 @@ mod tests {
                     .collect();
                 exp.sort();
                 if got != exp {
-                    failures.push(format!(
-                        "[{name}] new urls: got {got:?}, expected {exp:?}"
-                    ));
+                    failures.push(format!("[{name}] new urls: got {got:?}, expected {exp:?}"));
                 }
             }
 
@@ -436,13 +431,14 @@ mod tests {
                     .collect();
                 exp.sort();
                 if got != exp {
-                    failures.push(format!(
-                        "[{name}] gone urls: got {got:?}, expected {exp:?}"
-                    ));
+                    failures.push(format!("[{name}] gone urls: got {got:?}, expected {exp:?}"));
                 }
             }
 
-            if let Some(exp) = case.get("expected_changed_deltas").and_then(Value::as_array) {
+            if let Some(exp) = case
+                .get("expected_changed_deltas")
+                .and_then(Value::as_array)
+            {
                 let mut got: Vec<Vec<String>> = out["changed"]
                     .as_array()
                     .unwrap()
@@ -493,10 +489,7 @@ mod tests {
     /// `diff_reports` + `list_snapshots` + `load_snapshot`.
     #[test]
     fn diff_reports_stages_match_python_contract() {
-        let tmp = std::env::temp_dir().join(format!(
-            "naked-memory-diff-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("naked-memory-diff-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -524,16 +517,12 @@ mod tests {
             json!({"_canonical_url": "https://x.com/b", "title": "B",
                    "price_usd": 200.0, "_score": 60.0, "_bucket": "maybe"}),
         ];
-        let s1 = write_snap(&tmp, "report_2026-04-20_1200.findings.jsonl",
-                            &s1_items);
+        let s1 = write_snap(&tmp, "report_2026-04-20_1200.findings.jsonl", &s1_items);
         let out = diff_reports(&tmp, None);
         assert_eq!(out["summary"]["n_new"], 2);
         assert_eq!(out["summary"]["n_total_old"], 0);
         assert!(out["old_snapshot"].is_null());
-        assert_eq!(
-            out["new_snapshot"].as_str().unwrap(),
-            s1.to_string_lossy()
-        );
+        assert_eq!(out["new_snapshot"].as_str().unwrap(), s1.to_string_lossy());
 
         // 3. Two snapshots.
         let s2_items = vec![
@@ -542,8 +531,7 @@ mod tests {
             json!({"_canonical_url": "https://x.com/c", "title": "C",
                    "price_usd": 300.0, "_score": 75.0, "_bucket": "shortlist"}),
         ];
-        let s2 = write_snap(&tmp, "report_2026-04-25_0930.findings.jsonl",
-                            &s2_items);
+        let s2 = write_snap(&tmp, "report_2026-04-25_0930.findings.jsonl", &s2_items);
         let out = diff_reports(&tmp, None);
         let s = &out["summary"];
         assert_eq!(s["n_new"], 1);
@@ -569,11 +557,19 @@ mod tests {
         let s3 = write_snap(&tmp, "report_2026-04-25_2330.findings.jsonl", &s2_items);
         let s4 = write_snap(&tmp, "report_2026-04-26_0010.findings.jsonl", &s2_items);
         let snaps = list_snapshots(&tmp);
-        let tail: Vec<String> = snaps.iter().rev().take(2).rev()
-            .map(|p| p.to_string_lossy().into_owned()).collect();
+        let tail: Vec<String> = snaps
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             tail,
-            vec![s3.to_string_lossy().into_owned(), s4.to_string_lossy().into_owned()]
+            vec![
+                s3.to_string_lossy().into_owned(),
+                s4.to_string_lossy().into_owned()
+            ]
         );
 
         // 8. Malformed JSONL lines are skipped, valid ones survive.
@@ -584,10 +580,12 @@ mod tests {
                 "{}\n{{this-is-not-json\n{}\n",
                 serde_json::to_string(&json!({
                     "_canonical_url": "https://x.com/d", "title": "D"
-                })).unwrap(),
+                }))
+                .unwrap(),
                 serde_json::to_string(&json!({
                     "_canonical_url": "https://x.com/e", "title": "E"
-                })).unwrap(),
+                }))
+                .unwrap(),
             ),
         )
         .unwrap();

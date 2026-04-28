@@ -300,7 +300,9 @@ pub fn is_addressed_to_bot(msg: &Message, identity: &BotIdentity) -> bool {
         return false;
     }
 
-    let entities = msg.parse_entities().or_else(|| msg.parse_caption_entities());
+    let entities = msg
+        .parse_entities()
+        .or_else(|| msg.parse_caption_entities());
     if let Some(entities) = entities {
         let our_handle = identity.username_lc();
         let our_handle_at = format!("@{our_handle}");

@@ -79,8 +79,10 @@ impl SnippetExtractor {
     /// - `vnd` / `đ` / `vnđ`         → ×1
     pub fn extract_price(&self, s: &str) -> Option<u64> {
         let re = RE_PRICE.get_or_init(|| {
-            Regex::new(r"(?i)(\d+(?:[.,]\d+)?)\s*(triệu|tr|tỷ|ty|million|billion|usd|\$|vnd|vnđ|đ)\b")
-                .unwrap()
+            Regex::new(
+                r"(?i)(\d+(?:[.,]\d+)?)\s*(triệu|tr|tỷ|ty|million|billion|usd|\$|vnd|vnđ|đ)\b",
+            )
+            .unwrap()
         });
         let cap = re.captures(s)?;
         let n: f64 = cap[1].replace(',', ".").parse().ok()?;
@@ -118,10 +120,7 @@ impl SnippetExtractor {
     /// - +84 prefix, with optional space/dot separators.
     pub fn extract_phone(&self, s: &str) -> Option<String> {
         let re = RE_PHONE.get_or_init(|| {
-            Regex::new(
-                r"(?:\+?84[\s.-]?|0)((?:3|5|7|8|9)\d(?:[\s.-]?\d){7,8})",
-            )
-            .unwrap()
+            Regex::new(r"(?:\+?84[\s.-]?|0)((?:3|5|7|8|9)\d(?:[\s.-]?\d){7,8})").unwrap()
         });
         let cap = re.captures(s)?;
         let digits: String = cap[1].chars().filter(|c| c.is_ascii_digit()).collect();

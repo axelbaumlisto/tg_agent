@@ -79,15 +79,17 @@ fn run() -> Result<ExitCode> {
     }
 
     let config = if let Some(p) = &args.naked_json {
-        Config::from_json_file(p)
-            .with_context(|| format!("loading {}", p.display()))?
+        Config::from_json_file(p).with_context(|| format!("loading {}", p.display()))?
     } else {
         Config::load().context("loading naked.json")?
     };
 
     let skill_path = args.skill_path.unwrap_or_else(|| {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        root.join("naked").join("skills").join("model-catalog").join("SKILL.md")
+        root.join("naked")
+            .join("skills")
+            .join("model-catalog")
+            .join("SKILL.md")
     });
 
     if args.dry_run {
@@ -114,8 +116,7 @@ fn run() -> Result<ExitCode> {
             eprintln!("naked-catalog-export: {e}");
             Ok(ExitCode::from(2))
         }
-        Err(e) => Err(anyhow::anyhow!(e)
-            .context(format!("exporting to {}", skill_path.display()))),
+        Err(e) => Err(anyhow::anyhow!(e).context(format!("exporting to {}", skill_path.display()))),
     }
 }
 

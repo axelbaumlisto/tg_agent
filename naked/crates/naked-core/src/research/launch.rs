@@ -102,10 +102,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(
-            outcome,
-            LaunchOutcome::Verified { pid: 42, .. }
-        ));
+        assert!(matches!(outcome, LaunchOutcome::Verified { pid: 42, .. }));
     }
 
     #[tokio::test]

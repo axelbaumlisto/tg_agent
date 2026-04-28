@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use naked_core::ResearchPatch;
 use naked_core::AgentCore;
+use naked_core::ResearchPatch;
 use naked_core::research::{
     Inflight, ResearchSpec, ResearchStore, RunState, SchedulerEvent, SchedulerHook, StopReason,
 };
@@ -194,7 +194,12 @@ struct RunningHandle {
 /// "first successful run after N failures" hooks.
 #[async_trait]
 pub trait TaskNotifier: Send + Sync {
-    async fn notify_failure(&self, spec: &ResearchSpec, consecutive_failures: u32, last_error: &str);
+    async fn notify_failure(
+        &self,
+        spec: &ResearchSpec,
+        consecutive_failures: u32,
+        last_error: &str,
+    );
     async fn notify_success(&self, _spec: &ResearchSpec, _run_id: &str) {}
 
     /// Fired by [`supervised_run_loop`] when the scheduler's main loop panics.
@@ -327,27 +332,32 @@ impl ResearchScheduler {
         let supervisor_notifier = notifier.clone();
         let supervisor_backoff = Duration::from_secs(5);
         tokio::spawn(async move {
-            supervised_run_loop("research", supervisor_notifier, supervisor_backoff, move || {
-                let core = core.clone();
-                let config = config.clone();
-                let semaphore = semaphore.clone();
-                let state = state.clone();
-                let notifier = notifier.clone();
-                let loop_notify = loop_notify.clone();
-                let loop_shutdown = loop_shutdown.clone();
-                async move {
-                    run_loop(
-                        core,
-                        config,
-                        semaphore,
-                        state,
-                        notifier,
-                        loop_notify,
-                        loop_shutdown,
-                    )
-                    .await;
-                }
-            })
+            supervised_run_loop(
+                "research",
+                supervisor_notifier,
+                supervisor_backoff,
+                move || {
+                    let core = core.clone();
+                    let config = config.clone();
+                    let semaphore = semaphore.clone();
+                    let state = state.clone();
+                    let notifier = notifier.clone();
+                    let loop_notify = loop_notify.clone();
+                    let loop_shutdown = loop_shutdown.clone();
+                    async move {
+                        run_loop(
+                            core,
+                            config,
+                            semaphore,
+                            state,
+                            notifier,
+                            loop_notify,
+                            loop_shutdown,
+                        )
+                        .await;
+                    }
+                },
+            )
             .await;
         });
 
@@ -493,10 +503,7 @@ async fn run_loop(
 /// using the configured retention. Logs the count at debug level.
 /// Errors are downgraded to a warn — a failed purge is never fatal
 /// (the on-disk records are inert).
-async fn purge_terminal_inflight_now(
-    store: &Arc<dyn ResearchStore>,
-    config: &SchedulerConfig,
-) {
+async fn purge_terminal_inflight_now(store: &Arc<dyn ResearchStore>, config: &SchedulerConfig) {
     if config.inflight_terminal_retention == Duration::ZERO {
         return;
     }
@@ -509,7 +516,10 @@ async fn purge_terminal_inflight_now(
             return;
         }
     };
-    match store.purge_terminal_inflight(chrono::Utc::now(), retention).await {
+    match store
+        .purge_terminal_inflight(chrono::Utc::now(), retention)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => tracing::debug!(removed = n, "purged stale terminal inflight records"),
         Err(e) => tracing::warn!("purge_terminal_inflight failed: {e:#}"),
@@ -569,8 +579,7 @@ async fn rebuild_resurrection_queue(
             let _ = store.save_inflight(&spec.id, &final_inf).await;
             continue;
         }
-        if config.max_resurrection_attempts == 0
-            || infl.attempt >= config.max_resurrection_attempts
+        if config.max_resurrection_attempts == 0 || infl.attempt >= config.max_resurrection_attempts
         {
             tracing::warn!(
                 spec = %spec.id,
@@ -909,7 +918,11 @@ async fn purge_stale_tmp_files(store: &Arc<dyn ResearchStore>) {
 /// on any error. Logging is intentionally `debug!` because a stale
 /// tmp from a previous boot is the *normal* case here.
 async fn try_remove_tmp(path: &std::path::Path) -> Option<u64> {
-    let bytes = tokio::fs::metadata(path).await.ok().map(|m| m.len()).unwrap_or(0);
+    let bytes = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
     match tokio::fs::remove_file(path).await {
         Ok(()) => Some(bytes),
         Err(e) => {
@@ -1038,9 +1051,7 @@ async fn scan_and_dispatch(
     // ── Plan ───────────────────────────────────────────────────────────────
     let plan = {
         let s = state.lock().await;
-        let available_slots = config
-            .max_concurrent_runs
-            .saturating_sub(s.running.len());
+        let available_slots = config.max_concurrent_runs.saturating_sub(s.running.len());
         let running_set: HashSet<String> = s.running.keys().cloned().collect();
         plan_dispatches(&specs, &s.last_runs, &running_set, available_slots, now)
     };
@@ -1408,10 +1419,7 @@ fn evaluate_outcome(prev_count: u32, alerted: bool, cfg: &SchedulerConfig) -> Fa
     if cfg.auto_pause_after_failures > 0 && next >= cfg.auto_pause_after_failures {
         return FailurePolicy::AutoPause { count: next };
     }
-    if cfg.max_retries_before_alert > 0
-        && next >= cfg.max_retries_before_alert
-        && !alerted
-    {
+    if cfg.max_retries_before_alert > 0 && next >= cfg.max_retries_before_alert && !alerted {
         return FailurePolicy::AlertOnce { count: next };
     }
     FailurePolicy::Quiet
@@ -1513,9 +1521,7 @@ async fn apply_outcome(
                 paused_ok = false;
             }
             let label = if paused_ok {
-                format!(
-                    "auto-paused after {count} consecutive failures · last error: {last_err}"
-                )
+                format!("auto-paused after {count} consecutive failures · last error: {last_err}")
             } else {
                 format!(
                     "{count} consecutive failures (auto-pause patch FAILED — pause manually) · last error: {last_err}"
@@ -2103,13 +2109,7 @@ mod tests {
 
         // No record yet.
         assert!(store.load_inflight(&spec.id).await.unwrap().is_none());
-        assert!(
-            store
-                .list_nonterminal_inflight()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store.list_nonterminal_inflight().await.unwrap().is_empty());
 
         let mut infl = Inflight::scheduled(spec.id.clone(), 1);
         store.save_inflight(&spec.id, &infl).await.unwrap();
@@ -2128,13 +2128,7 @@ mod tests {
         infl.mark_running();
         infl.mark_completed(Some("run-99".into()));
         store.save_inflight(&spec.id, &infl).await.unwrap();
-        assert!(
-            store
-                .list_nonterminal_inflight()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store.list_nonterminal_inflight().await.unwrap().is_empty());
 
         // load_inflight still returns the terminal record for inspection.
         let loaded = store.load_inflight(&spec.id).await.unwrap().unwrap();
@@ -2217,14 +2211,8 @@ mod tests {
 
         purge_stale_tmp_files(&store).await;
 
-        assert!(
-            !root_tmp.exists(),
-            "root-level *.tmp orphan must be purged"
-        );
-        assert!(
-            !spec_tmp.exists(),
-            "spec-level *.tmp orphan must be purged"
-        );
+        assert!(!root_tmp.exists(), "root-level *.tmp orphan must be purged");
+        assert!(!spec_tmp.exists(), "spec-level *.tmp orphan must be purged");
         assert!(
             lock_file.exists(),
             "scheduler.lock (no .tmp extension) must be left alone"
@@ -2427,7 +2415,9 @@ mod tests {
 
         let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
         let cfg = SchedulerConfig::default();
-        rebuild_resurrection_queue(&store, &notifier, &cfg).await.unwrap();
+        rebuild_resurrection_queue(&store, &notifier, &cfg)
+            .await
+            .unwrap();
 
         let after = store.load_inflight(&spec.id).await.unwrap().unwrap();
         assert_eq!(
@@ -2455,7 +2445,9 @@ mod tests {
 
         let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
         let cfg = SchedulerConfig::default();
-        rebuild_resurrection_queue(&store, &notifier, &cfg).await.unwrap();
+        rebuild_resurrection_queue(&store, &notifier, &cfg)
+            .await
+            .unwrap();
 
         let after = store.load_inflight(&spec.id).await.unwrap().unwrap();
         assert_eq!(after.state, RunState::Failed);
@@ -2478,7 +2470,9 @@ mod tests {
             max_resurrection_attempts: 5,
             ..SchedulerConfig::default()
         };
-        rebuild_resurrection_queue(&store, &notifier, &cfg).await.unwrap();
+        rebuild_resurrection_queue(&store, &notifier, &cfg)
+            .await
+            .unwrap();
 
         let after = store.load_inflight(&spec.id).await.unwrap().unwrap();
         assert_eq!(after.state, RunState::Failed);
@@ -2530,13 +2524,7 @@ mod tests {
             }
         };
 
-        supervised_run_loop(
-            "test",
-            trait_notifier,
-            Duration::from_millis(10),
-            make_loop,
-        )
-        .await;
+        supervised_run_loop("test", trait_notifier, Duration::from_millis(10), make_loop).await;
 
         assert_eq!(
             entries.load(Ordering::SeqCst),
@@ -2817,7 +2805,15 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(&state, &notifier, std::slice::from_ref(&spec), &cfg, &store, None).await;
+        sweep_running(
+            &state,
+            &notifier,
+            std::slice::from_ref(&spec),
+            &cfg,
+            &store,
+            None,
+        )
+        .await;
 
         // The token MUST have been cancelled.
         assert!(
@@ -2890,7 +2886,15 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(&state, &notifier, std::slice::from_ref(&spec), &cfg, &store, None).await;
+        sweep_running(
+            &state,
+            &notifier,
+            std::slice::from_ref(&spec),
+            &cfg,
+            &store,
+            None,
+        )
+        .await;
 
         // Slot MUST be freed.
         assert!(
@@ -2948,7 +2952,15 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(&state, &notifier, std::slice::from_ref(&spec), &cfg, &store, None).await;
+        sweep_running(
+            &state,
+            &notifier,
+            std::slice::from_ref(&spec),
+            &cfg,
+            &store,
+            None,
+        )
+        .await;
 
         assert!(
             state.lock().await.running.is_empty(),
@@ -2997,7 +3009,15 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(&state, &notifier, std::slice::from_ref(&spec), &cfg, &store, None).await;
+        sweep_running(
+            &state,
+            &notifier,
+            std::slice::from_ref(&spec),
+            &cfg,
+            &store,
+            None,
+        )
+        .await;
 
         // Slot MUST still be held — worker still inside grace window.
         let s = state.lock().await;
@@ -3038,7 +3058,15 @@ mod tests {
         let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
         let cfg = SchedulerConfig::default();
 
-        sweep_running(&state, &notifier, std::slice::from_ref(&spec), &cfg, &store, None).await;
+        sweep_running(
+            &state,
+            &notifier,
+            std::slice::from_ref(&spec),
+            &cfg,
+            &store,
+            None,
+        )
+        .await;
 
         assert!(state.lock().await.running.is_empty());
     }
