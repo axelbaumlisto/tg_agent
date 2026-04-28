@@ -11,6 +11,7 @@ use naked_tg::research_ui::{
     HeartbeatProgress, PendingClarification, keyboard_after_complete,
     keyboard_paused_awaiting_clarification, keyboard_stop, render_waterfall,
 };
+use naked_tg::tg_markup::{self, MAX_TG_MSG as TG_MSG_LIMIT};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -30,7 +31,7 @@ use naked_core::types::{AgentEvent, AgentHandle, Permission, PermissionResponse,
 
 use channel_map::{ChannelSessionMap, format_tg_channel_id};
 
-const MAX_TG_MSG: usize = 4096;
+const MAX_TG_MSG: usize = TG_MSG_LIMIT;
 const EDIT_INTERVAL: Duration = Duration::from_secs(10);
 const MIN_EDIT_GAP: Duration = Duration::from_secs(5);
 const TYPING_INTERVAL: Duration = Duration::from_secs(3);
@@ -297,6 +298,19 @@ async fn main() {
         naked_core::build_provider_from_config(&config).expect("Failed to build provider");
     let agent = Arc::new(AgentCore::new(config.clone(), provider));
     agent.init_self_ref();
+
+    // Register telegram_attach tool — lets the agent send files to chat.
+    // The attachment queue is per-turn (created in stream_response), but
+    // the tool factory captures a global queue that stream_response swaps.
+    let tg_attach_queue: naked_tg::tg_attach::AttachmentQueue = naked_tg::tg_attach::new_queue();
+    {
+        let q = tg_attach_queue.clone();
+        agent
+            .register_extra_tool(move || {
+                Box::new(naked_tg::tg_attach::TelegramAttachTool::new(q.clone()))
+            })
+            .await;
+    }
 
     // Cross-process advisory lock guarding `<NAKED_HOME>/research/`.
     // Acquired BEFORE we wire the scheduler so a second `naked-tg`
@@ -633,7 +647,7 @@ async fn main() {
         let body = serde_json::json!({
             "offset": offset,
             "timeout": 30,
-            "allowed_updates": ["message", "callback_query"]
+            "allowed_updates": ["message", "edited_message", "callback_query", "message_reaction"]
         });
         tracing::debug!(offset, "polling getUpdates");
 
@@ -719,6 +733,7 @@ async fn main() {
                     attribution_flag: attribution_flag.clone(),
                     bot_token: bot_token_arc.clone(),
                     bot_identity: bot_identity.clone(),
+                    tg_attach_queue: tg_attach_queue.clone(),
                 };
                 let permit = task_tracker.clone();
                 let album = album_buffer.clone();
@@ -749,6 +764,44 @@ async fn main() {
                     }
                 });
             }
+            // edited_message → treat as a new message (simplest useful behavior).
+            // If the original was already processed, the agent sees the edit as
+            // follow-up context. If still pending, it appears as a correction.
+            if let Some(msg_val) = upd.get("edited_message") {
+                let msg: Message = match serde_json::from_value(msg_val.clone()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse edited_message: {e}");
+                        continue;
+                    }
+                };
+                tracing::info!(
+                    chat_id = msg.chat.id.0,
+                    msg_id = msg.id.0,
+                    "Dispatching edited_message as new message"
+                );
+                let deps = BotDeps {
+                    bot: bot.clone(),
+                    agent: agent.clone(),
+                    channel_map: channel_map.clone(),
+                    config: config.clone(),
+                    pending_perms: pending_perms.clone(),
+                    http_client: http_client.clone(),
+                    base_url: base_url.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                    attribution_flag: attribution_flag.clone(),
+                    bot_token: bot_token_arc.clone(),
+                    bot_identity: bot_identity.clone(),
+                    tg_attach_queue: tg_attach_queue.clone(),
+                };
+                let permit = task_tracker.clone();
+                tokio::spawn(async move {
+                    let _permit = permit.acquire().await;
+                    if let Err(e) = deps.handle(msg, Vec::new()).await {
+                        tracing::error!("handle edited_message error: {e}");
+                    }
+                });
+            }
             if let Some(cb_val) = upd.get("callback_query") {
                 tracing::info!("Dispatching callback_query");
                 let q: CallbackQuery = match serde_json::from_value(cb_val.clone()) {
@@ -772,6 +825,51 @@ async fn main() {
                         tracing::error!("handle_callback error: {e}");
                     }
                 });
+            }
+            // message_reaction → 👎 removes/cancels queued message hint.
+            // Since messages go directly into conversation history, we can't
+            // truly remove them. Instead, append a correction note.
+            if let Some(reaction_val) = upd.get("message_reaction") {
+                let chat_id = reaction_val
+                    .get("chat")
+                    .and_then(|c| c.get("id"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let msg_id = reaction_val
+                    .get("message_id")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let new_reactions: Vec<String> = reaction_val
+                    .get("new_reaction")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|r| r.get("emoji").and_then(|e| e.as_str()))
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tracing::debug!(chat_id, msg_id, ?new_reactions, "message_reaction");
+                // 👎 → queue cancellation note for the agent
+                if new_reactions.iter().any(|e| e == "👎") {
+                    let tid = reaction_val
+                        .get("chat")
+                        .and_then(|c| c.get("message_thread_id"))
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32);
+                    if let Some(sid) = channel_map.get(chat_id, tid).await {
+                        agent
+                            .queue_message(
+                                &sid,
+                                &format!(
+                                    "[The user reacted with 👎 to message #{msg_id}. \
+                                     Disregard that message if you haven't started working on it yet.]"
+                                ),
+                            )
+                            .await;
+                        tracing::info!(chat_id, msg_id, "queued 👎 cancellation note");
+                    }
+                }
             }
         }
     }
@@ -1546,6 +1644,7 @@ pub(crate) struct BotDeps {
     pub attribution_flag: Arc<std::sync::atomic::AtomicBool>,
     pub bot_token: Arc<String>,
     pub bot_identity: Arc<naked_tg::bot_identity::BotIdentity>,
+    pub tg_attach_queue: naked_tg::tg_attach::AttachmentQueue,
 }
 
 impl BotDeps {
@@ -1588,6 +1687,7 @@ impl BotDeps {
                 self.attribution_flag,
                 self.bot_token,
                 self.bot_identity,
+                self.tg_attach_queue,
                 extra_album_msgs,
             )
             .await
@@ -1611,6 +1711,7 @@ async fn handle_message(
     attribution_flag: Arc<std::sync::atomic::AtomicBool>,
     bot_token: Arc<String>,
     bot_identity: Arc<naked_tg::bot_identity::BotIdentity>,
+    tg_attach_queue: naked_tg::tg_attach::AttachmentQueue,
     extra_album_msgs: Vec<Message>,
 ) -> Result<(), teloxide::RequestError> {
     let ctx = ChatCtx::from_msg(&msg);
@@ -2009,6 +2110,7 @@ async fn handle_message(
         model_tag,
         &http_client,
         &base_url,
+        &tg_attach_queue,
         &rate_limiter,
     )
     .await;
@@ -2173,9 +2275,37 @@ async fn handle_callback(
                             .parse_mode(ParseMode::Html)
                             .await;
                     }
-                    bot.answer_callback_query(q.id.clone())
-                        .text(format!("Model: {model}"))
-                        .await?;
+                    // If agent is busy on this chat, trigger in-flight
+                    // model switch: abort current turn and re-dispatch.
+                    let chat_key = (cb_ctx.chat_id.0, cb_ctx.raw_thread_id());
+                    if agent.is_session_active(&sid).await {
+                        let switch = naked_tg::model_switch::PendingSwitch {
+                            provider: Some(prov.clone()),
+                            model: model.clone(),
+                            continuation: None,
+                        };
+                        let map = MODEL_SWITCHES.read().await;
+                        if let Some(ms) = map.get(&chat_key) {
+                            let continuation = naked_tg::model_switch::build_continuation(&switch);
+                            ms.lock().await.request(switch);
+                            agent.abort(&sid).await;
+                            // Queue continuation so the agent picks up
+                            // where it left off with the new model.
+                            agent.queue_message(&sid, &continuation).await;
+                            bot.answer_callback_query(q.id.clone())
+                                .text(format!("⚡ Switching to {model}…"))
+                                .await?;
+                        } else {
+                            drop(map);
+                            bot.answer_callback_query(q.id.clone())
+                                .text(format!("Model: {model} (next turn)"))
+                                .await?;
+                        }
+                    } else {
+                        bot.answer_callback_query(q.id.clone())
+                            .text(format!("Model: {model}"))
+                            .await?;
+                    }
                 }
                 Err(e) => {
                     bot.answer_callback_query(q.id.clone())
@@ -2713,6 +2843,7 @@ async fn stream_response(
     model_tag: String,
     http_client: &reqwest::Client,
     base_url: &str,
+    tg_attach_queue: &naked_tg::tg_attach::AttachmentQueue,
     rate_limiter: &TgRateLimiter,
 ) {
     let AgentHandle {
@@ -2758,10 +2889,20 @@ async fn stream_response(
         }
     });
 
+    // Register per-chat model-switch state so `/model` callbacks can
+    // request an in-flight switch during this stream.
+    let chat_key = (chat_id_raw, tid);
+    let model_switch = naked_tg::model_switch::new_shared();
+    MODEL_SWITCHES
+        .write()
+        .await
+        .insert(chat_key, model_switch.clone());
+
     let mut view = CompositeView::new(model_tag);
     let mut last_edit = tokio::time::Instant::now();
     let mut dirty = false;
     let mut last_sent = String::new();
+    let mut aborted_for_switch = false;
 
     loop {
         let event = tokio::select! {
@@ -2965,6 +3106,15 @@ async fn stream_response(
             }
         } // end if let Some(event)
 
+        // Check for in-flight model switch at every yield point.
+        if naked_tg::model_switch::check_and_take(&model_switch)
+            .await
+            .is_some()
+        {
+            aborted_for_switch = true;
+            break;
+        }
+
         // Tick spinner + flush periodically
         if force_flush || last_edit.elapsed() >= EDIT_INTERVAL {
             view.tick += 1;
@@ -2994,8 +3144,63 @@ async fn stream_response(
 
     typing_cancel.cancel();
 
+    // Deregister model-switch state.
+    MODEL_SWITCHES.write().await.remove(&chat_key);
+
+    if aborted_for_switch {
+        // Don't send final — the turn was interrupted.
+        // Edit placeholder to indicate switch in progress.
+        let _ = bot
+            .edit_message_text(ctx.chat_id, placeholder, "⚡ Switching model…")
+            .await;
+        return;
+    }
+
     let final_html = view.render_final();
-    send_final(bot, ctx, placeholder, &final_html, &view).await;
+    send_final(bot.clone(), ctx, placeholder, &final_html, &view).await;
+
+    // Deliver any files queued by telegram_attach tool.
+    let attachments: Vec<naked_tg::tg_attach::StagedAttachment> =
+        tg_attach_queue.lock().await.drain(..).collect();
+    for att in attachments {
+        let method = if naked_tg::tg_attach::is_image_path(&att.path) {
+            "sendPhoto"
+        } else {
+            "sendDocument"
+        };
+        let field = if method == "sendPhoto" {
+            "photo"
+        } else {
+            "document"
+        };
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", ctx.chat_id.0.to_string())
+            .file(field, &att.path)
+            .await;
+        match form {
+            Ok(form) => {
+                let url = format!("{base_url}/{method}");
+                match http_client.post(&url).multipart(form).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!(file = %att.file_name, "telegram_attach delivered");
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            file = %att.file_name,
+                            status = %resp.status(),
+                            "telegram_attach delivery failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(file = %att.file_name, error = %e, "telegram_attach send error");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(file = %att.file_name, error = %e, "telegram_attach form build failed");
+            }
+        }
+    }
 }
 
 const FILE_THRESHOLD: usize = MAX_TG_MSG * 2;
@@ -3065,7 +3270,7 @@ async fn send_final(bot: Bot, ctx: ChatCtx, msg_id: MessageId, html: &str, view:
         }
         for chunk in chunks.iter().skip(1) {
             let res = bot
-                .send_message(chat_id, *chunk)
+                .send_message(chat_id, chunk.as_str())
                 .parse_mode(ParseMode::Html)
                 .maybe_thread(ctx.thread_id)
                 .maybe_reply_to(ctx.reply_to)
@@ -3073,7 +3278,7 @@ async fn send_final(bot: Bot, ctx: ChatCtx, msg_id: MessageId, html: &str, view:
             if let Err(e) = res {
                 tracing::warn!("send chunk (HTML) failed: {e}, retrying plain text");
                 if let Err(e2) = bot
-                    .send_message(chat_id, *chunk)
+                    .send_message(chat_id, chunk.as_str())
                     .maybe_thread(ctx.thread_id)
                     .maybe_reply_to(ctx.reply_to)
                     .await
@@ -4786,6 +4991,14 @@ type PendingClarificationMap = HashMap<(i64, Option<i32>), PendingClarification>
 static PENDING_CLARIFICATIONS: LazyLock<tokio::sync::RwLock<PendingClarificationMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
+/// Per-chat model-switch state: when a user selects a new model via
+/// `/model` or inline keyboard while the agent is mid-generation,
+/// the pending switch is stored here. `stream_response` checks it
+/// between events and aborts+re-dispatches if set.
+type ModelSwitchMap = HashMap<(i64, Option<i32>), naked_tg::model_switch::SharedModelSwitch>;
+static MODEL_SWITCHES: LazyLock<tokio::sync::RwLock<ModelSwitchMap>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+
 /// Drop a Telegram slash command in a persona chat that opted out of the
 /// command surface.
 ///
@@ -4897,196 +5110,18 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     s.to_string()
 }
 
+// ── Telegram markup: delegate to tg_markup module (DRY) ─────────────────
+
 fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    tg_markup::escape_html(s)
 }
 
-/// Convert markdown to Telegram-compatible HTML.
 fn md_to_tg_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 256);
-    let mut in_code_block = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-
-        // Fenced code block toggle
-        if trimmed.starts_with("```") {
-            if in_code_block {
-                out.push_str("</pre>\n");
-                in_code_block = false;
-            } else {
-                out.push_str("<pre>");
-                in_code_block = true;
-            }
-            continue;
-        }
-
-        if in_code_block {
-            out.push_str(&escape_html(line));
-            out.push('\n');
-            continue;
-        }
-
-        // Horizontal rules
-        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-            continue;
-        }
-
-        // Table separator rows
-        if trimmed.starts_with('|') && trimmed.contains("---") {
-            continue;
-        }
-
-        // Table rows → strip pipes, format inline
-        if trimmed.starts_with('|') && trimmed.ends_with('|') {
-            let cells: Vec<&str> = trimmed
-                .trim_matches('|')
-                .split('|')
-                .map(|c| c.trim())
-                .filter(|c| !c.is_empty())
-                .collect();
-            if !cells.is_empty() {
-                let rendered: Vec<String> =
-                    cells.iter().map(|c| md_inline(&escape_html(c))).collect();
-                out.push_str(&rendered.join(" · "));
-                out.push('\n');
-            }
-            continue;
-        }
-
-        // Headers → bold
-        if let Some(rest) = trimmed.strip_prefix("### ") {
-            out.push_str(&format!("<b>{}</b>\n", md_inline(&escape_html(rest))));
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("## ") {
-            out.push_str(&format!("\n<b>{}</b>\n", md_inline(&escape_html(rest))));
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("# ") {
-            out.push_str(&format!("\n<b>{}</b>\n", md_inline(&escape_html(rest))));
-            continue;
-        }
-
-        // Regular line → escape + inline formatting
-        let escaped = escape_html(line);
-        out.push_str(&md_inline(&escaped));
-        out.push('\n');
-    }
-
-    if in_code_block {
-        out.push_str("</pre>\n");
-    }
-
-    // Clean up excessive newlines
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
-    }
-    out.trim().to_string()
+    tg_markup::md_to_tg_html(text)
 }
 
-/// Apply inline markdown formatting to already-escaped text.
-fn md_inline(s: &str) -> String {
-    let mut result = s.to_string();
-
-    // Links: [text](url) — url won't have < > since those are escaped
-    while let Some(start) = result.find('[') {
-        let after_bracket = start + 1;
-        if let Some(close) = result[after_bracket..].find("](") {
-            let text_end = after_bracket + close;
-            let url_start = text_end + 2;
-            if let Some(url_end) = result[url_start..].find(')') {
-                let link_text = &result[after_bracket..text_end];
-                let url = &result[url_start..url_start + url_end];
-                let replacement = format!("<a href=\"{}\">{}</a>", url, link_text);
-                result = format!(
-                    "{}{}{}",
-                    &result[..start],
-                    replacement,
-                    &result[url_start + url_end + 1..]
-                );
-                continue;
-            }
-        }
-        break;
-    }
-
-    // Bold: **text** (before italic to avoid conflict)
-    result = apply_pair(&result, "**", "<b>", "</b>");
-    // Bold: __text__
-    result = apply_pair(&result, "__", "<b>", "</b>");
-    // Italic: *text* (single)
-    result = apply_pair(&result, "*", "<i>", "</i>");
-    // Inline code: `text`
-    result = apply_pair(&result, "`", "<code>", "</code>");
-    // Strikethrough: ~~text~~
-    result = apply_pair(&result, "~~", "<s>", "</s>");
-
-    result
-}
-
-fn apply_pair(s: &str, marker: &str, open: &str, close: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find(marker) {
-            let after = start + marker.len();
-            if let Some(end) = rest[after..].find(marker) {
-                let inner = &rest[after..after + end];
-                if !inner.is_empty() && !inner.starts_with(' ') && !inner.ends_with(' ') {
-                    result.push_str(&rest[..start]);
-                    result.push_str(open);
-                    result.push_str(inner);
-                    result.push_str(close);
-                    rest = &rest[after + end + marker.len()..];
-                    continue;
-                }
-            }
-            result.push_str(&rest[..start + marker.len()]);
-            rest = &rest[start + marker.len()..];
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result
-}
-
-fn split_html(text: &str, max_bytes: usize) -> Vec<&str> {
-    if text.len() <= max_bytes {
-        return vec![text];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let tentative_end = (start + max_bytes).min(text.len());
-        let end = if tentative_end == text.len() {
-            tentative_end
-        } else {
-            let mut e = tentative_end;
-            while e > start && !text.is_char_boundary(e) {
-                e -= 1;
-            }
-            e
-        };
-        if end <= start {
-            break;
-        }
-        let split_at = if end == text.len() {
-            end
-        } else {
-            text[start..end]
-                .rfind('\n')
-                .map(|pos| start + pos + 1)
-                .unwrap_or(end)
-        };
-        chunks.push(&text[start..split_at]);
-        start = split_at;
-    }
-    chunks
+fn split_html(text: &str, max_bytes: usize) -> Vec<String> {
+    tg_markup::split_html(text, max_bytes)
 }
 
 // ── Health check server ─────────────────────────────────────────────────────

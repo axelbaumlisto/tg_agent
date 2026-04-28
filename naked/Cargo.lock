@@ -1127,6 +1127,7 @@ dependencies = [
  "chrono",
  "cron",
  "dotenvy",
+ "futures-util",
  "mime_guess",
  "naked-core",
  "reqwest",

@@ -15,6 +15,43 @@ The Rust `naked-tg` is the **live production bot** (managed by
 systemd — see `OPERATIONS.md`). It talks to LLM providers directly
 (no intermediate proxy).
 
+## Repo layout: code vs state
+
+```
+tg_agent/
+├── naked/                 # ── CODE (pushed to both GitHub and Forgejo) ──
+│   ├── Cargo.toml         # workspace root
+│   ├── crates/
+│   │   ├── naked-core/    # tool loop, providers, channels, memory, MCP
+│   │   ├── naked-cli/     # `naked` CLI
+│   │   └── naked-tg/      # `naked-tg` Telegram binary (systemd-managed)
+│   ├── scripts/           # ops scripts (token health, research tick, …)
+│   ├── skills/            # agent skills (JSON/MD)
+│   ├── tests/             # bash e2e + fixtures
+│   ├── ops/{systemd,cron} # unit files + cron snippets
+│   ├── docs/              # architecture + planning docs
+│   ├── data -> ../state/data        # symlink (gitignored)
+│   ├── results -> ../state/results  # symlink (gitignored)
+│   └── naked.json -> ../state/naked.json  # symlink (gitignored)
+│
+├── state/                 # ── DAEMON STATE (Forgejo only, not on GitHub) ──
+│   ├── naked.json         # live config (providers, chat_ids, scheduler)
+│   ├── data/              # research briefs, fx_rates
+│   └── results/           # HTML reports, findings JSONL
+│
+├── .env                   # API keys + tokens (never committed anywhere)
+├── .env.shared.example    # env template
+├── AGENTS.md              # ← you are here
+├── README.md
+└── OPERATIONS.md
+```
+
+**Why the split?**
+- `naked/` = pure code → safe to push to public GitHub
+- `state/` = runtime config + research data → Forgejo only (private)
+- Symlinks in `naked/` keep scripts working without path changes
+- `NAKED_CONFIG` env var points systemd at `state/naked.json`
+
 ## Commands
 
 ```bash
@@ -28,27 +65,14 @@ cargo build --release           # produces target/release/{naked,naked-tg}
 Pre-commit must pass `cargo fmt + clippy -D warnings + cargo test`
 for the Rust workspace.
 
-## Code map
+## Push targets
 
-```
-tg_agent/
-├── README.md              # what this project is
-├── OPERATIONS.md          # how it runs on this host (systemd, cron)
-├── AGENTS.md              # ← you are here
-├── .env                   # runtime secrets (gitignored)
-├── .env.shared.example    # full env template (Rust agent + scripts)
-└── naked/                 # ── Rust autonomous agent ──
-    ├── Cargo.toml         # workspace root
-    ├── naked.json         # agent config (models, MCPs, scheduler)
-    ├── crates/
-    │   ├── naked-core/    # tool loop, providers, channels, memory, MCP client
-    │   ├── naked-cli/     # `naked` CLI
-    │   └── naked-tg/      # `naked-tg` Telegram binary (systemd-managed)
-    ├── scripts/           # ops scripts (token health, research tick, …)
-    ├── ops/{systemd,cron} # unit files + cron snippets installed on the host
-    ├── docs/              # architecture + planning docs
-    ├── data/research_runs/# persistent research state (do not nuke)
-    └── results/           # rendered HTML reports (persistent)
+```bash
+# Forgejo (full: code + state)
+git push forgejo main
+
+# GitHub (sanitized: code only, no state/)
+naked/scripts/export_github_sanitized.sh
 ```
 
 ## Conventions

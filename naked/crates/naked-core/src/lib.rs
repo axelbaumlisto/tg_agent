@@ -195,6 +195,8 @@ pub struct ProviderInfo {
 }
 
 /// Top-level facade: manages sessions, tools, and the agent loop.
+type ExtraToolFactories = Vec<Arc<dyn Fn() -> Box<dyn tool::Tool> + Send + Sync>>;
+
 pub struct AgentCore {
     config: Config,
     provider: Arc<dyn Provider>,
@@ -274,6 +276,10 @@ pub struct AgentCore {
     /// built per session — per-host learning persists for the entire
     /// lifetime of the agent process (not just one tool invocation).
     host_policy: Arc<crate::scrape::host_policy::HostPolicy>,
+    /// Extra tools injected by the embedding binary (e.g. naked-tg).
+    /// Appended to every session's tool registry after the built-in
+    /// tools. Factory closures produce fresh instances per session.
+    extra_tool_factories: RwLock<ExtraToolFactories>,
 }
 
 impl AgentCore {
@@ -343,6 +349,7 @@ impl AgentCore {
             serpapi_key_pool,
             cloud_scraper,
             host_policy,
+            extra_tool_factories: RwLock::new(Vec::new()),
         }
     }
 
@@ -372,6 +379,20 @@ impl AgentCore {
     /// pause/resume) trigger immediate rescheduling.
     pub fn set_scheduler_hook(&self, hook: Arc<dyn research::SchedulerHook>) {
         *self.scheduler_hook.write().unwrap() = hook;
+    }
+
+    /// Register an extra tool factory. Each factory is called once per
+    /// session turn to produce a fresh tool instance. Use this to inject
+    /// tools from the embedding binary (e.g. `telegram_attach` from
+    /// `naked-tg`) without coupling naked-core to Telegram.
+    pub async fn register_extra_tool<F>(&self, factory: F)
+    where
+        F: Fn() -> Box<dyn tool::Tool> + Send + Sync + 'static,
+    {
+        self.extra_tool_factories
+            .write()
+            .await
+            .push(Arc::new(factory));
     }
 
     fn scheduler_hook(&self) -> Arc<dyn research::SchedulerHook> {
@@ -1717,6 +1738,11 @@ impl AgentCore {
         let extra = self.session_mcp_servers(session_id, effective).await;
         for server in &extra {
             tools.extend(McpToolWrapper::wrap_all(Arc::clone(server)));
+        }
+
+        // Append extra tools injected by the embedding binary.
+        for factory in self.extra_tool_factories.read().await.iter() {
+            tools.push(factory());
         }
 
         ToolRegistry::new(tools)
