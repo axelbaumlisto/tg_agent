@@ -147,13 +147,18 @@ fn assert_valid_tg_html(html: &str, label: &str) {
 
     for (tag, name) in [
         ("<pre>", "pre"),
-        ("<code>", "code"),
+        ("<code", "code"), // matches <code> and <code class="...">
         ("<b>", "b"),
         ("<i>", "i"),
         ("<s>", "s"),
         ("<blockquote>", "blockquote"),
     ] {
-        let open = html.matches(tag).count();
+        let open = if name == "code" {
+            // Count both <code> and <code class="..."> as openers
+            html.matches("<code>").count() + html.matches("<code ").count()
+        } else {
+            html.matches(tag).count()
+        };
         let close_tag = format!("</{name}>");
         let close = html.matches(close_tag.as_str()).count();
         assert_eq!(
@@ -244,7 +249,7 @@ async fn t200_render_rich_markdown_from_live_model() {
     assert_valid_tg_html(&html, "t200");
     assert!(html.contains("<b>"), "missing <b> (heading or bold)");
     assert!(
-        html.contains("<pre><code>") || html.contains("<code>"),
+        html.contains("<pre><code") || html.contains("<code>"),
         "missing code"
     );
     assert!(html.contains('•') || html.contains("1."), "missing list");
@@ -536,7 +541,7 @@ async fn t210_mixed_code_styles() {
     let md = "Use `inline` code.\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nThen more `inline` here.";
     let html = md_to_tg_html(md);
     assert!(html.contains("<code>inline</code>"));
-    assert!(html.contains("<pre><code>"));
+    assert!(html.contains("<pre><code"));
     assert!(html.contains("println!"));
     assert_valid_tg_html(&html, "t210");
     eprintln!("  PASS t210");
@@ -594,7 +599,7 @@ async fn t214_heading_then_code_no_blank_line() {
     let md = "## Example\n```python\nprint('hello')\n```";
     let html = md_to_tg_html(md);
     assert!(html.contains("<b>Example</b>"));
-    assert!(html.contains("<pre><code>"));
+    assert!(html.contains("<pre><code"));
     assert!(html.contains("print"));
     assert_valid_tg_html(&html, "t214");
     eprintln!("  PASS t214");

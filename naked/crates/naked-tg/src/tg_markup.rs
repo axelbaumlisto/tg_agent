@@ -623,23 +623,23 @@ pub fn split_html(html: &str, max_bytes: usize) -> Vec<String> {
 
         for part in &parts {
             let suffix_len: usize = open_tags.iter().map(|t| close_tag_for(t).len()).sum();
-            let reopener_len: usize = open_tags.iter().map(|t| t.len()).sum();
 
             if !current.is_empty() && current.len() + part.len() + suffix_len > max_bytes {
-                // Flush current chunk with closing tags
+                // Flush current chunk — close currently open tags
                 for tag in open_tags.iter().rev() {
                     current.push_str(&close_tag_for(tag));
                 }
                 chunks.push(current);
-                // Start new chunk with re-opened tags
+                // Start new chunk — reopen currently open tags
+                let reopener_len: usize = open_tags.iter().map(|t| t.len()).sum();
                 current = String::with_capacity(reopener_len + part.len());
                 for tag in &open_tags {
                     current.push_str(tag);
                 }
             }
 
-            track_tags(part, &mut open_tags);
             current.push_str(part);
+            track_tags(part, &mut open_tags);
         }
     }
 
@@ -667,11 +667,26 @@ fn split_long_line(line: &str, max: usize) -> Vec<String> {
         while boundary > start && !line.is_char_boundary(boundary) {
             boundary -= 1;
         }
-        // Try to split at a space
-        if boundary < line.len()
-            && let Some(sp) = line[start..boundary].rfind(' ')
-        {
-            boundary = start + sp + 1;
+        // Try to split at `>` (end of tag) or a space NOT inside a tag.
+        // Never split in the middle of an HTML tag.
+        if boundary < line.len() {
+            let slice = &line[start..boundary];
+            let mut best = None;
+            let mut in_tag = false;
+            for (j, ch) in slice.char_indices() {
+                match ch {
+                    '<' => in_tag = true,
+                    '>' => {
+                        in_tag = false;
+                        best = Some(j + 1); // split right after '>'
+                    }
+                    ' ' if !in_tag => best = Some(j + 1),
+                    _ => {}
+                }
+            }
+            if let Some(b) = best {
+                boundary = start + b;
+            }
         }
         if boundary <= start {
             boundary = end.min(line.len());
@@ -718,13 +733,9 @@ fn track_tags(text: &str, open_tags: &mut Vec<String>) {
             if let Some(name) = tag_name.strip_prefix('/') {
                 // Closing tag — pop matching open
                 if let Some(pos) = open_tags.iter().rposition(|t| {
+                    // Extract tag name: "<code class=\"...\">" → "code"
                     t.strip_prefix('<')
-                        .and_then(|s| s.strip_suffix('>'))
-                        .or_else(|| {
-                            t.strip_prefix('<')
-                                .and_then(|s| s.split('>').next())
-                                .and_then(|s| s.split_whitespace().next())
-                        })
+                        .and_then(|s| s.split(|c: char| c == '>' || c.is_whitespace()).next())
                         .map(|n| n == name)
                         .unwrap_or(false)
                 }) {
@@ -1594,5 +1605,25 @@ code
         let t = truncate_button(&long, 56);
         assert!(t.len() <= 60); // 55 + ellipsis char
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn split_with_language_code_block() {
+        // Build HTML with language-tagged code that will be split across chunks
+        let long_code = "x ".repeat(60);
+        let html = format!(
+            r#"<pre><code class="language-rust">{long_code}</code></pre>
+<pre><code class="language-python">short</code></pre>"#
+        );
+        let chunks = split_html(&html, 80);
+        assert!(chunks.len() > 1, "should split into multiple chunks");
+        for (i, chunk) in chunks.iter().enumerate() {
+            let open_code = chunk.matches("<code>").count() + chunk.matches("<code ").count();
+            let close_code = chunk.matches("</code>").count();
+            assert_eq!(
+                open_code, close_code,
+                "chunk {i} code unbalanced ({open_code} open vs {close_code} close): {chunk}"
+            );
+        }
     }
 }

@@ -1094,6 +1094,10 @@ pub(crate) async fn flush_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_dispatch::{
+        MediaItem, MediaProcessed, NativeImage, StickerFormat, decide_native_route, fmt_duration,
+        looks_like_supported_image,
+    };
 
     // ── render_thinking_block ───────────────────────────────────────────
 
@@ -1384,9 +1388,12 @@ mod tests {
     fn md_table_to_text() {
         let input = "| Name | Score |\n|---|---|\n| Alice | 100 |";
         let result = md_to_tg_html(input);
-        assert!(!result.contains('|'));
+        // Table is rendered in <pre> monospace — outer pipes stripped, inner kept
+        assert!(result.contains("<pre>"));
         assert!(result.contains("Alice"));
         assert!(result.contains("Score"));
+        // Separator row (---|---) should be removed
+        assert!(!result.contains("---"));
     }
 
     #[test]
