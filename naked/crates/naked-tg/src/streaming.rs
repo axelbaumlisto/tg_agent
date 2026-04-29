@@ -68,7 +68,11 @@ impl CompositeView {
     fn render_live(&self) -> String {
         let spin = self.spinner();
         let tokens = if let Some(u) = &self.usage {
-            format!(" · {} in / {} out", u.input_tokens, u.output_tokens)
+            format!(
+                " · ↑{} ↓{}",
+                naked_tg::tg_markup::format_tokens(u.input_tokens),
+                naked_tg::tg_markup::format_tokens(u.output_tokens)
+            )
         } else {
             String::new()
         };
@@ -143,6 +147,51 @@ impl CompositeView {
             }
         }
 
+        // ── Response text preview ────────────────────────────────
+        // Show the agent's response as it generates. Render closed
+        // Markdown blocks as HTML; leave the growing tail as escaped
+        // plain text so an unclosed fence doesn't break the message.
+        if !self.response_text.is_empty() {
+            let header_len: usize = parts.iter().map(|p| p.len() + 1).sum();
+            let budget = MAX_TG_MSG.saturating_sub(header_len + 100);
+            if budget > 50 {
+                use naked_tg::tg_markup::split_stable_unstable;
+
+                let text = &self.response_text;
+                let (stable, unstable) = split_stable_unstable(text);
+
+                let mut preview = String::new();
+
+                // Render stable (closed) blocks as rich HTML
+                if !stable.is_empty() {
+                    let html = md_to_tg_html(stable);
+                    if html.len() <= budget {
+                        preview.push_str(&html);
+                    } else {
+                        // Stable too big — tail-truncate
+                        let tail = truncate_str(&html, budget);
+                        preview.push_str(&tail);
+                    }
+                }
+
+                // Append unstable tail as escaped plain text
+                if !unstable.is_empty() {
+                    let remaining = budget.saturating_sub(preview.len() + 2);
+                    if remaining > 20 {
+                        if !preview.is_empty() {
+                            preview.push('\n');
+                        }
+                        let tail = truncate_str(&escape_html(unstable), remaining);
+                        preview.push_str(&tail);
+                    }
+                }
+
+                if !preview.is_empty() {
+                    parts.push(preview);
+                }
+            }
+        }
+
         parts.join("\n")
     }
 
@@ -157,8 +206,10 @@ impl CompositeView {
                 String::new()
             };
             format!(
-                "{} in / {} out{}",
-                u.input_tokens, u.output_tokens, cost_str
+                "↑{} ↓{}{}",
+                naked_tg::tg_markup::format_tokens(u.input_tokens),
+                naked_tg::tg_markup::format_tokens(u.output_tokens),
+                cost_str
             )
         } else {
             String::new()
@@ -451,7 +502,7 @@ pub(crate) async fn stream_response(
     http_client: &reqwest::Client,
     base_url: &str,
     tg_attach_queue: &naked_tg::tg_attach::AttachmentQueue,
-    rate_limiter: &TgRateLimiter,
+    rate_limiter: &naked_tg::rate_limit::RateLimiter,
 ) {
     let AgentHandle {
         mut events,
@@ -524,7 +575,7 @@ pub(crate) async fn stream_response(
                 Some(e) => Some(e),
                 None => break,
             },
-            _ = tokio::time::sleep(EDIT_INTERVAL) => None,
+            _ = tokio::time::sleep(rate_limiter.gap(chat_key).await) => None,
         };
 
         let mut force_flush = false;
@@ -584,15 +635,8 @@ pub(crate) async fn stream_response(
                     input,
                     permission,
                 } => {
-                    flush_live(
-                        &bot,
-                        ctx.chat_id,
-                        placeholder,
-                        &view,
-                        &mut last_sent,
-                        rate_limiter,
-                    )
-                    .await;
+                    rate_limiter.acquire(chat_key).await;
+                    let _ = flush_live(&bot, ctx.chat_id, placeholder, &view, &mut last_sent).await;
                     dirty = false;
 
                     let auto = channel_map
@@ -729,28 +773,21 @@ pub(crate) async fn stream_response(
             break;
         }
 
-        // Tick spinner + flush periodically
-        if force_flush || last_edit.elapsed() >= EDIT_INTERVAL {
+        // Tick spinner + flush via adaptive rate limiter.
+        let current_gap = rate_limiter.gap(chat_key).await;
+        if force_flush || last_edit.elapsed() >= current_gap {
             view.tick += 1;
             dirty = true;
         }
 
-        let elapsed = last_edit.elapsed();
-        let can_flush = if force_flush {
-            elapsed >= MIN_EDIT_GAP
-        } else {
-            elapsed >= EDIT_INTERVAL
-        };
-        if dirty && can_flush {
-            flush_live(
-                &bot,
-                ctx.chat_id,
-                placeholder,
-                &view,
-                &mut last_sent,
-                rate_limiter,
-            )
-            .await;
+        if dirty && last_edit.elapsed() >= current_gap {
+            rate_limiter.acquire(chat_key).await;
+            let ok = flush_live(&bot, ctx.chat_id, placeholder, &view, &mut last_sent).await;
+            if ok {
+                rate_limiter.report_ok(chat_key).await;
+            } else {
+                rate_limiter.report_429(chat_key, None).await;
+            }
             last_edit = tokio::time::Instant::now();
             dirty = false;
         }
@@ -1017,34 +1054,39 @@ pub(crate) fn parse_retry_after(err: &str) -> Option<u64> {
 
 /// Deduplicated edit: only sends if content changed. Acquires global rate limiter
 /// slot before sending. On rate limit from Telegram, backs off.
+/// Flush the live preview. Returns `true` on success, `false` on 429.
+/// Caller is responsible for rate limiting (acquire before, report after).
 pub(crate) async fn flush_live(
     bot: &Bot,
     chat_id: ChatId,
     msg_id: MessageId,
     view: &CompositeView,
     last_sent: &mut String,
-    rate_limiter: &TgRateLimiter,
-) {
+) -> bool {
     let html = view.render_live();
     let trimmed = truncate_str(&html, MAX_TG_MSG - 50);
     if trimmed == *last_sent {
-        return;
+        return true; // no-op counts as success
     }
-    rate_limiter.acquire().await;
     *last_sent = trimmed.clone();
     let result = bot
         .edit_message_text(chat_id, msg_id, &trimmed)
         .parse_mode(ParseMode::Html)
         .await;
-    if let Err(e) = result {
-        let err_str = e.to_string();
-        if err_str.contains("429") || err_str.contains("Too Many Requests") {
-            let wait = parse_retry_after(&err_str).unwrap_or(5);
-            tracing::debug!("rate-limited on live edit, backing off {wait}s");
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            *last_sent = String::new();
-        } else if !err_str.contains("not modified") {
-            tracing::warn!("edit_message_text error: {e}");
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("429") || err_str.contains("Too Many Requests") {
+                tracing::debug!("rate-limited on live edit");
+                *last_sent = String::new(); // force re-send next time
+                false
+            } else if err_str.contains("not modified") {
+                true // not an error
+            } else {
+                tracing::warn!("edit_message_text error: {e}");
+                true // non-rate-limit error, don't backoff
+            }
         }
     }
 }

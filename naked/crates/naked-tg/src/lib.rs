@@ -16,6 +16,7 @@ pub mod media_helpers;
 pub mod memory_scheduler;
 pub mod model_switch;
 pub mod persona;
+pub mod rate_limit;
 pub mod render;
 pub mod research_html;
 pub mod research_scheduler;

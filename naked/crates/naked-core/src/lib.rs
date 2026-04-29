@@ -693,6 +693,17 @@ impl AgentCore {
             full_prompt.push_str(&research::briefing::short(&self.config.research));
         }
 
+        if channel == "telegram" {
+            full_prompt.push_str("\n\n---\n");
+            full_prompt.push_str(
+                "Telegram bridge is active.\n\
+                 - Messages from the user are forwarded from Telegram.\n\
+                 - To send a file back to the user, use the telegram_attach tool with the absolute file path.\n\
+                 - Mentioning a file path in plain text will NOT deliver it — you must call telegram_attach.\n\
+                 - Keep responses concise — Telegram messages are read on mobile screens.",
+            );
+        }
+
         let metadata = SessionMetadata {
             name: None,
             provider: self.config.default_provider.clone(),
@@ -1163,6 +1174,16 @@ impl AgentCore {
         }
     }
 
+    /// Trigger history compaction for a session. Returns (before, after) message counts.
+    /// No-op if compaction not needed.
+    pub async fn compact_session(&self, session_id: &str) -> Option<(usize, usize)> {
+        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+            session.history.auto_compact()
+        } else {
+            None
+        }
+    }
+
     pub async fn abort(&self, session_id: &str) {
         if let Some(cancel) = self.cancels.read().await.get(session_id) {
             cancel.cancel();
@@ -1447,6 +1468,34 @@ impl AgentCore {
     }
 
     /// Get the currently active provider and model for a session.
+    /// Sum of token usage across all assistant turns in a session.
+    pub async fn session_total_usage(&self, session_id: &str) -> types::TurnUsage {
+        let sessions = self.sessions.read().await;
+        let mut total = types::TurnUsage::default();
+        if let Some(session) = sessions.get(session_id) {
+            for msg in session.history.messages() {
+                if let Some(u) = &msg.usage {
+                    total.input_tokens += u.input_tokens;
+                    total.output_tokens += u.output_tokens;
+                    total.cache_read_tokens += u.cache_read_tokens;
+                    total.cache_write_tokens += u.cache_write_tokens;
+                }
+            }
+        }
+        total
+    }
+
+    /// Returns (estimated_tokens, context_window_tokens) for a session.
+    pub async fn session_context_usage(&self, session_id: &str) -> Option<(usize, u32)> {
+        let sessions = self.sessions.read().await;
+        sessions.get(session_id).map(|s| {
+            (
+                s.history.estimated_tokens(),
+                s.history.context_window_tokens(),
+            )
+        })
+    }
+
     pub async fn session_provider_model(&self, session_id: &str) -> (String, String) {
         let sc = self.load_session_config_pub(session_id);
         let effective = self.config.merge_session(&sc);

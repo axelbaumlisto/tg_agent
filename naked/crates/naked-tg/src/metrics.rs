@@ -32,6 +32,7 @@ static RATE_LIMIT_DELAYED: AtomicU64 = AtomicU64::new(0);
 
 /// Public bump for the rate-limiter. Kept in this module so all counters
 /// stay in one place and the Prometheus renderer can see it directly.
+#[allow(dead_code)] // used by tests + may be re-wired to adaptive limiter
 pub fn record_rate_limit_delay() {
     RATE_LIMIT_DELAYED.fetch_add(1, Ordering::Relaxed);
 }

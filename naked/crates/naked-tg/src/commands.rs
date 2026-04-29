@@ -28,13 +28,26 @@ pub(crate) async fn handle_command(
     let cmd = cmd_word.split('@').next().unwrap_or(cmd_word);
     tracing::debug!(chat_id, cmd, cmd_word, "handle_command");
     match cmd {
-        "/start" => {
-            bot.send_message(
-                ctx.chat_id,
-                "naked agent ready. Send me a message to start.",
-            )
-            .maybe_thread(ctx.thread_id)
-            .await?;
+        "/start" | "/help" => {
+            let help = "\
+<b>naked agent</b> — send any message to start a conversation.
+
+\
+<b>Commands:</b>
+/new — start a new session
+/stop — cancel running task
+/status — session info, usage, cost
+/compact — compact session history
+/model — switch model
+/reasoning — set thinking level
+/sessions — list active sessions
+/metrics — bot performance stats
+/reload — reload config
+/help — show this message";
+            bot.send_message(ctx.chat_id, help)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .maybe_thread(ctx.thread_id)
+                .await?;
         }
         "/attribution" => {
             use std::sync::atomic::Ordering;
@@ -124,7 +137,7 @@ pub(crate) async fn handle_command(
                 send_long_text(bot, ctx, &text).await?;
             }
         }
-        "/abort" => {
+        "/abort" | "/stop" => {
             if let Some(sid) = channel_map.get(chat_id, tid).await {
                 agent.abort(&sid).await;
                 bot.send_message(ctx.chat_id, "Aborted.")
@@ -136,9 +149,126 @@ pub(crate) async fn handle_command(
                     .await?;
             }
         }
+        "/status" => {
+            let sid = match channel_map.get(chat_id, tid).await {
+                Some(s) => s,
+                None => {
+                    bot.send_message(ctx.chat_id, "No active session. Send a message first.")
+                        .maybe_thread(ctx.thread_id)
+                        .await?;
+                    return Ok(true);
+                }
+            };
+            let (prov, model) = agent.session_provider_model(&sid).await;
+            let reasoning = agent.session_reasoning(&sid).await;
+            let usage = agent.session_total_usage(&sid).await;
+            let (_, _, cost) = usage.estimate_cost(&format!("{prov}/{model}"));
+
+            use naked_tg::tg_markup::format_tokens;
+            let mut lines = vec![
+                format!(
+                    "<b>Model:</b> <code>{}/{}</code>",
+                    escape_html_min(&prov),
+                    escape_html_min(&model)
+                ),
+                format!(
+                    "<b>Reasoning:</b> <code>{}</code>",
+                    reasoning.as_deref().unwrap_or("off")
+                ),
+                format!(
+                    "<b>Usage:</b> ↑{} ↓{}",
+                    format_tokens(usage.input_tokens),
+                    format_tokens(usage.output_tokens)
+                ),
+            ];
+            if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
+                lines.push(format!(
+                    "<b>Cache:</b> R{} W{}",
+                    format_tokens(usage.cache_read_tokens),
+                    format_tokens(usage.cache_write_tokens)
+                ));
+            }
+            if let Some((est, cw)) = agent.session_context_usage(&sid).await
+                && cw > 0
+            {
+                let pct = (est as f64 / cw as f64) * 100.0;
+                lines.push(format!(
+                    "<b>Context:</b> {:.1}%/{}",
+                    pct,
+                    format_tokens(cw as u64)
+                ));
+            }
+            if cost > 0.0 {
+                lines.push(format!("<b>Cost:</b> <code>${cost:.4}</code>"));
+            }
+
+            let kb = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+                teloxide::types::InlineKeyboardButton::callback("🤖 Model", "cmd:model"),
+                teloxide::types::InlineKeyboardButton::callback("💭 Reasoning", "cmd:reasoning"),
+            ]]);
+            bot.send_message(ctx.chat_id, lines.join("\n"))
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(kb)
+                .maybe_thread(ctx.thread_id)
+                .await?;
+        }
         "/metrics" => {
             let snap = crate::metrics::snapshot();
-            bot.send_message(ctx.chat_id, snap.render_text())
+            let rl_stats = (*RATE_LIMITER).stats().await;
+            let mut text = snap.render_text();
+            text.push_str(&format!(
+                "\n\nRate limiter:\n\
+                 • active chats: {}\n\
+                 • global calls/min: {}",
+                rl_stats.active_chats, rl_stats.global_calls_last_min,
+            ));
+            for (key, gap_ms, calls) in &rl_stats.chat_gaps {
+                text.push_str(&format!(
+                    "\n  chat {}: gap={}ms, calls/min={}",
+                    key.0, gap_ms, calls
+                ));
+            }
+            bot.send_message(ctx.chat_id, text)
+                .maybe_thread(ctx.thread_id)
+                .await?;
+        }
+        "/compact" => {
+            if let Some(sid) = channel_map.get(chat_id, tid).await {
+                if agent.is_session_active(&sid).await {
+                    bot.send_message(ctx.chat_id, "⏳ Wait for current task to finish.")
+                        .maybe_thread(ctx.thread_id)
+                        .await?;
+                } else {
+                    match agent.compact_session(&sid).await {
+                        Some((before, after)) => {
+                            bot.send_message(
+                                ctx.chat_id,
+                                format!("✅ Compacted: {before} messages → {after}"),
+                            )
+                            .maybe_thread(ctx.thread_id)
+                            .await?;
+                        }
+                        None => {
+                            bot.send_message(ctx.chat_id, "ℹ️ No compaction needed.")
+                                .maybe_thread(ctx.thread_id)
+                                .await?;
+                        }
+                    }
+                }
+            } else {
+                bot.send_message(ctx.chat_id, "No active session.")
+                    .maybe_thread(ctx.thread_id)
+                    .await?;
+            }
+        }
+        "/reload" => {
+            agent.refresh_skills_and_mcp().await;
+            let skills = agent.list_skills();
+            let reply = format!(
+                "✅ Reloaded.\n• skills: {}\n• Use /metrics for more.",
+                skills.len()
+            );
+            bot.send_message(ctx.chat_id, reply)
                 .maybe_thread(ctx.thread_id)
                 .await?;
         }
@@ -216,35 +346,98 @@ pub(crate) async fn handle_command(
                         config.default_model.clone(),
                     )
                 };
-                let models = provider_models(config, &prov);
-                if models.is_empty() {
-                    bot.send_message(ctx.chat_id, "No models for current provider.")
+                // Build model list: scoped (if configured) or all
+                let all_models: Vec<(String, String)> = config
+                    .providers
+                    .iter()
+                    .flat_map(|(p, pc)| pc.models.iter().map(move |m| (p.clone(), m.clone())))
+                    .collect();
+                let scope = &config.model_scope;
+                let display_models = if scope.is_empty() {
+                    // No scope: show current provider's models (legacy behavior)
+                    provider_models(config, &prov)
+                        .into_iter()
+                        .map(|m| (prov.clone(), m))
+                        .collect::<Vec<_>>()
+                } else {
+                    naked_tg::tg_markup::filter_models_by_scope(&all_models, scope)
+                        .into_iter()
+                        .cloned()
+                        .collect()
+                };
+
+                if display_models.is_empty() {
+                    bot.send_message(ctx.chat_id, "No models match scope.")
                         .maybe_thread(ctx.thread_id)
                         .await?;
                 } else {
-                    let rows: Vec<Vec<InlineKeyboardButton>> = models
+                    const PAGE_SIZE: usize = 8;
+                    let page = 0usize;
+                    let total_pages = display_models.len().div_ceil(PAGE_SIZE);
+                    let page_models = &display_models[page * PAGE_SIZE
+                        ..(page * PAGE_SIZE + PAGE_SIZE).min(display_models.len())];
+
+                    let mut rows: Vec<Vec<InlineKeyboardButton>> = page_models
                         .iter()
-                        .map(|m| {
-                            let mark = if *m == current_model { " ✅" } else { "" };
+                        .map(|(p, m)| {
+                            let label = if scope.is_empty() {
+                                m.clone()
+                            } else {
+                                format!("{p}/{m}")
+                            };
+                            let mark = if *m == current_model && *p == prov {
+                                " ✅"
+                            } else {
+                                ""
+                            };
                             vec![InlineKeyboardButton::callback(
-                                format!("{m}{mark}"),
+                                format!("{label}{mark}"),
                                 format!("sm:{m}"),
                             )]
                         })
                         .collect();
+
+                    // Pagination buttons
+                    if total_pages > 1 {
+                        let mut nav = Vec::new();
+                        if page > 0 {
+                            nav.push(InlineKeyboardButton::callback(
+                                "◀ Prev",
+                                format!("mp:{}", page - 1),
+                            ));
+                        }
+                        nav.push(InlineKeyboardButton::callback(
+                            format!("{}/{total_pages}", page + 1),
+                            "mp:noop".to_string(),
+                        ));
+                        if page + 1 < total_pages {
+                            nav.push(InlineKeyboardButton::callback(
+                                "Next ▶",
+                                format!("mp:{}", page + 1),
+                            ));
+                        }
+                        rows.push(nav);
+                    }
+
                     let kb = InlineKeyboardMarkup::new(rows);
-                    bot.send_message(
-                        ctx.chat_id,
+                    let header = if scope.is_empty() {
                         format!(
-                            "Provider: <b>{}</b>\nCurrent: <b>{}</b>\n\nSelect model:",
-                            escape_html(&prov),
-                            escape_html(&current_model)
-                        ),
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(kb)
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                            "Provider: <b>{}</b>\nCurrent: <b>{}</b>",
+                            escape_html_min(&prov),
+                            escape_html_min(&current_model)
+                        )
+                    } else {
+                        format!(
+                            "Current: <b>{}/{}</b>\nShowing scoped models:",
+                            escape_html_min(&prov),
+                            escape_html_min(&current_model)
+                        )
+                    };
+                    bot.send_message(ctx.chat_id, header)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(kb)
+                        .maybe_thread(ctx.thread_id)
+                        .await?;
                 }
             } else {
                 let sid = get_or_create_session(ctx, agent, channel_map, config).await;

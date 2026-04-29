@@ -29,6 +29,10 @@ pub struct Config {
     pub tool_timeout_secs: u64,
     #[serde(default)]
     pub fallback: Vec<String>,
+    /// Glob patterns to filter the /model menu (e.g. `["anthropic/*", "openai/gpt-4*"]`).
+    /// Empty = show all models. Patterns match `provider/model`.
+    #[serde(default)]
+    pub model_scope: Vec<String>,
     #[serde(default)]
     pub system_prompt_path: Option<PathBuf>,
     #[serde(default, rename = "mcpServers")]
@@ -1364,6 +1368,7 @@ impl Default for Config {
             chat_personas: HashMap::new(),
             enforce_model_capabilities: default_enforce_model_capabilities(),
             model_health: crate::model_catalog::ModelHealthConfig::default(),
+            model_scope: Vec::new(),
         }
     }
 }
