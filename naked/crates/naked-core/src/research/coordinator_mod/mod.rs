@@ -2104,4 +2104,44 @@ mod tests {
         // floor, so we refuse to fingerprint it (would over-collapse).
         assert!(fp.is_none());
     }
+
+    #[test]
+    fn fuzzy_fingerprint_none_for_short_title() {
+        let fp = FuzzyFingerprint::new(Some("hi"), Some("100"));
+        assert!(fp.is_none(), "title <10 chars should return None");
+    }
+
+    #[test]
+    fn fuzzy_fingerprint_none_without_title() {
+        let fp = FuzzyFingerprint::new(None, Some("1000"));
+        assert!(fp.is_none());
+    }
+
+    #[test]
+    fn fuzzy_fingerprint_none_without_price() {
+        // Title alone without price — fingerprint still works (price_digits empty)
+        let fp = FuzzyFingerprint::new(Some("beautiful apartment ocean view"), None);
+        assert!(fp.is_some(), "should fingerprint even without price");
+    }
+
+    #[test]
+    fn fuzzy_fingerprint_jaccard_identical() {
+        let a =
+            FuzzyFingerprint::new(Some("luxury condo ocean view phuket"), Some("5000000")).unwrap();
+        let b =
+            FuzzyFingerprint::new(Some("luxury condo ocean view phuket"), Some("5000000")).unwrap();
+        assert!(a.is_duplicate_of(&b));
+    }
+
+    #[test]
+    fn fuzzy_fingerprint_different_price_not_dup() {
+        let a =
+            FuzzyFingerprint::new(Some("luxury condo ocean view phuket"), Some("5000000")).unwrap();
+        let b =
+            FuzzyFingerprint::new(Some("luxury condo ocean view phuket"), Some("9999999")).unwrap();
+        assert!(
+            !a.is_duplicate_of(&b),
+            "different prices should not be duplicates"
+        );
+    }
 }

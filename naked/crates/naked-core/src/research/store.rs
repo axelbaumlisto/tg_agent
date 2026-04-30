@@ -229,8 +229,12 @@ impl FsResearchStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let mut line = serde_json::to_string(value)
-            .map_err(|e| AgentError::Provider(format!("serialize jsonl: {e}")))?;
+        let mut line = serde_json::to_string(value).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                context: "jsonl".into(),
+                source: e.to_string(),
+            })
+        })?;
         line.push('\n');
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -281,8 +285,12 @@ impl SpecStore for FsResearchStore {
                 spec.id
             )));
         }
-        let json = serde_json::to_vec_pretty(spec)
-            .map_err(|e| AgentError::Provider(format!("serialize spec: {e}")))?;
+        let json = serde_json::to_vec_pretty(spec).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                context: "spec".into(),
+                source: e.to_string(),
+            })
+        })?;
         self.atomic_write(&path, &json).await
     }
 
@@ -299,8 +307,12 @@ impl SpecStore for FsResearchStore {
     async fn save_spec(&self, spec: &ResearchSpec) -> Result<()> {
         self.ensure_dir(&spec.id).await?;
         let path = self.dir(&spec.id).join("spec.json");
-        let json = serde_json::to_vec_pretty(spec)
-            .map_err(|e| AgentError::Provider(format!("serialize spec: {e}")))?;
+        let json = serde_json::to_vec_pretty(spec).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                context: "spec".into(),
+                source: e.to_string(),
+            })
+        })?;
         self.atomic_write(&path, &json).await
     }
 
@@ -452,8 +464,12 @@ impl FindingStore for FsResearchStore {
             if let Ok(f) = serde_json::from_str::<Finding>(line)
                 && f.dedup_hash == finding.dedup_hash
             {
-                let new_line = serde_json::to_string(finding)
-                    .map_err(|e| AgentError::Provider(format!("serialize finding: {e}")))?;
+                let new_line = serde_json::to_string(finding).map_err(|e| {
+                    AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                        context: "finding".into(),
+                        source: e.to_string(),
+                    })
+                })?;
                 lines.push(new_line);
                 continue;
             }
@@ -542,8 +558,12 @@ impl RunStore for FsResearchStore {
         self.ensure_dir(id).await?;
         let mut c = cursor.clone();
         c.updated_at = Some(Utc::now());
-        let json = serde_json::to_vec_pretty(&c)
-            .map_err(|e| AgentError::Provider(format!("serialize cursor: {e}")))?;
+        let json = serde_json::to_vec_pretty(&c).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                context: "cursor".into(),
+                source: e.to_string(),
+            })
+        })?;
         let path = self.dir(id).join("cursor.json");
         self.atomic_write(&path, &json).await
     }
@@ -589,8 +609,12 @@ impl InflightStore for FsResearchStore {
     async fn save_inflight(&self, id: &str, infl: &Inflight) -> Result<()> {
         self.ensure_dir(id).await?;
         let path = self.dir(id).join("inflight.json");
-        let json = serde_json::to_vec_pretty(infl)
-            .map_err(|e| AgentError::Provider(format!("serialize inflight: {e}")))?;
+        let json = serde_json::to_vec_pretty(infl).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                context: "inflight".into(),
+                source: e.to_string(),
+            })
+        })?;
         self.atomic_write(&path, &json).await
     }
 

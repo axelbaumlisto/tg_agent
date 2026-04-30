@@ -88,8 +88,12 @@ impl McpServer {
         let resp = self.transport.send_and_recv(&req).await?;
         let value = resp.into_result()?;
 
-        let result: McpToolsListResult = serde_json::from_value(value)
-            .map_err(|e| AgentError::Provider(format!("MCP tools/list parse: {e}")))?;
+        let result: McpToolsListResult = serde_json::from_value(value).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Mcp {
+                context: "tools/list parse".into(),
+                source: e.to_string(),
+            })
+        })?;
 
         Ok(result.tools)
     }
@@ -119,8 +123,12 @@ impl McpServer {
         let resp = self.transport.send_and_recv(&req).await?;
         let value = resp.into_result()?;
 
-        let result: McpToolCallResult = serde_json::from_value(value)
-            .map_err(|e| AgentError::Provider(format!("MCP tools/call parse: {e}")))?;
+        let result: McpToolCallResult = serde_json::from_value(value).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Mcp {
+                context: "tools/call parse".into(),
+                source: e.to_string(),
+            })
+        })?;
 
         Ok(result)
     }

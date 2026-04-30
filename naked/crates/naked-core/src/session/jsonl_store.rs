@@ -93,10 +93,14 @@ impl SessionStore for JsonlSessionStore {
             "fork": session.fork_info,
             "system_prompt": session.history.system_prompt(),
         });
-        lines.push(
-            serde_json::to_string(&meta)
-                .map_err(|e| crate::error::AgentError::Provider(format!("serialize meta: {e}")))?,
-        );
+        lines.push(serde_json::to_string(&meta).map_err(|e| {
+            crate::error::AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::Serialize {
+                    context: "meta".into(),
+                    source: e.to_string(),
+                },
+            )
+        })?);
 
         let artifacts_dir = self.artifacts_dir(&session.id);
         for msg in session.history.messages() {
@@ -106,7 +110,12 @@ impl SessionStore for JsonlSessionStore {
                 "message": externalized,
             });
             lines.push(serde_json::to_string(&record).map_err(|e| {
-                crate::error::AgentError::Provider(format!("serialize message: {e}"))
+                crate::error::AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Serialize {
+                        context: "message".into(),
+                        source: e.to_string(),
+                    },
+                )
             })?);
         }
 

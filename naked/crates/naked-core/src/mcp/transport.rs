@@ -85,8 +85,12 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn send(&self, req: &JsonRpcRequest) -> Result<()> {
-        let mut line = serde_json::to_string(req)
-            .map_err(|e| AgentError::Provider(format!("MCP serialize: {e}")))?;
+        let mut line = serde_json::to_string(req).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Mcp {
+                context: "serialize".into(),
+                source: e.to_string(),
+            })
+        })?;
         line.push('\n');
 
         let mut stdin = self.stdin.lock().await;
@@ -119,8 +123,12 @@ impl McpTransport for StdioTransport {
             return Err(AgentError::Provider("MCP: empty response".into()));
         }
 
-        let resp: JsonRpcResponse = serde_json::from_str(line.trim())
-            .map_err(|e| AgentError::Provider(format!("MCP parse response: {e}")))?;
+        let resp: JsonRpcResponse = serde_json::from_str(line.trim()).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Mcp {
+                context: "parse response".into(),
+                source: e.to_string(),
+            })
+        })?;
 
         Ok(resp)
     }
