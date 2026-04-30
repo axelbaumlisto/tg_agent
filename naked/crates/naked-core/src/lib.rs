@@ -204,6 +204,25 @@ pub struct ProviderInfo {
 /// Top-level facade: manages sessions, tools, and the agent loop.
 type ExtraToolFactories = Vec<Arc<dyn Fn() -> Box<dyn tool::Tool> + Send + Sync>>;
 
+/// Grouped research subsystem state.
+pub(crate) struct ResearchState {
+    pub store: Arc<dyn ResearchStore>,
+    pub context: ResearchContext,
+    pub run_semaphore: Arc<tokio::sync::Semaphore>,
+    pub run_events: research::RunEventRegistry,
+    pub cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    pub scheduler_hook: std::sync::RwLock<Arc<dyn research::SchedulerHook>>,
+}
+
+/// Grouped search/scrape key pools.
+pub(crate) struct SearchState {
+    pub exa_key_pool: Arc<KeyPool>,
+    pub tavily_key_pool: Arc<KeyPool>,
+    pub serpapi_key_pool: Arc<KeyPool>,
+    pub cloud_scraper: Option<Arc<crate::scrape::multi::MultiCloudScraper>>,
+    pub host_policy: Arc<crate::scrape::host_policy::HostPolicy>,
+}
+
 pub struct AgentCore {
     config: Config,
     provider: Arc<dyn Provider>,
@@ -220,28 +239,11 @@ pub struct AgentCore {
     /// channel before a turn runs and consumed by the memory tool to implement
     /// `scope=user` without guessing.
     session_senders: RwLock<HashMap<String, String>>,
-    /// Shared research storage. Always present — `perfection-plan-v5` treats
-    /// disabled research as "no `/research *` commands accepted" rather than
-    /// a separate data path, so the store is cheap to keep live.
-    research_store: Arc<dyn ResearchStore>,
-    /// Ambient "which research is this turn driving?" handle, consumed by the
-    /// research tools. The research coordinator sets it before each run and
-    /// clears it after; outside of a research run it stays `None`.
-    research_context: ResearchContext,
+    research: ResearchState,
     /// Weak self-reference so orchestration tools (e.g. `research_launch`) can
     /// upgrade to `Arc<Self>` and call methods like `run_research`. Set once via
     /// `init_self_ref()` after Arc construction.
     self_ref: std::sync::RwLock<Option<Weak<AgentCore>>>,
-    /// In-process scheduler hook. Defaults to a no-op so the CLI / tests don't
-    /// need an explicit setup; the TG bot installs a real implementation via
-    /// [`AgentCore::set_scheduler_hook`] right after `init_self_ref()`.
-    scheduler_hook: std::sync::RwLock<Arc<dyn research::SchedulerHook>>,
-    /// Process-wide concurrency cap for research runs. Every entry point
-    /// (`run_research`, `run_research_verified`, the LLM `research_launch`
-    /// tool, the in-process scheduler) must acquire a permit before kicking
-    /// off a coordinator. Defaults to 1 permit so we never reach the
-    /// Playwright "Browser is already in use" race.
-    research_run_semaphore: Arc<tokio::sync::Semaphore>,
     /// Catalog of agent roles loaded from `Config::agent_dirs` at
     /// startup. Cheap to clone (`Arc` inside) so callers can hand it
     /// to coordinators / CLI subcommands without lock contention.
@@ -253,36 +255,7 @@ pub struct AgentCore {
     /// process-global, and its durable jsonl survives restarts.
     /// Constructed in [`AgentCore::new`] from `config.model_health`.
     model_health: Arc<crate::model_catalog::ModelHealth>,
-    /// Per-run event registry (waterfall) for the research subsystem.
-    /// Shared with every coordinator spawned from this core so the
-    /// TG heartbeat task can poll by `run_id` without reaching into
-    /// coordinator internals.
-    research_run_events: research::RunEventRegistry,
-    /// Live cancellation tokens keyed by research `run_id`. Populated
-    /// when [`Self::run_research*`] spawns a coordinator and cleared
-    /// on completion. The TG `r:stop:<run_id>` callback looks up the
-    /// token here and signals it — callers who kicked the run off
-    /// via `tokio::spawn` still own the `JoinHandle`, but the
-    /// cooperative cancel path works without them.
-    research_cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    /// Per-provider search/scrape API key pools. Built once at startup
-    /// from `~/.naked/secrets/search_pool.alive.json` (primary) plus
-    /// CSV env-vars (fallback) and cached for the lifetime of the
-    /// process. `WebSearchTool::new` borrows them on every turn, so
-    /// rebuilding the tool registry stays cheap.
-    exa_key_pool: Arc<KeyPool>,
-    tavily_key_pool: Arc<KeyPool>,
-    serpapi_key_pool: Arc<KeyPool>,
-    /// Cloud-scrape cascade injected into [`WebFetchTool`] as Tier 3.5.
-    /// Built once at startup from the same key pools as search; `None`
-    /// when no ScrapingBee or Firecrawl keys are available so the
-    /// existing 4-tier cascade remains untouched on hosts without them.
-    cloud_scraper: Option<Arc<crate::scrape::multi::MultiCloudScraper>>,
-    /// Adaptive per-host fetch-tier selector. Lives on `AgentCore` so a
-    /// single shared instance is reused across every `WebFetchTool`
-    /// built per session — per-host learning persists for the entire
-    /// lifetime of the agent process (not just one tool invocation).
-    host_policy: Arc<crate::scrape::host_policy::HostPolicy>,
+    search: SearchState,
     /// Extra tools injected by the embedding binary (e.g. naked-tg).
     /// Appended to every session's tool registry after the built-in
     /// tools. Factory closures produce fresh instances per session.
@@ -299,7 +272,6 @@ impl AgentCore {
             .unwrap_or_else(research::store::research_root);
         let research_store: Arc<dyn ResearchStore> = Arc::new(FsResearchStore::new(research_root));
         let max_concurrent = config.research.max_concurrent_runs.max(1);
-        let research_run_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
         // Load agent roles from disk. A failure here is a hard config
         // error — we'd rather refuse to start than silently run with
@@ -342,20 +314,24 @@ impl AgentCore {
             cancels: RwLock::new(HashMap::new()),
             agent_registry: AgentRegistry::new(),
             session_senders: RwLock::new(HashMap::new()),
-            research_store,
-            research_context,
             self_ref: std::sync::RwLock::new(None),
-            scheduler_hook: std::sync::RwLock::new(research::noop_hook()),
-            research_run_semaphore,
             agent_store,
             model_health,
-            research_run_events,
-            research_cancels: Arc::new(RwLock::new(HashMap::new())),
-            exa_key_pool,
-            tavily_key_pool,
-            serpapi_key_pool,
-            cloud_scraper,
-            host_policy,
+            research: ResearchState {
+                store: research_store,
+                context: ResearchContext::new(),
+                scheduler_hook: std::sync::RwLock::new(research::noop_hook()),
+                run_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+                run_events: research::RunEventRegistry::new(),
+                cancels: Arc::new(RwLock::new(HashMap::new())),
+            },
+            search: SearchState {
+                exa_key_pool,
+                tavily_key_pool,
+                serpapi_key_pool,
+                cloud_scraper,
+                host_policy,
+            },
             extra_tool_factories: RwLock::new(Vec::new()),
         }
     }
@@ -378,14 +354,14 @@ impl AgentCore {
     /// internal callers may need to inspect it (e.g. `available_permits()` for
     /// dispatch planning) without going through `run_research*`.
     pub fn research_run_permits(&self) -> Arc<tokio::sync::Semaphore> {
-        self.research_run_semaphore.clone()
+        self.research.run_semaphore.clone()
     }
 
     /// Install an in-process scheduler hook. The TG bot calls this once at
     /// startup so spec mutations (`research_create`, `research_update_spec`,
     /// pause/resume) trigger immediate rescheduling.
     pub fn set_scheduler_hook(&self, hook: Arc<dyn research::SchedulerHook>) {
-        *self.scheduler_hook.write().unwrap() = hook;
+        *self.research.scheduler_hook.write().unwrap() = hook;
     }
 
     /// Register an extra tool factory. Each factory is called once per
@@ -403,7 +379,7 @@ impl AgentCore {
     }
 
     fn scheduler_hook(&self) -> Arc<dyn research::SchedulerHook> {
-        self.scheduler_hook.read().unwrap().clone()
+        self.research.scheduler_hook.read().unwrap().clone()
     }
 
     /// Snapshot the scheduler's in-memory failure tracker for `spec_id`.
@@ -425,12 +401,12 @@ impl AgentCore {
     /// twist.
     pub async fn reset_research_failures(&self, id: &str) -> Result<()> {
         self.scheduler_hook().reset_failures(id).await;
-        let mut spec = self.research_store.load_spec(id).await?;
+        let mut spec = self.research.store.load_spec(id).await?;
         let needs_save = spec.paused || spec.pause_reason.is_some();
         spec.paused = false;
         spec.pause_reason = None;
         if needs_save {
-            self.research_store.save_spec(&spec).await?;
+            self.research.store.save_spec(&spec).await?;
         }
         self.scheduler_hook()
             .notify(research::SchedulerEvent::SpecUpdated {
@@ -455,7 +431,7 @@ impl AgentCore {
     /// callers still need to check `config.research.enabled` before offering
     /// `/research *` surfaces to the user.
     pub fn research_store(&self) -> Arc<dyn ResearchStore> {
-        self.research_store.clone()
+        self.research.store.clone()
     }
 
     /// Expose the underlying provider so out-of-loop consumers (e.g. the
@@ -605,11 +581,12 @@ impl research::AgentRunner for AgentCoreResearchRunner {
         //    Reset the per-run save counter so the new clear-target guard
         //    (`research_set_target`) starts at 0 for this run rather than
         //    inheriting a count from whatever happened previously.
-        self.core.research_context.set_id(Some(spec.id.clone()));
+        self.core.research.context.set_id(Some(spec.id.clone()));
         self.core
-            .research_context
+            .research
+            .context
             .set_run_id(Some(run_id.to_string()));
-        self.core.research_context.reset_saves();
+        self.core.research.context.reset_saves();
 
         let handle = self.core.send_prompt(&session_id, prompt).await?;
 
@@ -648,9 +625,9 @@ impl research::AgentRunner for AgentCoreResearchRunner {
             self.core.abort(&sid).await;
         }
 
-        self.core.research_context.set_id(None);
-        self.core.research_context.set_run_id(None);
-        self.core.research_context.reset_saves();
+        self.core.research.context.set_id(None);
+        self.core.research.context.set_run_id(None);
+        self.core.research.context.reset_saves();
     }
 }
 

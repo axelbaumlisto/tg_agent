@@ -1083,13 +1083,13 @@ Keep each section concise. Preserve exact paths and identifiers.";
             Box::new(AgentStatusTool::new(self.agent_registry.clone())),
             Box::new(AgentStopTool::new(self.agent_registry.clone())),
             Box::new(WebSearchTool::new(
-                self.exa_key_pool.clone(),
-                self.tavily_key_pool.clone(),
-                self.serpapi_key_pool.clone(),
+                self.search.exa_key_pool.clone(),
+                self.search.tavily_key_pool.clone(),
+                self.search.serpapi_key_pool.clone(),
             )),
             Box::new(WebFetchTool::with_components(
-                self.cloud_scraper.clone(),
-                self.host_policy.clone(),
+                self.search.cloud_scraper.clone(),
+                self.search.host_policy.clone(),
             )),
             Box::new(WebFetchTlsTool::new()),
             Box::new(WebFetchWaybackTool::new()),
@@ -1107,43 +1107,43 @@ Keep each section concise. Preserve exact paths and identifiers.";
         // the turn and clears it after).
         if self.config.research.enabled {
             tools.push(Box::new(ResearchSaveTool::new(
-                self.research_store.clone(),
-                self.research_context.clone(),
+                self.research.store.clone(),
+                self.research.context.clone(),
                 self.config.research.gatekeeper.clone(),
             )));
             tools.push(Box::new(ResearchListTool::new(
-                self.research_store.clone(),
-                self.research_context.clone(),
+                self.research.store.clone(),
+                self.research.context.clone(),
             )));
             tools.push(Box::new(ResearchSaveCursorTool::new(
-                self.research_store.clone(),
-                self.research_context.clone(),
+                self.research.store.clone(),
+                self.research.context.clone(),
             )));
             tools.push(Box::new(ResearchStatusTool::new(
-                self.research_store.clone(),
+                self.research.store.clone(),
             )));
 
             // High-level orchestration tools (usable from any chat turn)
             tools.push(Box::new(ResearchCreateTool::new(
-                self.research_store.clone(),
+                self.research.store.clone(),
                 self.config.research.clone(),
             )));
             tools.push(Box::new(ResearchListSpecsTool::new(
-                self.research_store.clone(),
+                self.research.store.clone(),
                 self.config.research.clone(),
             )));
             tools.push(Box::new(ResearchMetricsTool::new(
-                self.research_store.clone(),
+                self.research.store.clone(),
             )));
             tools.push(Box::new(ResearchHelpTool::new(
                 self.config.research.clone(),
             )));
             tools.push(Box::new(ResearchFindingsTool::new(
-                self.research_store.clone(),
+                self.research.store.clone(),
             )));
             tools.push(Box::new(ResearchSetTargetTool::new(
-                self.research_store.clone(),
-                self.research_context.clone(),
+                self.research.store.clone(),
+                self.research.context.clone(),
             )));
             if let Some(weak) = self.self_ref.read().unwrap().clone() {
                 tools.push(Box::new(ResearchLaunchTool::new(weak.clone())));

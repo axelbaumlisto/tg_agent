@@ -41,7 +41,7 @@ impl AgentCore {
             paused: false,
             pause_reason: None,
         };
-        self.research_store.create_spec(&spec).await?;
+        self.research.store.create_spec(&spec).await?;
         self.scheduler_hook()
             .notify(research::SchedulerEvent::SpecCreated {
                 spec_id: spec.id.clone(),
@@ -51,15 +51,15 @@ impl AgentCore {
     }
 
     pub async fn list_research(&self) -> Result<Vec<ResearchSpec>> {
-        self.research_store.list_specs().await
+        self.research.store.list_specs().await
     }
 
     pub async fn load_research(&self, id: &str) -> Result<ResearchSpec> {
-        self.research_store.load_spec(id).await
+        self.research.store.load_spec(id).await
     }
 
     pub async fn delete_research(&self, id: &str) -> Result<()> {
-        self.research_store.delete_spec(id).await?;
+        self.research.store.delete_spec(id).await?;
         self.scheduler_hook()
             .notify(research::SchedulerEvent::SpecRemoved {
                 spec_id: id.to_string(),
@@ -87,10 +87,10 @@ impl AgentCore {
         paused: bool,
         reason: Option<String>,
     ) -> Result<()> {
-        let mut spec = self.research_store.load_spec(id).await?;
+        let mut spec = self.research.store.load_spec(id).await?;
         spec.paused = paused;
         spec.pause_reason = if paused { reason } else { None };
-        self.research_store.save_spec(&spec).await?;
+        self.research.store.save_spec(&spec).await?;
         self.scheduler_hook()
             .notify(research::SchedulerEvent::SpecUpdated {
                 spec_id: id.to_string(),
@@ -119,13 +119,14 @@ impl AgentCore {
             return Err(AgentError::Config("question must not be empty".into()));
         }
 
-        let spec = self.research_store.load_spec(id).await?;
+        let spec = self.research.store.load_spec(id).await?;
         // Cap context: 30 most recent findings keeps us safely under typical
         // 16k token windows even for very long excerpts.
         const MAX_FINDINGS: usize = 30;
         const EXCERPT_BUDGET: usize = 600;
         let findings = self
-            .research_store
+            .research
+            .store
             .list_findings(id, Some(MAX_FINDINGS))
             .await?;
 
@@ -227,9 +228,9 @@ impl AgentCore {
     ///
     /// Returns the post-update spec for echoing back to LLM/UI callers.
     pub async fn update_research(&self, id: &str, patch: ResearchPatch) -> Result<ResearchSpec> {
-        let mut spec = self.research_store.load_spec(id).await?;
+        let mut spec = self.research.store.load_spec(id).await?;
         apply_research_patch(&mut spec, patch);
-        self.research_store.save_spec(&spec).await?;
+        self.research.store.save_spec(&spec).await?;
         tracing::info!(
             spec_id = %spec.id,
             topic = %spec.topic,
@@ -266,13 +267,13 @@ impl AgentCore {
         if !self.config.research.enabled {
             return Err(AgentError::Config("research subsystem is disabled".into()));
         }
-        let _permit = acquire_research_permit(&self.research_run_semaphore, id).await?;
+        let _permit = acquire_research_permit(&self.research.run_semaphore, id).await?;
         // Register the cancel token so the TG "Stop & clarify" callback
         // can signal it by spec_id. Cleared on exit — every path below
         // goes through the guard's `drop`.
         let _guard = ResearchCancelGuard::install(
-            self.research_cancels.clone(),
-            self.research_run_events.clone(),
+            self.research.cancels.clone(),
+            self.research.run_events.clone(),
             id,
             cancel.clone(),
         )
@@ -316,10 +317,10 @@ impl AgentCore {
         if !self.config.research.enabled {
             return Err(AgentError::Config("research subsystem is disabled".into()));
         }
-        let _permit = acquire_research_permit(&self.research_run_semaphore, id).await?;
+        let _permit = acquire_research_permit(&self.research.run_semaphore, id).await?;
         let _guard = ResearchCancelGuard::install(
-            self.research_cancels.clone(),
-            self.research_run_events.clone(),
+            self.research.cancels.clone(),
+            self.research.run_events.clone(),
             id,
             cancel.clone(),
         )
@@ -354,7 +355,7 @@ impl AgentCore {
         verified: Option<&VerifiedRunReport>,
     ) -> Result<()> {
         write_research_memory_link_for(
-            self.research_store.as_ref(),
+            self.research.store.as_ref(),
             &self.config.workspace,
             spec_id,
             run_id,
@@ -377,11 +378,11 @@ impl AgentCore {
             provider_capabilities: self.config.providers.clone(),
             enforce_model_capabilities: self.config.enforce_model_capabilities,
             model_health: Some(self.model_health.clone()),
-            run_events: Some(self.research_run_events.clone()),
+            run_events: Some(self.research.run_events.clone()),
         };
         let runner: Arc<dyn research::AgentRunner> =
             Arc::new(AgentCoreResearchRunner::new(self.clone()));
-        ResearchCoordinator::new(self.research_store.clone(), runner, coord_cfg)
+        ResearchCoordinator::new(self.research.store.clone(), runner, coord_cfg)
     }
 
     /// Shared waterfall registry. The TG heartbeat task polls this
@@ -390,7 +391,7 @@ impl AgentCore {
     /// future telemetry (metrics, CLI `/research tail`) can tap the
     /// same source of truth.
     pub fn research_run_events(&self) -> research::RunEventRegistry {
-        self.research_run_events.clone()
+        self.research.run_events.clone()
     }
 
     /// Snapshot the latest `limit` events for `run_id`. Empty when
@@ -401,7 +402,7 @@ impl AgentCore {
         run_id: &str,
         limit: usize,
     ) -> Vec<research::RunEvent> {
-        self.research_run_events.snapshot(run_id, limit).await
+        self.research.run_events.snapshot(run_id, limit).await
     }
 
     /// Stop a live research run cooperatively. Looks up the
@@ -413,7 +414,7 @@ impl AgentCore {
     /// after cleanup), which the caller typically surfaces as a
     /// benign "run already done".
     pub async fn cancel_research_run(&self, run_id: &str) -> bool {
-        if let Some(token) = self.research_cancels.read().await.get(run_id).cloned() {
+        if let Some(token) = self.research.cancels.read().await.get(run_id).cloned() {
             token.cancel();
             true
         } else {
