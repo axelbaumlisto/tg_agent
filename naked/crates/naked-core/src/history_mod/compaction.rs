@@ -339,3 +339,85 @@ pub(crate) fn safe_truncate(s: &str, max_chars: usize) -> String {
         .unwrap_or(s.len());
     format!("{}...", &s[..byte_end])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_file_candidates_finds_paths() {
+        let text = "I read /home/user/file.rs and ./src/main.rs today";
+        let files = extract_file_candidates(text);
+        assert!(files.contains(&"/home/user/file.rs".to_string()));
+        // ./src/main.rs: leading dot stripped by trim_matches
+        assert!(files.iter().any(|f| f.contains("src/main.rs")));
+    }
+
+    #[test]
+    fn extract_file_candidates_empty() {
+        assert!(extract_file_candidates("no files here").is_empty());
+    }
+
+    #[test]
+    fn merge_summaries_fresh() {
+        let result = merge_summaries(None, "## Goal\nBuild something");
+        assert!(result.contains("## Goal"));
+        assert!(result.contains("Build something"));
+    }
+
+    #[test]
+    fn merge_summaries_update() {
+        let existing = "## Goal\nOld goal\n## Progress\n### Done\n- [x] step1";
+        let new_info = "## Goal\nNew goal\n## Progress\n### Done\n- [x] step1\n- [x] step2";
+        let result = merge_summaries(Some(existing), new_info);
+        assert!(
+            result.contains("step2"),
+            "should include new info: {result}"
+        );
+    }
+
+    #[test]
+    fn safe_truncate_short() {
+        assert_eq!(safe_truncate("hello", 100), "hello");
+    }
+
+    #[test]
+    fn safe_truncate_cuts() {
+        let result = safe_truncate("hello world", 5);
+        assert!(result.len() <= 10); // 5 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn safe_truncate_multibyte() {
+        let result = safe_truncate("Привет мир", 3);
+        assert!(result.ends_with("..."));
+        // Should not panic on multi-byte boundary
+    }
+
+    #[test]
+    fn extract_highlights_finds_done() {
+        let summary = "## Progress\n### Done\n- [x] Built the thing\n- [x] Tested it\n### In Progress\n- [ ] Deploy";
+        let highlights = extract_highlights(summary);
+        assert!(highlights.iter().any(|h| h.contains("Built")));
+    }
+
+    #[test]
+    fn extract_timeline_no_panic() {
+        // extract_timeline looks for "- Key timeline:" in formatted output
+        let summary = "## Goal\nTest\n## Progress\n### Done\n- [x] Step A";
+        let _ = extract_timeline(summary); // just ensure no panic
+    }
+
+    #[test]
+    fn format_summary_wraps() {
+        let result = format_summary("test summary");
+        assert!(result.contains("<summary>") || result.contains("test summary"));
+    }
+
+    #[test]
+    fn build_continuation_has_summary() {
+        let msg = build_continuation_message("my summary", false);
+        assert!(msg.contains("my summary"));
+    }
+}

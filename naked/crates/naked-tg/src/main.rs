@@ -987,9 +987,7 @@ fn extract_reply_context(msg: &Message) -> Option<String> {
 
 // ── Media (extracted to media_dispatch.rs) ───────────────────────────────────
 mod media_dispatch;
-use media_dispatch::{
-    extract_media_items, format_age, format_interval, process_media_items, send_text,
-};
+use media_dispatch::{extract_media_items, process_media_items, send_text};
 
 // ── Message handler (extracted to message_handler.rs) ────────────────────────
 mod message_handler;
@@ -1041,9 +1039,9 @@ pub(crate) static RATE_LIMITER: LazyLock<naked_tg::rate_limit::RateLimiter> =
     LazyLock::new(naked_tg::rate_limit::RateLimiter::new);
 
 mod commands;
+mod fmt_utils;
 use commands::{
-    drop_slash_for_persona, escape_html_min, get_or_create_session, handle_command,
-    launch_research_run_with_ui,
+    drop_slash_for_persona, get_or_create_session, handle_command, launch_research_run_with_ui,
 };
 
 // ── Formatting helpers ──────────────────────────────────────────────────────

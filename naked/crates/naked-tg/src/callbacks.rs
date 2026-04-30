@@ -2,6 +2,7 @@
 //!
 //! Extracted from main.rs.
 
+use super::fmt_utils::escape_html_min;
 use super::*;
 
 // ── Callback handler (permissions) ──────────────────────────────────────────

@@ -191,36 +191,6 @@ pub(crate) fn fmt_duration(secs: u64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
-/// Render a polling interval (in seconds) as something a human-readable
-/// label suitable for `/research ls` ("every 30m", "every 2h", "every 1d").
-pub(crate) fn format_interval(secs: u64) -> String {
-    if secs == 0 {
-        return "manual".to_string();
-    }
-    if secs.is_multiple_of(86_400) {
-        format!("every {}d", secs / 86_400)
-    } else if secs.is_multiple_of(3_600) {
-        format!("every {}h", secs / 3_600)
-    } else if secs.is_multiple_of(60) {
-        format!("every {}m", secs / 60)
-    } else {
-        format!("every {secs}s")
-    }
-}
-
-/// Render a "time since" duration in seconds with one unit of precision.
-pub(crate) fn format_age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3_600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3_600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
-
 /// Outcome of processing a batch of Telegram media items: the text block to
 /// prepend to the user prompt, plus any **raw** image bytes that should be
 /// passed natively to the main model as image content blocks.
@@ -686,39 +656,6 @@ mod tests {
         assert_eq!(fmt_duration(99 * 60 + 59), "99:59");
         assert_eq!(fmt_duration(100 * 60), "99:59"); // capped
         assert_eq!(fmt_duration(u64::MAX), "99:59"); // capped
-    }
-
-    // ── format_interval ─────────────────────────────────────────────
-
-    #[test]
-    fn format_interval_units() {
-        assert_eq!(format_interval(0), "manual");
-        assert_eq!(format_interval(30), "every 30s");
-        assert_eq!(format_interval(60), "every 1m");
-        assert_eq!(format_interval(1800), "every 30m");
-        assert_eq!(format_interval(3600), "every 1h");
-        assert_eq!(format_interval(86400), "every 1d");
-        assert_eq!(format_interval(172800), "every 2d");
-    }
-
-    #[test]
-    fn format_interval_non_round() {
-        assert_eq!(format_interval(90), "every 90s"); // not a clean minute
-        assert_eq!(format_interval(5400), "every 90m"); // 1.5h → minutes
-    }
-
-    // ── format_age ──────────────────────────────────────────────────
-
-    #[test]
-    fn format_age_units() {
-        assert_eq!(format_age(0), "0s");
-        assert_eq!(format_age(59), "59s");
-        assert_eq!(format_age(60), "1m");
-        assert_eq!(format_age(3599), "59m");
-        assert_eq!(format_age(3600), "1h");
-        assert_eq!(format_age(86399), "23h");
-        assert_eq!(format_age(86400), "1d");
-        assert_eq!(format_age(864000), "10d");
     }
 
     // ── looks_like_supported_image ──────────────────────────────────

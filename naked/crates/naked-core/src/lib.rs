@@ -25,6 +25,9 @@ pub mod skill;
 pub mod tool;
 pub mod types;
 
+#[cfg(test)]
+pub mod test_support;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};

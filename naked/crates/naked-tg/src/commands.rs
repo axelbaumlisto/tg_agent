@@ -3,6 +3,7 @@
 //! All functions are `pub(crate)` so main.rs can call them.
 //! Uses `use super::*` to access types and statics from main.
 
+use super::fmt_utils::{escape_html_min, format_age, format_interval, safe_slug};
 use super::*;
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -928,42 +929,6 @@ pub(crate) async fn finalize_research_ui(
     {
         tracing::warn!(spec_id, ?e, "send_document(report.html) failed");
     }
-}
-
-/// Filename-safe slug for use in `research-<slug>.html`. Keeps ASCII
-/// alnum + dash/underscore; everything else collapses to `-`.
-pub(crate) fn safe_slug(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_dash = false;
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    if out.is_empty() {
-        return "run".to_string();
-    }
-    out
-}
-
-/// Minimal HTML escaper for summary messages. Not a security boundary —
-/// user-provided fields here are topic / ids / error strings and the
-/// Telegram parser only cares about `<`, `>`, `&`.
-pub(crate) fn escape_html_min(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// `/research ...` — operator surface in Telegram for the research subsystem.
