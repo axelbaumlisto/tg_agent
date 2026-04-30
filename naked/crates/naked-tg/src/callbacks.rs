@@ -387,6 +387,110 @@ pub(crate) async fn handle_callback(
             }
             bot.answer_callback_query(q.id.clone()).await?;
         }
+        // Model page navigation: mp:<page>
+        "mp" if parts.len() >= 2 => {
+            let page_str = parts[1];
+            if page_str == "noop" {
+                bot.answer_callback_query(q.id.clone()).await?;
+            } else if let Ok(page) = page_str.parse::<usize>() {
+                let cb_ctx = ChatCtx::from_callback(&q);
+                let sid = get_or_create_session(cb_ctx, &agent, &channel_map, &config).await;
+                let (prov, current_model) = agent.session_provider_model(&sid).await;
+                // Re-render model list at requested page
+                if let Some(msg) = &q.message
+                    && let Some(regular) = msg.regular_message()
+                {
+                    let models = agent.provider_models(&prov).await;
+                    let scope: Vec<String> =
+                        config.model_scope.iter().map(|s| s.to_string()).collect();
+                    let filtered = naked_tg::tg_markup::filter_models_by_scope(&models, &scope);
+                    let page_size = 8;
+                    let total_pages = filtered.len().div_ceil(page_size);
+                    let page = page.min(total_pages.saturating_sub(1));
+                    let page_items = &filtered
+                        [page * page_size..(page * page_size + page_size).min(filtered.len())];
+
+                    let mut rows: Vec<Vec<InlineKeyboardButton>> = page_items
+                        .iter()
+                        .map(|(p, m)| {
+                            let label = if let Some(alias) =
+                                config.providers.get(&prov).and_then(|pc| {
+                                    pc.model_aliases
+                                        .iter()
+                                        .find(|(_, v)| {
+                                            v.as_str() == format!("{p}/{m}").as_str()
+                                                || v.as_str() == m.as_str()
+                                        })
+                                        .map(|(k, _)| k.clone())
+                                }) {
+                                alias
+                            } else {
+                                m.clone()
+                            };
+                            let mark = if *m == current_model {
+                                format!("{label} ✅")
+                            } else {
+                                label
+                            };
+                            vec![InlineKeyboardButton::callback(
+                                naked_tg::tg_markup::truncate_button(&mark, 56),
+                                format!("sm:{m}"),
+                            )]
+                        })
+                        .collect();
+
+                    // Aliases on separate row
+                    if let Some(pc) = config.providers.get(&prov) {
+                        for alias in pc.model_aliases.keys() {
+                            if !page_items.iter().any(|(_, m)| m == alias) {
+                                // Only show aliases on first page
+                                if page == 0 {
+                                    rows.push(vec![InlineKeyboardButton::callback(
+                                        alias.clone(),
+                                        format!("sm:{alias}"),
+                                    )]);
+                                }
+                            }
+                        }
+                    }
+
+                    if total_pages > 1 {
+                        let mut nav = Vec::new();
+                        if page > 0 {
+                            nav.push(InlineKeyboardButton::callback(
+                                "◀ Prev",
+                                format!("mp:{}", page - 1),
+                            ));
+                        }
+                        nav.push(InlineKeyboardButton::callback(
+                            format!("{}/{total_pages}", page + 1),
+                            "mp:noop".to_string(),
+                        ));
+                        if page + 1 < total_pages {
+                            nav.push(InlineKeyboardButton::callback(
+                                "Next ▶",
+                                format!("mp:{}", page + 1),
+                            ));
+                        }
+                        rows.push(nav);
+                    }
+
+                    let kb = InlineKeyboardMarkup::new(rows);
+                    let _ = bot
+                        .edit_message_text(
+                            regular.chat.id,
+                            regular.id,
+                            format!("Provider: <b>{prov}</b>\nCurrent: <b>{current_model}</b>"),
+                        )
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(kb)
+                        .await;
+                }
+                bot.answer_callback_query(q.id.clone()).await?;
+            } else {
+                bot.answer_callback_query(q.id.clone()).await?;
+            }
+        }
         _ => {
             bot.answer_callback_query(q.id.clone()).await?;
         }

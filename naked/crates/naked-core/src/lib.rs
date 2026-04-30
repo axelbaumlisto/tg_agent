@@ -823,7 +823,10 @@ impl AgentCore {
             let ws = session.workspace.clone();
             let mdl = model.clone();
             let msg = classifier_text.clone();
-            let provider_ref = self.provider.clone();
+            // Use the session's provider — not the global default — so the
+            // model name is valid for the API endpoint. (Bug: using
+            // self.provider sent "kimi-for-coding" to qwen → 404.)
+            let provider_ref = self.provider_for(&provider_name).await;
             let sender_id = self.session_sender(session_id).await;
             let to_drafts = self.config.memory.auto_classify_to_drafts;
             tokio::spawn(async move {
@@ -1071,6 +1074,37 @@ impl AgentCore {
             .insert(session_id.to_string(), cancel.clone());
         drop(sessions);
 
+        // Validate model belongs to provider before making any API calls.
+        if let Some(pc) = self.config.providers.get(&provider_name) {
+            let valid = pc.models.iter().any(|x| x == &model)
+                || pc.model_aliases.contains_key(&model)
+                || pc.model_aliases.values().any(|v| v == &model);
+            if !valid {
+                let available: Vec<_> = pc
+                    .models
+                    .iter()
+                    .chain(pc.model_aliases.keys())
+                    .take(6)
+                    .cloned()
+                    .collect();
+                let err_msg = format!(
+                    "Model '{}' not found on provider '{}'. Try: {}",
+                    model,
+                    provider_name,
+                    available.join(", ")
+                );
+                let _ = tx.send(AgentEvent::Error(err_msg)).await;
+                let _ = tx.send(AgentEvent::Idle).await;
+                if let Some(s) = self.sessions.write().await.get_mut(session_id) {
+                    s.state = SessionState::Idle;
+                }
+                return Ok(AgentHandle {
+                    events: rx,
+                    permissions: perm_tx,
+                });
+            }
+        }
+
         // Per-session provider (falls back to global if unchanged)
         let session_provider = self.provider_for(&provider_name).await;
 
@@ -1271,6 +1305,18 @@ impl AgentCore {
         self.provider.models()
     }
 
+    /// List models for a specific provider as `(provider_name, model_id)` pairs.
+    pub async fn provider_models(&self, provider_name: &str) -> Vec<(String, String)> {
+        if let Some(pc) = self.config.providers.get(provider_name) {
+            pc.models
+                .iter()
+                .map(|m| (provider_name.to_string(), m.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// List all configured providers with their available models.
     pub fn list_providers(&self) -> Vec<ProviderInfo> {
         let mut result = Vec::new();
@@ -1298,6 +1344,38 @@ impl AgentCore {
             && !self.config.providers.contains_key(p)
         {
             return Err(AgentError::Config(format!("unknown provider: {p}")));
+        }
+
+        // Validate that the model belongs to the target provider.
+        // Resolve the effective provider (explicit or current session's).
+        if let Some(m) = model {
+            let target_provider = provider
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    let sessions = self.sessions.try_read().ok()?;
+                    sessions
+                        .get(session_id)
+                        .map(|s| s.metadata.provider.clone())
+                })
+                .unwrap_or_else(|| self.config.default_provider.clone());
+            if let Some(pc) = self.config.providers.get(&target_provider) {
+                let valid = pc.models.iter().any(|x| x == m)
+                    || pc.model_aliases.contains_key(m)
+                    || pc.model_aliases.values().any(|v| v == m);
+                if !valid {
+                    let available: Vec<_> = pc
+                        .models
+                        .iter()
+                        .chain(pc.model_aliases.keys())
+                        .take(8)
+                        .cloned()
+                        .collect();
+                    return Err(AgentError::Config(format!(
+                        "model '{m}' not found on provider '{target_provider}'. Available: {}",
+                        available.join(", ")
+                    )));
+                }
+            }
         }
 
         let session_root = self.store.session_root(session_id);

@@ -28,6 +28,8 @@ pub(crate) struct CompositeView {
     started_at: std::time::Instant,
     /// Live count of messages queued while this turn is active.
     queue_counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set when a provider error occurs — used to show retry buttons after final.
+    pub(crate) had_provider_error: bool,
 }
 
 const SPINNER: &[&str] = &["⏳", "⌛", "⏳", "⌛"];
@@ -47,16 +49,18 @@ impl CompositeView {
             phase: "thinking",
             started_at: std::time::Instant::now(),
             queue_counter,
+            had_provider_error: false,
         }
     }
 
     fn elapsed_label(&self) -> String {
-        let secs = self.started_at.elapsed().as_secs();
-        if secs < 60 {
-            format!("🕐 {secs}s")
+        let total = self.started_at.elapsed().as_secs();
+        let m = total / 60;
+        let s = total % 60;
+        if m == 0 {
+            format!("🕐 {s}s")
         } else {
-            let mins = secs / 60;
-            format!("🕐 {mins}min")
+            format!("🕐 {m}:{s:02}")
         }
     }
 
@@ -162,9 +166,11 @@ impl CompositeView {
 
                 let mut preview = String::new();
 
-                // Render stable (closed) blocks as rich HTML
+                // Render stable (closed) blocks as rich HTML.
+                // Strip class="language-*" — Telegram editMessageText
+                // rejects attributes on <code> tags during streaming.
                 if !stable.is_empty() {
-                    let html = md_to_tg_html(stable);
+                    let html = strip_code_class(&md_to_tg_html(stable));
                     if html.len() <= budget {
                         preview.push_str(&html);
                     } else {
@@ -567,6 +573,7 @@ pub(crate) async fn stream_response(
     let mut last_edit = tokio::time::Instant::now();
     let mut dirty = false;
     let mut last_sent = String::new();
+    let mut html_broken = false;
     let mut aborted_for_switch = false;
 
     loop {
@@ -636,7 +643,15 @@ pub(crate) async fn stream_response(
                     permission,
                 } => {
                     rate_limiter.acquire(chat_key).await;
-                    let _ = flush_live(&bot, ctx.chat_id, placeholder, &view, &mut last_sent).await;
+                    let _ = flush_live(
+                        &bot,
+                        ctx.chat_id,
+                        placeholder,
+                        &view,
+                        &mut last_sent,
+                        &mut html_broken,
+                    )
+                    .await;
                     dirty = false;
 
                     let auto = channel_map
@@ -737,26 +752,12 @@ pub(crate) async fn stream_response(
                     dirty = true;
                 }
                 AgentEvent::Error(e) => {
-                    // Friendly mapping for the one specific class of
-                    // provider failures we see often enough to warrant
-                    // a human-readable hint: the "0-token refusal" that
-                    // glm-5-turbo and a few OpenAI-compatible gateways
-                    // fall into when they decline without explaining.
-                    // The agent loop surfaces these as:
-                    //   "provider returned no content ..."
-                    // Surfacing that raw string is confusing; we replace
-                    // it with an actionable suggestion.
-                    let pretty = if e.contains("no content") {
-                        "— модель закрыла ход без ответа (0 токенов). \
-                         Попробуй переформулировать запрос или открой новую сессию: /new."
-                            .to_string()
-                    } else {
-                        format!("❌ {e}")
-                    };
+                    let pretty = format_provider_error(&e, &view.model_tag);
                     if !view.response_text.is_empty() {
                         view.response_text.push('\n');
                     }
                     view.response_text.push_str(&pretty);
+                    view.had_provider_error = true;
                     dirty = true;
                     force_flush = true;
                 }
@@ -782,7 +783,15 @@ pub(crate) async fn stream_response(
 
         if dirty && last_edit.elapsed() >= current_gap {
             rate_limiter.acquire(chat_key).await;
-            let ok = flush_live(&bot, ctx.chat_id, placeholder, &view, &mut last_sent).await;
+            let ok = flush_live(
+                &bot,
+                ctx.chat_id,
+                placeholder,
+                &view,
+                &mut last_sent,
+                &mut html_broken,
+            )
+            .await;
             if ok {
                 rate_limiter.report_ok(chat_key).await;
             } else {
@@ -1056,19 +1065,123 @@ pub(crate) fn parse_retry_after(err: &str) -> Option<u64> {
 /// slot before sending. On rate limit from Telegram, backs off.
 /// Flush the live preview. Returns `true` on success, `false` on 429.
 /// Caller is responsible for rate limiting (acquire before, report after).
+/// Format a provider error into a user-friendly diagnostic card.
+fn format_provider_error(err: &str, model_tag: &str) -> String {
+    if err.contains("no content") {
+        return "— модель закрыла ход без ответа (0 токенов).\n\
+             Попробуй переформулировать или /new."
+            .to_string();
+    }
+
+    let (icon, reason, hint) = if err.contains("429")
+        || err.contains("Too Many Requests")
+        || err.contains("rate limit")
+    {
+        (
+            "⏳",
+            "Rate limit (429)",
+            "Подожди 1–2 мин или /model — переключи модель",
+        )
+    } else if err.contains("402") || err.contains("Payment Required") || err.contains("membership")
+    {
+        (
+            "💳",
+            "API ключ — оплата/подписка (402)",
+            "/model — переключи провайдер",
+        )
+    } else if err.contains("401")
+        || err.contains("Unauthorized")
+        || err.contains("Invalid Authentication")
+    {
+        ("🔒", "Ключ невалиден (401)", "/model — переключи провайдер")
+    } else if err.contains("500")
+        || err.contains("502")
+        || err.contains("503")
+        || err.contains("Internal Server")
+    {
+        (
+            "🔧",
+            "Сервер провайдера упал (5xx)",
+            "Повтори через минуту или /model",
+        )
+    } else if err.contains("timeout") || err.contains("Timeout") {
+        ("⏱", "Timeout", "Попробуй короче или /model")
+    } else if err.contains("reasoning_content") {
+        (
+            "🧠",
+            "Модель требует reasoning format",
+            "/new — новая сессия или /model",
+        )
+    } else {
+        ("❌", "Ошибка провайдера", "/model — переключи модель")
+    };
+
+    // Extract short error (first sentence or 120 chars, no JSON blobs)
+    let short_err = err
+        .split('{')
+        .next()
+        .unwrap_or(err)
+        .trim()
+        .chars()
+        .take(120)
+        .collect::<String>();
+
+    format!(
+        "{icon} {reason}\n\
+         Модель: {model_tag}\n\
+         {short_err}\n\
+         💡 {hint}"
+    )
+}
+
+/// Strip `class="language-..."` from `<code>` tags.
+/// Telegram `editMessageText` rejects attributes during streaming preview
+/// but accepts them in `sendMessage` (final render).
+fn strip_code_class(html: &str) -> String {
+    // Fast path: no class= at all
+    if !html.contains("class=") {
+        return html.to_string();
+    }
+    // Replace <code class="language-X"> with <code>
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find("<code class=") {
+        out.push_str(&rest[..pos]);
+        out.push_str("<code>");
+        // Skip past the closing >
+        if let Some(close) = rest[pos..].find('>') {
+            rest = &rest[pos + close + 1..];
+        } else {
+            rest = &rest[pos..];
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub(crate) async fn flush_live(
     bot: &Bot,
     chat_id: ChatId,
     msg_id: MessageId,
     view: &CompositeView,
     last_sent: &mut String,
+    html_broken: &mut bool,
 ) -> bool {
     let html = view.render_live();
     let trimmed = truncate_str(&html, MAX_TG_MSG - 50);
     if trimmed == *last_sent {
-        return true; // no-op counts as success
+        return true;
     }
     *last_sent = trimmed.clone();
+
+    // If HTML was previously rejected, go straight to plain text
+    if *html_broken {
+        let plain = strip_html_tags(&trimmed);
+        let _ = bot.edit_message_text(chat_id, msg_id, &plain).await;
+        return true;
+    }
+
     let result = bot
         .edit_message_text(chat_id, msg_id, &trimmed)
         .parse_mode(ParseMode::Html)
@@ -1079,16 +1192,45 @@ pub(crate) async fn flush_live(
             let err_str = e.to_string();
             if err_str.contains("429") || err_str.contains("Too Many Requests") {
                 tracing::debug!("rate-limited on live edit");
-                *last_sent = String::new(); // force re-send next time
+                *last_sent = String::new();
                 false
             } else if err_str.contains("not modified") {
-                true // not an error
+                true
+            } else if err_str.contains("can't parse entities")
+                || err_str.contains("Unsupported start tag")
+                || err_str.contains("Can't find end tag")
+            {
+                // HTML rejected — fall back to plain text for rest of stream
+                tracing::warn!("HTML preview rejected, switching to plain text: {e}");
+                *html_broken = true;
+                let plain = strip_html_tags(&trimmed);
+                let _ = bot.edit_message_text(chat_id, msg_id, &plain).await;
+                true
             } else {
                 tracing::warn!("edit_message_text error: {e}");
-                true // non-rate-limit error, don't backoff
+                true
             }
         }
     }
+}
+
+/// Crude HTML tag stripper for plain-text fallback.
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    // Unescape HTML entities
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
 }
 
 #[cfg(test)]
@@ -2063,5 +2205,100 @@ mod tests {
             body.contains("%D0%9F%D1%80%D0%B8") || body.contains("Привет"),
             "cyrillic/emoji must survive serialisation: {body}"
         );
+    }
+}
+
+// ── Resilience tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+
+    // ── strip_code_class ────────────────────────────────────────────
+
+    #[test]
+    fn strip_code_class_removes_language_attr() {
+        let html = r#"<pre><code class="language-python">print(1)</code></pre>"#;
+        let out = strip_code_class(html);
+        assert_eq!(out, "<pre><code>print(1)</code></pre>");
+    }
+
+    #[test]
+    fn strip_code_class_preserves_plain_code() {
+        let html = "<pre><code>plain</code></pre>";
+        assert_eq!(strip_code_class(html), html);
+    }
+
+    #[test]
+    fn strip_code_class_multiple_blocks() {
+        let html = r#"<pre><code class="language-rust">fn main()</code></pre> text <pre><code class="language-js">var x</code></pre>"#;
+        let out = strip_code_class(html);
+        assert!(out.contains("<pre><code>fn main()"), "{out}");
+        assert!(out.contains("<pre><code>var x"), "{out}");
+        assert!(!out.contains("class="), "{out}");
+    }
+
+    // ── strip_html_tags ─────────────────────────────────────────────
+
+    #[test]
+    fn strip_html_tags_basic() {
+        assert_eq!(strip_html_tags("<b>bold</b> text"), "bold text");
+    }
+
+    #[test]
+    fn strip_html_tags_entities() {
+        assert_eq!(strip_html_tags("a &amp; b &lt; c"), "a & b < c");
+    }
+
+    #[test]
+    fn strip_html_tags_nested() {
+        assert_eq!(strip_html_tags("<pre><code>x</code></pre>"), "x");
+    }
+
+    // ── format_provider_error ───────────────────────────────────────
+
+    #[test]
+    fn error_429_shows_rate_limit() {
+        let msg = format_provider_error(
+            "provider error: OpenAI API 429 Too Many Requests: {\"error\":{}}",
+            "fireworks/minimax",
+        );
+        assert!(msg.contains("Rate limit"), "{msg}");
+        assert!(msg.contains("fireworks/minimax"), "{msg}");
+        assert!(msg.contains("/model"), "{msg}");
+        // No raw JSON in output
+        assert!(!msg.contains(r#""error""#), "should strip JSON: {msg}");
+    }
+
+    #[test]
+    fn error_402_shows_payment() {
+        let msg = format_provider_error(
+            "OpenAI API 402 Payment Required: {\"error\":{\"message\":\"membership\"}}",
+            "kimi-code/kimi",
+        );
+        assert!(msg.contains("402") || msg.contains("💳"), "{msg}");
+    }
+
+    #[test]
+    fn error_500_shows_server() {
+        let msg = format_provider_error("OpenAI API 500 Internal Server Error", "qwen/qwen3");
+        assert!(msg.contains("5xx") || msg.contains("🔧"), "{msg}");
+    }
+
+    #[test]
+    fn error_no_content_shows_friendly() {
+        let msg =
+            format_provider_error("provider returned no content after 3 retries", "any/model");
+        assert!(
+            msg.contains("0 токенов") || msg.contains("без ответа"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn error_unknown_strips_json() {
+        let msg = format_provider_error("some weird error: {\"details\":\"secret\"}", "x/y");
+        assert!(msg.contains("some weird error"), "{msg}");
+        assert!(!msg.contains("secret"), "JSON should be stripped: {msg}");
     }
 }

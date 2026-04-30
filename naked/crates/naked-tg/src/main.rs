@@ -860,6 +860,7 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("allow", "Manage tool allow-list for this topic"),
         BotCommand::new("memory", "Memory: rules / dreams / drafts / stats"),
         BotCommand::new("research", "Run, list, pause or resume research"),
+        BotCommand::new("health", "Provider health & key status"),
         BotCommand::new("help", "Show all commands"),
     ];
     if let Err(e) = bot.set_my_commands(commands).await {

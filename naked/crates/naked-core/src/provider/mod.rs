@@ -32,6 +32,11 @@ pub trait Provider: Send + Sync {
         &self,
         request: ChatRequest,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
+
+    /// Downcast to `ResilientProvider` for health diagnostics. Default: `None`.
+    fn as_resilient(&self) -> Option<&resilient::ResilientProvider> {
+        None
+    }
 }
 
 pub fn tool_spec_to_anthropic_json(spec: &ToolSpec) -> serde_json::Value {

@@ -68,7 +68,13 @@ impl Provider for OpenAiCompatProvider {
             DEFAULT_MAX_TOKENS
         };
 
-        let messages = build_openai_messages(&request);
+        let needs_reasoning = self
+            .config
+            .base_url
+            .as_deref()
+            .unwrap_or("")
+            .contains("deepseek");
+        let messages = build_openai_messages_inner(&request, needs_reasoning);
 
         let upstream_model = self.config.resolve_model_alias(&request.model);
 
@@ -173,7 +179,18 @@ fn apply_reasoning_params(body: &mut serde_json::Value, base_url: &str, reasonin
     }
 }
 
+#[cfg(test)]
 fn build_openai_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
+    build_openai_messages_inner(request, false)
+}
+
+/// When `emit_reasoning` is true, every assistant message gets a
+/// `reasoning_content` field (real thinking text or empty string).
+/// Required by DeepSeek thinking models; rejected by Groq.
+fn build_openai_messages_inner(
+    request: &ChatRequest,
+    emit_reasoning: bool,
+) -> Vec<serde_json::Value> {
     let mut messages = Vec::new();
 
     if !request.system.is_empty() {
@@ -278,10 +295,15 @@ fn build_openai_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
                     // All tool_calls orphaned — emit as plain assistant text
                     let all_text = text_parts.join("");
                     if !all_text.is_empty() {
-                        messages.push(serde_json::json!({
+                        let mut m = serde_json::json!({
                             "role": "assistant",
                             "content": all_text,
-                        }));
+                        });
+                        if emit_reasoning {
+                            m["reasoning_content"] =
+                                serde_json::Value::String(thinking_parts.join(""));
+                        }
+                        messages.push(m);
                     }
                     continue;
                 }
@@ -293,7 +315,7 @@ fn build_openai_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
                 if !text_parts.is_empty() {
                     assistant_msg["content"] = serde_json::Value::String(text_parts.join(""));
                 }
-                if !thinking_parts.is_empty() {
+                if emit_reasoning || !thinking_parts.is_empty() {
                     assistant_msg["reasoning_content"] =
                         serde_json::Value::String(thinking_parts.join(""));
                 }
@@ -376,16 +398,20 @@ fn build_openai_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
                     "role": role,
                     "content": text,
                 });
-                if !thinking.is_empty() && role == "assistant" {
+                if role == "assistant" && (emit_reasoning || !thinking.is_empty()) {
                     m["reasoning_content"] = serde_json::Value::String(thinking);
                 }
                 messages.push(m);
             }
         } else if let Some(text) = msg["content"].as_str() {
-            messages.push(serde_json::json!({
+            let mut m = serde_json::json!({
                 "role": role,
                 "content": text,
-            }));
+            });
+            if role == "assistant" && emit_reasoning {
+                m["reasoning_content"] = serde_json::Value::String(String::new());
+            }
+            messages.push(m);
         }
     }
 

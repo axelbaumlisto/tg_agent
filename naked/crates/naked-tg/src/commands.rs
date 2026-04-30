@@ -43,6 +43,7 @@ pub(crate) async fn handle_command(
 /sessions — list active sessions
 /metrics — bot performance stats
 /reload — reload config
+/health — provider health & key status
 /help — show this message";
             bot.send_message(ctx.chat_id, help)
                 .parse_mode(teloxide::types::ParseMode::Html)
@@ -209,6 +210,36 @@ pub(crate) async fn handle_command(
             bot.send_message(ctx.chat_id, lines.join("\n"))
                 .parse_mode(teloxide::types::ParseMode::Html)
                 .reply_markup(kb)
+                .maybe_thread(ctx.thread_id)
+                .await?;
+        }
+        "/health" => {
+            let mut lines = vec!["🏥 <b>Provider Health</b>".to_string()];
+            for (name, pc) in &config.providers {
+                let resolved = pc.resolved_all_keys();
+                let total = resolved.len();
+                if total == 0 {
+                    lines.push(format!("  <b>{name}</b>: ⚠️ no keys"));
+                    continue;
+                }
+                // Check which keys are alive via quick balance/auth probe
+                // For now, show key count + provider status from the resilient wrapper
+                let provider = agent.provider_for(name).await;
+                let info = if let Some(rp) = provider.as_resilient() {
+                    let bl = rp.blacklisted_count().await;
+                    let alive = total - bl;
+                    if bl > 0 {
+                        format!("⚠️ {alive}/{total} keys ({bl} blacklisted)")
+                    } else {
+                        format!("✅ {total} key(s)")
+                    }
+                } else {
+                    format!("✅ {total} key(s)")
+                };
+                lines.push(format!("  <b>{name}</b>: {info}"));
+            }
+            bot.send_message(ctx.chat_id, lines.join("\n"))
+                .parse_mode(teloxide::types::ParseMode::Html)
                 .maybe_thread(ctx.thread_id)
                 .await?;
         }

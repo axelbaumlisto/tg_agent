@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -10,16 +11,24 @@ use crate::types::{ModelInfo, StreamChunk};
 
 use super::{ChatRequest, Provider};
 
+/// How long a key stays blacklisted after a terminal error (401/402/403).
+const BLACKLIST_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Wraps multiple providers with automatic failover.
 ///
 /// Failed providers move to the back of the queue so that
 /// healthy keys/providers stay at the front. The successful
 /// provider stays at the head for subsequent calls.
+///
+/// Keys that return terminal errors (401/402/403) are blacklisted
+/// for [`BLACKLIST_TTL`] and skipped entirely until the TTL expires.
 pub struct ResilientProvider {
     providers: Vec<Box<dyn Provider>>,
     /// Mutable ordering of indices into `providers`.
     /// Front = preferred; failed indices are pushed to back.
     order: Mutex<VecDeque<usize>>,
+    /// Indices blacklisted after terminal errors. Value = when to un-blacklist.
+    blacklist: Mutex<HashMap<usize, Instant>>,
 }
 
 impl ResilientProvider {
@@ -32,6 +41,7 @@ impl ResilientProvider {
         Self {
             providers,
             order: Mutex::new(order),
+            blacklist: Mutex::new(HashMap::new()),
         }
     }
 
@@ -42,6 +52,26 @@ impl ResilientProvider {
     /// Current ordering snapshot (for testing / diagnostics).
     pub async fn current_order(&self) -> Vec<usize> {
         self.order.lock().await.iter().copied().collect()
+    }
+
+    /// Number of currently blacklisted keys.
+    pub async fn blacklisted_count(&self) -> usize {
+        let bl = self.blacklist.lock().await;
+        bl.values().filter(|&&exp| Instant::now() < exp).count()
+    }
+
+    /// Provider health summary for diagnostics.
+    pub async fn health_summary(&self) -> Vec<(String, bool)> {
+        let bl = self.blacklist.lock().await;
+        let now = Instant::now();
+        self.providers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let alive = bl.get(&i).map(|&exp| now >= exp).unwrap_or(true);
+                (p.name().to_string(), alive)
+            })
+            .collect()
     }
 }
 
@@ -60,16 +90,31 @@ impl Provider for ResilientProvider {
         self.providers.iter().flat_map(|p| p.models()).collect()
     }
 
+    fn as_resilient(&self) -> Option<&ResilientProvider> {
+        Some(self)
+    }
+
     async fn stream_chat(
         &self,
         request: ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let snapshot: Vec<usize> = { self.order.lock().await.iter().copied().collect() };
 
+        // Expire old blacklist entries
+        {
+            let mut bl = self.blacklist.lock().await;
+            let now = Instant::now();
+            bl.retain(|_, exp| now < *exp);
+        }
+
         let mut failed_indices = Vec::new();
         let mut last_err = None;
 
         for (pos, &idx) in snapshot.iter().enumerate() {
+            // Skip blacklisted keys
+            if self.blacklist.lock().await.contains_key(&idx) {
+                continue;
+            }
             let provider = &self.providers[idx];
 
             match provider.stream_chat(request.clone()).await {
@@ -98,7 +143,40 @@ impl Provider for ResilientProvider {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    tracing::warn!("Provider '{}' error: {e}, demoting", provider.name());
+                    let err_str = e.to_string();
+                    // Key-level terminal: auth/billing broken — blacklist key
+                    let key_dead = err_str.contains("401")
+                        || err_str.contains("402")
+                        || err_str.contains("403")
+                        || err_str.contains("Unauthorized")
+                        || err_str.contains("Payment Required")
+                        || err_str.contains("membership");
+                    // Model-level terminal: model doesn't exist on this provider.
+                    // Don't blacklist the key — other models may work.
+                    // Just stop retrying: all keys share the same model list.
+                    let model_dead = err_str.contains("404")
+                        || err_str.contains("model_not_found")
+                        || err_str.contains("does not exist");
+                    if key_dead {
+                        tracing::warn!(
+                            "Provider '{}' key dead: {e}, blacklisting for {}s",
+                            provider.name(),
+                            BLACKLIST_TTL.as_secs()
+                        );
+                        self.blacklist
+                            .lock()
+                            .await
+                            .insert(idx, Instant::now() + BLACKLIST_TTL);
+                    } else if model_dead {
+                        // Model doesn't exist — no point trying other keys.
+                        tracing::warn!(
+                            "Provider '{}' model not found: {e}, aborting rotation",
+                            provider.name(),
+                        );
+                        return Err(e);
+                    } else {
+                        tracing::warn!("Provider '{}' error: {e}, demoting", provider.name());
+                    }
                     failed_indices.push(idx);
                     last_err = Some(e);
                 }
@@ -311,5 +389,142 @@ mod tests {
         ]);
         let _s = p.stream_chat(test_request()).await.unwrap();
         assert_eq!(p.current_order().await, vec![0, 1, 2]);
+    }
+
+    // ── Blacklist tests ─────────────────────────────────────────────
+
+    struct TerminalFailProvider {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Provider for TerminalFailProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            Err(AgentError::Provider(format!(
+                "OpenAI API 402 Payment Required: {{\"error\":{{\"message\":\"membership not active\"}}}}"
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_error_blacklists_key() {
+        let p = ResilientProvider::new(vec![
+            Box::new(TerminalFailProvider {
+                name: "dead-key".into(),
+            }),
+            Box::new(SuccessProvider {
+                name: "good-key".into(),
+            }),
+        ]);
+        // First call: dead-key fails with 402, gets blacklisted, good-key succeeds
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.blacklisted_count().await, 1);
+        // Second call: dead-key is skipped (blacklisted), goes straight to good-key
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.blacklisted_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn blacklisted_count_is_zero_initially() {
+        let p = ResilientProvider::new(vec![Box::new(SuccessProvider { name: "k0".into() })]);
+        assert_eq!(p.blacklisted_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn all_blacklisted_still_returns_error() {
+        let p = ResilientProvider::new(vec![
+            Box::new(TerminalFailProvider {
+                name: "dead1".into(),
+            }),
+            Box::new(TerminalFailProvider {
+                name: "dead2".into(),
+            }),
+        ]);
+        let result = p.stream_chat(test_request()).await;
+        assert!(result.is_err());
+        assert_eq!(p.blacklisted_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn health_summary_shows_alive_and_dead() {
+        let p = ResilientProvider::new(vec![
+            Box::new(TerminalFailProvider {
+                name: "dead".into(),
+            }),
+            Box::new(SuccessProvider {
+                name: "alive".into(),
+            }),
+        ]);
+        let _s = p.stream_chat(test_request()).await.unwrap();
+        let summary = p.health_summary().await;
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0], ("dead".to_string(), false));
+        assert_eq!(summary[1], ("alive".to_string(), true));
+    }
+
+    struct ModelNotFoundProvider {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Provider for ModelNotFoundProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            Err(AgentError::Provider(
+                "OpenAI API 404 Not Found: model_not_found".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn model_not_found_aborts_without_blacklisting_key() {
+        // 404 = model problem, not key problem. Key stays alive for other models.
+        let p = ResilientProvider::new(vec![
+            Box::new(ModelNotFoundProvider {
+                name: "key-0".into(),
+            }),
+            Box::new(SuccessProvider {
+                name: "key-1".into(),
+            }),
+        ]);
+        let result = p.stream_chat(test_request()).await;
+        // Should fail immediately on first 404 without trying key-1
+        assert!(result.is_err(), "should return error");
+        assert_eq!(
+            p.blacklisted_count().await,
+            0,
+            "key should NOT be blacklisted — only the model is bad"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_not_found_doesnt_cycle_other_keys() {
+        // 3 keys, first returns 404. Should NOT try key-1 or key-2.
+        let p = ResilientProvider::new(vec![
+            Box::new(ModelNotFoundProvider { name: "k0".into() }),
+            Box::new(SuccessProvider { name: "k1".into() }),
+            Box::new(SuccessProvider { name: "k2".into() }),
+        ]);
+        let result = p.stream_chat(test_request()).await;
+        assert!(result.is_err(), "should fail — model doesn't exist");
+        // k1 and k2 were never tried (no point, same model list)
+        assert_eq!(p.blacklisted_count().await, 0);
     }
 }
