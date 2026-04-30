@@ -1,0 +1,140 @@
+//! Session configuration.
+
+use super::*;
+
+/// Per-session config override. All fields are optional — missing fields
+/// fall back to the global `Config`. Placed in `sessions/{id}/config.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionConfig {
+    #[serde(default)]
+    pub default_provider: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Reasoning/thinking level: "off", "low", "medium", "high"
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default, rename = "mcpServers")]
+    pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
+    #[serde(default)]
+    pub skill_roots: Option<Vec<PathBuf>>,
+    #[serde(default)]
+    pub system_prompt_path: Option<PathBuf>,
+    /// Unix timestamp (secs) when yolo was enabled. Expires after 72h.
+    #[serde(default)]
+    pub yolo_enabled_at: Option<i64>,
+    /// Per-session tool allow-list (persisted across restarts).
+    #[serde(default)]
+    pub allow_list: Option<Vec<String>>,
+}
+
+impl SessionConfig {
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        serde_json::from_str(&data)
+            .map_err(|e| AgentError::Config(format!("session config parse error: {e}")))
+    }
+}
+
+/// Effective config for a single session: global merged with per-session overrides.
+#[derive(Debug, Clone)]
+pub struct EffectiveSessionConfig {
+    pub provider: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub temperature: Option<f32>,
+    /// Context window in tokens (None = default 100k).
+    pub context_window: Option<u32>,
+    pub max_iterations: usize,
+    /// Reasoning/thinking level: "off", "low", "medium", "high"
+    pub reasoning: Option<String>,
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+    pub skill_roots: Vec<PathBuf>,
+    pub system_prompt_path: Option<PathBuf>,
+}
+
+impl Config {
+    /// Merge global config with per-session overrides.
+    /// Session values win; missing session fields fall back to global.
+    /// MCP servers are additive: session servers are merged on top of global
+    /// (session overrides global if same name).
+    pub fn merge_session(&self, session: &SessionConfig) -> EffectiveSessionConfig {
+        let mut mcp_servers = self.mcp_servers.clone();
+        if let Some(extra) = &session.mcp_servers {
+            for (name, cfg) in extra {
+                mcp_servers.insert(name.clone(), cfg.clone());
+            }
+        }
+
+        let skill_roots = session
+            .skill_roots
+            .clone()
+            .unwrap_or_else(|| self.skill_roots.clone());
+
+        EffectiveSessionConfig {
+            provider: session
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| self.default_provider.clone()),
+            model: session
+                .default_model
+                .clone()
+                .unwrap_or_else(|| self.default_model.clone()),
+            max_tokens: session.max_tokens.unwrap_or(self.max_tokens),
+            temperature: session.temperature.or(self.temperature),
+            context_window: session.context_window.or(self.context_window),
+            max_iterations: session.max_iterations.unwrap_or(self.max_iterations),
+            // Session reasoning wins; otherwise inherit `Config.default_reasoning`
+            // so e.g. the bot launches every chat at the configured global
+            // thinking level without the user re-typing `/reasoning medium`.
+            reasoning: session
+                .reasoning
+                .clone()
+                .or_else(|| self.default_reasoning.clone()),
+            mcp_servers,
+            skill_roots,
+            system_prompt_path: session
+                .system_prompt_path
+                .clone()
+                .or_else(|| self.system_prompt_path.clone()),
+        }
+    }
+
+    /// Produce an effective config with no overrides (all global values).
+    pub fn default_effective(&self) -> EffectiveSessionConfig {
+        self.merge_session(&SessionConfig::default())
+    }
+}
+
+/// Expand `$VAR` or `${VAR}` references in a string from env.
+pub fn expand_env(s: &str) -> Result<String> {
+    if let Some(var_name) = s.strip_prefix('$') {
+        let var_name = var_name.trim_start_matches('{').trim_end_matches('}');
+        std::env::var(var_name).map_err(|_| {
+            AgentError::Config(format!(
+                "env var '{var_name}' not set (referenced in config)"
+            ))
+        })
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+/// Expand leading `~` or `~/` to the user's home directory.
+pub fn expand_tilde(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if s == "~" {
+        dirs_home()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        dirs_home().join(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
