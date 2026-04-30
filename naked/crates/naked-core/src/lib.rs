@@ -523,11 +523,53 @@ impl AgentCore {
         }
     }
 
+    /// Structured compaction prompt (initial or iterative update).
+    fn compaction_prompt(previous_summary: Option<&str>) -> String {
+        if let Some(prev) = previous_summary {
+            format!(
+                "<previous-summary>\n{prev}\n</previous-summary>\n\n\
+                 The messages above are NEW conversation since the last summary. \
+                 Update the existing summary with new information.\n\
+                 RULES: PRESERVE existing info. ADD new progress/decisions. \
+                 Move In Progress → Done when completed. UPDATE Next Steps.\n\n\
+                 {}",
+                Self::COMPACTION_FORMAT
+            )
+        } else {
+            format!(
+                "Summarize the conversation above into a structured checkpoint.\n\n{}",
+                Self::COMPACTION_FORMAT
+            )
+        }
+    }
+
+    const COMPACTION_FORMAT: &'static str = "\
+Use this EXACT format:\n\n\
+## Goal\n\
+[What is the user trying to accomplish?]\n\n\
+## Constraints & Preferences\n\
+- [Any constraints or preferences mentioned]\n\n\
+## Progress\n\
+### Done\n\
+- [x] [Completed tasks]\n\n\
+### In Progress\n\
+- [ ] [Current work]\n\n\
+### Blocked\n\
+- [Issues if any]\n\n\
+## Key Decisions\n\
+- **[Decision]**: [Rationale]\n\n\
+## Next Steps\n\
+1. [What should happen next]\n\n\
+## Critical Context\n\
+- [File paths, function names, error messages needed to continue]\n\n\
+Keep each section concise. Preserve exact paths and identifiers.";
+
     /// Call the current model to summarize conversation for compaction.
     async fn llm_summarize(
         provider: &dyn Provider,
         model: &str,
         conversation_text: &str,
+        previous_summary: Option<&str>,
     ) -> Result<String> {
         use tokio_stream::StreamExt;
 
@@ -552,19 +594,25 @@ impl AgentCore {
             "LLM compaction: sending to model"
         );
 
-        let system = "Ты — помощник для сжатия контекста. Сделай краткое резюме разговора ниже. \
-            Сохрани: ключевые решения, текущую задачу, важные файлы/пути, незавершённую работу. \
-            Формат: компактный текст, без markdown заголовков, максимум 1500 символов.";
+        let system = "You are a context compaction assistant. Create a structured summary \
+            that another LLM will use to continue the work. Be concise, preserve exact file paths, \
+            function names, and error messages. Respond in the same language the user used.";
+
+        let user_prompt = format!(
+            "<conversation>\n{input}\n</conversation>\n\n\
+             {}",
+            Self::compaction_prompt(previous_summary)
+        );
 
         let request = provider::ChatRequest {
             model: model.to_string(),
             system: system.to_string(),
             messages: vec![serde_json::json!({
                 "role": "user",
-                "content": input,
+                "content": user_prompt,
             })],
             tools: vec![],
-            max_tokens: 1024,
+            max_tokens: 2048,
             temperature: Some(0.0),
             reasoning: None,
         };
@@ -883,6 +931,15 @@ impl AgentCore {
         } else {
             None
         };
+        let previous_summary = session
+            .history
+            .last_compaction_summary()
+            .map(|s| s.to_string());
+        let (read_files, modified_files) = if needs_compact {
+            session.history.files_in_compaction_range(4)
+        } else {
+            (vec![], vec![])
+        };
         let before_msgs = session.history.message_count();
         let workspace_for_compaction = session.workspace.clone();
 
@@ -909,8 +966,29 @@ impl AgentCore {
                 .await;
             }
 
-            match Self::llm_summarize(&*provider_arc, &model, &text_for_llm).await {
-                Ok(summary) => {
+            match Self::llm_summarize(
+                &*provider_arc,
+                &model,
+                &text_for_llm,
+                previous_summary.as_deref(),
+            )
+            .await
+            {
+                Ok(mut summary) => {
+                    // Append file tracking
+                    if !read_files.is_empty() || !modified_files.is_empty() {
+                        summary.push_str("\n\n<read-files>\n");
+                        for f in &read_files {
+                            summary.push_str(f);
+                            summary.push('\n');
+                        }
+                        summary.push_str("</read-files>\n<modified-files>\n");
+                        for f in &modified_files {
+                            summary.push_str(f);
+                            summary.push('\n');
+                        }
+                        summary.push_str("</modified-files>");
+                    }
                     tracing::info!("LLM compaction succeeded");
                     Some(summary)
                 }
@@ -931,6 +1009,7 @@ impl AgentCore {
 
         let compacted = if needs_compact {
             if let Some(summary) = llm_summary {
+                session.history.set_compaction_summary(summary.clone());
                 session.history.compact_with_llm_summary(&summary, 4);
                 session.history.set_last_input_tokens(None);
             } else {

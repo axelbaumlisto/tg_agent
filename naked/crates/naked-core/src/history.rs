@@ -121,6 +121,8 @@ pub struct ConversationHistory {
     messages: Vec<ConversationMessage>,
     context_window_tokens: u32,
     last_input_tokens: Option<u64>,
+    /// Summary from the last compaction (for iterative update).
+    last_compaction_summary: Option<String>,
 }
 
 impl ConversationHistory {
@@ -130,7 +132,18 @@ impl ConversationHistory {
             messages: Vec::new(),
             context_window_tokens: 128_000,
             last_input_tokens: None,
+            last_compaction_summary: None,
         }
+    }
+
+    /// Get the summary from the last compaction (if any).
+    pub fn last_compaction_summary(&self) -> Option<&str> {
+        self.last_compaction_summary.as_deref()
+    }
+
+    /// Store a compaction summary for iterative updates.
+    pub fn set_compaction_summary(&mut self, summary: String) {
+        self.last_compaction_summary = Some(summary);
     }
 
     /// Set context limit from a token count.
@@ -513,7 +526,11 @@ impl ConversationHistory {
         let existing_summary = self.messages.first().and_then(extract_existing_summary);
         let prefix_len = usize::from(existing_summary.is_some());
 
-        let keep_from = self.messages.len().saturating_sub(keep);
+        let raw_keep_from = self.messages.len().saturating_sub(keep);
+        // Snap cut point to a turn boundary: never split between
+        // assistant(tool_call) and its tool_result, or between a user
+        // message and its assistant response.
+        let keep_from = Self::snap_to_turn_boundary(&self.messages, raw_keep_from, prefix_len);
         let removed = &self.messages[prefix_len..keep_from];
         if removed.is_empty() {
             return;
@@ -529,6 +546,39 @@ impl ConversationHistory {
         self.messages = new_messages;
 
         self.truncate_tool_results();
+    }
+
+    /// Snap a cut point forward to a safe turn boundary.
+    /// Never cut between assistant(tool_use) and its tool_result,
+    /// or in the middle of a user→assistant exchange.
+    fn snap_to_turn_boundary(
+        messages: &[ConversationMessage],
+        mut idx: usize,
+        min: usize,
+    ) -> usize {
+        // If we're sitting on a Tool message, walk forward until we
+        // hit a User message (start of next turn).
+        while idx < messages.len() {
+            match messages[idx].role {
+                Role::User => break,    // clean boundary
+                Role::System => break,  // clean boundary
+                Role::Tool => idx += 1, // skip orphaned tool result
+                Role::Assistant => {
+                    // Check if this assistant has tool_calls — if so,
+                    // its tool_results follow. Walk past them.
+                    let has_tool_calls = messages[idx]
+                        .blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                    if has_tool_calls {
+                        idx += 1;
+                    } else {
+                        break; // plain assistant message = ok to cut here
+                    }
+                }
+            }
+        }
+        idx.max(min)
     }
 
     /// Truncate tool results in kept messages to save space.
@@ -568,6 +618,65 @@ impl ConversationHistory {
     }
 
     /// Prepare messages for LLM summarization — returns text of messages to be compacted.
+    /// Extract file paths mentioned in tool calls from messages being compacted.
+    pub fn files_in_compaction_range(&self, keep_recent: usize) -> (Vec<String>, Vec<String>) {
+        let keep = keep_recent.max(DEFAULT_PRESERVE_RECENT);
+        if self.messages.len() <= keep {
+            return (vec![], vec![]);
+        }
+        let keep_from = self.messages.len().saturating_sub(keep);
+        let prefix_len = self
+            .messages
+            .first()
+            .and_then(extract_existing_summary)
+            .map(|_| 1)
+            .unwrap_or(0);
+        let removed = &self.messages[prefix_len..keep_from];
+
+        let mut read_files = std::collections::BTreeSet::new();
+        let mut modified_files = std::collections::BTreeSet::new();
+
+        for msg in removed {
+            for block in &msg.blocks {
+                if let ContentBlock::ToolUse { name, input, .. } = block {
+                    match name.as_str() {
+                        "read" => {
+                            if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                                read_files.insert(p.to_string());
+                            }
+                        }
+                        "edit" | "write" => {
+                            if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                                modified_files.insert(p.to_string());
+                            }
+                        }
+                        "bash" => {
+                            // Crude: look for common file-touching patterns in command
+                            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                                if cmd.contains("cat ")
+                                    || cmd.contains("head ")
+                                    || cmd.contains("grep ")
+                                {
+                                    // read-like, skip — too noisy
+                                } else if cmd.contains("sed -i")
+                                    || cmd.contains(">> ")
+                                    || cmd.contains("> ")
+                                {
+                                    // modify-like — extract is unreliable, skip
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (
+            read_files.into_iter().collect(),
+            modified_files.into_iter().collect(),
+        )
+    }
+
     pub fn messages_for_compaction(&self, keep_recent: usize) -> Option<String> {
         let keep = keep_recent.max(DEFAULT_PRESERVE_RECENT);
         if self.messages.len() <= keep {
@@ -1643,6 +1752,7 @@ mod tests {
     #[test]
     fn auto_compact_triggers_on_threshold() {
         let mut h = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 50,
@@ -1669,6 +1779,7 @@ mod tests {
     #[test]
     fn needs_compaction_triggered_by_input_tokens() {
         let mut h = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 1000,
@@ -1713,6 +1824,7 @@ mod tests {
         h.set_context_window_tokens(100_000);
         assert_eq!(h.context_window_tokens(), 100_000);
         let mut h2 = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 0,
@@ -1725,6 +1837,7 @@ mod tests {
     #[test]
     fn tool_result_truncation_in_compact() {
         let mut h = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 100_000,
@@ -1772,6 +1885,7 @@ mod tests {
     #[test]
     fn auto_compact_reduces_message_count() {
         let mut h = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 5000,
@@ -1863,6 +1977,7 @@ mod tests {
     #[test]
     fn compact_summary_includes_file_tracking() {
         let mut h = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 100_000,
@@ -1919,6 +2034,7 @@ mod tests {
     #[test]
     fn auto_compact_clears_last_input_tokens() {
         let mut h = ConversationHistory {
+            last_compaction_summary: None,
             system_prompt: String::new(),
             messages: Vec::new(),
             context_window_tokens: 50,
@@ -1959,5 +2075,91 @@ mod tests {
 
         h.restore_system_prompt(original);
         assert_eq!(h.system_prompt(), "base prompt");
+    }
+
+    // ── Compaction v2 tests ─────────────────────────────────────────
+
+    #[test]
+    fn compaction_summary_stored_and_retrieved() {
+        let mut h = ConversationHistory::new("sys".into());
+        assert!(h.last_compaction_summary().is_none());
+        h.set_compaction_summary("## Goal\nTest goal".into());
+        assert_eq!(h.last_compaction_summary(), Some("## Goal\nTest goal"));
+    }
+
+    #[test]
+    fn snap_to_turn_boundary_skips_tool_results() {
+        let mut h = ConversationHistory::new("sys".into());
+        h.push_user("query");
+        h.push_assistant(
+            vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            }],
+            None,
+        );
+        h.push_tool_result("c1", "file1.txt", false);
+        h.push_user("next question");
+        // messages: [user, assistant(tool), tool_result, user]
+        // idx=1 (assistant with tool_call) should snap forward to idx=3 (next user)
+        let snapped = ConversationHistory::snap_to_turn_boundary(&h.messages, 1, 0);
+        assert_eq!(snapped, 3, "should snap past tool_result to next user");
+    }
+
+    #[test]
+    fn snap_to_turn_boundary_plain_assistant_is_ok() {
+        let mut h = ConversationHistory::new("sys".into());
+        h.push_user("hi");
+        h.push_assistant(
+            vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            None,
+        );
+        h.push_user("bye");
+        // idx=1 (plain assistant) is a clean cut point
+        let snapped = ConversationHistory::snap_to_turn_boundary(&h.messages, 1, 0);
+        assert_eq!(snapped, 1, "plain assistant is a clean boundary");
+    }
+
+    #[test]
+    fn files_in_compaction_range_extracts_paths() {
+        let mut h = ConversationHistory::new("sys".into());
+        h.push_user("read file");
+        h.push_assistant(
+            vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "/src/main.rs"}),
+            }],
+            None,
+        );
+        h.push_tool_result("c1", "fn main() {}", false);
+        h.push_user("edit file");
+        h.push_assistant(
+            vec![ContentBlock::ToolUse {
+                id: "c2".into(),
+                name: "edit".into(),
+                input: serde_json::json!({"path": "/src/lib.rs", "edits": []}),
+            }],
+            None,
+        );
+        h.push_tool_result("c2", "ok", false);
+        // Pad with enough messages so tool calls fall in compaction range
+        for i in 0..6 {
+            h.push_user(&format!("padding {i}"));
+            h.push_assistant(vec![ContentBlock::Text { text: "ok".into() }], None);
+        }
+        // Total: 6 (original) + 12 (padding) = 18 messages. keep=4 → compacts 0..14
+        let (read, modified) = h.files_in_compaction_range(4);
+        assert!(
+            read.contains(&"/src/main.rs".to_string()),
+            "should track read: {read:?}"
+        );
+        assert!(
+            modified.contains(&"/src/lib.rs".to_string()),
+            "should track edit: {modified:?}"
+        );
     }
 }
