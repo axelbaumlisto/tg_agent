@@ -44,6 +44,10 @@ pub enum ProviderError {
     },
     /// Server error (5xx) — transient, retry with same key.
     ServerError { status: u16, body: String },
+    /// Serialization failure (JSON encode/decode).
+    Serialize { context: String, source: String },
+    /// MCP protocol error.
+    Mcp { context: String, source: String },
     /// Non-classified upstream error — keep the raw body so the caller can log it.
     Other { status: u16, body: String },
 }
@@ -187,6 +191,12 @@ impl std::fmt::Display for ProviderError {
             }
             ProviderError::ServerError { status, body } => {
                 write!(f, "server error ({status}): {body}")
+            }
+            ProviderError::Serialize { context, source } => {
+                write!(f, "serialize {context}: {source}")
+            }
+            ProviderError::Mcp { context, source } => {
+                write!(f, "MCP {context}: {source}")
             }
             ProviderError::Other { status, body } => {
                 write!(f, "provider error ({status}): {body}")

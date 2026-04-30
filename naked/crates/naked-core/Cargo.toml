@@ -27,6 +27,7 @@ toml = "0.8"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = { workspace = true }
 filetime = "0.2"
 tracing-subscriber = { workspace = true }

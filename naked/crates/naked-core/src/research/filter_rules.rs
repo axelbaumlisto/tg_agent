@@ -657,3 +657,62 @@ mod tests {
         assert_eq!(finding["_extracted"]["price band"].as_f64(), Some(500.0));
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn apply_rule_never_panics_contains(
+            field_val in "\\PC{0,100}",
+            pattern in "\\PC{0,50}",
+        ) {
+            let rule = serde_json::json!({
+                "type": "contains",
+                "field": "title",
+                "value": pattern,
+                "score": 1.0,
+            });
+            let mut finding = serde_json::json!({
+                "title": field_val,
+                "url": "https://example.com",
+            });
+            let (score, fired) = apply_rule(&rule, &mut finding);
+            prop_assert!(score >= 0.0);
+            let _ = fired;
+        }
+
+        #[test]
+        fn apply_rule_never_panics_range(
+            price in 0.0f64..1_000_000.0,
+            min in 0.0f64..500_000.0,
+            max in 500_000.0f64..1_000_000.0,
+        ) {
+            let rule = serde_json::json!({
+                "type": "range",
+                "field": "price_thb",
+                "min": min,
+                "max": max,
+                "score": -1.0,
+            });
+            let mut finding = serde_json::json!({
+                "price_thb": price,
+                "url": "https://example.com",
+            });
+            let (score, _) = apply_rule(&rule, &mut finding);
+            prop_assert!(score <= 0.0 || score >= 0.0); // just no panic
+        }
+
+        #[test]
+        fn rules_for_intent_never_panics(topic in "\\PC{0,100}") {
+            let intent = serde_json::json!({
+                "topic": topic,
+                "sources": [],
+            });
+            let rules = rules_for_intent(&intent);
+            let _ = rules; // just ensure no panic
+        }
+    }
+}

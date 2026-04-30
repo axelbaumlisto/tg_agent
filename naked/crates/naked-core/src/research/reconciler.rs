@@ -1417,3 +1417,58 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn extract_price_never_panics(s in "\\PC{0,200}") {
+            let _ = extract_price(&s, None);
+        }
+
+        #[test]
+        fn extract_price_never_panics_with_currency(s in "\\PC{0,200}", curr in "(THB|USD|VND|EUR)") {
+            let _ = extract_price(&s, Some(&curr));
+        }
+
+        #[test]
+        fn extract_price_valid_result(s in "[0-9,.\\s]{1,20}(THB|฿|\\$|USD|VND|đ|EUR|€)?") {
+            if let Some(p) = extract_price(&s, None) {
+                prop_assert!(p.amount >= 0.0, "price must be non-negative: {}", p.amount);
+                prop_assert!(!p.currency.is_empty(), "currency must not be empty");
+            }
+        }
+
+        #[test]
+        fn reconcile_never_panics(n in 0usize..10) {
+            let findings: Vec<serde_json::Value> = (0..n)
+                .map(|i| serde_json::json!({
+                    "url": format!("https://example.com/{i}"),
+                    "title": format!("Item {i}"),
+                    "price": format!("{} THB", i * 1000 + 100),
+                    "dedup_hash": format!("hash{i}"),
+                }))
+                .collect();
+            let result = reconcile(&findings, None, false);
+            // Must not panic; output ≤ input
+            assert!(result.len() <= findings.len());
+        }
+
+        #[test]
+        fn reconcile_merge_deduplicates(n in 2usize..8) {
+            // All items with same URL should merge to 1
+            let findings: Vec<serde_json::Value> = (0..n)
+                .map(|i| serde_json::json!({
+                    "url": "https://example.com/same",
+                    "title": format!("Item {i}"),
+                    "dedup_hash": format!("hash{i}"),
+                }))
+                .collect();
+            let result = reconcile(&findings, None, true);
+            prop_assert!(result.len() <= 1, "same URL should merge: got {}", result.len());
+        }
+    }
+}
