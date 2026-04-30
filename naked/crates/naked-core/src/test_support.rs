@@ -158,3 +158,173 @@ mod tests {
         assert_eq!(model, "noop-model");
     }
 }
+
+#[cfg(test)]
+mod session_ops_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn set_and_get_sender() {
+        let tc = TestCore::build();
+        let sid = tc.core.create_session(tc.workspace()).await;
+        tc.core
+            .set_session_sender(&sid, Some("user123".into()))
+            .await;
+        assert_eq!(tc.core.session_sender(&sid).await, Some("user123".into()));
+    }
+
+    #[tokio::test]
+    async fn sender_cleared() {
+        let tc = TestCore::build();
+        let sid = tc.core.create_session(tc.workspace()).await;
+        tc.core
+            .set_session_sender(&sid, Some("user123".into()))
+            .await;
+        tc.core.set_session_sender(&sid, None).await;
+        assert_eq!(tc.core.session_sender(&sid).await, None);
+    }
+
+    #[tokio::test]
+    async fn create_session_with_channel() {
+        let tc = TestCore::build();
+        let sid = tc
+            .core
+            .create_session_with_channel(tc.workspace(), "ch42")
+            .await;
+        assert!(!sid.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_workspace_returns_path() {
+        let tc = TestCore::build();
+        let sid = tc.core.create_session(tc.workspace()).await;
+        let ws = tc.core.session_workspace(&sid).await;
+        assert!(ws.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_paged() {
+        let tc = TestCore::build();
+        for i in 0..5 {
+            tc.core
+                .create_session_with_channel(tc.workspace(), &format!("ch{i}"))
+                .await;
+        }
+        let page1 = tc.core.list_sessions_paged(0, 3).await;
+        let page2 = tc.core.list_sessions_paged(3, 3).await;
+        assert_eq!(page1.len(), 3);
+        assert_eq!(page2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_message_while_inactive() {
+        let tc = TestCore::build();
+        let sid = tc.core.create_session(tc.workspace()).await;
+        // Queue a message — should not panic even with no active turn
+        tc.core.queue_message(&sid, "hello").await;
+    }
+
+    #[tokio::test]
+    async fn set_channel_id() {
+        let tc = TestCore::build();
+        let sid = tc.core.create_session(tc.workspace()).await;
+        tc.core.set_session_channel_id(&sid, "tg:12345").await;
+        let mappings = tc.core.channel_session_mappings().await;
+        assert!(mappings.iter().any(|(ch, _)| ch == "tg:12345"));
+    }
+
+    #[tokio::test]
+    async fn session_total_usage_empty() {
+        let tc = TestCore::build();
+        let sid = tc.core.create_session(tc.workspace()).await;
+        let usage = tc.core.session_total_usage(&sid).await;
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+    }
+}
+
+#[cfg(test)]
+mod research_ops_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_and_load() {
+        let tc = TestCore::build();
+        let spec = tc
+            .core
+            .create_research("apartments samui", vec![], None, None, None)
+            .await
+            .unwrap();
+        let loaded = tc.core.load_research(&spec.id).await.unwrap();
+        assert_eq!(loaded.topic, "apartments samui");
+    }
+
+    #[tokio::test]
+    async fn delete_research() {
+        let tc = TestCore::build();
+        let spec = tc
+            .core
+            .create_research("temp topic", vec![], None, None, None)
+            .await
+            .unwrap();
+        tc.core.delete_research(&spec.id).await.unwrap();
+        assert!(tc.core.load_research(&spec.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_paused() {
+        let tc = TestCore::build();
+        let spec = tc
+            .core
+            .create_research("pausable", vec![], None, None, None)
+            .await
+            .unwrap();
+        tc.core.set_research_paused(&spec.id, true).await.unwrap();
+        let loaded = tc.core.load_research(&spec.id).await.unwrap();
+        assert!(loaded.paused);
+    }
+
+    #[tokio::test]
+    async fn update_research_patch() {
+        let tc = TestCore::build();
+        let spec = tc
+            .core
+            .create_research("patchable", vec![], None, None, None)
+            .await
+            .unwrap();
+        let patch = crate::ResearchPatch {
+            interval_seconds: Some(Some(3600)),
+            ..Default::default()
+        };
+        let updated = tc.core.update_research(&spec.id, patch).await.unwrap();
+        assert_eq!(updated.interval_seconds, Some(3600));
+    }
+}
+
+#[cfg(test)]
+mod provider_ops_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_models_includes_noop() {
+        let tc = TestCore::build();
+        let models = tc.core.list_models();
+        assert!(models.iter().any(|m| m.model_id == "noop-model"));
+    }
+
+    #[tokio::test]
+    async fn list_providers_includes_noop() {
+        let tc = TestCore::build();
+        let _providers = tc.core.list_providers();
+        let (prov, _) = tc.core.default_provider_model();
+        assert_eq!(prov, "noop");
+    }
+
+    #[tokio::test]
+    async fn list_skills_empty() {
+        let tc = TestCore::build();
+        let skills = tc.core.list_skills();
+        // No skill_roots configured → empty
+        assert!(skills.is_empty());
+    }
+}
