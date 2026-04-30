@@ -349,13 +349,12 @@ pub(crate) async fn handle_callback(
                             })
                             .collect();
                         let kb = InlineKeyboardMarkup::new(rows);
-                        bot.send_message(
-                            cb_ctx.chat_id,
-                            format!("Provider: <b>{prov}</b>\nSelect model:",),
+                        reply_html_kb(
+                            &bot,
+                            &cb_ctx,
+                            format!("Provider: <b>{prov}</b>\nSelect model:"),
+                            kb,
                         )
-                        .parse_mode(ParseMode::Html)
-                        .reply_markup(kb)
-                        .maybe_thread(cb_ctx.thread_id)
                         .await?;
                     }
                 }
@@ -374,13 +373,12 @@ pub(crate) async fn handle_callback(
                         })
                         .collect();
                     let kb = InlineKeyboardMarkup::new(rows);
-                    bot.send_message(
-                        cb_ctx.chat_id,
+                    reply_html_kb(
+                        &bot,
+                        &cb_ctx,
                         format!("💭 Reasoning: <b>{current_level}</b>"),
+                        kb,
                     )
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(kb)
-                    .maybe_thread(cb_ctx.thread_id)
                     .await?;
                 }
                 _ => {}
@@ -400,81 +398,8 @@ pub(crate) async fn handle_callback(
                 if let Some(msg) = &q.message
                     && let Some(regular) = msg.regular_message()
                 {
-                    let models = agent.provider_models(&prov).await;
-                    let scope: Vec<String> =
-                        config.model_scope.iter().map(|s| s.to_string()).collect();
-                    let filtered = naked_tg::tg_markup::filter_models_by_scope(&models, &scope);
-                    let page_size = 8;
-                    let total_pages = filtered.len().div_ceil(page_size);
-                    let page = page.min(total_pages.saturating_sub(1));
-                    let page_items = &filtered
-                        [page * page_size..(page * page_size + page_size).min(filtered.len())];
-
-                    let mut rows: Vec<Vec<InlineKeyboardButton>> = page_items
-                        .iter()
-                        .map(|(p, m)| {
-                            let label = if let Some(alias) =
-                                config.providers.get(&prov).and_then(|pc| {
-                                    pc.model_aliases
-                                        .iter()
-                                        .find(|(_, v)| {
-                                            v.as_str() == format!("{p}/{m}").as_str()
-                                                || v.as_str() == m.as_str()
-                                        })
-                                        .map(|(k, _)| k.clone())
-                                }) {
-                                alias
-                            } else {
-                                m.clone()
-                            };
-                            let mark = if *m == current_model {
-                                format!("{label} ✅")
-                            } else {
-                                label
-                            };
-                            vec![InlineKeyboardButton::callback(
-                                naked_tg::tg_markup::truncate_button(&mark, 56),
-                                format!("sm:{m}"),
-                            )]
-                        })
-                        .collect();
-
-                    // Aliases on separate row
-                    if let Some(pc) = config.providers.get(&prov) {
-                        for alias in pc.model_aliases.keys() {
-                            if !page_items.iter().any(|(_, m)| m == alias) {
-                                // Only show aliases on first page
-                                if page == 0 {
-                                    rows.push(vec![InlineKeyboardButton::callback(
-                                        alias.clone(),
-                                        format!("sm:{alias}"),
-                                    )]);
-                                }
-                            }
-                        }
-                    }
-
-                    if total_pages > 1 {
-                        let mut nav = Vec::new();
-                        if page > 0 {
-                            nav.push(InlineKeyboardButton::callback(
-                                "◀ Prev",
-                                format!("mp:{}", page - 1),
-                            ));
-                        }
-                        nav.push(InlineKeyboardButton::callback(
-                            format!("{}/{total_pages}", page + 1),
-                            "mp:noop".to_string(),
-                        ));
-                        if page + 1 < total_pages {
-                            nav.push(InlineKeyboardButton::callback(
-                                "Next ▶",
-                                format!("mp:{}", page + 1),
-                            ));
-                        }
-                        rows.push(nav);
-                    }
-
+                    let rows =
+                        build_model_keyboard(&agent, &config, &prov, &current_model, page).await;
                     let kb = InlineKeyboardMarkup::new(rows);
                     let _ = bot
                         .edit_message_text(
@@ -496,4 +421,78 @@ pub(crate) async fn handle_callback(
         }
     }
     Ok(())
+}
+
+async fn build_model_keyboard(
+    agent: &Arc<AgentCore>,
+    config: &Config,
+    prov: &str,
+    current_model: &str,
+    page: usize,
+) -> Vec<Vec<InlineKeyboardButton>> {
+    let models = agent.provider_models(prov).await;
+    let scope: Vec<String> = config.model_scope.iter().map(|s| s.to_string()).collect();
+    let filtered = naked_tg::tg_markup::filter_models_by_scope(&models, &scope);
+    let page_size = 8;
+    let total_pages = filtered.len().div_ceil(page_size);
+    let page = page.min(total_pages.saturating_sub(1));
+    let page_items =
+        &filtered[page * page_size..(page * page_size + page_size).min(filtered.len())];
+
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = page_items
+        .iter()
+        .map(|(p, m)| {
+            let label = if let Some(alias) = config.providers.get(prov).and_then(|pc| {
+                pc.model_aliases
+                    .iter()
+                    .find(|(_, v)| {
+                        v.as_str() == format!("{p}/{m}").as_str() || v.as_str() == m.as_str()
+                    })
+                    .map(|(k, _)| k.clone())
+            }) {
+                alias
+            } else {
+                m.clone()
+            };
+            let mark = if *m == current_model {
+                format!("{label} ✅")
+            } else {
+                label
+            };
+            vec![InlineKeyboardButton::callback(
+                naked_tg::tg_markup::truncate_button(&mark, 56),
+                format!("sm:{m}"),
+            )]
+        })
+        .collect();
+
+    if let Some(pc) = config.providers.get(prov) {
+        for alias in pc.model_aliases.keys() {
+            if !page_items.iter().any(|(_, m)| m == alias) && page == 0 {
+                rows.push(vec![InlineKeyboardButton::callback(
+                    alias.clone(),
+                    format!("sm:{alias}"),
+                )]);
+            }
+        }
+    }
+
+    if total_pages > 1 {
+        let mut nav = Vec::new();
+        if page > 0 {
+            nav.push(InlineKeyboardButton::callback(
+                "◀ Prev",
+                format!("mp:{}", page - 1),
+            ));
+        }
+        if page + 1 < total_pages {
+            nav.push(InlineKeyboardButton::callback(
+                "Next ▶",
+                format!("mp:{}", page + 1),
+            ));
+        }
+        rows.push(nav);
+    }
+
+    rows
 }

@@ -1,7 +1,7 @@
-//! Streaming response handler + CompositeView extracted from main.rs.
-//!
-//! Handles: stream_response, CompositeView, flush_live, edit_with_retry,
-//! send_final, ask_permission, render_html_document, format helpers.
+//! Streaming response handler + CompositeView.
+
+mod helpers;
+pub(crate) use helpers::*;
 
 use super::*;
 
@@ -114,42 +114,7 @@ impl CompositeView {
             parts.push(line.clone());
         }
 
-        if !self.sub_agents.is_empty() {
-            let last_ids: Vec<_> = self
-                .sub_agent_order
-                .iter()
-                .rev()
-                .take(3)
-                .rev()
-                .cloned()
-                .collect();
-            for id in &last_ids {
-                if let Some(sa) = self.sub_agents.get(id) {
-                    let icon = match sa.status {
-                        "running" => "🤖",
-                        "done" => "✅",
-                        "error" => "❌",
-                        _ => "⏳",
-                    };
-                    let tool_info = sa
-                        .last_tool
-                        .as_deref()
-                        .map(|t| {
-                            if sa.tool_count > 1 {
-                                format!(" · {t} ×{}", sa.tool_count)
-                            } else {
-                                format!(" · {t}")
-                            }
-                        })
-                        .unwrap_or_default();
-                    let short = truncate_str(&sa.prompt, 40);
-                    parts.push(format!(
-                        "{icon} <b>{id}</b> {}{tool_info}",
-                        escape_html(&short)
-                    ));
-                }
-            }
-        }
+        self.render_sub_agent_lines(&mut parts);
 
         // ── Response text preview ────────────────────────────────
         // Show the agent's response as it generates. Render closed
@@ -231,6 +196,47 @@ impl CompositeView {
     /// fits in a single Telegram message (`MAX_TG_MSG`) — no more
     /// "echo-chunk" second posts that leak CoT drafts after the real
     /// answer.
+    fn render_sub_agent_lines(&self, parts: &mut Vec<String>) {
+        if self.sub_agents.is_empty() {
+            return;
+        }
+        let last_ids: Vec<_> = self
+            .sub_agent_order
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .cloned()
+            .collect();
+        for id in &last_ids {
+            let Some(sa) = self.sub_agents.get(id) else {
+                continue;
+            };
+            let icon = match sa.status {
+                "running" => "🤖",
+                "done" => "✅",
+                "error" => "❌",
+                _ => "⏳",
+            };
+            let tool_info = sa
+                .last_tool
+                .as_deref()
+                .map(|t| {
+                    if sa.tool_count > 1 {
+                        format!(" · {t} ×{}", sa.tool_count)
+                    } else {
+                        format!(" · {t}")
+                    }
+                })
+                .unwrap_or_default();
+            let short = truncate_str(&sa.prompt, 40);
+            parts.push(format!(
+                "{icon} <b>{id}</b> {}{tool_info}",
+                escape_html(&short)
+            ));
+        }
+    }
+
     fn render_final(&self) -> String {
         let text = self.response_text.trim();
         let thinking = self.thinking.trim();
@@ -332,39 +338,6 @@ impl CompositeView {
             self.usage_footer()
         )
     }
-}
-
-pub(crate) fn format_input_preview(input: &serde_json::Value, max_len: usize) -> String {
-    if let Some(map) = input.as_object() {
-        if map.len() == 1 {
-            let (key, val) = map.iter().next().unwrap();
-            let fallback = val.to_string();
-            let v = val.as_str().unwrap_or(&fallback);
-            return format!("{key}: {}", truncate_str(v, max_len));
-        }
-        let parts: Vec<String> = map
-            .iter()
-            .map(|(k, v)| {
-                let fallback = v.to_string();
-                let s = v.as_str().unwrap_or(&fallback);
-                format!("{k}: {}", truncate_str(s, 60))
-            })
-            .collect();
-        truncate_str(&parts.join(", "), max_len)
-    } else {
-        truncate_str(&input.to_string(), max_len)
-    }
-}
-
-pub(crate) fn truncate_str(s: &str, max_chars: usize) -> String {
-    let mut last_boundary = 0;
-    for (i, (byte_pos, _)) in s.char_indices().enumerate() {
-        if i >= max_chars {
-            return format!("{}…", &s[..last_boundary]);
-        }
-        last_boundary = byte_pos;
-    }
-    s.to_string()
 }
 
 fn render_html_document(view: &CompositeView) -> Vec<u8> {
@@ -495,6 +468,51 @@ hr {{
     );
 
     doc.into_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Apply a sub-agent progress event to the composite view.
+fn apply_sub_agent_event(
+    view: &mut CompositeView,
+    agent_id: String,
+    event: naked_core::types::SubAgentEvent,
+) {
+    use naked_core::types::SubAgentEvent;
+    match event {
+        SubAgentEvent::Started { prompt_preview } => {
+            view.phase = "sub_agent";
+            if !view.sub_agent_order.contains(&agent_id) {
+                view.sub_agent_order.push(agent_id.clone());
+            }
+            view.sub_agents.insert(
+                agent_id,
+                SubAgentState {
+                    prompt: prompt_preview,
+                    status: "running",
+                    last_tool: None,
+                    tool_count: 0,
+                },
+            );
+        }
+        SubAgentEvent::ToolUse { name, .. } => {
+            if let Some(sa) = view.sub_agents.get_mut(&agent_id) {
+                sa.last_tool = Some(name);
+                sa.tool_count = sa.tool_count.saturating_add(1);
+            }
+        }
+        SubAgentEvent::ToolDone { .. } | SubAgentEvent::TextDelta(_) => {}
+        SubAgentEvent::Finished { .. } => {
+            if let Some(sa) = view.sub_agents.get_mut(&agent_id) {
+                sa.status = "done";
+                sa.last_tool = None;
+            }
+        }
+        SubAgentEvent::Error(_) => {
+            if let Some(sa) = view.sub_agents.get_mut(&agent_id) {
+                sa.status = "error";
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -707,43 +725,7 @@ pub(crate) async fn stream_response(
                     agent_id,
                     event: sa_ev,
                 } => {
-                    use naked_core::types::SubAgentEvent;
-                    match sa_ev {
-                        SubAgentEvent::Started { prompt_preview } => {
-                            view.phase = "sub_agent";
-                            if !view.sub_agent_order.contains(&agent_id) {
-                                view.sub_agent_order.push(agent_id.clone());
-                            }
-                            view.sub_agents.insert(
-                                agent_id,
-                                SubAgentState {
-                                    prompt: prompt_preview,
-                                    status: "running",
-                                    last_tool: None,
-                                    tool_count: 0,
-                                },
-                            );
-                        }
-                        SubAgentEvent::ToolUse { name, .. } => {
-                            if let Some(sa) = view.sub_agents.get_mut(&agent_id) {
-                                sa.last_tool = Some(name);
-                                sa.tool_count = sa.tool_count.saturating_add(1);
-                            }
-                        }
-                        SubAgentEvent::ToolDone { .. } => {}
-                        SubAgentEvent::TextDelta(_) => {}
-                        SubAgentEvent::Finished { .. } => {
-                            if let Some(sa) = view.sub_agents.get_mut(&agent_id) {
-                                sa.status = "done";
-                                sa.last_tool = None;
-                            }
-                        }
-                        SubAgentEvent::Error(_) => {
-                            if let Some(sa) = view.sub_agents.get_mut(&agent_id) {
-                                sa.status = "error";
-                            }
-                        }
-                    }
+                    apply_sub_agent_event(&mut view, agent_id, sa_ev);
                     dirty = true;
                     force_flush = true;
                 }
@@ -979,15 +961,11 @@ pub(crate) async fn send_long_text(
     text: &str,
 ) -> Result<(), teloxide::RequestError> {
     if text.len() <= MAX_TG_MSG {
-        bot.send_message(ctx.chat_id, text)
-            .maybe_thread(ctx.thread_id)
-            .await?;
+        reply_text(bot, &ctx, text).await?;
         return Ok(());
     }
     for chunk in split_html(text, MAX_TG_MSG - 100) {
-        bot.send_message(ctx.chat_id, chunk)
-            .maybe_thread(ctx.thread_id)
-            .await?;
+        reply_text(bot, &ctx, chunk).await?;
     }
     Ok(())
 }
@@ -1049,23 +1027,6 @@ pub(crate) async fn ask_permission(
     }
 }
 
-/// Parse "Retry after Xs" from Telegram error string.
-pub(crate) fn parse_retry_after(err: &str) -> Option<u64> {
-    let s = err.to_lowercase();
-    if let Some(pos) = s.find("retry after") {
-        let after = &s[pos + 12..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    } else {
-        None
-    }
-}
-
-/// Deduplicated edit: only sends if content changed. Acquires global rate limiter
-/// slot before sending. On rate limit from Telegram, backs off.
-/// Flush the live preview. Returns `true` on success, `false` on 429.
-/// Caller is responsible for rate limiting (acquire before, report after).
-/// Format a provider error into a user-friendly diagnostic card.
 fn format_provider_error(err: &str, model_tag: &str) -> String {
     if err.contains("no content") {
         return "— модель закрыла ход без ответа (0 токенов).\n\
@@ -1134,32 +1095,6 @@ fn format_provider_error(err: &str, model_tag: &str) -> String {
     )
 }
 
-/// Strip `class="language-..."` from `<code>` tags.
-/// Telegram `editMessageText` rejects attributes during streaming preview
-/// but accepts them in `sendMessage` (final render).
-fn strip_code_class(html: &str) -> String {
-    // Fast path: no class= at all
-    if !html.contains("class=") {
-        return html.to_string();
-    }
-    // Replace <code class="language-X"> with <code>
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(pos) = rest.find("<code class=") {
-        out.push_str(&rest[..pos]);
-        out.push_str("<code>");
-        // Skip past the closing >
-        if let Some(close) = rest[pos..].find('>') {
-            rest = &rest[pos + close + 1..];
-        } else {
-            rest = &rest[pos..];
-            break;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 pub(crate) async fn flush_live(
     bot: &Bot,
     chat_id: ChatId,
@@ -1212,25 +1147,6 @@ pub(crate) async fn flush_live(
             }
         }
     }
-}
-
-/// Crude HTML tag stripper for plain-text fallback.
-fn strip_html_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    // Unescape HTML entities
-    out.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
 }
 
 #[cfg(test)]
@@ -2300,5 +2216,52 @@ mod resilience_tests {
         let msg = format_provider_error("some weird error: {\"details\":\"secret\"}", "x/y");
         assert!(msg.contains("some weird error"), "{msg}");
         assert!(!msg.contains("secret"), "JSON should be stripped: {msg}");
+    }
+
+    // ── parse_retry_after ───────────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_seconds() {
+        assert_eq!(parse_retry_after("retry after 30s"), Some(30));
+        assert_eq!(parse_retry_after("Retry after 5 seconds"), Some(5));
+    }
+
+    #[test]
+    fn parse_retry_after_in_error_message() {
+        assert_eq!(
+            parse_retry_after("rate limited, retry after 60 seconds"),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_none() {
+        assert_eq!(parse_retry_after("some random error"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    // ── format_input_preview ────────────────────────────────────────
+
+    #[test]
+    fn format_input_preview_single_key() {
+        let v = serde_json::json!({"query": "hello world"});
+        let s = format_input_preview(&v, 50);
+        assert!(s.contains("query:"), "{s}");
+        assert!(s.contains("hello world"), "{s}");
+    }
+
+    #[test]
+    fn format_input_preview_multi_key() {
+        let v = serde_json::json!({"a": 1, "b": 2});
+        let s = format_input_preview(&v, 50);
+        // Multi-key shows key: val pairs
+        assert!(s.contains("a:") || s.contains("b:"), "{s}");
+    }
+
+    #[test]
+    fn format_input_preview_truncates() {
+        let v = serde_json::json!({"query": "a".repeat(200)});
+        let s = format_input_preview(&v, 20);
+        assert!(s.len() <= 30, "should truncate: {}", s.len()); // some slack for key + …
     }
 }

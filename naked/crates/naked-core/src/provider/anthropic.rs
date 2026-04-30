@@ -119,7 +119,10 @@ impl Provider for AnthropicProvider {
         }
 
         let response = req
-            .body(serde_json::to_string(&body).unwrap())
+            .body(
+                serde_json::to_string(&body)
+                    .map_err(|e| AgentError::Provider(format!("serialize: {e}")))?,
+            )
             .send()
             .await
             .map_err(|e| AgentError::Provider(format!("HTTP error: {e}")))?;

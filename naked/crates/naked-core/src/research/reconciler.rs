@@ -536,8 +536,9 @@ fn parse_amount(s: &str) -> Option<f64> {
     let has_dot = stripped.contains('.');
 
     let normalised: String = if has_comma && has_dot {
-        let last_comma = stripped.rfind(',').unwrap();
-        let last_dot = stripped.rfind('.').unwrap();
+        let (Some(last_comma), Some(last_dot)) = (stripped.rfind(','), stripped.rfind('.')) else {
+            return None;
+        };
         if last_comma > last_dot {
             stripped.replace('.', "").replace(',', ".")
         } else {

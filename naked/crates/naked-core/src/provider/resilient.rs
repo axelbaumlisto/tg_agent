@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_stream::Stream;
 
-use crate::error::Result;
+use crate::error::{AgentError, Result};
 use crate::types::{ModelInfo, StreamChunk};
 
 use super::{ChatRequest, Provider};
@@ -78,7 +78,7 @@ impl ResilientProvider {
 #[async_trait]
 impl Provider for ResilientProvider {
     fn name(&self) -> &str {
-        // Synchronous access needed — use try_lock fallback
+        // Synchronous access needed - use try_lock fallback
         if let Ok(order) = self.order.try_lock() {
             let idx = order.front().copied().unwrap_or(0);
             return self.providers[idx].name();
@@ -143,20 +143,18 @@ impl Provider for ResilientProvider {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    // Key-level terminal: auth/billing broken — blacklist key
-                    let key_dead = err_str.contains("401")
-                        || err_str.contains("402")
-                        || err_str.contains("403")
-                        || err_str.contains("Unauthorized")
-                        || err_str.contains("Payment Required")
-                        || err_str.contains("membership");
-                    // Model-level terminal: model doesn't exist on this provider.
-                    // Don't blacklist the key — other models may work.
-                    // Just stop retrying: all keys share the same model list.
-                    let model_dead = err_str.contains("404")
-                        || err_str.contains("model_not_found")
-                        || err_str.contains("does not exist");
+                    // Try to extract typed error; fall back to string classification
+                    let (key_dead, model_dead) = if let AgentError::ProviderTyped(ref pe) = e {
+                        (pe.is_key_dead(), pe.is_model_dead())
+                    } else {
+                        let err_str = e.to_string();
+                        let pe = super::error::ProviderError::from_llm_http(
+                            extract_status_from_error(&err_str),
+                            &err_str,
+                            &request.model,
+                        );
+                        (pe.is_key_dead(), pe.is_model_dead())
+                    };
                     if key_dead {
                         tracing::warn!(
                             "Provider '{}' key dead: {e}, blacklisting for {}s",
@@ -168,7 +166,7 @@ impl Provider for ResilientProvider {
                             .await
                             .insert(idx, Instant::now() + BLACKLIST_TTL);
                     } else if model_dead {
-                        // Model doesn't exist — no point trying other keys.
+                        // Model doesn't exist - no point trying other keys.
                         tracing::warn!(
                             "Provider '{}' model not found: {e}, aborting rotation",
                             provider.name(),
@@ -195,6 +193,19 @@ impl Provider for ResilientProvider {
 
         Err(last_err.expect("at least one provider must be configured"))
     }
+}
+
+/// Extract HTTP status code from a provider error string.
+/// Looks for patterns like "401", "402 Payment", "(429)", "HTTP 500".
+fn extract_status_from_error(err: &str) -> u16 {
+    // Try common patterns: "API 401:", "(402)", "HTTP 429", bare "500"
+    for code in [401u16, 402, 403, 404, 429, 500, 502, 503] {
+        let s = code.to_string();
+        if err.contains(&s) {
+            return code;
+        }
+    }
+    0 // unknown
 }
 
 #[cfg(test)]
@@ -409,9 +420,9 @@ mod tests {
             &self,
             _request: ChatRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
-            Err(AgentError::Provider(format!(
-                "OpenAI API 402 Payment Required: {{\"error\":{{\"message\":\"membership not active\"}}}}"
-            )))
+            Err(AgentError::Provider(
+                "OpenAI API 402 Payment Required: {\"error\":{\"message\":\"membership not active\"}}".to_string()
+            ))
         }
     }
 
@@ -510,7 +521,7 @@ mod tests {
         assert_eq!(
             p.blacklisted_count().await,
             0,
-            "key should NOT be blacklisted — only the model is bad"
+            "key should NOT be blacklisted - only the model is bad"
         );
     }
 
@@ -523,8 +534,36 @@ mod tests {
             Box::new(SuccessProvider { name: "k2".into() }),
         ]);
         let result = p.stream_chat(test_request()).await;
-        assert!(result.is_err(), "should fail — model doesn't exist");
+        assert!(result.is_err(), "should fail - model doesn't exist");
         // k1 and k2 were never tried (no point, same model list)
         assert_eq!(p.blacklisted_count().await, 0);
+    }
+
+    #[test]
+    fn extract_status_401() {
+        assert_eq!(
+            extract_status_from_error("auth failed 401 Unauthorized"),
+            401
+        );
+    }
+
+    #[test]
+    fn extract_status_429() {
+        assert_eq!(extract_status_from_error("rate limited (429)"), 429);
+    }
+
+    #[test]
+    fn extract_status_500() {
+        assert_eq!(extract_status_from_error("server error 500"), 500);
+    }
+
+    #[test]
+    fn extract_status_unknown() {
+        assert_eq!(extract_status_from_error("some random error"), 0);
+    }
+
+    #[test]
+    fn extract_status_empty() {
+        assert_eq!(extract_status_from_error(""), 0);
     }
 }

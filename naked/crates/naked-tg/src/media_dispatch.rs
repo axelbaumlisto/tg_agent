@@ -646,3 +646,121 @@ pub(crate) async fn send_text(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── mime_ext ────────────────────────────────────────────────────
+
+    #[test]
+    fn mime_ext_audio_formats() {
+        assert_eq!(mime_ext("audio/ogg"), Some("ogg"));
+        assert_eq!(mime_ext("audio/opus"), Some("ogg"));
+        assert_eq!(mime_ext("audio/mpeg"), Some("mp3"));
+        assert_eq!(mime_ext("audio/mp3"), Some("mp3"));
+        assert_eq!(mime_ext("audio/x-wav"), Some("wav"));
+        assert_eq!(mime_ext("audio/flac"), Some("flac"));
+        assert_eq!(mime_ext("audio/mp4"), Some("m4a"));
+    }
+
+    #[test]
+    fn mime_ext_unknown_returns_none() {
+        assert_eq!(mime_ext("video/mp4"), None);
+        assert_eq!(mime_ext(""), None);
+        assert_eq!(mime_ext("text/plain"), None);
+    }
+
+    // ── fmt_duration ────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_duration_minutes_seconds() {
+        assert_eq!(fmt_duration(0), "00:00");
+        assert_eq!(fmt_duration(5), "00:05");
+        assert_eq!(fmt_duration(61), "01:01");
+        assert_eq!(fmt_duration(3599), "59:59");
+    }
+
+    #[test]
+    fn fmt_duration_capped_at_99_59() {
+        assert_eq!(fmt_duration(99 * 60 + 59), "99:59");
+        assert_eq!(fmt_duration(100 * 60), "99:59"); // capped
+        assert_eq!(fmt_duration(u64::MAX), "99:59"); // capped
+    }
+
+    // ── format_interval ─────────────────────────────────────────────
+
+    #[test]
+    fn format_interval_units() {
+        assert_eq!(format_interval(0), "manual");
+        assert_eq!(format_interval(30), "every 30s");
+        assert_eq!(format_interval(60), "every 1m");
+        assert_eq!(format_interval(1800), "every 30m");
+        assert_eq!(format_interval(3600), "every 1h");
+        assert_eq!(format_interval(86400), "every 1d");
+        assert_eq!(format_interval(172800), "every 2d");
+    }
+
+    #[test]
+    fn format_interval_non_round() {
+        assert_eq!(format_interval(90), "every 90s"); // not a clean minute
+        assert_eq!(format_interval(5400), "every 90m"); // 1.5h → minutes
+    }
+
+    // ── format_age ──────────────────────────────────────────────────
+
+    #[test]
+    fn format_age_units() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(3599), "59m");
+        assert_eq!(format_age(3600), "1h");
+        assert_eq!(format_age(86399), "23h");
+        assert_eq!(format_age(86400), "1d");
+        assert_eq!(format_age(864000), "10d");
+    }
+
+    // ── looks_like_supported_image ──────────────────────────────────
+
+    #[test]
+    fn image_detection_jpeg() {
+        let mut data = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        data.extend_from_slice(&[0; 20]);
+        assert!(looks_like_supported_image(&data));
+    }
+
+    #[test]
+    fn image_detection_png() {
+        let mut data = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        data.extend_from_slice(&[0; 20]);
+        assert!(looks_like_supported_image(&data));
+    }
+
+    #[test]
+    fn image_detection_gif() {
+        let mut data = b"GIF89a".to_vec();
+        data.extend_from_slice(&[0; 20]);
+        assert!(looks_like_supported_image(&data));
+    }
+
+    #[test]
+    fn image_detection_webp() {
+        let mut data = b"RIFF".to_vec();
+        data.extend_from_slice(&[0; 4]); // size
+        data.extend_from_slice(b"WEBP");
+        data.extend_from_slice(&[0; 10]);
+        assert!(looks_like_supported_image(&data));
+    }
+
+    #[test]
+    fn image_detection_rejects_small() {
+        assert!(!looks_like_supported_image(&[0xFF, 0xD8]));
+        assert!(!looks_like_supported_image(&[]));
+    }
+
+    #[test]
+    fn image_detection_rejects_unknown() {
+        assert!(!looks_like_supported_image(&[0; 20]));
+    }
+}

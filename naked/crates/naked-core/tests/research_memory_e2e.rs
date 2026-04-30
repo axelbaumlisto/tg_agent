@@ -18,7 +18,9 @@ use naked_core::research::ops_tool::{
     ResearchHelpTool, ResearchListSpecsTool, ResearchMetricsTool, ResearchSetScheduleTool,
 };
 use naked_core::research::spec::{Finding, ResearchSpec, RunRecord, dedup_hash};
-use naked_core::research::store::{FsResearchStore, ResearchStore, research_runlog_path};
+use naked_core::research::store::{
+    FsResearchStore, ReportStore, ResearchStore, RunStore, SpecStore, research_runlog_path,
+};
 use naked_core::tool::Tool;
 use naked_core::types::{AgentEvent, AgentHandle, PermissionResponse};
 use naked_core::{ResearchPatch, apply_research_patch, write_research_memory_link_for};

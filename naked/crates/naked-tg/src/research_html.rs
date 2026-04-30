@@ -266,7 +266,7 @@ fn emit_list_block<'a, I>(
         if !matches_kind {
             break;
         }
-        let line = lines.next().unwrap();
+        let Some(line) = lines.next() else { break };
         emit_list_item(out, line.trim_end());
     }
 

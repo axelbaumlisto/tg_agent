@@ -31,6 +31,19 @@ pub enum ProviderError {
     /// Origin responded with a Cloudflare challenge (403 + `cf-browser-verification`,
     /// or similar). Body is effectively empty / unusable from an HTTP client.
     CloudflareBlocked { url: String, hint: FallbackHint },
+    /// Authentication failed (401/403) — key is dead, try next key.
+    AuthFailed { status: u16, body: String },
+    /// Payment required (402) — key quota exhausted, try next key.
+    PaymentRequired { status: u16, body: String },
+    /// Model not found (404 + "model_not_found") — abort, don’t cycle keys.
+    ModelNotFound { model: String, body: String },
+    /// Rate limited (429) — back off and retry.
+    RateLimited {
+        retry_after: Option<u64>,
+        body: String,
+    },
+    /// Server error (5xx) — transient, retry with same key.
+    ServerError { status: u16, body: String },
     /// Non-classified upstream error — keep the raw body so the caller can log it.
     Other { status: u16, body: String },
 }
@@ -39,6 +52,47 @@ impl ProviderError {
     /// Parse an upstream HTTP response into a typed error. `status` is the
     /// HTTP status code; `body` is the response body (small; callers should
     /// cap it before calling if responses can be huge).
+    /// Classify an LLM provider HTTP error by status + body.
+    pub fn from_llm_http(status: u16, body: &str, model: &str) -> Self {
+        let lower = body.to_ascii_lowercase();
+        match status {
+            401 | 403 => ProviderError::AuthFailed {
+                status,
+                body: truncate(body, 512),
+            },
+            402 => ProviderError::PaymentRequired {
+                status,
+                body: truncate(body, 512),
+            },
+            404 if lower.contains("model_not_found")
+                || lower.contains("does not exist")
+                || lower.contains("not found") =>
+            {
+                ProviderError::ModelNotFound {
+                    model: model.to_string(),
+                    body: truncate(body, 512),
+                }
+            }
+            429 => {
+                // Try to parse retry-after from body
+                let retry_after = extract_retry_seconds(&lower);
+                ProviderError::RateLimited {
+                    retry_after,
+                    body: truncate(body, 512),
+                }
+            }
+            500..=599 => ProviderError::ServerError {
+                status,
+                body: truncate(body, 512),
+            },
+            _ => ProviderError::Other {
+                status,
+                body: truncate(body, 512),
+            },
+        }
+    }
+
+    /// Classify a web-fetch/search HTTP error (original method).
     pub fn from_http(status: u16, body: &str) -> Self {
         let lower = body.to_ascii_lowercase();
         // Exa-style quota exhausted
@@ -59,13 +113,43 @@ impl ProviderError {
         }
     }
 
+    /// Is this a key-level failure (try next key)?
+    pub fn is_key_dead(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::AuthFailed { .. } | ProviderError::PaymentRequired { .. }
+        )
+    }
+
+    /// Is this a model-level failure (abort, don’t cycle keys)?
+    pub fn is_model_dead(&self) -> bool {
+        matches!(self, ProviderError::ModelNotFound { .. })
+    }
+
+    /// Is this a transient failure (retry with backoff)?
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::RateLimited { .. } | ProviderError::ServerError { .. }
+        )
+    }
+
     pub fn hint(&self) -> FallbackHint {
         match self {
             ProviderError::QuotaExhausted { hint, .. } => *hint,
             ProviderError::CloudflareBlocked { hint, .. } => *hint,
-            ProviderError::Other { .. } => FallbackHint::None,
+            _ => FallbackHint::None,
         }
     }
+}
+
+fn extract_retry_seconds(lower: &str) -> Option<u64> {
+    if let Some(pos) = lower.find("retry after") {
+        let after = &lower[pos + 12..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return digits.parse().ok();
+    }
+    None
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -85,8 +169,27 @@ impl std::fmt::Display for ProviderError {
             ProviderError::CloudflareBlocked { url, hint } => {
                 write!(f, "cloudflare challenge at `{url}` (hint: {hint:?})")
             }
+            ProviderError::AuthFailed { status, body } => {
+                write!(f, "auth failed ({status}): {body}")
+            }
+            ProviderError::PaymentRequired { status, body } => {
+                write!(f, "payment required ({status}): {body}")
+            }
+            ProviderError::ModelNotFound { model, body } => {
+                write!(f, "model not found `{model}`: {body}")
+            }
+            ProviderError::RateLimited { retry_after, body } => {
+                if let Some(secs) = retry_after {
+                    write!(f, "rate limited (retry after {secs}s): {body}")
+                } else {
+                    write!(f, "rate limited: {body}")
+                }
+            }
+            ProviderError::ServerError { status, body } => {
+                write!(f, "server error ({status}): {body}")
+            }
             ProviderError::Other { status, body } => {
-                write!(f, "provider error {status}: {body}")
+                write!(f, "provider error ({status}): {body}")
             }
         }
     }
@@ -119,5 +222,69 @@ mod tests {
     fn other_status_passthrough() {
         let err = ProviderError::from_http(500, "boom");
         assert!(matches!(err, ProviderError::Other { status: 500, .. }));
+    }
+
+    // ── LLM provider errors ───────────────────────────────────────────
+
+    #[test]
+    fn llm_401_is_auth_failed() {
+        let err = ProviderError::from_llm_http(401, "Unauthorized", "gpt-4");
+        assert!(err.is_key_dead());
+        assert!(!err.is_model_dead());
+        assert!(matches!(err, ProviderError::AuthFailed { status: 401, .. }));
+    }
+
+    #[test]
+    fn llm_402_is_payment_required() {
+        let err = ProviderError::from_llm_http(402, "membership not active", "gpt-4");
+        assert!(err.is_key_dead());
+        assert!(matches!(err, ProviderError::PaymentRequired { .. }));
+    }
+
+    #[test]
+    fn llm_404_model_not_found() {
+        let err = ProviderError::from_llm_http(404, "model_not_found", "gpt-5");
+        assert!(err.is_model_dead());
+        assert!(!err.is_key_dead());
+        assert!(matches!(err, ProviderError::ModelNotFound { .. }));
+    }
+
+    #[test]
+    fn llm_404_generic_is_not_model_dead() {
+        let err = ProviderError::from_llm_http(404, "endpoint unavailable", "gpt-4");
+        // "endpoint unavailable" doesn't contain model_not_found keywords
+        // so this is NOT a model-dead error
+        assert!(!err.is_model_dead());
+    }
+
+    #[test]
+    fn llm_429_rate_limited() {
+        let err = ProviderError::from_llm_http(429, "retry after 30 seconds", "gpt-4");
+        assert!(err.is_transient());
+        assert!(matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after: Some(30),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn llm_500_server_error() {
+        let err = ProviderError::from_llm_http(500, "internal server error", "gpt-4");
+        assert!(err.is_transient());
+        assert!(matches!(
+            err,
+            ProviderError::ServerError { status: 500, .. }
+        ));
+    }
+
+    #[test]
+    fn llm_200_other() {
+        let err = ProviderError::from_llm_http(200, "unexpected", "gpt-4");
+        assert!(!err.is_key_dead());
+        assert!(!err.is_model_dead());
+        assert!(!err.is_transient());
     }
 }

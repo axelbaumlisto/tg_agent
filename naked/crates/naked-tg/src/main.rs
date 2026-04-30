@@ -150,6 +150,37 @@ impl SendExt for teloxide::requests::MultipartRequest<teloxide::payloads::SendDo
     }
 }
 
+// ── Reply helpers (DRY: replaces 43× repeated send_message chains) ──────────
+
+/// Send a plain-text message. Handles thread_id automatically.
+async fn reply_text(bot: &Bot, ctx: &ChatCtx, text: impl Into<String>) -> ResponseResult<Message> {
+    bot.send_message(ctx.chat_id, text)
+        .maybe_thread(ctx.thread_id)
+        .await
+}
+
+/// Send an HTML-formatted message. Handles thread_id + ParseMode::Html.
+async fn reply_html(bot: &Bot, ctx: &ChatCtx, text: impl Into<String>) -> ResponseResult<Message> {
+    bot.send_message(ctx.chat_id, text)
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .maybe_thread(ctx.thread_id)
+        .await
+}
+
+/// Send an HTML message with an inline keyboard.
+async fn reply_html_kb(
+    bot: &Bot,
+    ctx: &ChatCtx,
+    text: impl Into<String>,
+    kb: teloxide::types::InlineKeyboardMarkup,
+) -> ResponseResult<Message> {
+    bot.send_message(ctx.chat_id, text)
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .reply_markup(kb)
+        .maybe_thread(ctx.thread_id)
+        .await
+}
+
 async fn send_typing_raw(
     client: &reqwest::Client,
     base: &str,
@@ -978,6 +1009,7 @@ mod callbacks;
 use callbacks::handle_callback;
 
 // ── Streaming (extracted to streaming.rs) ────────────────────────────────────
+#[path = "streaming_mod/mod.rs"]
 mod streaming;
 use streaming::{send_long_text, stream_response};
 

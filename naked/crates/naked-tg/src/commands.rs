@@ -45,10 +45,7 @@ pub(crate) async fn handle_command(
 /reload — reload config
 /health — provider health & key status
 /help — show this message";
-            bot.send_message(ctx.chat_id, help)
-                .parse_mode(teloxide::types::ParseMode::Html)
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_html(bot, &ctx, help).await?;
         }
         "/attribution" => {
             use std::sync::atomic::Ordering;
@@ -73,9 +70,7 @@ pub(crate) async fn handle_command(
                     format!("Unknown arg `{other}`. Usage: /attribution on|off|status")
                 }
             };
-            bot.send_message(ctx.chat_id, reply)
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_text(bot, &ctx, reply).await?;
         }
         "/new" => {
             // Best-effort: snapshot the closing session into a daily
@@ -91,9 +86,7 @@ pub(crate) async fn handle_command(
             channel_map.disable_yolo(chat_id, tid).await;
             let cid = format_tg_channel_id(chat_id, tid);
             agent.set_session_channel_id(&session_id, &cid).await;
-            bot.send_message(ctx.chat_id, format!("🆕 {session_id}"))
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_text(bot, &ctx, format!("🆕 {session_id}")).await?;
         }
         "/sessions" => {
             // `/sessions [page]` — 1-indexed, 20 per page, newest first.
@@ -112,15 +105,13 @@ pub(crate) async fn handle_command(
             let slice = agent.list_sessions_paged(skip, PAGE_SIZE).await;
 
             if total == 0 {
-                bot.send_message(ctx.chat_id, "No sessions.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "No sessions.").await?;
             } else if slice.is_empty() {
-                bot.send_message(
-                    ctx.chat_id,
+                reply_text(
+                    bot,
+                    &ctx,
                     format!("Page {page} is empty. Total pages: {total_pages}."),
                 )
-                .maybe_thread(ctx.thread_id)
                 .await?;
             } else {
                 let mut list: Vec<String> = slice
@@ -141,22 +132,16 @@ pub(crate) async fn handle_command(
         "/abort" | "/stop" => {
             if let Some(sid) = channel_map.get(chat_id, tid).await {
                 agent.abort(&sid).await;
-                bot.send_message(ctx.chat_id, "Aborted.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "Aborted.").await?;
             } else {
-                bot.send_message(ctx.chat_id, "No active session.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "No active session.").await?;
             }
         }
         "/status" => {
             let sid = match channel_map.get(chat_id, tid).await {
                 Some(s) => s,
                 None => {
-                    bot.send_message(ctx.chat_id, "No active session. Send a message first.")
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_text(bot, &ctx, "No active session. Send a message first.").await?;
                     return Ok(true);
                 }
             };
@@ -207,11 +192,7 @@ pub(crate) async fn handle_command(
                 teloxide::types::InlineKeyboardButton::callback("🤖 Model", "cmd:model"),
                 teloxide::types::InlineKeyboardButton::callback("💭 Reasoning", "cmd:reasoning"),
             ]]);
-            bot.send_message(ctx.chat_id, lines.join("\n"))
-                .parse_mode(teloxide::types::ParseMode::Html)
-                .reply_markup(kb)
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_html_kb(bot, &ctx, lines.join("\n"), kb).await?;
         }
         "/health" => {
             let mut lines = vec!["🏥 <b>Provider Health</b>".to_string()];
@@ -238,10 +219,7 @@ pub(crate) async fn handle_command(
                 };
                 lines.push(format!("  <b>{name}</b>: {info}"));
             }
-            bot.send_message(ctx.chat_id, lines.join("\n"))
-                .parse_mode(teloxide::types::ParseMode::Html)
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_html(bot, &ctx, lines.join("\n")).await?;
         }
         "/metrics" => {
             let snap = crate::metrics::snapshot();
@@ -259,37 +237,29 @@ pub(crate) async fn handle_command(
                     key.0, gap_ms, calls
                 ));
             }
-            bot.send_message(ctx.chat_id, text)
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_text(bot, &ctx, text).await?;
         }
         "/compact" => {
             if let Some(sid) = channel_map.get(chat_id, tid).await {
                 if agent.is_session_active(&sid).await {
-                    bot.send_message(ctx.chat_id, "⏳ Wait for current task to finish.")
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_text(bot, &ctx, "⏳ Wait for current task to finish.").await?;
                 } else {
                     match agent.compact_session(&sid).await {
                         Some((before, after)) => {
-                            bot.send_message(
-                                ctx.chat_id,
+                            reply_text(
+                                bot,
+                                &ctx,
                                 format!("✅ Compacted: {before} messages → {after}"),
                             )
-                            .maybe_thread(ctx.thread_id)
                             .await?;
                         }
                         None => {
-                            bot.send_message(ctx.chat_id, "ℹ️ No compaction needed.")
-                                .maybe_thread(ctx.thread_id)
-                                .await?;
+                            reply_text(bot, &ctx, "ℹ️ No compaction needed.").await?;
                         }
                     }
                 }
             } else {
-                bot.send_message(ctx.chat_id, "No active session.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "No active session.").await?;
             }
         }
         "/reload" => {
@@ -299,9 +269,7 @@ pub(crate) async fn handle_command(
                 "✅ Reloaded.\n• skills: {}\n• Use /metrics for more.",
                 skills.len()
             );
-            bot.send_message(ctx.chat_id, reply)
-                .maybe_thread(ctx.thread_id)
-                .await?;
+            reply_text(bot, &ctx, reply).await?;
         }
         "/provider" | "/providers" => {
             let arg = text[cmd_word.len()..].trim();
@@ -354,14 +322,10 @@ pub(crate) async fn handle_command(
                 match agent.set_session_provider(&sid, Some(arg), None).await {
                     Ok(()) => {
                         let (prov, model) = agent.session_provider_model(&sid).await;
-                        bot.send_message(ctx.chat_id, format!("Switched to: {prov}/{model}"))
-                            .maybe_thread(ctx.thread_id)
-                            .await?;
+                        reply_text(bot, &ctx, format!("Switched to: {prov}/{model}")).await?;
                     }
                     Err(e) => {
-                        bot.send_message(ctx.chat_id, format!("Error: {e}"))
-                            .maybe_thread(ctx.thread_id)
-                            .await?;
+                        reply_text(bot, &ctx, format!("Error: {e}")).await?;
                     }
                 }
             }
@@ -398,9 +362,7 @@ pub(crate) async fn handle_command(
                 };
 
                 if display_models.is_empty() {
-                    bot.send_message(ctx.chat_id, "No models match scope.")
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_text(bot, &ctx, "No models match scope.").await?;
                 } else {
                     const PAGE_SIZE: usize = 8;
                     let page = 0usize;
@@ -464,25 +426,17 @@ pub(crate) async fn handle_command(
                             escape_html_min(&current_model)
                         )
                     };
-                    bot.send_message(ctx.chat_id, header)
-                        .parse_mode(ParseMode::Html)
-                        .reply_markup(kb)
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_html_kb(bot, &ctx, header, kb).await?;
                 }
             } else {
                 let sid = get_or_create_session(ctx, agent, channel_map, config).await;
                 match agent.set_session_provider(&sid, None, Some(arg)).await {
                     Ok(()) => {
                         let (prov, model) = agent.session_provider_model(&sid).await;
-                        bot.send_message(ctx.chat_id, format!("Model set: {prov}/{model}"))
-                            .maybe_thread(ctx.thread_id)
-                            .await?;
+                        reply_text(bot, &ctx, format!("Model set: {prov}/{model}")).await?;
                     }
                     Err(e) => {
-                        bot.send_message(ctx.chat_id, format!("Error: {e}"))
-                            .maybe_thread(ctx.thread_id)
-                            .await?;
+                        reply_text(bot, &ctx, format!("Error: {e}")).await?;
                     }
                 }
             }
@@ -503,24 +457,21 @@ pub(crate) async fn handle_command(
                 })
                 .collect();
             let kb = InlineKeyboardMarkup::new(rows);
-            bot.send_message(
-                ctx.chat_id,
+            reply_html_kb(
+                bot,
+                &ctx,
                 format!(
                     "💭 Reasoning: <b>{}</b>\n\nSelect level:",
                     escape_html(current_level)
                 ),
+                kb,
             )
-            .parse_mode(ParseMode::Html)
-            .reply_markup(kb)
-            .maybe_thread(ctx.thread_id)
             .await?;
         }
         "/skills" => {
             let skills = agent.list_skills();
             if skills.is_empty() {
-                bot.send_message(ctx.chat_id, "No skills loaded.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "No skills loaded.").await?;
             } else {
                 let list: Vec<String> = skills
                     .iter()
@@ -533,18 +484,13 @@ pub(crate) async fn handle_command(
                     })
                     .collect();
                 let header = format!("📚 <b>{} skill(s)</b>\n\n{}", skills.len(), list.join("\n"));
-                bot.send_message(ctx.chat_id, header)
-                    .parse_mode(ParseMode::Html)
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_html(bot, &ctx, header).await?;
             }
         }
         "/mcp" => {
             let servers = agent.list_mcp_servers().await;
             if servers.is_empty() {
-                bot.send_message(ctx.chat_id, "No MCP servers connected.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "No MCP servers connected.").await?;
             } else {
                 let list: Vec<String> = servers
                     .iter()
@@ -557,34 +503,29 @@ pub(crate) async fn handle_command(
                     servers.len(),
                     list.join("\n")
                 );
-                bot.send_message(ctx.chat_id, header)
-                    .parse_mode(ParseMode::Html)
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_html(bot, &ctx, header).await?;
             }
         }
         "/refresh" => {
             agent.refresh_skills_and_mcp().await;
             let skills = agent.list_skills();
             let servers = agent.list_mcp_servers().await;
-            bot.send_message(
-                ctx.chat_id,
+            reply_text(
+                bot,
+                &ctx,
                 format!(
                     "🔄 Refreshed\n• {} skill(s)\n• {} MCP server(s)",
                     skills.len(),
                     servers.len()
                 ),
             )
-            .maybe_thread(ctx.thread_id)
             .await?;
         }
         "/approve" | "/yolo" => {
             tracing::info!(chat_id, ?tid, "yolo: enabling");
             let already = channel_map.is_yolo(chat_id, tid).await;
             if already {
-                bot.send_message(ctx.chat_id, "⚡ YOLO already active.")
-                    .maybe_thread(ctx.thread_id)
-                    .await?;
+                reply_text(bot, &ctx, "⚡ YOLO already active.").await?;
             } else {
                 channel_map.enable_yolo(chat_id, tid).await;
                 // Persist yolo timestamp to session config
@@ -613,8 +554,9 @@ pub(crate) async fn handle_command(
                     tracing::info!("yolo: auto-approved {n} pending permission(s)");
                 }
                 let remaining_h = channel_map.yolo_remaining_secs(chat_id, tid).await / 3600;
-                bot.send_message(
-                    ctx.chat_id,
+                reply_text(
+                    bot,
+                    &ctx,
                     format!(
                         "⚡ YOLO ON — all tools auto-approved ({remaining_h}h).{}",
                         if n > 0 {
@@ -624,7 +566,6 @@ pub(crate) async fn handle_command(
                         }
                     ),
                 )
-                .maybe_thread(ctx.thread_id)
                 .await?;
             }
         }
@@ -646,10 +587,7 @@ pub(crate) async fn handle_command(
                     } else {
                         format!("ℹ️ <b>{}</b> already in allow-list.", escape_html(tool))
                     };
-                    bot.send_message(ctx.chat_id, msg)
-                        .parse_mode(ParseMode::Html)
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_html(bot, &ctx, msg).await?;
                 }
                 Some("rm" | "remove" | "del") if args.len() >= 2 => {
                     let tool = args[1];
@@ -666,10 +604,7 @@ pub(crate) async fn handle_command(
                     } else {
                         format!("ℹ️ <b>{}</b> not in allow-list.", escape_html(tool))
                     };
-                    bot.send_message(ctx.chat_id, msg)
-                        .parse_mode(ParseMode::Html)
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_html(bot, &ctx, msg).await?;
                 }
                 _ => {
                     let list = channel_map.allow_get(chat_id, tid).await;
@@ -692,10 +627,7 @@ pub(crate) async fn handle_command(
                     text.push_str(
                         "\nUsage:\n<code>/allow add bash</code>\n<code>/allow rm bash</code>",
                     );
-                    bot.send_message(ctx.chat_id, text)
-                        .parse_mode(ParseMode::Html)
-                        .maybe_thread(ctx.thread_id)
-                        .await?;
+                    reply_html(bot, &ctx, text).await?;
                 }
             }
         }
@@ -1052,9 +984,7 @@ pub(crate) async fn handle_research_cmd(
     cmd_word: &str,
 ) -> Result<(), teloxide::RequestError> {
     if !config.research.enabled {
-        bot.send_message(ctx.chat_id, "Research subsystem is disabled in config.")
-            .maybe_thread(ctx.thread_id)
-            .await?;
+        reply_text(bot, ctx, "Research subsystem is disabled in config.").await?;
         return Ok(());
     }
     let rest = text[cmd_word.len()..].trim();
@@ -1178,69 +1108,7 @@ research-skill через LLM."
             }
             Err(e) => format!("error: {e}"),
         },
-        "metrics" => {
-            if tail.is_empty() {
-                "Usage: /research metrics <id>".to_string()
-            } else {
-                match agent.load_research(&tail).await {
-                    Ok(spec) => {
-                        let store = agent.research_store();
-                        let total = store.count_findings(&spec.id).await.unwrap_or(0);
-                        let runs = store.list_runs(&spec.id, Some(5)).await.unwrap_or_default();
-                        let mut out = format!(
-                            "🔬 metrics for `{}`\ntopic: {}\npaused: {}\nsources: {}\nschedule: {}\ntotal findings: {}\n",
-                            spec.id,
-                            spec.topic,
-                            spec.paused,
-                            if spec.sources.is_empty() {
-                                "(auto)".to_string()
-                            } else {
-                                spec.sources.join(", ")
-                            },
-                            match spec.interval_seconds {
-                                Some(s) => format_interval(s),
-                                None => "manual".to_string(),
-                            },
-                            total,
-                        );
-                        if runs.is_empty() {
-                            out.push_str("\n(no runs yet — `/research run ");
-                            out.push_str(&spec.id);
-                            out.push_str("` to start)");
-                        } else {
-                            out.push_str("\nrecent runs:\n");
-                            for r in &runs {
-                                let age = (chrono::Utc::now() - r.finished_at).num_seconds().max(0)
-                                    as u64;
-                                out.push_str(&format!(
-                                    "• `{}` — {} ago · stop={} · +{} new (total {})",
-                                    r.run_id,
-                                    format_age(age),
-                                    r.stop_reason,
-                                    r.new_findings,
-                                    r.total_findings_after,
-                                ));
-                                if let Some(elapsed) = r.elapsed_secs {
-                                    out.push_str(&format!(" · {}s", elapsed));
-                                }
-                                if let Some(rounds) = r.verification_rounds {
-                                    out.push_str(&format!(
-                                        "\n   gatekeeper: {} rd · removed={} · replaced={} · remaining={}",
-                                        rounds,
-                                        r.dead_removed.unwrap_or(0),
-                                        r.replacements_found.unwrap_or(0),
-                                        r.remaining_issues.unwrap_or(0),
-                                    ));
-                                }
-                                out.push('\n');
-                            }
-                        }
-                        out
-                    }
-                    Err(e) => format!("error: {e}"),
-                }
-            }
-        }
+        "metrics" => format_research_metrics(agent, &tail).await,
         "state" => {
             if tail.is_empty() {
                 "Usage: /research state <id>".to_string()
@@ -1274,79 +1142,7 @@ research-skill через LLM."
             }
         }
         "show" | "fresh" | "delta" => {
-            let fresh_only = sub == "fresh" || sub == "delta";
-            let usage = if fresh_only {
-                "Usage: /research fresh <id>"
-            } else {
-                "Usage: /research show <id>"
-            };
-            if tail.is_empty() {
-                usage.to_string()
-            } else {
-                match agent.load_research(&tail).await {
-                    Ok(spec) => {
-                        let store = agent.research_store();
-                        let total = store.count_findings(&spec.id).await.unwrap_or(0);
-                        let runs = store.list_runs(&spec.id, Some(1)).await.unwrap_or_default();
-                        let mut findings = if fresh_only {
-                            store
-                                .list_findings(&spec.id, None)
-                                .await
-                                .unwrap_or_default()
-                        } else {
-                            store
-                                .list_findings(&spec.id, Some(5))
-                                .await
-                                .unwrap_or_default()
-                        };
-                        if fresh_only && let Some(last_run) = runs.last() {
-                            let run_id = &last_run.run_id;
-                            findings.retain(|f| f.run_id == *run_id);
-                        }
-                        let header = if fresh_only {
-                            format!(
-                                "🔬 `{}`\ntopic: {}\nfindings: {} total, {} fresh (latest run)\n",
-                                spec.id,
-                                spec.topic,
-                                total,
-                                findings.len()
-                            )
-                        } else {
-                            format!(
-                                "🔬 `{}`\ntopic: {}\nsources: {}\npaused: {}\nfindings: {}\n",
-                                spec.id,
-                                spec.topic,
-                                if spec.sources.is_empty() {
-                                    "(auto)".to_string()
-                                } else {
-                                    spec.sources.join(", ")
-                                },
-                                spec.paused,
-                                total
-                            )
-                        };
-                        let mut out = header;
-                        if !findings.is_empty() {
-                            out.push_str(if fresh_only {
-                                "\nfresh:\n"
-                            } else {
-                                "\nrecent:\n"
-                            });
-                            for f in findings.iter().rev() {
-                                let title = f.title.as_deref().unwrap_or("(untitled)");
-                                let date_str = f.listing_date.as_deref().unwrap_or("");
-                                if date_str.is_empty() {
-                                    out.push_str(&format!("• {title} — {}\n", f.url));
-                                } else {
-                                    out.push_str(&format!("• {title} [{date_str}] — {}\n", f.url));
-                                }
-                            }
-                        }
-                        out
-                    }
-                    Err(e) => format!("error: {e}"),
-                }
-            }
+            format_research_show(agent, &tail, sub == "fresh" || sub == "delta").await
         }
         "run" => {
             if tail.is_empty() {
@@ -1446,28 +1242,8 @@ research-skill через LLM."
                         }
                     }
                     "" | "on" | "enable" => {
-                        let secs = if arg.is_empty() {
-                            Some(3600)
-                        } else {
-                            parse_interval(arg)
-                        };
-                        match secs {
-                            None => format!("bad interval `{arg}` — try `3600`, `30m`, `1h`, `1d`"),
-                            Some(s) => {
-                                let patch = naked_core::ResearchPatch {
-                                    interval_seconds: Some(Some(s)),
-                                    ..Default::default()
-                                };
-                                match agent.update_research(id, patch).await {
-                                    Ok(spec) => format!(
-                                        "⏰ scheduled `{id}` — every {} (verify={})",
-                                        format_interval(spec.interval_seconds.unwrap_or(s)),
-                                        agent.config().research.verify_by_default
-                                    ),
-                                    Err(e) => format!("error: {e}"),
-                                }
-                            }
-                        }
+                        let secs = if arg.is_empty() { Some(3600) } else { parse_interval(arg) };
+                        schedule_research_on(agent, id, secs, arg).await
                     }
                     "status" => match agent.load_research(id).await {
                         Ok(spec) => match spec.interval_seconds {
@@ -1552,9 +1328,7 @@ research-skill через LLM."
     if reply.is_empty() {
         return Ok(());
     }
-    bot.send_message(ctx.chat_id, reply)
-        .maybe_thread(ctx.thread_id)
-        .await?;
+    reply_text(bot, ctx, reply).await?;
     Ok(())
 }
 
@@ -1728,10 +1502,7 @@ re-appear across days."
         other => format!("Unknown subcommand: {other}. Try /memory help"),
     };
 
-    bot.send_message(ctx.chat_id, reply)
-        .parse_mode(ParseMode::Html)
-        .maybe_thread(ctx.thread_id)
-        .await?;
+    reply_html(bot, ctx, reply).await?;
     Ok(())
 }
 
@@ -1844,4 +1615,198 @@ pub(crate) async fn resolve_session_workspace(chat_id: i64, config: &Config) -> 
         return ws;
     }
     config.workspace.clone()
+}
+
+// ── Formatting helpers ──────────────────────────────────────────────────────
+
+async fn schedule_research_on(
+    agent: &Arc<AgentCore>,
+    id: &str,
+    secs: Option<u64>,
+    arg: &str,
+) -> String {
+    let Some(s) = secs else {
+        return format!("bad interval `{arg}` — try `3600`, `30m`, `1h`, `1d`");
+    };
+    let patch = naked_core::ResearchPatch {
+        interval_seconds: Some(Some(s)),
+        ..Default::default()
+    };
+    match agent.update_research(id, patch).await {
+        Ok(spec) => format!(
+            "⏰ scheduled `{id}` — every {} (verify={})",
+            format_interval(spec.interval_seconds.unwrap_or(s)),
+            agent.config().research.verify_by_default
+        ),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+async fn format_research_show(agent: &Arc<AgentCore>, tail: &str, fresh_only: bool) -> String {
+    let usage = if fresh_only {
+        "Usage: /research fresh <id>"
+    } else {
+        "Usage: /research show <id>"
+    };
+    if tail.is_empty() {
+        return usage.to_string();
+    }
+    let spec = match agent.load_research(tail).await {
+        Ok(s) => s,
+        Err(e) => return format!("error: {e}"),
+    };
+    let store = agent.research_store();
+    let total = store.count_findings(&spec.id).await.unwrap_or(0);
+    let runs = store.list_runs(&spec.id, Some(1)).await.unwrap_or_default();
+    let mut findings = if fresh_only {
+        store
+            .list_findings(&spec.id, None)
+            .await
+            .unwrap_or_default()
+    } else {
+        store
+            .list_findings(&spec.id, Some(5))
+            .await
+            .unwrap_or_default()
+    };
+    if fresh_only && let Some(last_run) = runs.last() {
+        let run_id = &last_run.run_id;
+        findings.retain(|f| f.run_id == *run_id);
+    }
+    let sources = if spec.sources.is_empty() {
+        "(auto)".to_string()
+    } else {
+        spec.sources.join(", ")
+    };
+    let mut out = if fresh_only {
+        format!(
+            "🔬 `{}`\ntopic: {}\nfindings: {} total, {} fresh (latest run)\n",
+            spec.id,
+            spec.topic,
+            total,
+            findings.len()
+        )
+    } else {
+        format!(
+            "🔬 `{}`\ntopic: {}\nsources: {sources}\npaused: {}\nfindings: {total}\n",
+            spec.id, spec.topic, spec.paused,
+        )
+    };
+    if !findings.is_empty() {
+        out.push_str(if fresh_only {
+            "\nfresh:\n"
+        } else {
+            "\nrecent:\n"
+        });
+        for f in findings.iter().rev() {
+            let title = f.title.as_deref().unwrap_or("(untitled)");
+            let date_str = f.listing_date.as_deref().unwrap_or("");
+            if date_str.is_empty() {
+                out.push_str(&format!("• {title} — {}\n", f.url));
+            } else {
+                out.push_str(&format!("• {title} [{date_str}] — {}\n", f.url));
+            }
+        }
+    }
+    out
+}
+
+async fn format_research_metrics(agent: &Arc<AgentCore>, tail: &str) -> String {
+    if tail.is_empty() {
+        return "Usage: /research metrics <id>".to_string();
+    }
+    let spec = match agent.load_research(tail).await {
+        Ok(s) => s,
+        Err(e) => return format!("error: {e}"),
+    };
+    let store = agent.research_store();
+    let total = store.count_findings(&spec.id).await.unwrap_or(0);
+    let runs = store.list_runs(&spec.id, Some(5)).await.unwrap_or_default();
+    let sources = if spec.sources.is_empty() {
+        "(auto)".to_string()
+    } else {
+        spec.sources.join(", ")
+    };
+    let schedule = match spec.interval_seconds {
+        Some(s) => format_interval(s),
+        None => "manual".to_string(),
+    };
+    let mut out = format!(
+        "🔬 metrics for `{}`\ntopic: {}\npaused: {}\nsources: {sources}\nschedule: {schedule}\ntotal findings: {total}\n",
+        spec.id, spec.topic, spec.paused,
+    );
+    if runs.is_empty() {
+        out.push_str(&format!(
+            "\n(no runs yet — `/research run {}` to start)",
+            spec.id
+        ));
+    } else {
+        out.push_str("\nrecent runs:\n");
+        format_run_list(&runs, &mut out);
+    }
+    out
+}
+
+fn format_run_list(runs: &[naked_core::research::RunRecord], out: &mut String) {
+    for r in runs {
+        let age = (chrono::Utc::now() - r.finished_at).num_seconds().max(0) as u64;
+        out.push_str(&format!(
+            "• `{}` — {} ago · stop={} · +{} new (total {})",
+            r.run_id,
+            format_age(age),
+            r.stop_reason,
+            r.new_findings,
+            r.total_findings_after,
+        ));
+        if let Some(elapsed) = r.elapsed_secs {
+            out.push_str(&format!(" · {}s", elapsed));
+        }
+        if let Some(rounds) = r.verification_rounds {
+            out.push_str(&format!(
+                "\n   gatekeeper: {} rd · removed={} · replaced={} · remaining={}",
+                rounds,
+                r.dead_removed.unwrap_or(0),
+                r.replacements_found.unwrap_or(0),
+                r.remaining_issues.unwrap_or(0),
+            ));
+        }
+        out.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_slug_basic() {
+        assert_eq!(safe_slug("hello world"), "hello-world");
+        assert_eq!(safe_slug("my-topic_v2"), "my-topic_v2");
+        assert_eq!(safe_slug("  spaces  everywhere  "), "-spaces-everywhere-");
+    }
+
+    #[test]
+    fn safe_slug_unicode() {
+        assert_eq!(safe_slug("квартиры Самуи"), "-");
+        assert_eq!(safe_slug("test квартиры"), "test-");
+    }
+
+    #[test]
+    fn safe_slug_empty() {
+        assert_eq!(safe_slug(""), "run");
+        assert_eq!(safe_slug("   "), "-"); // all spaces collapse to single dash
+    }
+
+    #[test]
+    fn escape_html_min_entities() {
+        assert_eq!(escape_html_min("a < b > c & d"), "a &lt; b &gt; c &amp; d");
+        assert_eq!(escape_html_min("no special"), "no special");
+        assert_eq!(escape_html_min(""), "");
+    }
+
+    #[test]
+    fn escape_html_min_preserves_quotes() {
+        // Unlike full escape_html, this minimal version does NOT escape quotes
+        assert_eq!(escape_html_min("he said \"hi\""), "he said \"hi\"");
+    }
 }

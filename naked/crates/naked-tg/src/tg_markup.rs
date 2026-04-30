@@ -53,26 +53,7 @@ pub fn md_to_tg_html(md: &str) -> String {
 
         // ── Fenced code blocks ──────────────────────────────────────
         if trimmed.starts_with("```") {
-            if in_code {
-                // Close: strip trailing newline inside <pre> if present
-                if out.ends_with('\n') {
-                    out.pop();
-                }
-                out.push_str("</code></pre>\n");
-                in_code = false;
-            } else {
-                if !prev_was_blank && !out.is_empty() {
-                    out.push('\n');
-                }
-                // Extract language tag after ```
-                let lang = sanitize_code_lang(trimmed.trim_start_matches('`'));
-                if lang.is_empty() {
-                    out.push_str("<pre><code>");
-                } else {
-                    out.push_str(&format!("<pre><code class=\"language-{lang}\">"));
-                }
-                in_code = true;
-            }
+            emit_fence_toggle(&mut out, trimmed, &mut in_code, prev_was_blank);
             prev_was_blank = false;
             continue;
         }
@@ -94,9 +75,7 @@ pub fn md_to_tg_html(md: &str) -> String {
 
         // ── Headings → bold ─────────────────────────────────────────
         if let Some(rest) = strip_heading(trimmed) {
-            if !prev_was_blank && !out.is_empty() {
-                out.push('\n');
-            }
+            ensure_gap(&mut out, prev_was_blank);
             out.push_str("<b>");
             out.push_str(&inline_md(&escape_html(rest)));
             out.push_str("</b>\n");
@@ -116,81 +95,22 @@ pub fn md_to_tg_html(md: &str) -> String {
             .strip_prefix("> ")
             .or_else(|| trimmed.strip_prefix(">"))
         {
-            // Collect consecutive quote lines
-            let mut quote = String::new();
-            quote.push_str(&inline_md(&escape_html(rest.trim())));
-            while let Some(next) = lines.peek() {
-                let nt = next.trim();
-                if let Some(qr) = nt.strip_prefix("> ").or_else(|| nt.strip_prefix(">")) {
-                    quote.push('\n');
-                    quote.push_str(&inline_md(&escape_html(qr.trim())));
-                    lines.next();
-                } else {
-                    break;
-                }
-            }
-            out.push_str("<blockquote>");
-            out.push_str(&quote);
-            out.push_str("</blockquote>\n");
+            emit_blockquote(&mut out, &mut lines, rest);
             prev_was_blank = false;
             continue;
         }
 
         // ── Tables → monospace ──────────────────────────────────────
         if trimmed.contains('|') && looks_like_table_row(trimmed) {
-            if !prev_was_blank && !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str("<pre>");
-            // Emit this row
-            out.push_str(&format_table_row(trimmed));
-            out.push('\n');
-            // Consume remaining table rows
-            while let Some(next) = lines.peek() {
-                let nt = next.trim();
-                if nt.contains('|') && looks_like_table_row(nt) {
-                    // Skip separator rows (---|---|---)
-                    if !is_table_separator(nt) {
-                        out.push_str(&format_table_row(nt));
-                        out.push('\n');
-                    }
-                    lines.next();
-                } else {
-                    break;
-                }
-            }
-            if out.ends_with('\n') {
-                out.pop();
-            }
-            out.push_str("</pre>\n");
+            ensure_gap(&mut out, prev_was_blank);
+            emit_table(&mut out, &mut lines, trimmed);
             prev_was_blank = false;
             continue;
         }
 
         // ── Indented code block (4+ spaces after blank line) ─────────
         if prev_was_blank && raw.starts_with("    ") && !raw.trim_start().is_empty() {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str("<pre><code>");
-            out.push_str(&escape_html(raw.strip_prefix("    ").unwrap_or(raw)));
-            out.push('\n');
-            while let Some(next) = lines.peek() {
-                if let Some(stripped) = next.strip_prefix("    ") {
-                    out.push_str(&escape_html(stripped));
-                    out.push('\n');
-                    lines.next();
-                } else if next.trim().is_empty() {
-                    out.push('\n');
-                    lines.next();
-                } else {
-                    break;
-                }
-            }
-            if out.ends_with('\n') {
-                out.pop();
-            }
-            out.push_str("</code></pre>\n");
+            emit_indented_code(&mut out, &mut lines, raw);
             prev_was_blank = false;
             continue;
         }
@@ -211,10 +131,7 @@ pub fn md_to_tg_html(md: &str) -> String {
 
     // Close unclosed code block
     if in_code {
-        if out.ends_with('\n') {
-            out.pop();
-        }
-        out.push_str("</code></pre>\n");
+        close_pre(&mut out);
     }
 
     // Trim trailing whitespace
@@ -222,6 +139,119 @@ pub fn md_to_tg_html(md: &str) -> String {
         out.pop();
     }
     out
+}
+
+// ── Block-element helpers (extracted from md_to_tg_html) ────────────────────
+
+/// Insert a blank line gap before a block element if not already present.
+fn ensure_gap(out: &mut String, prev_was_blank: bool) {
+    if !prev_was_blank && !out.is_empty() {
+        out.push('\n');
+    }
+}
+
+/// Strip trailing newline inside `<pre>` and close the block.
+fn close_pre(out: &mut String) {
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out.push_str("</code></pre>\n");
+}
+
+/// Toggle a fenced code block open/close on a ` ``` ` line.
+fn emit_fence_toggle(out: &mut String, trimmed: &str, in_code: &mut bool, prev_was_blank: bool) {
+    if *in_code {
+        close_pre(out);
+        *in_code = false;
+    } else {
+        ensure_gap(out, prev_was_blank);
+        let lang = sanitize_code_lang(trimmed.trim_start_matches('`'));
+        if lang.is_empty() {
+            out.push_str("<pre><code>");
+        } else {
+            out.push_str(&format!("<pre><code class=\"language-{lang}\">"));
+        }
+        *in_code = true;
+    }
+}
+
+/// Consume consecutive `> ` lines into a `<blockquote>` block.
+fn emit_blockquote<'a>(
+    out: &mut String,
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    first_line: &str,
+) {
+    let mut quote = String::new();
+    quote.push_str(&inline_md(&escape_html(first_line.trim())));
+    while let Some(next) = lines.peek() {
+        let nt = next.trim();
+        if let Some(qr) = nt.strip_prefix("> ").or_else(|| nt.strip_prefix(">")) {
+            quote.push('\n');
+            quote.push_str(&inline_md(&escape_html(qr.trim())));
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    out.push_str("<blockquote>");
+    out.push_str(&quote);
+    out.push_str("</blockquote>\n");
+}
+
+/// Consume a markdown table into a `<pre>` block.
+fn emit_table<'a>(
+    out: &mut String,
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    first_row: &str,
+) {
+    out.push_str("<pre>");
+    out.push_str(&format_table_row(first_row));
+    out.push('\n');
+    while let Some(next) = lines.peek() {
+        let nt = next.trim();
+        if nt.contains('|') && looks_like_table_row(nt) {
+            if !is_table_separator(nt) {
+                out.push_str(&format_table_row(nt));
+                out.push('\n');
+            }
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out.push_str("</pre>\n");
+}
+
+/// Consume an indented code block (4+ leading spaces) into `<pre><code>`.
+fn emit_indented_code<'a>(
+    out: &mut String,
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    first_line: &str,
+) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("<pre><code>");
+    out.push_str(&escape_html(
+        first_line.strip_prefix("    ").unwrap_or(first_line),
+    ));
+    out.push('\n');
+    while let Some(next) = lines.peek() {
+        if let Some(stripped) = next.strip_prefix("    ") {
+            out.push_str(&escape_html(stripped));
+            out.push('\n');
+            lines.next();
+        } else if next.trim().is_empty() {
+            out.push('\n');
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    close_pre(out);
 }
 
 // ─── Heading helpers ─────────────────────────────────────────────────────
@@ -482,7 +512,7 @@ fn linkify(s: &str) -> String {
             continue;
         }
         // Regular character (may be multi-byte)
-        let ch = rest.chars().next().unwrap();
+        let Some(ch) = rest.chars().next() else { break };
         out.push(ch);
         i += ch.len_utf8();
     }

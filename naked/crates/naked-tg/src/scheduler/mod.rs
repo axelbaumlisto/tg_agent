@@ -51,6 +51,13 @@ use crate::cron_util::next_cron_after;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
+mod dispatch;
+mod lifecycle;
+mod tasks;
+
+// Public re-exports for external tests and other crates
+pub use dispatch::{is_due, plan_dispatches};
+
 /// Configuration knobs for [`ResearchScheduler`]. Defaults match the prod TG
 /// bot: scan every 30s, allow five runs at a time, time out individual runs
 /// at 10 minutes, alert after 3 consecutive failures.
@@ -332,7 +339,7 @@ impl ResearchScheduler {
         let supervisor_notifier = notifier.clone();
         let supervisor_backoff = Duration::from_secs(5);
         tokio::spawn(async move {
-            supervised_run_loop(
+            lifecycle::supervised_run_loop(
                 "research",
                 supervisor_notifier,
                 supervisor_backoff,
@@ -345,7 +352,7 @@ impl ResearchScheduler {
                     let loop_notify = loop_notify.clone();
                     let loop_shutdown = loop_shutdown.clone();
                     async move {
-                        run_loop(
+                        lifecycle::run_loop(
                             core,
                             config,
                             semaphore,
@@ -398,1150 +405,11 @@ struct SchedulerState {
     one_shot_fired: HashSet<String>,
 }
 
-async fn run_loop(
-    core: Weak<AgentCore>,
-    config: SchedulerConfig,
-    semaphore: Arc<Semaphore>,
-    state: Arc<Mutex<SchedulerState>>,
-    notifier: Arc<dyn TaskNotifier>,
-    notify: Arc<Notify>,
-    shutdown: Arc<Notify>,
-) {
-    tracing::info!(
-        tick_secs = config.tick_interval.as_secs(),
-        max_concurrent = config.max_concurrent_runs,
-        timeout_secs = config.task_timeout.as_secs(),
-        max_retries = config.max_retries_before_alert,
-        max_resurrect = config.max_resurrection_attempts,
-        heartbeat_budget_secs = config.heartbeat_budget.as_secs(),
-        verify = config.verify_by_default,
-        "research scheduler started"
-    );
-
-    // Boot pass: clean up stale `*.tmp` files from interrupted
-    // atomic-writes, then resurrect or finalise tasks that were
-    // running when the previous process died. Done once;
-    // subsequent ticks deal only with newly-stuck tasks via the
-    // sweep.
-    if let Some(core_arc) = core.upgrade() {
-        purge_stale_tmp_files(&core_arc.research_store()).await;
-        if let Err(e) = resurrect_at_boot(&core_arc, &state, &notifier, &config).await {
-            tracing::warn!("scheduler boot resurrection failed: {e:#}");
-        }
-        // Boot-time purge of stale terminal inflights. Cheap and gives
-        // operators a clean slate immediately after a long downtime
-        // (when many terminal records may have aged past the retention
-        // window). Subsequent purges happen inside the main loop on
-        // `inflight_purge_interval`.
-        purge_terminal_inflight_now(&core_arc.research_store(), &config).await;
-    }
-
-    let mut last_inflight_purge = Instant::now();
-    loop {
-        let woke_for_shutdown = tokio::select! {
-            _ = sleep_until_next(config.tick_interval) => false,
-            _ = notify.notified() => false,
-            _ = shutdown.notified() => true,
-        };
-        if woke_for_shutdown {
-            tracing::info!("research scheduler shutting down");
-            // Best-effort: abort every in-flight worker and flip its
-            // ledger to `Failed("shutdown")` so the next process'
-            // resurrection pass picks them up instead of leaving
-            // them as `Running` forever.
-            if let Some(core_arc) = core.upgrade() {
-                let store = core_arc.research_store();
-                let aborted = shutdown_running_tasks(&state, &store).await;
-                if !aborted.is_empty() {
-                    tracing::info!(
-                        count = aborted.len(),
-                        ids = ?aborted,
-                        "scheduler shutdown: aborted in-flight workers"
-                    );
-                }
-            }
-            return;
-        }
-
-        let Some(core_arc) = core.upgrade() else {
-            tracing::info!("agent core dropped; scheduler exiting");
-            // Same cleanup path as graceful shutdown: if the core was
-            // dropped while runs were live, mark them Failed so we don't
-            // strand them as `Running` on disk.
-            let dummy_store_lookup: Option<Arc<dyn ResearchStore>> = None;
-            if let Some(store) = dummy_store_lookup {
-                let _ = shutdown_running_tasks(&state, &store).await;
-            } else {
-                // No store handle available — at least abort the
-                // futures so they stop burning CPU/network.
-                let mut s = state.lock().await;
-                for (_, h) in s.running.drain() {
-                    h.handle.abort();
-                }
-            }
-            return;
-        };
-        if let Err(e) = scan_and_dispatch(&core_arc, &semaphore, &state, &notifier, &config).await {
-            tracing::warn!("scheduler scan failed: {e:#}");
-        }
-
-        // Periodic purge of stale terminal inflights. Disabled when
-        // either knob is `Duration::ZERO`. We piggy-back on the existing
-        // tick instead of a separate task to keep the lifetime story
-        // simple (one cancel point on shutdown).
-        if config.inflight_purge_interval > Duration::ZERO
-            && config.inflight_terminal_retention > Duration::ZERO
-            && last_inflight_purge.elapsed() >= config.inflight_purge_interval
-        {
-            purge_terminal_inflight_now(&core_arc.research_store(), &config).await;
-            last_inflight_purge = Instant::now();
-        }
-    }
-}
-
-/// Run a single pass of [`ResearchStore::purge_terminal_inflight`]
-/// using the configured retention. Logs the count at debug level.
-/// Errors are downgraded to a warn — a failed purge is never fatal
-/// (the on-disk records are inert).
-async fn purge_terminal_inflight_now(store: &Arc<dyn ResearchStore>, config: &SchedulerConfig) {
-    if config.inflight_terminal_retention == Duration::ZERO {
-        return;
-    }
-    let retention = match chrono::Duration::from_std(config.inflight_terminal_retention) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                "inflight_terminal_retention out of chrono::Duration range: {e}; skipping purge"
-            );
-            return;
-        }
-    };
-    match store
-        .purge_terminal_inflight(chrono::Utc::now(), retention)
-        .await
-    {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!(removed = n, "purged stale terminal inflight records"),
-        Err(e) => tracing::warn!("purge_terminal_inflight failed: {e:#}"),
-    }
-}
-
-/// On startup, walk every spec's `inflight.json`. For each
-/// non-terminal record we either:
-/// * mark `Failed` (paused spec, or resurrection cap reached), or
-/// * re-tag as `Scheduled + scheduled_after_resurrection = true` so
-///   the next dispatch tick picks it up under the same
-///   `max_concurrent_runs` cap as fresh runs.
-///
-/// Pull-model: NEVER spawns tasks here. That guarantees a 50-spec
-/// crash-recovery can't punch through the concurrency cap and
-/// flood the upstream LLM API.
-async fn resurrect_at_boot(
-    core: &Arc<AgentCore>,
-    _state: &Arc<Mutex<SchedulerState>>,
-    notifier: &Arc<dyn TaskNotifier>,
-    config: &SchedulerConfig,
-) -> anyhow::Result<()> {
-    let store = core.research_store();
-    rebuild_resurrection_queue(&store, notifier, config).await
-}
-
-/// Pull-model implementation, unit-testable against any
-/// `Arc<dyn ResearchStore>`. Walks all non-terminal inflight records:
-/// re-tags healthy ones for drain, finalises paused / cap-hit ones as
-/// `Failed`, and emits an alert for the latter.
-async fn rebuild_resurrection_queue(
-    store: &Arc<dyn ResearchStore>,
-    notifier: &Arc<dyn TaskNotifier>,
-    config: &SchedulerConfig,
-) -> anyhow::Result<()> {
-    let stale = store.list_nonterminal_inflight().await?;
-    if stale.is_empty() {
-        return Ok(());
-    }
-    tracing::info!(
-        count = stale.len(),
-        "scheduler resurrection: found non-terminal inflight records"
-    );
-    for infl in stale {
-        let spec = match store.load_spec(&infl.spec_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(spec = %infl.spec_id, "spec missing during resurrect: {e:#}; clearing inflight");
-                let _ = store.clear_inflight(&infl.spec_id).await;
-                continue;
-            }
-        };
-        if spec.paused {
-            tracing::info!(spec = %spec.id, "skipping resurrection: spec is paused");
-            let mut final_inf = infl.clone();
-            final_inf.mark_failed("paused before resurrection — pending attempt dropped");
-            let _ = store.save_inflight(&spec.id, &final_inf).await;
-            continue;
-        }
-        if config.max_resurrection_attempts == 0 || infl.attempt >= config.max_resurrection_attempts
-        {
-            tracing::warn!(
-                spec = %spec.id,
-                attempt = infl.attempt,
-                cap = config.max_resurrection_attempts,
-                "resurrection cap hit; finalising as Failed"
-            );
-            let mut final_inf = infl.clone();
-            final_inf.mark_failed(format!(
-                "resurrection cap reached after {} attempt(s)",
-                infl.attempt
-            ));
-            let _ = store.save_inflight(&spec.id, &final_inf).await;
-            notifier
-                .notify_failure(
-                    &spec,
-                    config.max_retries_before_alert.max(1),
-                    final_inf.error.as_deref().unwrap_or("resurrection failed"),
-                )
-                .await;
-            continue;
-        }
-        tracing::info!(
-            spec = %spec.id,
-            prev_attempt = infl.attempt,
-            prev_state = ?infl.state,
-            "tagging interrupted attempt for capacity-aware resurrection"
-        );
-        let next_attempt = infl.attempt.saturating_add(1);
-        let mut next = infl.clone();
-        next.mark_scheduled_for_resurrection(next_attempt);
-        if let Err(e) = store.save_inflight(&spec.id, &next).await {
-            tracing::warn!(spec = %spec.id, "failed to persist resurrection tag: {e:#}");
-        }
-    }
-    Ok(())
-}
-
-/// Pure planner: from the set of non-terminal inflight records, pick
-/// the spec ids that should drain through `spawn_task` *this tick*.
-///
-/// Selection rules:
-/// * Only entries whose state is `Scheduled` AND
-///   `scheduled_after_resurrection` is true.
-/// * Skip specs already in `running` (in-memory map).
-/// * Sort by `spec_id` for deterministic order (stable logs / tests).
-/// * Cap at `available_slots`.
-///
-/// Returns `(spec_id, attempt)` pairs so the caller passes the
-/// current attempt count into `spawn_task`.
-fn plan_resurrection_drains(
-    nonterminal: &[Inflight],
-    running: &HashSet<String>,
-    available_slots: usize,
-) -> Vec<(String, u32)> {
-    if available_slots == 0 {
-        return Vec::new();
-    }
-    let mut candidates: Vec<(String, u32)> = nonterminal
-        .iter()
-        .filter(|i| i.state == RunState::Scheduled && i.scheduled_after_resurrection)
-        .filter(|i| !running.contains(&i.spec_id))
-        .map(|i| (i.spec_id.clone(), i.attempt))
-        .collect();
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
-    candidates.truncate(available_slots);
-    candidates
-}
-
-/// Tick-time orchestrator: drain the resurrection queue under the same
-/// concurrency cap as fresh dispatches. Calls `spawn_task` for each
-/// drained spec; staggers consecutive spawns to avoid a thundering
-/// herd of LLM calls. Returns the number of slots consumed.
-async fn drain_resurrection_queue(
-    core: &Arc<AgentCore>,
-    state: &Arc<Mutex<SchedulerState>>,
-    notifier: &Arc<dyn TaskNotifier>,
-    config: &SchedulerConfig,
-) -> usize {
-    let store = core.research_store();
-    let nonterminal = match store.list_nonterminal_inflight().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("resurrection drain: list failed: {e:#}");
-            return 0;
-        }
-    };
-    if nonterminal.is_empty() {
-        return 0;
-    }
-    let (running_ids, available_slots) = {
-        let s = state.lock().await;
-        let cap = config.max_concurrent_runs.saturating_sub(s.running.len());
-        let ids: HashSet<String> = s.running.keys().cloned().collect();
-        (ids, cap)
-    };
-    let plan = plan_resurrection_drains(&nonterminal, &running_ids, available_slots);
-    let mut consumed = 0;
-    for (id, attempt) in plan {
-        let spec = match store.load_spec(&id).await {
-            Ok(s) if !s.paused => s,
-            Ok(_) => {
-                tracing::debug!(spec = %id, "skipping drain: spec is paused");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(spec = %id, "drain: load_spec failed: {e:#}");
-                continue;
-            }
-        };
-        tracing::info!(
-            spec = %spec.id,
-            attempt,
-            "draining resurrection-tagged inflight under concurrency cap"
-        );
-        spawn_task(core, state, notifier, config, &spec, attempt).await;
-        consumed += 1;
-        if config.resurrection_stagger > Duration::ZERO {
-            sleep(config.resurrection_stagger).await;
-        }
-    }
-    consumed
-}
-
-/// Wrap a long-running async loop in a panic-catching supervisor.
-///
-/// Spawns the inner loop on a fresh tokio task; when that task panics, fires
-/// `notifier.notify_supervisor_panic`, sleeps `backoff`, and re-spawns. Returns
-/// only when the inner future completes cleanly or the inner task is cancelled
-/// (we don't want to fight `JoinHandle::abort` from the outside).
-///
-/// The supervisor also logs every panic at `error!` level so observability
-/// never depends solely on the notifier hook.
-///
-/// `make_loop_body` must be `FnMut` because we re-invoke it for every
-/// restart (each restart needs a fresh future).
-///
-/// SOLID: this is the single supervision primitive. `run_loop` plugs into it
-/// without knowing supervision details; tests plug in fake bodies the same way.
-pub async fn supervised_run_loop<F, Fut>(
-    name: &'static str,
-    notifier: Arc<dyn TaskNotifier>,
-    backoff: Duration,
-    make_loop_body: F,
-) where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    supervised_run_loop_capped(name, notifier, backoff, u32::MAX, make_loop_body).await
-}
-
-/// Same as [`supervised_run_loop`] but with a hard cap on restart attempts.
-/// Used by tests to keep pathological-panic scenarios bounded; production
-/// uses the uncapped variant.
-pub async fn supervised_run_loop_capped<F, Fut>(
-    name: &'static str,
-    notifier: Arc<dyn TaskNotifier>,
-    backoff: Duration,
-    max_attempts: u32,
-    mut make_loop_body: F,
-) where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        let body = make_loop_body();
-        let handle = tokio::spawn(body);
-        match handle.await {
-            Ok(()) => return,
-            Err(je) if je.is_cancelled() => {
-                tracing::info!(loop_name = %name, "supervised loop cancelled");
-                return;
-            }
-            Err(je) => {
-                let panic_msg = format_panic_payload(&je);
-                let details = format!(
-                    "scheduler '{name}' loop panicked (attempt {attempt}/{cap}): {panic_msg}",
-                    cap = if max_attempts == u32::MAX {
-                        "∞".to_string()
-                    } else {
-                        max_attempts.to_string()
-                    }
-                );
-                tracing::error!("{details}");
-                notifier.notify_supervisor_panic(&details).await;
-                if attempt >= max_attempts {
-                    tracing::error!(
-                        loop_name = %name,
-                        attempts = attempt,
-                        "supervised loop reached restart cap; giving up"
-                    );
-                    return;
-                }
-                if backoff > Duration::ZERO {
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-}
-
-fn format_panic_payload(je: &tokio::task::JoinError) -> String {
-    // `JoinError::into_panic` would consume; we want a borrowed inspection.
-    // Fall back to Debug — for `panic!("msg")` this includes the message.
-    format!("{je:?}")
-}
-
-/// Graceful-shutdown sweep: abort every entry in the in-memory
-/// `running` map and flip the corresponding on-disk inflight ledger
-/// to `Failed("shutdown")` so the next process boot resurrects the
-/// task instead of leaving it as `Running` forever.
-///
-/// Skips inflight records that already reached a terminal state on
-/// disk — this can happen if the worker future crossed the finish
-/// line in the same millisecond shutdown was requested. We trust
-/// the worker's own write in that case.
-///
-/// Returns the spec ids actually aborted (for logging/test).
-async fn shutdown_running_tasks(
-    state: &Arc<Mutex<SchedulerState>>,
-    store: &Arc<dyn ResearchStore>,
-) -> Vec<String> {
-    let drained: Vec<(String, RunningHandle)> = {
-        let mut s = state.lock().await;
-        s.running.drain().collect()
-    };
-    let mut aborted_ids = Vec::with_capacity(drained.len());
-    for (id, handle) in drained {
-        // Issue cooperative cancel first; abort is the safety net
-        // for anything not yet at an `await` point.
-        handle.cancel.cancel();
-        handle.handle.abort();
-        match store.load_inflight(&id).await {
-            Ok(Some(mut infl)) if !infl.state.is_terminal() => {
-                infl.mark_failed(
-                    "scheduler shutdown — worker aborted before completion (will be \
-                     resurrected on next boot)",
-                );
-                if let Err(e) = store.save_inflight(&id, &infl).await {
-                    tracing::warn!(
-                        spec = %id,
-                        "shutdown sweep: failed to persist Failed inflight: {e:#}"
-                    );
-                }
-            }
-            Ok(Some(_terminal)) => {
-                tracing::debug!(
-                    spec = %id,
-                    "shutdown sweep: inflight already terminal, leaving as-is"
-                );
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    spec = %id,
-                    "shutdown sweep: no inflight record on disk to update"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    spec = %id,
-                    "shutdown sweep: failed to load inflight: {e:#}"
-                );
-            }
-        }
-        aborted_ids.push(id);
-    }
-    aborted_ids
-}
-
-/// Best-effort cleanup of half-written `*.tmp` files left over
-/// from a `tmp + rename` atomic-write that was interrupted by a
-/// process kill. These can otherwise pile up in research
-/// directories indefinitely.
-async fn purge_stale_tmp_files(store: &Arc<dyn ResearchStore>) {
-    let Some(root) = store.fs_root() else {
-        // Non-FS backend (RAM-only test fake) → nothing to do.
-        return;
-    };
-    let mut count = 0u32;
-    let mut total_bytes = 0u64;
-    let Ok(mut dir) = tokio::fs::read_dir(root).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = dir.next_entry().await {
-        let Ok(ft) = entry.file_type().await else {
-            continue;
-        };
-        let path = entry.path();
-        if ft.is_file() {
-            // Root-level `*.tmp` files. `FsResearchStore::atomic_write`
-            // can leave these behind for `scheduler.lock`-adjacent
-            // writes (e.g. a future `root.json` summary): a crash
-            // between `fs::write(tmp)` and `fs::rename(tmp, final)`
-            // strands the half-written `.tmp`. We sweep them here
-            // rather than letting them accumulate; never touch the
-            // lock file itself (no `.tmp` extension) or anything
-            // without `.tmp`.
-            if path.extension().is_some_and(|ext| ext == "tmp")
-                && let Some(removed_bytes) = try_remove_tmp(&path).await
-            {
-                count += 1;
-                total_bytes = total_bytes.saturating_add(removed_bytes);
-            }
-            continue;
-        }
-        if !ft.is_dir() {
-            continue;
-        }
-        let spec_dir = path;
-        let Ok(mut sub) = tokio::fs::read_dir(&spec_dir).await else {
-            continue;
-        };
-        while let Ok(Some(file)) = sub.next_entry().await {
-            let path = file.path();
-            if path.extension().is_some_and(|ext| ext == "tmp")
-                && let Some(removed_bytes) = try_remove_tmp(&path).await
-            {
-                count += 1;
-                total_bytes = total_bytes.saturating_add(removed_bytes);
-            }
-        }
-    }
-    if count > 0 {
-        tracing::info!(
-            removed = count,
-            bytes = total_bytes,
-            "scheduler boot: purged stale *.tmp files from previous crash"
-        );
-    }
-}
-
-/// Best-effort delete of a `*.tmp` file. Returns `Some(bytes)` when
-/// the file was successfully removed (and we know its size), `None`
-/// on any error. Logging is intentionally `debug!` because a stale
-/// tmp from a previous boot is the *normal* case here.
-async fn try_remove_tmp(path: &std::path::Path) -> Option<u64> {
-    let bytes = tokio::fs::metadata(path)
-        .await
-        .ok()
-        .map(|m| m.len())
-        .unwrap_or(0);
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Some(bytes),
-        Err(e) => {
-            tracing::debug!(?path, "purge_stale_tmp_files: {e:#}");
-            None
-        }
-    }
-}
-
-async fn sleep_until_next(d: Duration) {
-    let deadline = Instant::now() + d;
-    sleep(deadline.saturating_duration_since(Instant::now())).await;
-}
-
-/// Pure decision predicate: should the scheduler launch a run for this spec
-/// right now? Honours the four-tier priority documented at the top of this
-/// module.
-///
-/// `last_run` is the timestamp of the most recent *finished* run for this
-/// spec (any outcome). `now` is the current wall clock.
-pub fn is_due(spec: &ResearchSpec, last_run: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    if spec.paused {
-        return false;
-    }
-
-    // 1. One-shot at-time trigger.
-    if let Some(at) = spec.run_at
-        && now >= at
-    {
-        // Did we already run *after* the run_at moment? If yes, we've
-        // fired this one-shot already (the cleanup write to disk may
-        // not have landed yet, hence the in-memory `one_shot_fired`
-        // tracking inside `scan_and_dispatch`).
-        match last_run {
-            Some(t) if t >= at => {} // already fired, fall through to other triggers
-            _ => return true,
-        }
-    }
-
-    // 2. Recurring cron trigger.
-    if let Some(expr) = spec.cron.as_deref() {
-        let anchor = last_run.unwrap_or_else(|| now - chrono::Duration::days(365 * 10));
-        if let Some(next) = next_cron_after(expr, anchor)
-            && next <= now
-        {
-            return true;
-        }
-    }
-
-    // 3. Legacy interval trigger.
-    if let Some(interval) = spec.interval_seconds {
-        if interval == 0 {
-            return false;
-        }
-        return match last_run {
-            Some(t) => (now - t).num_seconds() >= interval as i64,
-            None => true,
-        };
-    }
-
-    false
-}
-
-/// Pure scheduling decision. Returns the list of spec ids that should be
-/// dispatched on this tick, capped at `available_slots`. Specs already
-/// running are excluded.
-pub fn plan_dispatches(
-    specs: &[ResearchSpec],
-    last_runs: &HashMap<String, DateTime<Utc>>,
-    running: &HashSet<String>,
-    available_slots: usize,
-    now: DateTime<Utc>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    if available_slots == 0 {
-        return out;
-    }
-    for spec in specs {
-        if out.len() >= available_slots {
-            break;
-        }
-        if running.contains(&spec.id) {
-            continue;
-        }
-        let last = last_runs.get(&spec.id).copied();
-        if !is_due(spec, last, now) {
-            continue;
-        }
-        out.push(spec.id.clone());
-    }
-    out
-}
-
-async fn scan_and_dispatch(
-    core: &Arc<AgentCore>,
-    _semaphore: &Arc<Semaphore>,
-    state: &Arc<Mutex<SchedulerState>>,
-    notifier: &Arc<dyn TaskNotifier>,
-    config: &SchedulerConfig,
-) -> anyhow::Result<()> {
-    let store = core.research_store();
-    let specs = store.list_specs().await?;
-    let now = Utc::now();
-
-    // ── Sweep phase: free slots from completed / timed-out runs ────────────
-    sweep_running(state, notifier, &specs, config, &store, Some(core)).await;
-
-    // ── Resurrection drain (pull-model) ───────────────────────────────────
-    // Drain re-queued inflights BEFORE planning fresh dispatches so a
-    // crash-recovered job has the same priority as a freshly-due one,
-    // and so resurrection respects the same `max_concurrent_runs` cap.
-    let _drained = drain_resurrection_queue(core, state, notifier, config).await;
-
-    // ── Hydrate last-run cache ────────────────────────────────────────────
-    {
-        let mut s = state.lock().await;
-        for spec in &specs {
-            if !s.last_runs.contains_key(&spec.id)
-                && let Some(t) = lookup_last_run_on_disk(&store, &spec.id).await
-            {
-                s.last_runs.insert(spec.id.clone(), t);
-            }
-        }
-    }
-
-    // ── Plan ───────────────────────────────────────────────────────────────
-    let plan = {
-        let s = state.lock().await;
-        let available_slots = config.max_concurrent_runs.saturating_sub(s.running.len());
-        let running_set: HashSet<String> = s.running.keys().cloned().collect();
-        plan_dispatches(&specs, &s.last_runs, &running_set, available_slots, now)
-    };
-    if plan.is_empty() {
-        return Ok(());
-    }
-
-    // ── Dispatch ───────────────────────────────────────────────────────────
-    for id in plan {
-        let spec = match specs.iter().find(|s| s.id == id) {
-            Some(s) => s.clone(),
-            None => continue,
-        };
-
-        // If this dispatch was triggered by a one-shot `run_at`, clear the
-        // field on disk *before* spawning so a crash mid-run doesn't cause a
-        // re-fire on next boot.
-        if let Some(at) = spec.run_at
-            && now >= at
-        {
-            let patch = ResearchPatch {
-                run_at: Some(None),
-                ..Default::default()
-            };
-            if let Err(e) = core.update_research(&spec.id, patch).await {
-                tracing::warn!(spec = %spec.id, "failed to clear run_at: {e:#}");
-            }
-            state.lock().await.one_shot_fired.insert(spec.id.clone());
-        }
-
-        // Pre-set last_run so other planning passes wait one full cycle.
-        state.lock().await.last_runs.insert(spec.id.clone(), now);
-
-        spawn_task(core, state, notifier, config, &spec, 1).await;
-    }
-    Ok(())
-}
-
-/// Spawn the worker for one scheduling attempt. Owns the on-disk
-/// state-machine: writes `Scheduled` before spawn, has the worker
-/// flip to `Running`, and finalises to `Completed` / `Failed` from
-/// inside the spawned future.
-///
-/// `attempt` is `1` for a fresh dispatch and `prev_attempt + 1`
-/// when called from `resurrect_at_boot`.
-async fn spawn_task(
-    core: &Arc<AgentCore>,
-    state: &Arc<Mutex<SchedulerState>>,
-    notifier: &Arc<dyn TaskNotifier>,
-    config: &SchedulerConfig,
-    spec: &ResearchSpec,
-    attempt: u32,
-) {
-    let store = core.research_store();
-    let timeout = spec
-        .task_timeout_seconds
-        .map(Duration::from_secs)
-        .unwrap_or(config.task_timeout);
-    let started = Instant::now();
-
-    // Phase 1: persist `Scheduled` so we survive a crash *before*
-    // the worker future actually starts running.
-    let mut infl = Inflight::scheduled(spec.id.clone(), attempt);
-    let attempt_id = infl.attempt_id.clone();
-    if let Err(e) = store.save_inflight(&spec.id, &infl).await {
-        tracing::warn!(spec = %spec.id, "failed to persist Scheduled inflight: {e:#}");
-    }
-
-    let core_clone = core.clone();
-    let state_clone = state.clone();
-    let notifier_clone = notifier.clone();
-    let config_clone = config.clone();
-    let spec_for_task = spec.clone();
-    let id_for_task = spec.id.clone();
-    let attempt_id_for_task = attempt_id.clone();
-    // Cooperative cancel handle. Stored in the `RunningHandle` for
-    // the sweep loop and a clone is moved into the worker future so
-    // the coordinator can observe it via `run_once_with_cancel`.
-    let cancel = CancellationToken::new();
-    let cancel_for_task = cancel.clone();
-    let handle = tokio::spawn(async move {
-        // Phase 2: flip ledger to `Running` immediately.
-        let store_inner = core_clone.research_store();
-        infl.mark_running();
-        if let Err(e) = store_inner.save_inflight(&id_for_task, &infl).await {
-            tracing::warn!(spec = %id_for_task, "failed to persist Running inflight: {e:#}");
-        }
-
-        tracing::info!(
-            spec = %id_for_task,
-            attempt = attempt,
-            attempt_id = %attempt_id_for_task,
-            verify = config_clone.verify_by_default,
-            "scheduler launching research run"
-        );
-        // Keep the full RunReport so we can tell a `Cancelled`
-        // stop reason apart from a real success — the scheduler
-        // treats cancellation as a *failure* (it always means the
-        // sweep timeout fired), not as a normal completion.
-        let result: Result<(String, StopReason), _> = if config_clone.verify_by_default {
-            core_clone
-                .clone()
-                .run_research_verified_with_cancel(
-                    &id_for_task,
-                    config_clone.max_verification_rounds,
-                    cancel_for_task,
-                )
-                .await
-                .map(|v| (v.last_run.run_id, v.last_run.stop_reason))
-        } else {
-            core_clone
-                .clone()
-                .run_research_with_cancel(&id_for_task, cancel_for_task)
-                .await
-                .map(|r| (r.run_id, r.stop_reason))
-        };
-        // Phase 3: stamp terminal state on the ledger.
-        match &result {
-            Ok((run_id, stop)) if !matches!(stop, StopReason::Cancelled) => {
-                tracing::info!(spec = %id_for_task, %run_id, ?stop, "scheduler run complete");
-                infl.mark_completed(Some(run_id.clone()));
-            }
-            Ok((run_id, _cancelled)) => {
-                tracing::warn!(
-                    spec = %id_for_task,
-                    %run_id,
-                    "scheduler run cancelled by sweep timeout — recording as Failed"
-                );
-                infl.run_id = Some(run_id.clone());
-                infl.mark_failed("cancelled by sweep timeout");
-            }
-            Err(e) => {
-                tracing::warn!(spec = %id_for_task, "scheduler run failed: {e:#}");
-                infl.mark_failed(format!("{e:#}"));
-            }
-        }
-        if let Err(e) = store_inner.save_inflight(&id_for_task, &infl).await {
-            tracing::warn!(spec = %id_for_task, "failed to persist terminal inflight: {e:#}");
-        }
-        let outcome = match &result {
-            Ok((_, stop)) if !matches!(stop, StopReason::Cancelled) => RunOutcome::Success,
-            Ok((_, _)) => RunOutcome::Failure("cancelled by sweep timeout".into()),
-            Err(e) => RunOutcome::Failure(format!("{e:#}")),
-        };
-        apply_outcome(
-            &state_clone,
-            &notifier_clone,
-            Some(&core_clone),
-            &spec_for_task,
-            &outcome,
-            &config_clone,
-        )
-        .await;
-        outcome
-    });
-    state.lock().await.running.insert(
-        spec.id.clone(),
-        RunningHandle {
-            started_at: started,
-            timeout,
-            handle,
-            cancel,
-            cancel_requested_at: None,
-            attempt_id,
-        },
-    );
-}
-
-/// Walk the `running` map: drop entries whose JoinHandle finished, treat
-/// over-budget entries as timed-out failures (drop the slot, let the underlying
-/// task finish naturally), refresh the heartbeat on the on-disk inflight
-/// ledger for live entries, and update the failure counters accordingly.
-async fn sweep_running(
-    state: &Arc<Mutex<SchedulerState>>,
-    notifier: &Arc<dyn TaskNotifier>,
-    specs: &[ResearchSpec],
-    config: &SchedulerConfig,
-    store: &Arc<dyn ResearchStore>,
-    core: Option<&Arc<AgentCore>>,
-) {
-    // Two-stage timeout handling:
-    //   * `to_drop`            — JoinHandle naturally finished, free slot.
-    //   * `to_request_cancel`  — over budget for the *first* time; issue
-    //                            cooperative `CancellationToken::cancel()`
-    //                            but KEEP the slot reserved so the next
-    //                            cron tick doesn't immediately spawn a
-    //                            fresh duplicate while the worker is
-    //                            still draining.
-    //   * `to_hard_abort`      — cooperative cancel was issued more than
-    //                            `cancel_grace_period` ago and the worker
-    //                            is still alive; escalate to
-    //                            `JoinHandle::abort()` and free the slot.
-    let mut to_drop: Vec<String> = Vec::new();
-    let mut to_request_cancel: Vec<String> = Vec::new();
-    let mut to_hard_abort: Vec<String> = Vec::new();
-    let mut to_heartbeat: Vec<String> = Vec::new();
-    {
-        let s = state.lock().await;
-        for (id, h) in s.running.iter() {
-            if h.handle.is_finished() {
-                to_drop.push(id.clone());
-            } else if let Some(req_at) = h.cancel_requested_at {
-                if req_at.elapsed() > config.cancel_grace_period {
-                    to_hard_abort.push(id.clone());
-                }
-                // else: still in grace window — leave slot reserved,
-                // refresh heartbeat NOT needed (worker is winding down).
-            } else if h.started_at.elapsed() > h.timeout {
-                to_request_cancel.push(id.clone());
-            } else {
-                to_heartbeat.push(id.clone());
-            }
-        }
-    }
-    // Refresh heartbeats for healthy in-flight runs so external
-    // observers can tell live tasks from frozen ones.
-    for id in to_heartbeat {
-        if let Ok(Some(mut infl)) = store.load_inflight(&id).await
-            && infl.state == RunState::Running
-        {
-            infl.heartbeat();
-            let _ = store.save_inflight(&id, &infl).await;
-        }
-    }
-    // Stage 1: cooperative cancel for newly over-budget runs. We
-    // re-acquire the lock as `&mut` so we can stamp
-    // `cancel_requested_at` on the handle in place; the slot is NOT
-    // released yet — the worker still owns it until either it
-    // finishes on its own or the grace window expires.
-    if !to_request_cancel.is_empty() && config.cancel_grace_period > Duration::ZERO {
-        let mut s = state.lock().await;
-        for id in &to_request_cancel {
-            if let Some(h) = s.running.get_mut(id) {
-                h.cancel.cancel();
-                h.cancel_requested_at = Some(Instant::now());
-                tracing::warn!(
-                    spec = %id,
-                    timeout_secs = h.timeout.as_secs(),
-                    grace_secs = config.cancel_grace_period.as_secs(),
-                    "scheduler task exceeded timeout — issued cooperative cancel; will hard-abort if worker doesn't honour it within grace window"
-                );
-            }
-        }
-    } else if !to_request_cancel.is_empty() {
-        // Grace window disabled — escalate immediately.
-        to_hard_abort.extend(to_request_cancel.into_iter());
-    }
-    // Stage 2: hard-abort (after grace OR with grace disabled).
-    for id in to_hard_abort {
-        let removed = state.lock().await.running.remove(&id);
-        let timeout_secs = removed
-            .as_ref()
-            .map(|h| h.timeout.as_secs())
-            .unwrap_or_else(|| config.task_timeout.as_secs());
-        let grace_secs = config.cancel_grace_period.as_secs();
-        // CRITICAL loop-prevention: hard-abort the runaway
-        // JoinHandle. Without this, dropping the handle
-        // detaches the future — it keeps consuming HTTP/LLM
-        // budget while the next tick happily spawns a fresh
-        // attempt for the same spec (because the in-memory
-        // slot is already free), creating a 1 → 2 → 4 →
-        // worker-fan-out death-spiral. abort() schedules a
-        // cancellation point at the next .await; since the
-        // research coordinator is fully async (HTTP, file
-        // IO, LLM streaming), this lands in milliseconds in
-        // practice.
-        if let Some(h) = removed.as_ref() {
-            // Belt + suspenders: also cancel the token in case the
-            // worker reaches an `await` *between* drop(handle) and
-            // the next `select!` poll — `cancel.cancel()` is idempotent.
-            h.cancel.cancel();
-            h.handle.abort();
-        }
-        if grace_secs == 0 {
-            tracing::warn!(
-                spec = %id,
-                timeout_secs,
-                "scheduler task exceeded timeout — aborting runaway worker (cooperative grace disabled)"
-            );
-        } else {
-            tracing::error!(
-                spec = %id,
-                timeout_secs,
-                grace_secs,
-                "scheduler task ignored cooperative cancel after grace window — escalating to hard abort"
-            );
-        }
-        // Ensure the on-disk ledger reflects the timeout
-        // even though the aborted worker won't get to
-        // overwrite it.
-        if let Ok(Some(mut infl)) = store.load_inflight(&id).await
-            && !infl.state.is_terminal()
-        {
-            infl.mark_failed(format!(
-                "task timeout (> {timeout_secs}s) — worker hard-aborted after {grace_secs}s grace"
-            ));
-            let _ = store.save_inflight(&id, &infl).await;
-        }
-        if let Some(spec) = specs.iter().find(|s| s.id == id) {
-            let outcome =
-                RunOutcome::Failure(format!("task timeout (> {timeout_secs}s, hard-abort)"));
-            apply_outcome(state, notifier, core, spec, &outcome, config).await;
-        }
-        drop(removed);
-    }
-    // Stage 3: naturally-finished slots. Successful / errored / cooperatively
-    // cancelled handles already updated their own counters via
-    // `apply_outcome` from inside the spawned future. We just drop
-    // the handle here.
-    for id in to_drop {
-        let removed = state.lock().await.running.remove(&id);
-        drop(removed);
-    }
-
-    // Independent pass: detect ledgers whose `last_heartbeat` is
-    // way past budget but the in-memory `running` map doesn't know
-    // about them (e.g. previous process died and the boot
-    // resurrection somehow missed it). Finalise as Failed.
-    let now = Utc::now();
-    let budget = chrono::Duration::from_std(config.heartbeat_budget)
-        .unwrap_or_else(|_| chrono::Duration::seconds(120));
-    let running_ids: HashSet<String> = state.lock().await.running.keys().cloned().collect();
-    for spec in specs {
-        if running_ids.contains(&spec.id) {
-            continue;
-        }
-        let Ok(Some(mut infl)) = store.load_inflight(&spec.id).await else {
-            continue;
-        };
-        if infl.state.is_terminal() {
-            continue;
-        }
-        if infl.is_stale(now, budget) {
-            tracing::warn!(
-                spec = %spec.id,
-                state = ?infl.state,
-                attempt = infl.attempt,
-                "kicking heartbeat-stale inflight (no in-memory worker) — finalising as Failed"
-            );
-            infl.mark_failed("heartbeat budget exceeded with no live worker");
-            let _ = store.save_inflight(&spec.id, &infl).await;
-        }
-    }
-}
-
-/// Decision returned by [`evaluate_outcome`]. Pure value; `apply_outcome`
-/// is the thin async shell that mutates state, calls the notifier, and
-/// (for `AutoPause`) patches the spec on disk.
-#[derive(Debug, PartialEq, Eq)]
-enum FailurePolicy {
-    /// Either a success, or a failure under both thresholds — log only.
-    Quiet,
-    /// First failure reaching `max_retries_before_alert` for this
-    /// streak — emit a single `notify_failure`.
-    AlertOnce { count: u32 },
-    /// `auto_pause_after_failures` reached — patch `paused = true` on
-    /// disk, emit a clearly-labelled alert, reset counters.
-    AutoPause { count: u32 },
-}
-
-/// Pure decision over the failure counter. Easy to unit-test without
-/// touching tokio, the store, or the notifier.
-fn evaluate_outcome(prev_count: u32, alerted: bool, cfg: &SchedulerConfig) -> FailurePolicy {
-    let next = prev_count;
-    if cfg.auto_pause_after_failures > 0 && next >= cfg.auto_pause_after_failures {
-        return FailurePolicy::AutoPause { count: next };
-    }
-    if cfg.max_retries_before_alert > 0 && next >= cfg.max_retries_before_alert && !alerted {
-        return FailurePolicy::AlertOnce { count: next };
-    }
-    FailurePolicy::Quiet
-}
-
-/// Update the in-memory failure counter for `spec` based on an outcome,
-/// fire the notifier alert when the streak crosses the alert threshold
-/// (once per streak), and auto-pause the spec on disk when the
-/// `auto_pause_after_failures` threshold is hit. Auto-pause is the
-/// loop breaker — without it a deterministic-failure spec would burn
-/// LLM budget on every cron tick forever.
-async fn apply_outcome(
-    state: &Arc<Mutex<SchedulerState>>,
-    notifier: &Arc<dyn TaskNotifier>,
-    core: Option<&Arc<AgentCore>>,
-    spec: &ResearchSpec,
-    outcome: &RunOutcome,
-    cfg: &SchedulerConfig,
-) {
-    let (decision, last_err): (FailurePolicy, String) = match outcome {
-        RunOutcome::Success => {
-            let mut s = state.lock().await;
-            s.failures.remove(&spec.id);
-            s.alerted.remove(&spec.id);
-            s.last_runs.insert(spec.id.clone(), Utc::now());
-            (FailurePolicy::Quiet, String::new())
-        }
-        RunOutcome::Failure(msg) => {
-            let mut s = state.lock().await;
-            let counter = s.failures.entry(spec.id.clone()).or_insert(0);
-            *counter += 1;
-            let count = *counter;
-            let already_alerted = s.alerted.contains(&spec.id);
-            let decision = evaluate_outcome(count, already_alerted, cfg);
-            // Record alert / clear counter as appropriate before
-            // releasing the lock so concurrent ticks don't double-fire.
-            match &decision {
-                FailurePolicy::AlertOnce { .. } => {
-                    s.alerted.insert(spec.id.clone());
-                }
-                FailurePolicy::AutoPause { .. } => {
-                    s.failures.remove(&spec.id);
-                    s.alerted.remove(&spec.id);
-                }
-                FailurePolicy::Quiet => {}
-            }
-            (decision, msg.clone())
-        }
-    };
-
-    match decision {
-        FailurePolicy::Quiet => {}
-        FailurePolicy::AlertOnce { count } => {
-            tracing::warn!(
-                spec = %spec.id,
-                consecutive = count,
-                "scheduler: alert threshold reached, notifying operator"
-            );
-            notifier.notify_failure(spec, count, &last_err).await;
-        }
-        FailurePolicy::AutoPause { count } => {
-            tracing::warn!(
-                spec = %spec.id,
-                consecutive = count,
-                "scheduler: auto-pausing spec after consecutive failures"
-            );
-            // Flip spec.paused = true on disk so cron stops
-            // firing. `set_research_paused` also notifies the
-            // SchedulerHook so cached planning state catches up
-            // immediately.
-            let mut paused_ok = true;
-            // Reason carrier — surfaced by `/research ls` and
-            // `/research state` so operators can tell auto-pauses
-            // apart from manual `/research pause` without grepping
-            // journalctl. Truncated to keep the on-disk JSON tidy.
-            let reason = {
-                let short_err: String = last_err.chars().take(200).collect();
-                Some(format!(
-                    "auto: {count} consecutive failures — last error: {short_err}"
-                ))
-            };
-            if let Some(c) = core {
-                if let Err(e) = c
-                    .set_research_paused_with_reason(&spec.id, true, reason)
-                    .await
-                {
-                    tracing::error!(
-                        spec = %spec.id,
-                        "auto-pause: failed to patch spec.paused: {e:#} \
-                         (alert will still fire — consider manual /research pause)"
-                    );
-                    paused_ok = false;
-                }
-            } else {
-                tracing::warn!(
-                    spec = %spec.id,
-                    "auto-pause: no AgentCore handle; sending alert without disk patch"
-                );
-                paused_ok = false;
-            }
-            let label = if paused_ok {
-                format!("auto-paused after {count} consecutive failures · last error: {last_err}")
-            } else {
-                format!(
-                    "{count} consecutive failures (auto-pause patch FAILED — pause manually) · last error: {last_err}"
-                )
-            };
-            notifier.notify_failure(spec, count, &label).await;
-        }
-    }
-}
-
-async fn lookup_last_run_on_disk(
-    store: &Arc<dyn ResearchStore>,
-    spec_id: &str,
-) -> Option<DateTime<Utc>> {
-    let runs = store.list_runs(spec_id, Some(1)).await.ok()?;
-    runs.first().map(|r| r.finished_at)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::dispatch::*;
+    use super::lifecycle::*;
+    use super::tasks::*;
     use super::*;
     use chrono::Duration as ChronoDuration;
     use naked_core::research::SchedulerEvent;
@@ -1825,36 +693,42 @@ mod tests {
     #[test]
     fn evaluate_outcome_quiet_below_thresholds() {
         let cfg = cfg_with(3, 5);
-        assert_eq!(evaluate_outcome(1, false, &cfg), FailurePolicy::Quiet);
-        assert_eq!(evaluate_outcome(2, false, &cfg), FailurePolicy::Quiet);
+        assert_eq!(
+            tasks::evaluate_outcome(1, false, &cfg),
+            FailurePolicy::Quiet
+        );
+        assert_eq!(
+            tasks::evaluate_outcome(2, false, &cfg),
+            FailurePolicy::Quiet
+        );
     }
 
     #[test]
     fn evaluate_outcome_alerts_once_at_threshold() {
         let cfg = cfg_with(3, 5);
         assert_eq!(
-            evaluate_outcome(3, false, &cfg),
+            tasks::evaluate_outcome(3, false, &cfg),
             FailurePolicy::AlertOnce { count: 3 }
         );
         // Already alerted → quiet until pause.
-        assert_eq!(evaluate_outcome(4, true, &cfg), FailurePolicy::Quiet);
+        assert_eq!(tasks::evaluate_outcome(4, true, &cfg), FailurePolicy::Quiet);
     }
 
     #[test]
     fn evaluate_outcome_pauses_at_or_above_threshold() {
         let cfg = cfg_with(3, 5);
         assert_eq!(
-            evaluate_outcome(5, true, &cfg),
+            tasks::evaluate_outcome(5, true, &cfg),
             FailurePolicy::AutoPause { count: 5 }
         );
         assert_eq!(
-            evaluate_outcome(7, true, &cfg),
+            tasks::evaluate_outcome(7, true, &cfg),
             FailurePolicy::AutoPause { count: 7 }
         );
         // Pause takes precedence over alert when both would trigger.
         let cfg_eq = cfg_with(3, 3);
         assert_eq!(
-            evaluate_outcome(3, false, &cfg_eq),
+            tasks::evaluate_outcome(3, false, &cfg_eq),
             FailurePolicy::AutoPause { count: 3 }
         );
     }
@@ -1899,7 +773,7 @@ mod tests {
                             auto_pause_after_failures: pause_thr,
                             ..SchedulerConfig::default()
                         };
-                        let got = evaluate_outcome(prev, alerted, &cfg);
+                        let got = tasks::evaluate_outcome(prev, alerted, &cfg);
                         let want = oracle(prev, alerted, &cfg);
                         assert_eq!(
                             got, want,
@@ -1933,7 +807,7 @@ mod tests {
                             auto_pause_after_failures: pause_thr,
                             ..SchedulerConfig::default()
                         };
-                        let policy = evaluate_outcome(prev, alerted, &cfg);
+                        let policy = tasks::evaluate_outcome(prev, alerted, &cfg);
 
                         // Invariant 1: with prev = 0 we never alert
                         // or pause — the streak hasn't started.
@@ -1999,7 +873,10 @@ mod tests {
     #[test]
     fn evaluate_outcome_disabled_thresholds() {
         let cfg = cfg_with(0, 0); // both disabled
-        assert_eq!(evaluate_outcome(100, false, &cfg), FailurePolicy::Quiet);
+        assert_eq!(
+            tasks::evaluate_outcome(100, false, &cfg),
+            FailurePolicy::Quiet
+        );
     }
 
     // ── hook ───────────────────────────────────────────────────────────────
@@ -2096,7 +973,7 @@ mod tests {
 
     // ── inflight ledger + resurrection ─────────────────────────────────────
 
-    use naked_core::research::{FsResearchStore, Inflight, RunState};
+    use naked_core::research::{FsResearchStore, Inflight, InflightStore, RunState, SpecStore};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -2161,7 +1038,7 @@ mod tests {
             inflight_terminal_retention: Duration::ZERO,
             ..SchedulerConfig::default()
         };
-        purge_terminal_inflight_now(&store, &cfg_off).await;
+        lifecycle::purge_terminal_inflight_now(&store, &cfg_off).await;
         assert!(store.load_inflight(&s_old.id).await.unwrap().is_some());
         assert!(store.load_inflight(&s_new.id).await.unwrap().is_some());
 
@@ -2170,7 +1047,7 @@ mod tests {
             inflight_terminal_retention: Duration::from_secs(7 * 24 * 60 * 60),
             ..SchedulerConfig::default()
         };
-        purge_terminal_inflight_now(&store, &cfg_on).await;
+        lifecycle::purge_terminal_inflight_now(&store, &cfg_on).await;
         assert!(
             store.load_inflight(&s_old.id).await.unwrap().is_none(),
             "30-day-old terminal must be purged"
@@ -2524,7 +1401,13 @@ mod tests {
             }
         };
 
-        supervised_run_loop("test", trait_notifier, Duration::from_millis(10), make_loop).await;
+        lifecycle::supervised_run_loop(
+            "test",
+            trait_notifier,
+            Duration::from_millis(10),
+            make_loop,
+        )
+        .await;
 
         assert_eq!(
             entries.load(Ordering::SeqCst),
@@ -2562,7 +1445,7 @@ mod tests {
             }
         };
 
-        supervised_run_loop_capped(
+        lifecycle::supervised_run_loop_capped(
             "test-cap",
             trait_notifier,
             Duration::from_millis(0),
@@ -2592,7 +1475,7 @@ mod tests {
             }
         };
 
-        supervised_run_loop("clean", notifier, Duration::from_secs(99), make_loop).await;
+        lifecycle::supervised_run_loop("clean", notifier, Duration::from_secs(99), make_loop).await;
         assert_eq!(entries.load(Ordering::SeqCst), 1);
     }
 
@@ -2805,7 +1688,7 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(
+        tasks::sweep_running(
             &state,
             &notifier,
             std::slice::from_ref(&spec),
@@ -2886,7 +1769,7 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(
+        tasks::sweep_running(
             &state,
             &notifier,
             std::slice::from_ref(&spec),
@@ -2952,7 +1835,7 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(
+        tasks::sweep_running(
             &state,
             &notifier,
             std::slice::from_ref(&spec),
@@ -3009,7 +1892,7 @@ mod tests {
             ..SchedulerConfig::default()
         };
 
-        sweep_running(
+        tasks::sweep_running(
             &state,
             &notifier,
             std::slice::from_ref(&spec),
@@ -3058,7 +1941,7 @@ mod tests {
         let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
         let cfg = SchedulerConfig::default();
 
-        sweep_running(
+        tasks::sweep_running(
             &state,
             &notifier,
             std::slice::from_ref(&spec),
@@ -3081,6 +1964,84 @@ mod tests {
         assert!(
             cfg.cancel_grace_period < cfg.task_timeout,
             "grace window must be shorter than the task timeout itself"
+        );
+    }
+
+    // ── plan_resurrection_drains ─────────────────────────────────────
+
+    #[test]
+    fn resurrection_drains_nothing_with_zero_slots() {
+        let inflight = vec![Inflight {
+            spec_id: "a".into(),
+            state: RunState::Scheduled,
+            scheduled_after_resurrection: true,
+            attempt: 2,
+            ..Default::default()
+        }];
+        let running = HashSet::new();
+        assert!(lifecycle::plan_resurrection_drains(&inflight, &running, 0).is_empty());
+    }
+
+    #[test]
+    fn resurrection_drains_only_scheduled_resurrected() {
+        let inflight = vec![
+            Inflight {
+                spec_id: "a".into(),
+                state: RunState::Scheduled,
+                scheduled_after_resurrection: true,
+                attempt: 2,
+                ..Default::default()
+            },
+            Inflight {
+                spec_id: "b".into(),
+                state: RunState::Running, // not eligible
+                scheduled_after_resurrection: true,
+                attempt: 1,
+                ..Default::default()
+            },
+            Inflight {
+                spec_id: "c".into(),
+                state: RunState::Scheduled,
+                scheduled_after_resurrection: false, // not resurrection
+                attempt: 1,
+                ..Default::default()
+            },
+        ];
+        let running = HashSet::new();
+        let result = lifecycle::plan_resurrection_drains(&inflight, &running, 10);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "a");
+    }
+
+    #[test]
+    fn resurrection_skips_already_running() {
+        let inflight = vec![Inflight {
+            spec_id: "a".into(),
+            state: RunState::Scheduled,
+            scheduled_after_resurrection: true,
+            attempt: 2,
+            ..Default::default()
+        }];
+        let mut running = HashSet::new();
+        running.insert("a".to_string());
+        assert!(lifecycle::plan_resurrection_drains(&inflight, &running, 10).is_empty());
+    }
+
+    #[test]
+    fn resurrection_respects_slot_limit() {
+        let inflight: Vec<_> = (0..5)
+            .map(|i| Inflight {
+                spec_id: format!("s{i}"),
+                state: RunState::Scheduled,
+                scheduled_after_resurrection: true,
+                attempt: 1,
+                ..Default::default()
+            })
+            .collect();
+        let running = HashSet::new();
+        assert_eq!(
+            lifecycle::plan_resurrection_drains(&inflight, &running, 2).len(),
+            2
         );
     }
 }

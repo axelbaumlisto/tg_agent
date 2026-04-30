@@ -489,7 +489,7 @@ async fn t206_incremental_render_never_breaks() {
             pre_o, pre_c,
             "unbalanced <pre> at line {i}: {pre_o} vs {pre_c}\nhtml: {html}"
         );
-        let code_o = html.matches("<code>").count();
+        let code_o = html.matches("<code>").count() + html.matches("<code ").count();
         let code_c = html.matches("</code>").count();
         assert_eq!(
             code_o, code_c,

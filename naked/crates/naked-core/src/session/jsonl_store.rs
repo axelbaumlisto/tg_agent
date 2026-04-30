@@ -228,7 +228,10 @@ impl SessionStore for JsonlSessionStore {
             "type": "message",
             "message": externalized,
         });
-        let line = serde_json::to_string(&record).unwrap() + "\n";
+        let line = serde_json::to_string(&record).unwrap_or_else(|e| {
+            tracing::error!("failed to serialize session record: {e}");
+            String::new()
+        }) + "\n";
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)

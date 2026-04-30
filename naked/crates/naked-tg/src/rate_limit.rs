@@ -91,7 +91,7 @@ impl RateLimiter {
                     g.pop_front();
                 }
                 if g.len() >= GLOBAL_PER_MIN {
-                    let wait = *g.front().unwrap() + Duration::from_secs(60);
+                    let wait = *g.front().expect("len >= 1") + Duration::from_secs(60);
                     drop(g);
                     tokio::time::sleep_until(wait).await;
                     continue;
@@ -105,7 +105,7 @@ impl RateLimiter {
             pc.prune(now);
 
             if pc.window.len() >= PER_CHAT_PER_MIN {
-                let wait = *pc.window.front().unwrap() + Duration::from_secs(60);
+                let wait = *pc.window.front().expect("len >= 1") + Duration::from_secs(60);
                 drop(chats);
                 tokio::time::sleep_until(wait).await;
                 continue;

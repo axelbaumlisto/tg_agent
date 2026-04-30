@@ -302,7 +302,9 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
         return (0.0, false);
     }
 
-    let raw_field = field_value.as_ref().unwrap();
+    let Some(raw_field) = field_value.as_ref() else {
+        return (0.0, false);
+    };
     let raw_str: String = match raw_field {
         Value::String(s) => s.clone(),
         // Python `str(field_value)` for any non-string value. Numbers,

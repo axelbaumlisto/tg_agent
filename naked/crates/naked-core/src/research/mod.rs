@@ -10,6 +10,7 @@
 //! stateless between runs.
 
 pub mod briefing;
+#[path = "coordinator_mod/mod.rs"]
 pub mod coordinator;
 pub mod filter_rules;
 pub mod inflight;
@@ -43,7 +44,10 @@ pub use spec::{
     normalize_title_for_similarity, titles_are_similar,
 };
 pub use state_view::{StateView, render_state};
-pub use store::{FsResearchStore, ResearchStore, research_root};
+pub use store::{
+    ArtifactStore, FindingStore, FsResearchStore, InflightStore, ReportStore, ResearchStore,
+    RunStore, SpecStore, research_root,
+};
 pub use tool::{
     ResearchContext, ResearchListTool, ResearchSaveCursorTool, ResearchSaveTool,
     ResearchStatusTool, scan_and_redact,

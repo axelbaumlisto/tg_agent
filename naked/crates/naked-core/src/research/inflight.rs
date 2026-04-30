@@ -31,9 +31,10 @@ use serde::{Deserialize, Serialize};
 /// Lifecycle states of a single scheduler attempt. Stored verbatim
 /// in `inflight.json`; the four lowercase string values are part of
 /// the on-disk contract — never rename them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
+    #[default]
     /// Scheduler decided to fire this spec; the slot is reserved
     /// in the in-memory `running` map and the inflight ledger is
     /// flushed to disk *before* the worker is spawned. If the
@@ -74,7 +75,7 @@ impl RunState {
 /// `spec.json`. Older fields are `#[serde(default)]` so a binary
 /// written before this module landed reads cleanly as `None` /
 /// `0` / etc.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Inflight {
     pub spec_id: String,
     /// Stable id for *this* attempt — distinct from the eventual

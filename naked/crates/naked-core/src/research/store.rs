@@ -49,14 +49,21 @@ pub fn research_runlog_path() -> PathBuf {
     research_root().join("run_log.md")
 }
 
+// ── Sub-traits (ISP: Interface Segregation) ────────────────────────────────
+
+/// CRUD for research specifications (topics).
 #[async_trait]
-pub trait ResearchStore: Send + Sync {
+pub trait SpecStore: Send + Sync {
     async fn create_spec(&self, spec: &ResearchSpec) -> Result<()>;
     async fn load_spec(&self, id: &str) -> Result<ResearchSpec>;
     async fn save_spec(&self, spec: &ResearchSpec) -> Result<()>;
     async fn list_specs(&self) -> Result<Vec<ResearchSpec>>;
     async fn delete_spec(&self, id: &str) -> Result<()>;
+}
 
+/// Storage for research findings (append-only, dedup by hash).
+#[async_trait]
+pub trait FindingStore: Send + Sync {
     /// Append a finding if it is not a duplicate. Returns `true` when stored,
     /// `false` when the `dedup_hash` was already present. MUST be atomic per
     /// research id — concurrent calls for the same id go through a mutex.
@@ -74,74 +81,45 @@ pub trait ResearchStore: Send + Sync {
     /// `findings.jsonl` atomically and updates the in-memory dedup cache.
     /// Returns the number of findings actually removed.
     async fn remove_findings_by_hash(&self, id: &str, hashes: &HashSet<String>) -> Result<u32>;
+}
 
+/// Runs and cursors.
+#[async_trait]
+pub trait RunStore: Send + Sync {
     async fn append_run(&self, run: &RunRecord) -> Result<()>;
     async fn list_runs(&self, id: &str, limit: Option<usize>) -> Result<Vec<RunRecord>>;
-
     async fn load_cursor(&self, id: &str) -> Result<Cursor>;
     async fn save_cursor(&self, id: &str, cursor: &Cursor) -> Result<()>;
+}
 
+/// Reports and agent briefs.
+#[async_trait]
+pub trait ReportStore: Send + Sync {
     async fn write_report(&self, id: &str, report: &str) -> Result<()>;
     async fn read_report(&self, id: &str) -> Result<Option<String>>;
-
     /// Filesystem path of the report file, when the backend is disk-backed.
-    /// Default returns `None` so non-fs implementations don't need to fake
-    /// a path; callers must handle the `None` case gracefully.
     fn report_path(&self, _id: &str) -> Option<PathBuf> {
         None
     }
-
-    /// Structured context file for the next agent run. Contains a rich summary
-    /// of all findings so the agent knows exactly what has already been collected.
     async fn write_agent_brief(&self, id: &str, brief: &str) -> Result<()>;
     async fn read_agent_brief(&self, id: &str) -> Result<Option<String>>;
+}
 
-    // ── Inflight ledger (per-spec scheduler state-machine) ────────────────
-    //
-    // Each spec has at most one *active* inflight record on disk. Terminal
-    // records (Completed / Failed) are kept until the next attempt is
-    // scheduled — this gives operators a one-shot "last attempt outcome"
-    // without scrolling `runs.jsonl`.
-
-    /// Atomically write the current inflight record. Default impl is a
-    /// no-op so non-disk backends (RAM-only test fakes) opt in
-    /// explicitly.
+/// Inflight scheduler state-machine ledger.
+#[async_trait]
+pub trait InflightStore: Send + Sync {
     async fn save_inflight(&self, _id: &str, _infl: &Inflight) -> Result<()> {
         Ok(())
     }
-
-    /// Read the latest inflight record for `id`. `None` means no
-    /// scheduler attempt has ever fired (or the file was deleted).
     async fn load_inflight(&self, _id: &str) -> Result<Option<Inflight>> {
         Ok(None)
     }
-
-    /// Remove the inflight record. Used by tests and by manual reset.
-    /// In normal operation we *replace*, not delete, so the operator
-    /// can always inspect the last attempt.
     async fn clear_inflight(&self, _id: &str) -> Result<()> {
         Ok(())
     }
-
-    /// Walk every spec directory and collect non-terminal inflight
-    /// records. Used by the scheduler at boot to resurrect tasks
-    /// that were running when the process died.
     async fn list_nonterminal_inflight(&self) -> Result<Vec<Inflight>> {
         Ok(Vec::new())
     }
-
-    /// Delete every `inflight.json` whose state is terminal
-    /// (`Completed`/`Failed`) **and** whose `finished_at` is older than
-    /// `now - retention`. Records without a `finished_at` are never
-    /// touched (treat missing timestamp as "we don't know, keep it").
-    /// Non-terminal records are always kept regardless of age — they
-    /// belong to the resurrection pull-model.
-    ///
-    /// Returns the number of files actually removed. Default impl is a
-    /// no-op so RAM-only backends opt in explicitly.
-    ///
-    /// Operators normally do not call this directly; the scheduler
-    /// invokes it periodically with `SchedulerConfig::inflight_terminal_retention`.
     async fn purge_terminal_inflight(
         &self,
         _now: chrono::DateTime<chrono::Utc>,
@@ -149,14 +127,24 @@ pub trait ResearchStore: Send + Sync {
     ) -> Result<u32> {
         Ok(0)
     }
-
-    /// Filesystem root for backends that have one. Used by the
-    /// scheduler at boot to purge stale `*.tmp` files left over from
-    /// half-written atomic-writes. RAM-only fakes return `None`.
+    /// Filesystem root for backends that have one.
     fn fs_root(&self) -> Option<&Path> {
         None
     }
 }
+
+/// Composite: RunStore + ReportStore + InflightStore.
+pub trait ArtifactStore: RunStore + ReportStore + InflightStore {}
+impl<T: RunStore + ReportStore + InflightStore> ArtifactStore for T {}
+
+// ── Composite trait (backward compat) ──────────────────────────────────
+
+/// Full research store = SpecStore + FindingStore + ArtifactStore.
+/// Existing code can keep using `dyn ResearchStore` unchanged.
+pub trait ResearchStore: SpecStore + FindingStore + ArtifactStore {}
+
+/// Blanket impl: anything implementing all three sub-traits is a ResearchStore.
+impl<T: SpecStore + FindingStore + ArtifactStore> ResearchStore for T {}
 
 /// Filesystem-backed research store. Holds a per-id mutex to serialize the
 /// read-modify-write dance on `findings.jsonl` (dedup set lookup, then append).
@@ -283,7 +271,7 @@ impl FsResearchStore {
 }
 
 #[async_trait]
-impl ResearchStore for FsResearchStore {
+impl SpecStore for FsResearchStore {
     async fn create_spec(&self, spec: &ResearchSpec) -> Result<()> {
         self.ensure_dir(&spec.id).await?;
         let path = self.dir(&spec.id).join("spec.json");
@@ -351,7 +339,10 @@ impl ResearchStore for FsResearchStore {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl FindingStore for FsResearchStore {
     async fn try_append_finding(&self, finding: &Finding) -> Result<bool> {
         self.ensure_dir(&finding.research_id).await?;
         let set = self.dedup_set(&finding.research_id).await?;
@@ -522,7 +513,10 @@ impl ResearchStore for FsResearchStore {
         }
         Ok(removed)
     }
+}
 
+#[async_trait]
+impl RunStore for FsResearchStore {
     async fn append_run(&self, run: &RunRecord) -> Result<()> {
         self.ensure_dir(&run.spec_id).await?;
         let path = self.dir(&run.spec_id).join("runs.jsonl");
@@ -553,7 +547,10 @@ impl ResearchStore for FsResearchStore {
         let path = self.dir(id).join("cursor.json");
         self.atomic_write(&path, &json).await
     }
+}
 
+#[async_trait]
+impl ReportStore for FsResearchStore {
     async fn write_report(&self, id: &str, report: &str) -> Result<()> {
         self.ensure_dir(id).await?;
         let path = self.dir(id).join("report.md");
@@ -585,7 +582,10 @@ impl ResearchStore for FsResearchStore {
         }
         Ok(Some(fs::read_to_string(&path).await?))
     }
+}
 
+#[async_trait]
+impl InflightStore for FsResearchStore {
     async fn save_inflight(&self, id: &str, infl: &Inflight) -> Result<()> {
         self.ensure_dir(id).await?;
         let path = self.dir(id).join("inflight.json");
@@ -1079,8 +1079,8 @@ mod tests {
     #[tokio::test]
     async fn purge_terminal_inflight_default_trait_impl_is_noop() {
         struct NoopStore;
-        #[async_trait::async_trait]
-        impl ResearchStore for NoopStore {
+        #[async_trait]
+        impl SpecStore for NoopStore {
             async fn create_spec(&self, _spec: &ResearchSpec) -> Result<()> {
                 Ok(())
             }
@@ -1096,6 +1096,9 @@ mod tests {
             async fn delete_spec(&self, _id: &str) -> Result<()> {
                 Ok(())
             }
+        }
+        #[async_trait]
+        impl FindingStore for NoopStore {
             async fn try_append_finding(&self, _finding: &Finding) -> Result<bool> {
                 Ok(false)
             }
@@ -1119,6 +1122,9 @@ mod tests {
             ) -> Result<u32> {
                 Ok(0)
             }
+        }
+        #[async_trait]
+        impl RunStore for NoopStore {
             async fn append_run(&self, _run: &RunRecord) -> Result<()> {
                 Ok(())
             }
@@ -1131,6 +1137,9 @@ mod tests {
             async fn save_cursor(&self, _id: &str, _cursor: &Cursor) -> Result<()> {
                 Ok(())
             }
+        }
+        #[async_trait]
+        impl ReportStore for NoopStore {
             async fn write_report(&self, _id: &str, _report: &str) -> Result<()> {
                 Ok(())
             }
@@ -1144,6 +1153,7 @@ mod tests {
                 Ok(None)
             }
         }
+        impl InflightStore for NoopStore {}
         let store = NoopStore;
         let removed = store
             .purge_terminal_inflight(Utc::now(), chrono::Duration::days(1))

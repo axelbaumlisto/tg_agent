@@ -129,12 +129,13 @@ impl Provider for OpenAiCompatProvider {
             .map_err(|e| AgentError::Provider(format!("HTTP error: {e}")))?;
 
         if !response.status().is_success() {
-            let status = response.status();
+            let status = response.status().as_u16();
             let text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "no body".to_string());
-            return Err(AgentError::Provider(format!("OpenAI API {status}: {text}")));
+            let typed = super::error::ProviderError::from_llm_http(status, &text, &request.model);
+            return Err(typed.into());
         }
 
         let stream = sse_stream_from_response(response);
