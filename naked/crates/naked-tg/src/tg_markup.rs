@@ -419,7 +419,7 @@ fn protect_escapes(s: &str) -> String {
             && "*_`~[]>!#+-".contains(next)
         {
             let idx = "*_`~[]>!#+-".find(next).unwrap_or(0);
-            out.push(char::from_u32(0xE000 + idx as u32).unwrap());
+            out.push(char::from_u32(0xE000 + idx as u32).expect("PUA codepoint"));
             chars.next();
             continue;
         }

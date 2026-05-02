@@ -207,7 +207,7 @@ pub(crate) async fn sweep_running(
         }
     } else if !to_request_cancel.is_empty() {
         // Grace window disabled — escalate immediately.
-        to_hard_abort.extend(to_request_cancel.into_iter());
+        to_hard_abort.extend(to_request_cancel);
     }
     // Stage 2: hard-abort (after grace OR with grace disabled).
     for id in to_hard_abort {

@@ -336,7 +336,7 @@ impl SpecStore for FsResearchStore {
                 out.push(spec);
             }
         }
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         Ok(out)
     }
 

@@ -228,8 +228,7 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
                         _ => {}
                     }
                 }
-                "content_block_stop" => {
-                    if has_pending_tool {
+                "content_block_stop" if has_pending_tool => {
                         let input: serde_json::Value =
                             serde_json::from_str(&pending_tool_json).unwrap_or(serde_json::json!({}));
                         yield StreamChunk::ToolUse {
@@ -239,8 +238,8 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
                         };
                         pending_tool_json.clear();
                         has_pending_tool = false;
-                    }
                 }
+                "content_block_stop" => {}
                 "message_delta" => {
                     if let Some(usage) = event.get("usage") {
                         yield StreamChunk::Usage(parse_usage(usage));

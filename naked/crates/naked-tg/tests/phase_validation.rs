@@ -1,7 +1,7 @@
 //! Integration tests validating Phase 1-4 changes without Telegram.
 
-use naked_core::types::AgentEvent;
 use naked_core::session::FileTracker;
+use naked_core::types::AgentEvent;
 
 // ── A4: SAFE_TOOLS auto-approve ─────────────────────────────────────
 
@@ -28,8 +28,8 @@ async fn safe_tools_auto_approve() {
 
 #[tokio::test]
 async fn multi_edit_three_replacements() {
-    use naked_core::tool::file_ops::EditFileTool;
     use naked_core::tool::Tool;
+    use naked_core::tool::file_ops::EditFileTool;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -65,8 +65,8 @@ async fn multi_edit_three_replacements() {
 
 #[tokio::test]
 async fn multi_edit_backward_compat() {
-    use naked_core::tool::file_ops::EditFileTool;
     use naked_core::tool::Tool;
+    use naked_core::tool::file_ops::EditFileTool;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f.txt"), "old text here").unwrap();
@@ -98,10 +98,16 @@ fn file_tracker_from_tool_calls() {
     let mut ft = FileTracker::default();
 
     // Simulate tool calls
-    ft.record_tool("read_file", &serde_json::json!({"file_path": "src/main.rs"}));
+    ft.record_tool(
+        "read_file",
+        &serde_json::json!({"file_path": "src/main.rs"}),
+    );
     ft.record_tool("read_file", &serde_json::json!({"file_path": "src/lib.rs"}));
     ft.record_tool("edit_file", &serde_json::json!({"file_path": "src/lib.rs"}));
-    ft.record_tool("write_file", &serde_json::json!({"file_path": "new_file.rs"}));
+    ft.record_tool(
+        "write_file",
+        &serde_json::json!({"file_path": "new_file.rs"}),
+    );
     ft.record_tool("bash", &serde_json::json!({"command": "cargo build"}));
 
     // read_only: only main.rs (lib.rs was also edited)
@@ -120,8 +126,8 @@ fn file_tracker_from_tool_calls() {
 
 #[tokio::test]
 async fn bash_large_output_saves_log() {
-    use naked_core::tool::bash::BashTool;
     use naked_core::tool::Tool;
+    use naked_core::tool::bash::BashTool;
 
     let tool = BashTool::new(10);
     let result = tool
@@ -159,8 +165,8 @@ async fn bash_large_output_saves_log() {
 
 #[tokio::test]
 async fn bash_error_output_not_truncated_to_80() {
-    use naked_core::tool::bash::BashTool;
     use naked_core::tool::Tool;
+    use naked_core::tool::bash::BashTool;
 
     let tool = BashTool::new(10);
     // Command that produces a long error message
@@ -208,7 +214,11 @@ async fn file_lock_serializes_access() {
         h.await.unwrap();
     }
 
-    let final_val: i32 = std::fs::read_to_string(&path).unwrap().trim().parse().unwrap();
+    let final_val: i32 = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert_eq!(final_val, 10, "without lock this would be less than 10");
 }
 
@@ -257,8 +267,8 @@ fn context_compacted_event_has_summary_hint() {
 
 #[tokio::test]
 async fn read_file_image_returns_base64() {
-    use naked_core::tool::file_ops::ReadFileTool;
     use naked_core::tool::Tool;
+    use naked_core::tool::file_ops::ReadFileTool;
 
     let dir = tempfile::tempdir().unwrap();
     // Minimal valid PNG (1x1 pixel, red)
@@ -268,9 +278,8 @@ async fn read_file_image_returns_base64() {
         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
         0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, // 8-bit RGB
         0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
-        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00,
-        0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33,
-        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND
+        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+        0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND
         0xAE, 0x42, 0x60, 0x82,
     ];
     std::fs::write(dir.path().join("test.png"), png_data).unwrap();
@@ -282,8 +291,12 @@ async fn read_file_image_returns_base64() {
 
     assert!(!result.is_error, "should NOT be error: {}", result.output);
     // Image is pushed to image_result collector, text says "[image sent to vision model]"
-    assert!(result.output.contains("image sent to vision model") || result.output.contains("data:image"),
-        "should indicate image handling: {}", &result.output[..100.min(result.output.len())]);
+    assert!(
+        result.output.contains("image sent to vision model")
+            || result.output.contains("data:image"),
+        "should indicate image handling: {}",
+        &result.output[..100.min(result.output.len())]
+    );
     assert!(result.output.contains("PNG"), "should mention PNG");
 
     // Verify image was pushed to collector

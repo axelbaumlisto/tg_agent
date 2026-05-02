@@ -22,7 +22,9 @@ pub async fn lock_file(path: &std::path::Path) -> tokio::sync::OwnedMutexGuard<(
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mutex = {
         let mut map = FILE_LOCKS.lock().await;
-        map.entry(canonical).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        map.entry(canonical)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     };
     mutex.lock_owned().await
 }

@@ -120,12 +120,11 @@ mod tests {
         // Block any rm -rf command
         registry
             .on_tool_call(Arc::new(|name: &str, input: &mut serde_json::Value| {
-                if name == "bash" {
-                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                        if cmd.contains("rm -rf") {
-                            return false;
-                        }
-                    }
+                if name == "bash"
+                    && let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+                    && cmd.contains("rm -rf")
+                {
+                    return false;
                 }
                 true
             }))
@@ -151,13 +150,11 @@ mod tests {
         // Hook that adds --color=never to all bash commands
         registry
             .on_tool_call(Arc::new(|name: &str, input: &mut serde_json::Value| {
-                if name == "bash" {
-                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                        if !cmd.contains("--color") {
-                            input["command"] =
-                                serde_json::Value::String(format!("{cmd} --color=never"));
-                        }
-                    }
+                if name == "bash"
+                    && let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+                    && !cmd.contains("--color")
+                {
+                    input["command"] = serde_json::Value::String(format!("{cmd} --color=never"));
                 }
                 true
             }))

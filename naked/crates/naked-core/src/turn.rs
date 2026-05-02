@@ -37,16 +37,23 @@ pub struct TurnHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn turn_context_fields_complete() {
         // Compile-time check that TurnContext has all required fields.
         // If send_prompt_multimodal needs something not here, this fails.
         let _fields = [
-            "session_id", "history", "provider_name", "model",
-            "workspace", "provider", "tools", "max_tokens",
-            "temperature", "reasoning", "context_window",
+            "session_id",
+            "history",
+            "provider_name",
+            "model",
+            "workspace",
+            "provider",
+            "tools",
+            "max_tokens",
+            "temperature",
+            "reasoning",
+            "context_window",
             "original_system_prompt",
         ];
     }
@@ -61,16 +68,11 @@ use crate::memory;
 use crate::session::FileTracker;
 
 /// Phase: inject per-session prompt.md into system context.
-pub async fn inject_session_prompt(
-    history: &mut History,
-    prompt_path: &std::path::Path,
-) {
+pub async fn inject_session_prompt(history: &mut History, prompt_path: &std::path::Path) {
     if let Ok(extra) = tokio::fs::read_to_string(prompt_path).await {
         let trimmed = extra.trim();
         if !trimmed.is_empty() {
-            history.inject_system_context(&format!(
-                "\n\n[Session instructions]\n{trimmed}"
-            ));
+            history.inject_system_context(&format!("\n\n[Session instructions]\n{trimmed}"));
         }
     }
 }
@@ -98,11 +100,9 @@ pub fn inject_memory_shift(
         return;
     }
     let mut blocks: Vec<String> = Vec::new();
-    if let Some(b) = memory::daily::recent_shift_block(
-        workspace,
-        &memory::types::MemoryScope::Project,
-        config,
-    ) {
+    if let Some(b) =
+        memory::daily::recent_shift_block(workspace, &memory::types::MemoryScope::Project, config)
+    {
         blocks.push(b);
     }
     if let Some(s) = sender
@@ -128,16 +128,16 @@ pub fn inject_file_context(history: &mut History, files: &FileTracker) {
     let modified = files.modified();
     let read_only = files.read_only();
     if !modified.is_empty() {
-        lines.push(format!("Modified files this session: {}", modified.join(", ")));
+        lines.push(format!(
+            "Modified files this session: {}",
+            modified.join(", ")
+        ));
     }
     if !read_only.is_empty() && read_only.len() <= 10 {
         lines.push(format!("Read files this session: {}", read_only.join(", ")));
     }
     if !lines.is_empty() {
-        history.inject_system_context(&format!(
-            "\n\n[File context]\n{}",
-            lines.join("\n")
-        ));
+        history.inject_system_context(&format!("\n\n[File context]\n{}", lines.join("\n")));
     }
 }
 
@@ -159,7 +159,10 @@ mod phase_tests {
     fn inject_file_context_adds_modified() {
         let mut h = History::new("sys".into());
         let mut ft = FileTracker::default();
-        ft.record_tool("edit_file", &serde_json::json!({"file_path": "src/main.rs"}));
+        ft.record_tool(
+            "edit_file",
+            &serde_json::json!({"file_path": "src/main.rs"}),
+        );
         ft.record_tool("read_file", &serde_json::json!({"file_path": "README.md"}));
 
         inject_file_context(&mut h, &ft);
@@ -320,11 +323,7 @@ mod validate_tests {
 }
 
 /// Append <read-files> and <modified-files> XML tags to a compaction summary.
-pub fn append_file_tags(
-    summary: &mut String,
-    read_files: &[String],
-    modified_files: &[String],
-) {
+pub fn append_file_tags(summary: &mut String, read_files: &[String], modified_files: &[String]) {
     if read_files.is_empty() && modified_files.is_empty() {
         return;
     }
@@ -519,8 +518,7 @@ pub async fn persist_turn_result(
 ) {
     match result {
         Ok(usage) => {
-            crate::types::TURN_COMPLETED_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::types::TURN_COMPLETED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 "turn complete [{}]: {} tokens",
                 session_id,
@@ -531,10 +529,11 @@ pub async fn persist_turn_result(
             }
         }
         Err(e) => {
-            crate::types::TURN_ERROR_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::types::TURN_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::error!("turn error [{}]: {e}", session_id);
-            let _ = tx.send(crate::types::AgentEvent::Error(e.to_string())).await;
+            let _ = tx
+                .send(crate::types::AgentEvent::Error(e.to_string()))
+                .await;
         }
     }
 

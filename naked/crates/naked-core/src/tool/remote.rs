@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::ops::{SshOps, ToolOps, LocalOps};
+use super::ops::{LocalOps, SshOps, ToolOps};
 
 /// Global remote context — shared across all tools in a session.
 #[derive(Clone)]

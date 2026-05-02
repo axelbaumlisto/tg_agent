@@ -10,11 +10,11 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::ProviderInfo;
 use crate::config::Config;
 use crate::model_catalog::ModelHealth;
 use crate::provider::Provider;
 use crate::types::ModelInfo;
-use crate::ProviderInfo;
 
 /// Owns provider resolution, caching, and health tracking.
 pub struct ProviderService {
@@ -29,11 +29,7 @@ pub struct ProviderService {
 }
 
 impl ProviderService {
-    pub fn new(
-        default: Arc<dyn Provider>,
-        health: Arc<ModelHealth>,
-        config: Arc<Config>,
-    ) -> Self {
+    pub fn new(default: Arc<dyn Provider>, health: Arc<ModelHealth>, config: Arc<Config>) -> Self {
         Self {
             default,
             cache: RwLock::new(HashMap::new()),
@@ -59,13 +55,14 @@ impl ProviderService {
         {
             Arc::from(crate::create_provider(name, resolved))
         } else {
-            tracing::warn!(
-                "session requests provider '{name}' not in catalog, using default"
-            );
+            tracing::warn!("session requests provider '{name}' not in catalog, using default");
             return self.default.clone();
         };
 
-        self.cache.write().await.insert(name.to_string(), built.clone());
+        self.cache
+            .write()
+            .await
+            .insert(name.to_string(), built.clone());
         built
     }
 
@@ -113,7 +110,9 @@ impl ProviderService {
 
     /// Default provider + model.
     pub fn default_provider_model(&self) -> (String, String) {
-        let effective = self.config.merge_session(&crate::config::SessionConfig::default());
+        let effective = self
+            .config
+            .merge_session(&crate::config::SessionConfig::default());
         (effective.provider, effective.model)
     }
 
@@ -162,9 +161,7 @@ mod tests {
             &self,
             _request: crate::provider::ChatRequest,
         ) -> crate::error::Result<
-            std::pin::Pin<
-                Box<dyn tokio_stream::Stream<Item = crate::types::StreamChunk> + Send>,
-            >,
+            std::pin::Pin<Box<dyn tokio_stream::Stream<Item = crate::types::StreamChunk> + Send>>,
         > {
             Err(crate::error::AgentError::Config("mock".into()))
         }
@@ -177,7 +174,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_empty_returns_default() {
         let svc = ProviderService::new(
-            Arc::new(MockProvider { name: "default".into() }),
+            Arc::new(MockProvider {
+                name: "default".into(),
+            }),
             Arc::new(ModelHealth::new(Default::default())),
             test_config(),
         );
@@ -188,7 +187,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_unknown_returns_default() {
         let svc = ProviderService::new(
-            Arc::new(MockProvider { name: "default".into() }),
+            Arc::new(MockProvider {
+                name: "default".into(),
+            }),
             Arc::new(ModelHealth::new(Default::default())),
             test_config(),
         );
@@ -199,7 +200,9 @@ mod tests {
     #[tokio::test]
     async fn trait_impl_works() {
         let svc = ProviderService::new(
-            Arc::new(MockProvider { name: "default".into() }),
+            Arc::new(MockProvider {
+                name: "default".into(),
+            }),
             Arc::new(ModelHealth::new(Default::default())),
             test_config(),
         );

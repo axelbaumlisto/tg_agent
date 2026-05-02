@@ -327,7 +327,7 @@ fn parse_entry_line(
                 id = val.to_string();
             } else if let Some(val) = part.strip_prefix("created:") {
                 if let Ok(dt) = chrono::NaiveDate::parse_from_str(val, "%Y-%m-%d") {
-                    created_at = dt.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                    created_at = dt.and_hms_opt(0, 0, 0).expect("midnight").and_utc();
                 }
             } else if let Some(val) = part.strip_prefix("source:") {
                 source = val.to_string();
@@ -338,7 +338,7 @@ fn parse_entry_line(
             } else if let Some(val) = part.strip_prefix("last_recall:")
                 && let Ok(dt) = chrono::NaiveDate::parse_from_str(val, "%Y-%m-%d")
             {
-                last_recalled_at = Some(dt.and_hms_opt(0, 0, 0).unwrap().and_utc());
+                last_recalled_at = Some(dt.and_hms_opt(0, 0, 0).expect("midnight").and_utc());
             }
         }
     }

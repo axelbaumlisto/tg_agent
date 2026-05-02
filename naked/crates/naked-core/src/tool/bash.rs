@@ -276,7 +276,11 @@ impl Tool for BashTool {
 
         // B7: Dispatch to remote ops or local execution.
         enum ExecOutcome {
-            Ok { stdout: Vec<u8>, stderr: Vec<u8>, success: bool },
+            Ok {
+                stdout: Vec<u8>,
+                stderr: Vec<u8>,
+                success: bool,
+            },
             ExecErr(String),
             Timeout,
         }
@@ -313,7 +317,11 @@ impl Tool for BashTool {
         };
 
         match outcome {
-            ExecOutcome::Ok { stdout: out_bytes, stderr: err_bytes, success } => {
+            ExecOutcome::Ok {
+                stdout: out_bytes,
+                stderr: err_bytes,
+                success,
+            } => {
                 let output_success = success;
                 const MAX_STREAM: usize = 16_384;
                 let raw_stdout = String::from_utf8_lossy(&out_bytes);
@@ -554,36 +562,34 @@ mod tests {
     }
 }
 
-    #[tokio::test]
-    async fn execute_large_output_saves_to_file() {
-        let tool = BashTool::new(10);
-        // Generate output larger than MAX_STREAM (16KB)
-        let input = serde_json::json!({
-            "command": "seq 1 2000 | while read n; do echo \"line_$n padding_data_to_make_it_bigger_0123456789\"; done"
-        });
-        let result = tool
-            .execute(input, std::path::Path::new("/tmp"))
-            .await;
-        assert!(!result.is_error, "command should succeed");
-        // Output should mention truncation and temp file
-        assert!(
-            result.output.contains("[truncated:"),
-            "should contain truncation note, got: {}",
-            &result.output[result.output.len().saturating_sub(200)..]
-        );
-        assert!(
-            result.output.contains("/tmp/naked_bash_"),
-            "should contain temp file path, got: {}",
-            &result.output[result.output.len().saturating_sub(200)..]
-        );
-        // Temp file should exist
-        let path_start = result.output.find("/tmp/naked_bash_").unwrap();
-        let path_end = result.output[path_start..].find(']').unwrap() + path_start;
-        let path = &result.output[path_start..path_end];
-        assert!(
-            std::path::Path::new(path).exists(),
-            "temp file should exist: {path}"
-        );
-        // Clean up
-        let _ = std::fs::remove_file(path);
-    }
+#[tokio::test]
+async fn execute_large_output_saves_to_file() {
+    let tool = BashTool::new(10);
+    // Generate output larger than MAX_STREAM (16KB)
+    let input = serde_json::json!({
+        "command": "seq 1 2000 | while read n; do echo \"line_$n padding_data_to_make_it_bigger_0123456789\"; done"
+    });
+    let result = tool.execute(input, std::path::Path::new("/tmp")).await;
+    assert!(!result.is_error, "command should succeed");
+    // Output should mention truncation and temp file
+    assert!(
+        result.output.contains("[truncated:"),
+        "should contain truncation note, got: {}",
+        &result.output[result.output.len().saturating_sub(200)..]
+    );
+    assert!(
+        result.output.contains("/tmp/naked_bash_"),
+        "should contain temp file path, got: {}",
+        &result.output[result.output.len().saturating_sub(200)..]
+    );
+    // Temp file should exist
+    let path_start = result.output.find("/tmp/naked_bash_").unwrap();
+    let path_end = result.output[path_start..].find(']').unwrap() + path_start;
+    let path = &result.output[path_start..path_end];
+    assert!(
+        std::path::Path::new(path).exists(),
+        "temp file should exist: {path}"
+    );
+    // Clean up
+    let _ = std::fs::remove_file(path);
+}

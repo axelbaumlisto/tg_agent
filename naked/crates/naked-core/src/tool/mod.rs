@@ -1,14 +1,14 @@
 pub mod agent_control;
 pub mod bash;
+pub mod factory;
 pub mod file_lock;
 pub mod file_ops;
 pub mod image_result;
-pub mod factory;
+pub mod memory;
 pub mod ops;
 pub mod policy;
-pub mod remote;
-pub mod memory;
 pub mod registry;
+pub mod remote;
 pub mod search;
 pub mod sub_agent;
 pub mod web_fetch;

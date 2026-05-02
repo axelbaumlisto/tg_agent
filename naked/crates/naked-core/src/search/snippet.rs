@@ -82,7 +82,7 @@ impl SnippetExtractor {
             Regex::new(
                 r"(?i)(\d+(?:[.,]\d+)?)\s*(triệu|tr|tỷ|ty|million|billion|usd|\$|vnd|vnđ|đ)\b",
             )
-            .unwrap()
+            .expect("static regex")
         });
         let cap = re.captures(s)?;
         let n: f64 = cap[1].replace(',', ".").parse().ok()?;
@@ -100,7 +100,7 @@ impl SnippetExtractor {
     /// Parse area in m² (m2 / m vuông / mét vuông variants).
     pub fn extract_area(&self, s: &str) -> Option<u32> {
         let re = RE_AREA.get_or_init(|| {
-            Regex::new(r"(?i)(\d{2,5})\s*m\s*(?:²|2|\bvuông\b|\bvuong\b)").unwrap()
+            Regex::new(r"(?i)(\d{2,5})\s*m\s*(?:²|2|\bvuông\b|\bvuong\b)").expect("static regex")
         });
         re.captures(s).and_then(|c| c[1].parse().ok())
     }
@@ -120,7 +120,8 @@ impl SnippetExtractor {
     /// - +84 prefix, with optional space/dot separators.
     pub fn extract_phone(&self, s: &str) -> Option<String> {
         let re = RE_PHONE.get_or_init(|| {
-            Regex::new(r"(?:\+?84[\s.-]?|0)((?:3|5|7|8|9)\d(?:[\s.-]?\d){7,8})").unwrap()
+            Regex::new(r"(?:\+?84[\s.-]?|0)((?:3|5|7|8|9)\d(?:[\s.-]?\d){7,8})")
+                .expect("static regex")
         });
         let cap = re.captures(s)?;
         let digits: String = cap[1].chars().filter(|c| c.is_ascii_digit()).collect();

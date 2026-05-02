@@ -445,7 +445,8 @@ Keep each section concise. Preserve exact paths and identifiers.";
         };
 
         if let Some((before, after)) = compacted {
-            let summary_hint = llm_summary.as_ref()
+            let summary_hint = llm_summary
+                .as_ref()
                 .and_then(|s| crate::turn::extract_summary_hint(s));
             let files_count = ci.read_files.len() + ci.modified_files.len();
             tracing::info!("context compacted: {before} msgs -> {after} msgs");
@@ -540,7 +541,8 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let session_workspace = session.workspace.clone();
 
         let cancel = CancellationToken::new();
-        self.ss.cancels
+        self.ss
+            .cancels
             .write()
             .await
             .insert(session_id.to_string(), cancel.clone());
@@ -737,7 +739,8 @@ Keep each section concise. Preserve exact paths and identifiers.";
                     session.metadata.model = effective.model;
 
                     restored.push(session.id.clone());
-                    self.ss.sessions
+                    self.ss
+                        .sessions
                         .write()
                         .await
                         .insert(session.id.clone(), session);
@@ -772,7 +775,11 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let new_id = forked.id.clone();
         self.ss.store.save(&forked).await?;
         drop(sessions);
-        self.ss.sessions.write().await.insert(new_id.clone(), forked);
+        self.ss
+            .sessions
+            .write()
+            .await
+            .insert(new_id.clone(), forked);
         Ok(new_id)
     }
 
@@ -867,18 +874,16 @@ Keep each section concise. Preserve exact paths and identifiers.";
     ) -> ToolRegistry {
         let sender_id = self.session_sender(session_id).await;
 
-        let mut tools = crate::tool::factory::core_tools(
-            &crate::tool::factory::CoreToolCtx {
-                config: &self.config,
-                remote_ctx: &self.remote_ctx,
-                agent_registry: &self.agent_registry,
-                search: &self.search,
-                provider,
-                model,
-                workspace,
-                sender_id,
-            },
-        )
+        let mut tools = crate::tool::factory::core_tools(&crate::tool::factory::CoreToolCtx {
+            config: &self.config,
+            remote_ctx: &self.remote_ctx,
+            agent_registry: &self.agent_registry,
+            search: &self.search,
+            provider,
+            model,
+            workspace,
+            sender_id,
+        })
         .await;
 
         tools.extend(crate::tool::factory::research_tools(
@@ -890,13 +895,9 @@ Keep each section concise. Preserve exact paths and identifiers.";
         tools.extend(crate::tool::factory::skill_tools(&effective.skill_roots));
 
         let session_mcp = self.session_mcp_servers(session_id, effective).await;
-        tools.extend(
-            crate::tool::factory::mcp_tools(&self.mcp_registry, &session_mcp).await,
-        );
+        tools.extend(crate::tool::factory::mcp_tools(&self.mcp_registry, &session_mcp).await);
 
-        tools.extend(
-            crate::tool::factory::extra_tools(&self.extra_tool_factories).await,
-        );
+        tools.extend(crate::tool::factory::extra_tools(&self.extra_tool_factories).await);
 
         ToolRegistry::new(tools)
     }

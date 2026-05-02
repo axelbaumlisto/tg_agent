@@ -270,7 +270,7 @@ async fn main() {
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive("naked=info".parse().unwrap());
+        .add_directive("naked=info".parse().expect("static directive"));
 
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let combined = std::io::stderr.and(non_blocking_file);
@@ -399,9 +399,9 @@ async fn main() {
                     let stat = String::from_utf8_lossy(&out.stdout);
                     let stat = stat.trim();
                     if !stat.is_empty() && stat.len() < 500 {
-                        msgs.push(naked_core::types::ConversationMessage::user(
-                            format!("[git diff --stat]\n{stat}"),
-                        ));
+                        msgs.push(naked_core::types::ConversationMessage::user(format!(
+                            "[git diff --stat]\n{stat}"
+                        )));
                     }
                 }
             },
@@ -526,7 +526,7 @@ async fn main() {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
-        .unwrap();
+        .expect("reqwest client");
     let base = format!("https://api.telegram.org/bot{bot_token}");
     let http_client: Arc<reqwest::Client> = Arc::new(client.clone());
     let base_url: Arc<String> = Arc::new(base.clone());
@@ -629,9 +629,14 @@ async fn main() {
         );
     }
 
-    // ── FIX-1: Notify ONLY chats with crashed (mid-turn) sessions ────
+    // ── FIX-1: Notify ONLY chats with genuinely interrupted sessions ─────
+    //
+    // drain_interrupted_sessions filters to sessions updated within 5 min.
+    // Stale entries (accumulated across SIGKILL restarts) are silently skipped.
     {
-        let crashed_sessions = agent.drain_interrupted_sessions().await;
+        let crashed_sessions = agent
+            .drain_interrupted_sessions(chrono::Duration::minutes(5))
+            .await;
         if !crashed_sessions.is_empty() {
             let entries = channel_map.all_entries().await;
             let mut notified = 0u32;

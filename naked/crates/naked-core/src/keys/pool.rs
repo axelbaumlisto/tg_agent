@@ -56,7 +56,7 @@ impl KeyPool {
 
     fn refresh_if_stale(&self) {
         let stale = {
-            let g = self.inner.read().unwrap();
+            let g = self.inner.read().expect("key_pool lock");
             g.refreshed_at.elapsed() > self.ttl || g.keys.is_empty()
         };
         if !stale {
@@ -74,7 +74,7 @@ impl KeyPool {
         }
         all.sort();
         all.dedup();
-        let mut g = self.inner.write().unwrap();
+        let mut g = self.inner.write().expect("key_pool lock");
         // Keep the dead-set across refreshes so a transient 401 doesn't
         // re-introduce a known-dead key on the next TTL tick.
         all.retain(|k| !g.dead.contains(k));
@@ -86,7 +86,7 @@ impl KeyPool {
     /// refresh) — callers should treat this as "this engine is unusable now".
     pub fn next(&self) -> Option<String> {
         self.refresh_if_stale();
-        let g = self.inner.read().unwrap();
+        let g = self.inner.read().expect("key_pool lock");
         if g.keys.is_empty() {
             return None;
         }
@@ -97,13 +97,13 @@ impl KeyPool {
     /// Number of currently-live keys.
     pub fn size(&self) -> usize {
         self.refresh_if_stale();
-        self.inner.read().unwrap().keys.len()
+        self.inner.read().expect("key_pool lock").keys.len()
     }
 
     /// Mark a key as dead for the lifetime of this process. The next refresh
     /// will skip it; the cursor adjusts naturally on the next call.
     pub fn mark_dead(&self, key: &str) {
-        let mut g = self.inner.write().unwrap();
+        let mut g = self.inner.write().expect("key_pool lock");
         g.dead.insert(key.to_string());
         g.keys.retain(|k| k != key);
     }

@@ -220,16 +220,10 @@ pub(crate) async fn handle_command(
             // B3: File tracking
             let (read_files, modified_files) = agent.session_file_stats(&sid).await;
             if !modified_files.is_empty() {
-                lines.push(format!(
-                    "<b>Modified:</b> {} file(s)",
-                    modified_files.len()
-                ));
+                lines.push(format!("<b>Modified:</b> {} file(s)", modified_files.len()));
             }
             if !read_files.is_empty() {
-                lines.push(format!(
-                    "<b>Read:</b> {} file(s)",
-                    read_files.len()
-                ));
+                lines.push(format!("<b>Read:</b> {} file(s)", read_files.len()));
             }
 
             let kb = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
@@ -698,7 +692,13 @@ pub(crate) async fn handle_command(
 
             // Extract commit message from command text or auto-generate
             let user_msg = text.strip_prefix("/commit").unwrap_or("").trim();
-            let workspace = match agent.session_workspace(&sid).await { Some(w) => w, None => { reply_text(bot, &ctx, "Session has no workspace.").await?; return Ok(true); } };
+            let workspace = match agent.session_workspace(&sid).await {
+                Some(w) => w,
+                None => {
+                    reply_text(bot, &ctx, "Session has no workspace.").await?;
+                    return Ok(true);
+                }
+            };
             let ws = workspace.to_string_lossy();
 
             // Check if inside a git repo
@@ -707,7 +707,11 @@ pub(crate) async fn handle_command(
                 .current_dir(&workspace)
                 .output()
                 .await;
-            if !git_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+            if !git_check
+                .as_ref()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
                 reply_text(bot, &ctx, &format!("Not a git repo: {ws}")).await?;
                 return Ok(true);
             }
@@ -761,9 +765,16 @@ pub(crate) async fn handle_command(
 
             if args.is_empty() || args == "status" {
                 let label = remote_ctx.label().await;
-                reply_text(bot, &ctx, &format!("🌐 Target: <b>{label}</b>\n\n\
+                reply_text(
+                    bot,
+                    &ctx,
+                    &format!(
+                        "🌐 Target: <b>{label}</b>\n\n\
                     /remote &lt;host&gt; — switch to SSH\n\
-                    /remote off — back to local")).await?;
+                    /remote off — back to local"
+                    ),
+                )
+                .await?;
             } else if args == "off" || args == "local" {
                 remote_ctx.set_local().await;
                 reply_text(bot, &ctx, "🌐 Switched to <b>local</b>").await?;
@@ -771,7 +782,8 @@ pub(crate) async fn handle_command(
                 // args = host, optionally "host key=/path/to/key"
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 let host = parts[0].to_string();
-                let key = parts.get(1)
+                let key = parts
+                    .get(1)
                     .and_then(|s| s.strip_prefix("key="))
                     .map(|s| s.to_string());
 

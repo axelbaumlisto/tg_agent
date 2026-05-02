@@ -32,9 +32,15 @@ impl FileTracker {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         match (tool_name, path) {
-            ("read_file", Some(p)) => { self.read.insert(p); }
-            ("write_file", Some(p)) => { self.written.insert(p); }
-            ("edit_file", Some(p)) => { self.edited.insert(p); }
+            ("read_file", Some(p)) => {
+                self.read.insert(p);
+            }
+            ("write_file", Some(p)) => {
+                self.written.insert(p);
+            }
+            ("edit_file", Some(p)) => {
+                self.edited.insert(p);
+            }
             _ => {}
         }
     }
@@ -350,7 +356,10 @@ mod file_tracker_tests {
     #[test]
     fn record_and_classify() {
         let mut ft = FileTracker::default();
-        ft.record_tool("read_file", &serde_json::json!({"file_path": "src/main.rs"}));
+        ft.record_tool(
+            "read_file",
+            &serde_json::json!({"file_path": "src/main.rs"}),
+        );
         ft.record_tool("edit_file", &serde_json::json!({"file_path": "src/lib.rs"}));
         ft.record_tool("write_file", &serde_json::json!({"file_path": "new.rs"}));
         ft.record_tool("read_file", &serde_json::json!({"file_path": "src/lib.rs"}));

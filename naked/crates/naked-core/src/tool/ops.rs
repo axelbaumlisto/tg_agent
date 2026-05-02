@@ -4,8 +4,8 @@
 //! Each tool that does I/O accepts an `Arc<dyn ToolOps>` to abstract
 //! the underlying transport.
 
-use std::path::Path;
 use async_trait::async_trait;
+use std::path::Path;
 
 /// Result of executing a command.
 pub struct ExecResult {
@@ -113,7 +113,10 @@ impl ToolOps for SshOps {
 
     async fn write_file(&self, path: &Path, contents: &str) -> std::io::Result<()> {
         // Create parent dirs + write via heredoc
-        let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let parent = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         let escaped_contents = contents.replace('\'', "'\\''");
         let cmd = format!(
             "mkdir -p {} && cat > {} << 'NAKED_EOF'\n{}\nNAKED_EOF",
@@ -123,8 +126,7 @@ impl ToolOps for SshOps {
         );
         let result = self.exec(&cmd, Path::new("/"), 30).await?;
         if result.exit_code != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 String::from_utf8_lossy(&result.stderr).to_string(),
             ));
         }
@@ -152,9 +154,12 @@ impl ToolOps for SshOps {
 
         let mut ssh_cmd = tokio::process::Command::new("ssh");
         ssh_cmd
-            .arg("-o").arg("ConnectTimeout=10")
-            .arg("-o").arg("BatchMode=yes")
-            .arg("-o").arg("StrictHostKeyChecking=no");
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no");
 
         if let Some(ref key) = self.key {
             ssh_cmd.arg("-i").arg(key);
@@ -212,10 +217,7 @@ mod tests {
     #[tokio::test]
     async fn local_ops_exec() {
         let ops = LocalOps;
-        let result = ops
-            .exec("echo hello", Path::new("/tmp"), 5)
-            .await
-            .unwrap();
+        let result = ops.exec("echo hello", Path::new("/tmp"), 5).await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
     }

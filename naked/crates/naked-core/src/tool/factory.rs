@@ -8,14 +8,17 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::AgentCore;
+use crate::ResearchState;
 use crate::agent_registry::AgentRegistry;
 use crate::config::Config;
 use crate::mcp::client::{McpRegistry, McpServer};
 use crate::mcp::wrapper::McpToolWrapper;
 use crate::provider::Provider;
-use crate::ResearchState;
 use crate::skill::resolver::SkillResolver;
 use crate::skill::tool::SkillTool;
+use crate::tool::Tool;
+use crate::tool::agent_control::{AgentStatusTool, AgentStopTool};
 use crate::tool::bash::BashTool;
 use crate::tool::file_ops::{EditFileTool, ReadFileTool, WriteFileTool};
 use crate::tool::memory::MemoryTool;
@@ -26,10 +29,6 @@ use crate::tool::web_fetch::WebFetchTool;
 use crate::tool::web_fetch_tls::WebFetchTlsTool;
 use crate::tool::web_fetch_wayback::WebFetchWaybackTool;
 use crate::tool::web_search::WebSearchTool;
-use crate::tool::agent_control::{AgentStatusTool, AgentStopTool};
-use crate::tool::Tool;
-use crate::AgentCore;
-
 
 /// Context for building core tools (reduces argument count).
 pub(crate) struct CoreToolCtx<'a> {
@@ -84,7 +83,10 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         )),
         Box::new(WebFetchTlsTool::new()),
         Box::new(WebFetchWaybackTool::new()),
-        Box::new(MemoryTool::with_context(ctx.workspace.to_path_buf(), memory_ctx)),
+        Box::new(MemoryTool::with_context(
+            ctx.workspace.to_path_buf(),
+            memory_ctx,
+        )),
     ]
 }
 
@@ -94,8 +96,8 @@ pub(crate) fn research_tools(
     research: &ResearchState,
     self_ref: &std::sync::RwLock<Option<std::sync::Weak<AgentCore>>>,
 ) -> Vec<Box<dyn Tool>> {
-    use crate::research::tool::*;
     use crate::research::ops_tool::*;
+    use crate::research::tool::*;
 
     if !config.research.enabled {
         return Vec::new();
@@ -133,7 +135,7 @@ pub(crate) fn research_tools(
         )),
     ];
 
-    if let Some(weak) = self_ref.read().unwrap().clone() {
+    if let Some(weak) = self_ref.read().expect("self_ref lock").clone() {
         tools.push(Box::new(ResearchLaunchTool::new(weak.clone())));
         tools.push(Box::new(ResearchUpdateSpecTool::new(weak.clone())));
         tools.push(Box::new(ResearchSetScheduleTool::new(weak.clone())));
@@ -195,10 +197,5 @@ pub(crate) async fn mcp_tools(
 pub(crate) async fn extra_tools(
     factories: &RwLock<crate::ExtraToolFactories>,
 ) -> Vec<Box<dyn Tool>> {
-    factories
-        .read()
-        .await
-        .iter()
-        .map(|f| f())
-        .collect()
+    factories.read().await.iter().map(|f| f()).collect()
 }

@@ -148,7 +148,7 @@ fn render_quick_decision(providers: &BTreeMap<String, ProviderConfig>) -> String
             .copied()
             .filter(|(_, _, c)| matches!(c.status, ModelStatus::Active) && c.fits(task))
             .collect();
-        candidates.sort_by(|a, b| rank_key(a.2).cmp(&rank_key(b.2)));
+        candidates.sort_by_key(|a| rank_key(a.2));
         let first = candidates.first().copied();
         let backup = candidates.get(1).copied();
         let why = first

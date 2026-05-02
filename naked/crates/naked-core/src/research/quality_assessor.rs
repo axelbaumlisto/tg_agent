@@ -331,7 +331,7 @@ fn dominant_reasons(graded: &[&Value], low_relevance_max: i64) -> Vec<ReasonCoun
     }
     // Stable sort by count desc — ties preserve insertion order
     // (this is what makes the differential output byte-stable).
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.sort_by_key(|a| std::cmp::Reverse(a.1));
     counts
         .into_iter()
         .take(3)

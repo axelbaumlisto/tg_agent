@@ -43,7 +43,11 @@ pub(crate) fn handle_text_delta(view: &mut CompositeView, text: &str) -> ViewAct
     ViewAction::Dirty
 }
 
-pub(crate) fn handle_tool_start(view: &mut CompositeView, name: &str, input: &serde_json::Value) -> ViewAction {
+pub(crate) fn handle_tool_start(
+    view: &mut CompositeView,
+    name: &str,
+    input: &serde_json::Value,
+) -> ViewAction {
     view.in_thinking = false;
     view.phase = "tool use";
     let preview = format_input_preview(input, 200);
@@ -113,7 +117,10 @@ pub(crate) fn handle_sub_agent(
     ViewAction::DirtyFlush
 }
 
-pub(crate) fn handle_usage(view: &mut CompositeView, usage: naked_core::types::TurnUsage) -> ViewAction {
+pub(crate) fn handle_usage(
+    view: &mut CompositeView,
+    usage: naked_core::types::TurnUsage,
+) -> ViewAction {
     view.usage = Some(usage);
     ViewAction::Dirty
 }
@@ -137,7 +144,10 @@ mod tests {
     use super::*;
 
     fn new_view() -> CompositeView {
-        CompositeView::new("test-model".into(), Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        CompositeView::new(
+            "test-model".into(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
     }
 
     #[test]

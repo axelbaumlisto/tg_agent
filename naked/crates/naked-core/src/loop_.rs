@@ -1292,10 +1292,11 @@ mod tests {
         // Collect events
         let mut saw_deny = false;
         while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::ToolEnd { output, state, .. } = ev {
-                if output.contains("denied by policy") && state == ToolState::Error {
-                    saw_deny = true;
-                }
+            if let AgentEvent::ToolEnd { output, state, .. } = ev
+                && output.contains("denied by policy")
+                && state == ToolState::Error
+            {
+                saw_deny = true;
             }
         }
         assert!(saw_deny, "policy denial should emit ToolEnd with error");

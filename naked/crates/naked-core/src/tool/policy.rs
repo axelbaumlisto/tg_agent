@@ -133,10 +133,7 @@ mod tests {
             Path::new("/tmp"),
             Permission::Dangerous,
         );
-        assert_eq!(
-            decision,
-            ToolDecision::Deny("bash is disabled".into())
-        );
+        assert_eq!(decision, ToolDecision::Deny("bash is disabled".into()));
     }
 
     #[test]

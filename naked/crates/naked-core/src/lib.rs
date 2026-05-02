@@ -1,3 +1,4 @@
+pub mod active_turns;
 pub mod agent_registry;
 pub mod agent_role;
 pub mod agent_run;
@@ -5,10 +6,9 @@ pub mod agent_store;
 pub mod agent_validator;
 pub mod config;
 pub mod error;
-pub mod hooks;
-pub mod active_turns;
 #[path = "history_mod/mod.rs"]
 pub mod history;
+pub mod hooks;
 pub mod keys;
 pub mod loop_;
 pub mod mcp;
@@ -51,9 +51,9 @@ use provider::copilot::CopilotProvider;
 use provider::openai_compat::OpenAiCompatProvider;
 use provider::resilient::ResilientProvider;
 use research::{
-    CoordinatorConfig, FsResearchStore, ResearchContext, ResearchCoordinator,
-    ResearchSpec, ResearchStore, RunRecord, RunReport,
-    VerifiedRunReport, new_research_id, parse_provider_model_pair,
+    CoordinatorConfig, FsResearchStore, ResearchContext, ResearchCoordinator, ResearchSpec,
+    ResearchStore, RunRecord, RunReport, VerifiedRunReport, new_research_id,
+    parse_provider_model_pair,
 };
 use session::jsonl_store::JsonlSessionStore;
 use session::store::SessionStore;
@@ -295,7 +295,6 @@ impl AgentCore {
         let provider_arc: Arc<dyn Provider> = Arc::from(provider);
         let config_arc = Arc::new(config.clone());
 
-
         Self {
             config,
             mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
@@ -337,8 +336,36 @@ impl AgentCore {
     }
 
     /// Load session IDs that were mid-turn when the process crashed.
-    pub async fn drain_interrupted_sessions(&self) -> Vec<String> {
-        self.ss.store.drain_interrupted().await
+    /// Filters to sessions updated within `recency` to avoid spamming
+    /// stale topics that accumulated in `.active_sessions` across restarts.
+    pub async fn drain_interrupted_sessions(&self, recency: chrono::Duration) -> Vec<String> {
+        let all = self.ss.store.drain_interrupted().await;
+        if all.is_empty() {
+            return all;
+        }
+        let cutoff = chrono::Utc::now() - recency;
+        let sessions = self.ss.sessions.read().await;
+        let mut recent = Vec::new();
+        for sid in &all {
+            if let Some(s) = sessions.get(sid.as_str()) {
+                if s.updated_at >= cutoff {
+                    recent.push(sid.clone());
+                } else {
+                    tracing::debug!(
+                        session = %sid,
+                        updated = %s.updated_at,
+                        "skip stale interrupted session"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            "{} in .active_sessions, {} recent (within {}s)",
+            all.len(),
+            recent.len(),
+            recency.num_seconds(),
+        );
+        recent
     }
 
     /// B6: Get the hook registry.

@@ -144,11 +144,7 @@ impl SessionState {
         }
     }
 
-    pub async fn queue_message_multimodal(
-        &self,
-        session_id: &str,
-        blocks: Vec<ContentBlock>,
-    ) {
+    pub async fn queue_message_multimodal(&self, session_id: &str, blocks: Vec<ContentBlock>) {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
             session.history.push_user_multimodal(blocks);
@@ -227,7 +223,7 @@ mod tests {
 
     fn test_state() -> SessionState {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(JsonlSessionStore::new(dir.into_path()));
+        let store = Arc::new(JsonlSessionStore::new(dir.keep()));
         SessionState::new(store)
     }
 

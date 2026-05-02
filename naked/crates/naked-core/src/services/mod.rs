@@ -45,11 +45,7 @@ pub trait ProviderResolver: Send + Sync {
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     async fn create_session(&self, workspace: &Path) -> String;
-    async fn send_prompt(
-        &self,
-        session_id: &str,
-        text: &str,
-    ) -> Result<AgentHandle>;
+    async fn send_prompt(&self, session_id: &str, text: &str) -> Result<AgentHandle>;
     async fn is_session_active(&self, session_id: &str) -> bool;
     async fn abort(&self, session_id: &str);
     async fn list_sessions(&self) -> Vec<SessionSummary>;

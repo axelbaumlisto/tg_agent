@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("naked=info".parse().unwrap()),
+                .add_directive("naked=info".parse().expect("static directive")),
         )
         .init();
 
@@ -315,7 +315,9 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
                 files_count,
             } => {
                 let hint = summary_hint.as_deref().unwrap_or("");
-                eprintln!("\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m");
+                eprintln!(
+                    "\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m"
+                );
             }
             AgentEvent::UsageUpdate(u) => {
                 last_usage = Some(u);
@@ -351,7 +353,7 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
 fn cli_input_preview(input: &serde_json::Value, max_len: usize) -> String {
     let raw = if let Some(map) = input.as_object() {
         if map.len() == 1 {
-            let (key, val) = map.iter().next().unwrap();
+            let (key, val) = map.iter().next().expect("checked len==1");
             let fallback = val.to_string();
             let v = val.as_str().unwrap_or(&fallback);
             format!("{key}: {v}")

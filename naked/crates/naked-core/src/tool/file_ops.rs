@@ -93,28 +93,28 @@ impl Tool for ReadFileTool {
             if is_image {
                 // For images: base64-encode if small enough for vision models.
                 const MAX_IMAGE_BYTES: u64 = 512_000; // 500KB
-                if size <= MAX_IMAGE_BYTES {
-                    if let Ok(bytes) = tokio::fs::read(&path).await {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        let mime = match ext {
-                            "png" => "image/png",
-                            "jpg" | "jpeg" => "image/jpeg",
-                            "gif" => "image/gif",
-                            "webp" => "image/webp",
-                            _ => "application/octet-stream",
-                        };
-                        // Push image for vision model injection.
-                        super::image_result::push_image(mime, &b64);
-                        return ToolResult {
-                            output: format!(
-                                "Image ({}, {size} bytes): {}\n[image sent to vision model]",
-                                ext.to_uppercase(),
-                                path.display()
-                            ),
-                            is_error: false,
-                        };
-                    }
+                if size <= MAX_IMAGE_BYTES
+                    && let Ok(bytes) = tokio::fs::read(&path).await
+                {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    let mime = match ext {
+                        "png" => "image/png",
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "gif" => "image/gif",
+                        "webp" => "image/webp",
+                        _ => "application/octet-stream",
+                    };
+                    // Push image for vision model injection.
+                    super::image_result::push_image(mime, &b64);
+                    return ToolResult {
+                        output: format!(
+                            "Image ({}, {size} bytes): {}\n[image sent to vision model]",
+                            ext.to_uppercase(),
+                            path.display()
+                        ),
+                        is_error: false,
+                    };
                 }
                 let p = path.display();
                 return ToolResult {
@@ -287,13 +287,13 @@ struct EditFileInput {
 impl EditFileInput {
     /// Normalize: merge legacy old_string/new_string into edits array.
     fn into_edits(mut self) -> (String, Vec<EditOp>) {
-        if self.edits.is_empty() {
-            if let (Some(old), Some(new)) = (self.old_string.take(), self.new_string.take()) {
-                self.edits.push(EditOp {
-                    old_string: old,
-                    new_string: new,
-                });
-            }
+        if self.edits.is_empty()
+            && let (Some(old), Some(new)) = (self.old_string.take(), self.new_string.take())
+        {
+            self.edits.push(EditOp {
+                old_string: old,
+                new_string: new,
+            });
         }
         (self.file_path, self.edits)
     }
@@ -407,8 +407,22 @@ impl Tool for EditFileTool {
                 // C2: Build a compact diff preview for each edit.
                 let mut diff_lines = Vec::new();
                 for (i, edit) in edits.iter().enumerate() {
-                    let old_preview: String = edit.old_string.lines().next().unwrap_or("").chars().take(60).collect();
-                    let new_preview: String = edit.new_string.lines().next().unwrap_or("").chars().take(60).collect();
+                    let old_preview: String = edit
+                        .old_string
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    let new_preview: String = edit
+                        .new_string
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect();
                     let old_lc = edit.old_string.lines().count();
                     let new_lc = edit.new_string.lines().count();
                     diff_lines.push(format!(
@@ -725,7 +739,10 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "{}", result.output);
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "goodbye world");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "goodbye world"
+        );
     }
 
     #[tokio::test]
@@ -774,7 +791,10 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("edits[1]"));
         // File should be UNCHANGED (atomic)
-        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "aaa\nbbb\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "aaa\nbbb\n"
+        );
     }
 
     #[tokio::test]

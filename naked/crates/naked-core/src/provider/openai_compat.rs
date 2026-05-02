@@ -163,10 +163,8 @@ fn apply_reasoning_params(body: &mut serde_json::Value, base_url: &str, reasonin
         || url_lc.contains("moonshot.cn")
         || url_lc.contains("moonshot.ai");
     match reasoning {
-        Some("off") => {
-            if supports_enable_thinking {
-                body["enable_thinking"] = serde_json::json!(false);
-            }
+        Some("off") if supports_enable_thinking => {
+            body["enable_thinking"] = serde_json::json!(false);
         }
         Some(effort) => {
             if supports_reasoning_effort {

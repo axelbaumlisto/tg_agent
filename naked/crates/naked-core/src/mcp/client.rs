@@ -165,9 +165,7 @@ impl McpRegistry {
 
     /// Connect to all configured MCP servers. Returns both successes and
     /// failures so callers can notify users about broken servers.
-    pub async fn connect_all_with_diagnostics(
-        configs: &[McpServerConfig],
-    ) -> McpConnectResult {
+    pub async fn connect_all_with_diagnostics(configs: &[McpServerConfig]) -> McpConnectResult {
         let mut servers = Vec::new();
         let mut failures = Vec::new();
         for config in configs {

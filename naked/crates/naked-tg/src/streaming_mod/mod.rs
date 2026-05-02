@@ -616,9 +616,8 @@ pub(crate) async fn stream_response(
             stall_warned = false;
         } else if !stall_warned && last_event_at.elapsed() > STALL_TIMEOUT {
             stall_warned = true;
-            view.tool_lines.push(
-                "⏳ Бот не отвечает >90s — возможно завис. /stop для отмены.".to_string(),
-            );
+            view.tool_lines
+                .push("⏳ Бот не отвечает >90s — возможно завис. /stop для отмены.".to_string());
             dirty = true;
             force_flush = true;
         }
@@ -643,7 +642,8 @@ pub(crate) async fn stream_response(
                     ..
                 } => {
                     let is_error = matches!(state, naked_core::types::ToolState::Error);
-                    let (action, detail_msg) = handlers::handle_tool_end(&mut view, &name, is_error, &output);
+                    let (action, detail_msg) =
+                        handlers::handle_tool_end(&mut view, &name, is_error, &output);
                     if let Some(msg) = detail_msg {
                         let _ = bot
                             .send_message(ctx.chat_id, &msg)
@@ -710,7 +710,9 @@ pub(crate) async fn stream_response(
                     files_count,
                 } => {
                     let note = handlers::handle_compaction(
-                        before_msgs, after_msgs, files_count,
+                        before_msgs,
+                        after_msgs,
+                        files_count,
                         summary_hint.as_deref(),
                     );
                     let _ = bot
@@ -807,7 +809,10 @@ pub(crate) async fn stream_response(
             InlineKeyboardButton::callback("🔀 Switch model", "err:switch".to_string()),
         ]]);
         let _ = bot
-            .send_message(ctx.chat_id, "⚠️ Ответ содержит ошибку провайдера. Повторить?")
+            .send_message(
+                ctx.chat_id,
+                "⚠️ Ответ содержит ошибку провайдера. Повторить?",
+            )
             .maybe_thread(ctx.thread_id)
             .reply_markup(keyboard)
             .await;

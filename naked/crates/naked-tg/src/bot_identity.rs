@@ -243,15 +243,13 @@ pub fn is_addressed_to_bot(msg: &Message, identity: &BotIdentity) -> bool {
             let our_handle_at = format!("@{our_handle}");
             for ent in caption_entities {
                 match ent.kind() {
-                    MessageEntityKind::Mention => {
-                        if ent.text().to_ascii_lowercase() == our_handle_at {
-                            return true;
-                        }
+                    MessageEntityKind::Mention
+                        if ent.text().to_ascii_lowercase() == our_handle_at =>
+                    {
+                        return true;
                     }
-                    MessageEntityKind::TextMention { user } => {
-                        if user.id.0 == identity.id {
-                            return true;
-                        }
+                    MessageEntityKind::TextMention { user } if user.id.0 == identity.id => {
+                        return true;
                     }
                     _ => {}
                 }
@@ -314,10 +312,8 @@ pub fn is_addressed_to_bot(msg: &Message, identity: &BotIdentity) -> bool {
                         return true;
                     }
                 }
-                MessageEntityKind::TextMention { user } => {
-                    if user.id.0 == identity.id {
-                        return true;
-                    }
+                MessageEntityKind::TextMention { user } if user.id.0 == identity.id => {
+                    return true;
                 }
                 _ => {}
             }
