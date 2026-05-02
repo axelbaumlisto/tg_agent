@@ -4198,6 +4198,7 @@ async fn t62_emergency_compaction_then_continue_working() {
             AgentEvent::ContextCompacted {
                 before_msgs,
                 after_msgs,
+                ..
             } => {
                 saw_compaction = true;
                 compaction_before = *before_msgs;

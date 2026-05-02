@@ -220,6 +220,7 @@ async fn drain_to_output(
             Some(AgentEvent::ContextCompacted {
                 before_msgs,
                 after_msgs,
+                ..
             }) => {
                 tracing::info!(target: "naked::agent_run::stream", task = %label,
                     "[context-compact] {before_msgs} -> {after_msgs} msgs");

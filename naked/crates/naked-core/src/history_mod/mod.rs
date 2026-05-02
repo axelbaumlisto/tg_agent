@@ -175,6 +175,11 @@ impl ConversationHistory {
         &self.messages
     }
 
+    /// B6: Mutable access for context hooks.
+    pub fn messages_mut(&mut self) -> &mut Vec<ConversationMessage> {
+        &mut self.messages
+    }
+
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
@@ -283,6 +288,21 @@ impl ConversationHistory {
         self.messages.push(ConversationMessage::tool_result(
             call_id, &trimmed, is_error,
         ));
+    }
+
+    /// Push an image into the conversation (for vision models).
+    /// Added as a user message with a single Image block.
+    pub fn push_image(&mut self, mime: &str, base64_data: &str) {
+        self.messages.push(ConversationMessage {
+            role: crate::types::Role::User,
+            blocks: vec![crate::types::ContentBlock::Image {
+                mime: mime.to_string(),
+                data_base64: base64_data.to_string(),
+                detail: None,
+            }],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+        });
     }
 
     pub fn push_raw(&mut self, msg: ConversationMessage) {

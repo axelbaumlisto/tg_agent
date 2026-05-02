@@ -84,6 +84,7 @@ pub struct AgentLoop {
     provider: Box<dyn Provider>,
     tools: ToolRegistry,
     config: LoopConfig,
+    policy: Box<dyn crate::tool::policy::ToolPolicy>,
 }
 
 impl AgentLoop {
@@ -92,6 +93,22 @@ impl AgentLoop {
             provider,
             tools,
             config,
+            policy: Box::new(crate::tool::policy::DefaultPolicy),
+        }
+    }
+
+    /// Create with a custom tool policy.
+    pub fn with_policy(
+        provider: Box<dyn Provider>,
+        tools: ToolRegistry,
+        config: LoopConfig,
+        policy: Box<dyn crate::tool::policy::ToolPolicy>,
+    ) -> Self {
+        Self {
+            provider,
+            tools,
+            config,
+            policy,
         }
     }
 
@@ -181,6 +198,8 @@ impl AgentLoop {
                                 .send(AgentEvent::ContextCompacted {
                                     before_msgs: before,
                                     after_msgs: after,
+                                    summary_hint: None,
+                                    files_count: 0,
                                 })
                                 .await;
                             continue 'outer;
@@ -371,9 +390,11 @@ impl AgentLoop {
                 return Ok(cumulative_usage);
             }
 
-            // Classify tool calls by permission to enable parallel execution of read-only ones.
+            // Classify tool calls via policy (Step 2: no permission rules in loop).
+            use crate::tool::policy::ToolDecision;
             let mut readonly_batch: Vec<(String, String, serde_json::Value)> = Vec::new();
             let mut gated_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+            let mut denied_calls: Vec<(String, String, String)> = Vec::new(); // (id, name, reason)
 
             for (id, name, input) in tool_calls {
                 let perm = self
@@ -382,10 +403,24 @@ impl AgentLoop {
                     .map(|t| t.effective_permission(&input, &self.config.cwd))
                     .unwrap_or(Permission::Dangerous);
 
-                match perm {
-                    Permission::ReadOnly => readonly_batch.push((id, name, input)),
-                    _ => gated_calls.push((id, name, input)),
+                match self.policy.classify(&name, &input, &self.config.cwd, perm) {
+                    ToolDecision::Execute => readonly_batch.push((id, name, input)),
+                    ToolDecision::AskUser(_) => gated_calls.push((id, name, input)),
+                    ToolDecision::Deny(reason) => denied_calls.push((id, name, reason)),
                 }
+            }
+
+            // Emit denied tool results.
+            for (id, name, reason) in denied_calls {
+                let _ = tx
+                    .send(AgentEvent::ToolEnd {
+                        call_id: id.clone(),
+                        name,
+                        state: ToolState::Error,
+                        output: reason.clone(),
+                    })
+                    .await;
+                history.push_tool_result(&id, &reason, true);
             }
 
             // Execute read-only tools in parallel (no permission needed).
@@ -429,6 +464,10 @@ impl AgentLoop {
                         })
                         .await;
                     history.push_tool_result(&id, &result.output, result.is_error);
+                    // Inject any images produced by the tool.
+                    for (mime, b64) in crate::tool::image_result::drain_images() {
+                        history.push_image(&mime, &b64);
+                    }
                 }
             }
 
@@ -516,6 +555,9 @@ impl AgentLoop {
                     })
                     .await;
                 history.push_tool_result(&id, &result.output, result.is_error);
+                for (mime, b64) in crate::tool::image_result::drain_images() {
+                    history.push_image(&mime, &b64);
+                }
             }
         }
 
@@ -1186,5 +1228,76 @@ mod tests {
         assert!(saw_tool_end, "tool should have been executed");
         let result = loop_handle.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    // -- Step 2: ToolPolicy tests ------------------------------------------------
+
+    /// Policy that denies the echo tool.
+    struct DenyEchoPolicy;
+    impl crate::tool::policy::ToolPolicy for DenyEchoPolicy {
+        fn classify(
+            &self,
+            name: &str,
+            _input: &serde_json::Value,
+            _cwd: &std::path::Path,
+            permission: Permission,
+        ) -> crate::tool::policy::ToolDecision {
+            if name == "echo" {
+                return crate::tool::policy::ToolDecision::Deny("echo denied by policy".into());
+            }
+            match permission {
+                Permission::ReadOnly => crate::tool::policy::ToolDecision::Execute,
+                p => crate::tool::policy::ToolDecision::AskUser(p),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_policy_deny_blocks_tool() {
+        let provider = MockProvider::new(vec![
+            vec![
+                StreamChunk::ToolUse {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text": "hello"}),
+                },
+                StreamChunk::Done,
+            ],
+            vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
+        ]);
+
+        let agent_loop = AgentLoop::with_policy(
+            Box::new(provider),
+            crate::tool::registry::ToolRegistry::new(vec![Box::new(EchoTool)]),
+            LoopConfig {
+                max_iterations: 10,
+                cwd: std::path::PathBuf::from("/tmp"),
+                model: "mock".into(),
+                max_tokens: 1024,
+                temperature: None,
+                reasoning: None,
+                provider: String::new(),
+                health: None,
+            },
+            Box::new(DenyEchoPolicy),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let mut history = ConversationHistory::new(String::new());
+        history.push_user("test");
+
+        let _ = agent_loop.run(&mut history, tx, cancel, None).await;
+
+        // Collect events
+        let mut saw_deny = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ToolEnd { output, state, .. } = ev {
+                if output.contains("denied by policy") && state == ToolState::Error {
+                    saw_deny = true;
+                }
+            }
+        }
+        assert!(saw_deny, "policy denial should emit ToolEnd with error");
     }
 }

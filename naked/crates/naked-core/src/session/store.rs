@@ -15,6 +15,17 @@ pub trait SessionStore: Send + Sync {
     async fn list(&self) -> Result<Vec<SessionSummary>>;
     async fn delete(&self, session_id: &str) -> Result<()>;
 
+    /// Mark a session as having an active turn (persists to disk).
+    /// On crash recovery, sessions still marked active were interrupted.
+    async fn mark_active(&self, session_id: &str) -> Result<()>;
+
+    /// Mark a session as idle (turn finished). Clears the active marker.
+    async fn mark_idle(&self, session_id: &str) -> Result<()>;
+
+    /// Return session IDs that were active when the process last crashed.
+    /// Clears the markers after reading (one-shot).
+    async fn drain_interrupted(&self) -> Vec<String>;
+
     /// Returns the isolated artifacts directory for a session's tools to use as cwd.
     fn artifacts_dir(&self, session_id: &str) -> PathBuf;
 

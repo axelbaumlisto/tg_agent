@@ -77,7 +77,45 @@ impl SessionStore for JsonlSessionStore {
     async fn save(&self, session: &Session) -> Result<()> {
         self.ensure_session_dir(&session.id).await?;
         let path = self.session_path(&session.id);
+        let msg_count = session.history.message_count();
+        let artifacts_dir = self.artifacts_dir(&session.id);
 
+        // (applied: KISS) Incremental save: if only new messages were added
+        // since last persist, append them instead of rewriting everything.
+        // Full rewrite on: first save, compaction (msg count shrank), or
+        // if the file doesn't exist yet.
+        let can_append = session.persisted_msg_count > 0
+            && msg_count > session.persisted_msg_count
+            && path.exists();
+
+        if can_append {
+            // Append only the new messages (fast path: O(delta)).
+            let new_msgs = &session.history.messages()[session.persisted_msg_count..];
+            let mut buf = String::new();
+            for msg in new_msgs {
+                let externalized = extern_image_blocks(&artifacts_dir, msg).await?;
+                let record = serde_json::json!({ "type": "message", "message": externalized });
+                buf.push_str(&serde_json::to_string(&record).map_err(|e| {
+                    crate::error::AgentError::ProviderTyped(
+                        crate::provider::error::ProviderError::Serialize {
+                            context: "message".into(),
+                            source: e.to_string(),
+                        },
+                    )
+                })?);
+                buf.push('\n');
+            }
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .await?;
+            file.write_all(buf.as_bytes()).await?;
+            file.flush().await?;
+            return Ok(());
+        }
+
+        // Full rewrite (compaction, first save, or corruption recovery).
         rotate_if_needed(&path).await?;
 
         let mut lines = Vec::new();
@@ -92,6 +130,7 @@ impl SessionStore for JsonlSessionStore {
             "metadata": session.metadata,
             "fork": session.fork_info,
             "system_prompt": session.history.system_prompt(),
+            "files": serde_json::to_value(&session.files).unwrap_or_default(),
         });
         lines.push(serde_json::to_string(&meta).map_err(|e| {
             crate::error::AgentError::ProviderTyped(
@@ -102,13 +141,9 @@ impl SessionStore for JsonlSessionStore {
             )
         })?);
 
-        let artifacts_dir = self.artifacts_dir(&session.id);
         for msg in session.history.messages() {
             let externalized = extern_image_blocks(&artifacts_dir, msg).await?;
-            let record = serde_json::json!({
-                "type": "message",
-                "message": externalized,
-            });
+            let record = serde_json::json!({ "type": "message", "message": externalized });
             lines.push(serde_json::to_string(&record).map_err(|e| {
                 crate::error::AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::Serialize {
@@ -120,8 +155,6 @@ impl SessionStore for JsonlSessionStore {
         }
 
         let content = lines.join("\n") + "\n";
-
-        // Atomic write
         let tmp = path.with_extension("tmp");
         tokio::fs::write(&tmp, &content).await?;
         tokio::fs::rename(&tmp, &path).await?;
@@ -201,6 +234,7 @@ impl SessionStore for JsonlSessionStore {
             .get("fork")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+        let msg_count = history.message_count();
         let session = Session {
             id: meta["session_id"]
                 .as_str()
@@ -223,6 +257,10 @@ impl SessionStore for JsonlSessionStore {
             fork_info,
             state: SessionState::Sleeping,
             metadata: session_metadata,
+            files: meta.get("files")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+            persisted_msg_count: msg_count,
         };
 
         Ok(Some(session))
@@ -318,6 +356,41 @@ impl SessionStore for JsonlSessionStore {
 
     fn session_root(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id)
+    }
+
+    async fn mark_active(&self, session_id: &str) -> Result<()> {
+        let path = self.base_dir.join(".active_sessions");
+        let mut content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        if !content.lines().any(|l| l.trim() == session_id) {
+            content.push_str(session_id);
+            content.push('\n');
+            tokio::fs::write(&path, &content).await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_idle(&self, session_id: &str) -> Result<()> {
+        let path = self.base_dir.join(".active_sessions");
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            let filtered: String = content
+                .lines()
+                .filter(|l| l.trim() != session_id)
+                .map(|l| format!("{l}\n"))
+                .collect();
+            tokio::fs::write(&path, &filtered).await?;
+        }
+        Ok(())
+    }
+
+    async fn drain_interrupted(&self) -> Vec<String> {
+        let path = self.base_dir.join(".active_sessions");
+        let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let _ = tokio::fs::remove_file(&path).await;
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect()
     }
 }
 
@@ -1071,3 +1144,86 @@ mod tests {
         assert_eq!(msgs[3].text_content(), "q2");
     }
 }
+
+    #[tokio::test]
+    async fn file_tracker_persists_across_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path().to_path_buf());
+
+        // Create session with file tracker data
+        let mut session = crate::session::Session::new(
+            dir.path().to_path_buf(),
+            "test".into(),
+            crate::session::SessionMetadata {
+                name: None,
+                provider: "test".into(),
+                model: "test".into(),
+                channel: "test".into(),
+                channel_id: None,
+            },
+        );
+        session.files.record_tool("read_file", &serde_json::json!({"file_path": "src/main.rs"}));
+        session.files.record_tool("edit_file", &serde_json::json!({"file_path": "src/lib.rs"}));
+        session.files.record_tool("write_file", &serde_json::json!({"file_path": "new.rs"}));
+
+        let sid = session.id.clone();
+        store.save(&session).await.unwrap();
+
+        // Load and verify
+        let loaded = store.load(&sid).await.unwrap().unwrap();
+        assert!(loaded.files.read.contains("src/main.rs"), "read files should persist");
+        assert!(loaded.files.edited.contains("src/lib.rs"), "edited files should persist");
+        assert!(loaded.files.written.contains("new.rs"), "written files should persist");
+
+        // read_only should exclude edited
+        let ro = loaded.files.read_only();
+        assert!(ro.contains(&"src/main.rs"));
+        assert!(!ro.contains(&"src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn incremental_save_appends_not_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(dir.path().to_path_buf());
+
+        let mut session = crate::session::Session::new(
+            dir.path().to_path_buf(),
+            "system".into(),
+            crate::session::SessionMetadata {
+                name: None,
+                provider: "test".into(),
+                model: "test".into(),
+                channel: "test".into(),
+                channel_id: None,
+            },
+        );
+
+        // First save: full rewrite (persisted_msg_count = 0)
+        session.history.push_user("hello");
+        store.save(&session).await.unwrap();
+        session.persisted_msg_count = session.history.message_count();
+
+        let path = store.session_path(&session.id);
+        let size_after_first = tokio::fs::metadata(&path).await.unwrap().len();
+
+        // Second save: add one message → incremental append
+        session.history.push_user("world");
+        store.save(&session).await.unwrap();
+        session.persisted_msg_count = session.history.message_count();
+
+        let size_after_second = tokio::fs::metadata(&path).await.unwrap().len();
+        // File grew (append), not rewrote from scratch
+        assert!(size_after_second > size_after_first,
+            "file should grow: {size_after_first} → {size_after_second}");
+
+        // Load and verify both messages present
+        let loaded = store.load(&session.id).await.unwrap().unwrap();
+        let texts: Vec<String> = loaded.history.messages().iter()
+            .filter_map(|m| {
+                if m.blocks.is_empty() { None }
+                else { Some(m.text_content()) }
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("hello")), "should have 'hello'");
+        assert!(texts.iter().any(|t| t.contains("world")), "should have 'world'");
+    }

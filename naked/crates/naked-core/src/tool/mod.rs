@@ -1,6 +1,12 @@
 pub mod agent_control;
 pub mod bash;
+pub mod file_lock;
 pub mod file_ops;
+pub mod image_result;
+pub mod factory;
+pub mod ops;
+pub mod policy;
+pub mod remote;
 pub mod memory;
 pub mod registry;
 pub mod search;

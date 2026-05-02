@@ -311,8 +311,11 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
             AgentEvent::ContextCompacted {
                 before_msgs,
                 after_msgs,
+                summary_hint,
+                files_count,
             } => {
-                eprintln!("\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs}]\x1b[0m");
+                let hint = summary_hint.as_deref().unwrap_or("");
+                eprintln!("\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m");
             }
             AgentEvent::UsageUpdate(u) => {
                 last_usage = Some(u);

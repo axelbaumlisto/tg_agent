@@ -3,35 +3,19 @@
 use super::*;
 
 impl AgentCore {
+    /// Delegates to ProviderService.
     pub fn list_models(&self) -> Vec<types::ModelInfo> {
-        self.provider.models()
+        self.provider_svc.list_models()
     }
 
-    /// List models for a specific provider as `(provider_name, model_id)` pairs.
-    pub async fn provider_models(&self, provider_name: &str) -> Vec<(String, String)> {
-        if let Some(pc) = self.config.providers.get(provider_name) {
-            pc.models
-                .iter()
-                .map(|m| (provider_name.to_string(), m.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        }
+    /// Delegates to ProviderService.
+    pub fn provider_models(&self, provider_name: &str) -> Vec<(String, String)> {
+        self.provider_svc.provider_models(provider_name)
     }
 
-    /// List all configured providers with their available models.
+    /// Delegates to ProviderService.
     pub fn list_providers(&self) -> Vec<ProviderInfo> {
-        let mut result = Vec::new();
-        for (name, pc) in &self.config.providers {
-            let active = name == &self.config.default_provider;
-            result.push(ProviderInfo {
-                name: name.clone(),
-                models: pc.models.clone(),
-                active,
-            });
-        }
-        result.sort_by(|a, b| a.name.cmp(&b.name));
-        result
+        self.provider_svc.list_providers()
     }
 
     /// Switch the provider and model for a specific session.
@@ -54,7 +38,7 @@ impl AgentCore {
             let target_provider = provider
                 .map(|s| s.to_string())
                 .or_else(|| {
-                    let sessions = self.sessions.try_read().ok()?;
+                    let sessions = self.ss.sessions.try_read().ok()?;
                     sessions
                         .get(session_id)
                         .map(|s| s.metadata.provider.clone())
@@ -80,7 +64,7 @@ impl AgentCore {
             }
         }
 
-        let session_root = self.store.session_root(session_id);
+        let session_root = self.ss.store.session_root(session_id);
         let config_path = session_root.join("config.json");
 
         let mut sc = if config_path.exists() {
@@ -107,14 +91,14 @@ impl AgentCore {
 
         // Update in-memory metadata immediately
         let effective = self.config.merge_session(&sc);
-        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
             session.metadata.provider = effective.provider;
             session.metadata.model = effective.model;
         }
 
         // Invalidate cached provider so next turn rebuilds it (cache is keyed by provider name)
         if let Some(p) = provider {
-            self.provider_cache.write().await.remove(p);
+            self.provider_svc.invalidate(p).await;
         }
 
         Ok(())
@@ -131,7 +115,7 @@ impl AgentCore {
             }
         };
 
-        let session_root = self.store.session_root(session_id);
+        let session_root = self.ss.store.session_root(session_id);
         let config_path = session_root.join("config.json");
 
         let mut sc = if config_path.exists() {
@@ -157,7 +141,7 @@ impl AgentCore {
     /// Set yolo timestamp for a session. Writes to config.json.
     /// Pass `Some(ts)` to enable with a specific unix timestamp, `None` to disable.
     pub async fn set_session_yolo(&self, session_id: &str, enabled_at: Option<i64>) -> Result<()> {
-        let session_root = self.store.session_root(session_id);
+        let session_root = self.ss.store.session_root(session_id);
         let config_path = session_root.join("config.json");
 
         let mut sc = if config_path.exists() {
@@ -182,7 +166,7 @@ impl AgentCore {
 
     /// Set allow-list for a session. Writes to config.json.
     pub async fn set_session_allow_list(&self, session_id: &str, tools: &[String]) -> Result<()> {
-        let session_root = self.store.session_root(session_id);
+        let session_root = self.ss.store.session_root(session_id);
         let config_path = session_root.join("config.json");
 
         let mut sc = if config_path.exists() {
@@ -218,56 +202,30 @@ impl AgentCore {
     /// Persist a channel-specific key so the channel→session mapping survives restarts.
     /// For Telegram: `"tg:{chat_id}:{thread_id}"`.
     pub async fn set_session_channel_id(&self, session_id: &str, channel_id: &str) {
-        let mut sessions = self.sessions.write().await;
-        if let Some(session) = sessions.get_mut(session_id) {
-            session.metadata.channel_id = Some(channel_id.to_string());
-            if let Err(e) = self.store.save(session).await {
-                tracing::error!("failed to persist channel_id for {session_id}: {e}");
-            }
-        }
+        self.ss.set_session_channel_id(session_id, channel_id).await
     }
 
     /// Return `(channel_id, session_id)` pairs for sessions that have a channel_id.
     /// When multiple sessions share the same channel_id, only the most recently
     /// updated one is returned.
     pub async fn channel_session_mappings(&self) -> Vec<(String, String)> {
-        let sessions = self.sessions.read().await;
-        let mut best: std::collections::HashMap<String, (&str, chrono::DateTime<chrono::Utc>)> =
-            std::collections::HashMap::new();
-        for s in sessions.values() {
-            if let Some(cid) = &s.metadata.channel_id {
-                let entry = best.entry(cid.clone()).or_insert((&s.id, s.updated_at));
-                if s.updated_at > entry.1 {
-                    *entry = (&s.id, s.updated_at);
-                }
-            }
-        }
-        best.into_iter()
-            .map(|(cid, (sid, _))| (cid, sid.to_string()))
-            .collect()
+        self.ss.channel_session_mappings().await
     }
 
     /// Get the currently active provider and model for a session.
     /// Sum of token usage across all assistant turns in a session.
     pub async fn session_total_usage(&self, session_id: &str) -> types::TurnUsage {
-        let sessions = self.sessions.read().await;
-        let mut total = types::TurnUsage::default();
-        if let Some(session) = sessions.get(session_id) {
-            for msg in session.history.messages() {
-                if let Some(u) = &msg.usage {
-                    total.input_tokens += u.input_tokens;
-                    total.output_tokens += u.output_tokens;
-                    total.cache_read_tokens += u.cache_read_tokens;
-                    total.cache_write_tokens += u.cache_write_tokens;
-                }
-            }
-        }
-        total
+        self.ss.session_total_usage(session_id).await
+    }
+
+    /// B3: Get file tracking stats for a session (read-only, modified).
+    pub async fn session_file_stats(&self, session_id: &str) -> (Vec<String>, Vec<String>) {
+        self.ss.session_file_stats(session_id).await
     }
 
     /// Returns (estimated_tokens, context_window_tokens) for a session.
     pub async fn session_context_usage(&self, session_id: &str) -> Option<(usize, u32)> {
-        let sessions = self.sessions.read().await;
+        let sessions = self.ss.sessions.read().await;
         sessions.get(session_id).map(|s| {
             (
                 s.history.estimated_tokens(),
@@ -292,8 +250,8 @@ impl AgentCore {
     /// `SessionConfig::default()`. That worked, but baking a magic
     /// session-id sentinel into the contract was a code smell — this method
     /// makes the intent explicit and never touches the filesystem.
+    /// Delegates to ProviderService.
     pub fn default_provider_model(&self) -> (String, String) {
-        let effective = self.config.merge_session(&SessionConfig::default());
-        (effective.provider, effective.model)
+        self.provider_svc.default_provider_model()
     }
 }

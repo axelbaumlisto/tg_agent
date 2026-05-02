@@ -290,6 +290,10 @@ pub enum AgentEvent {
     ContextCompacted {
         before_msgs: usize,
         after_msgs: usize,
+        /// Short label from the compaction summary (e.g. first line of ## Goal).
+        summary_hint: Option<String>,
+        /// Number of tracked files (read + modified).
+        files_count: usize,
     },
     Error(String),
     Idle,

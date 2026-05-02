@@ -210,6 +210,16 @@ impl ChannelSessionMap {
             .cloned()
     }
 
+    /// All (chat_id, thread_id, session_id) entries.
+    pub async fn all_entries(&self) -> Vec<(i64, i64, String)> {
+        self.map
+            .read()
+            .await
+            .iter()
+            .map(|((cid, tid), sid)| (*cid, *tid, sid.clone()))
+            .collect()
+    }
+
     pub async fn set(&self, chat_id: i64, thread_id: Option<i32>, session_id: String) {
         self.map
             .write()
@@ -292,12 +302,25 @@ impl ChannelSessionMap {
     // ── allow-list (per-topic tool whitelist) ────────────────────────────
 
     /// Returns true if `tool_name` should be auto-approved for this topic.
+    /// Tools that are always safe to auto-approve (read-only, no side effects).
+    const SAFE_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "web_search",
+        "glob_search",
+        "grep_search",
+        "agent_status",
+    ];
+
     pub async fn should_auto_approve(
         &self,
         chat_id: i64,
         thread_id: Option<i32>,
         tool_name: &str,
     ) -> bool {
+        // A4: Read-only tools always auto-approve.
+        if Self::SAFE_TOOLS.contains(&tool_name) {
+            return true;
+        }
         if self.is_yolo(chat_id, thread_id).await {
             return true;
         }
@@ -419,21 +442,25 @@ mod tests {
     #[tokio::test]
     async fn allow_list_basics() {
         let map = ChannelSessionMap::new();
+        // bash is NOT safe — needs explicit allow or yolo
         assert!(!map.should_auto_approve(1, Some(2), "bash").await);
+        // A4: read_file IS safe — always auto-approved
+        assert!(map.should_auto_approve(1, Some(2), "read_file").await);
+        assert!(map.should_auto_approve(1, Some(2), "web_search").await);
+        assert!(map.should_auto_approve(1, Some(2), "grep_search").await);
 
         map.allow_add(1, Some(2), "bash").await;
-        map.allow_add(1, Some(2), "read_file").await;
 
         assert!(map.should_auto_approve(1, Some(2), "bash").await);
-        assert!(map.should_auto_approve(1, Some(2), "read_file").await);
         assert!(!map.should_auto_approve(1, Some(2), "write_file").await);
         assert!(!map.should_auto_approve(1, Some(3), "bash").await);
 
         let list = map.allow_get(1, Some(2)).await;
-        assert_eq!(list, vec!["bash", "read_file"]);
+        assert_eq!(list, vec!["bash"]);
 
         map.allow_remove(1, Some(2), "bash").await;
         assert!(!map.should_auto_approve(1, Some(2), "bash").await);
+        // read_file still auto-approved (safe tool)
         assert!(map.should_auto_approve(1, Some(2), "read_file").await);
     }
 

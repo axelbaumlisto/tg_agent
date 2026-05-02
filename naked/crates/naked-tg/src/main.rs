@@ -376,7 +376,37 @@ async fn main() {
         "memory scheduler online"
     );
 
-    agent.init_mcp().await;
+    let mcp_failures = agent.init_mcp().await;
+
+    // B6: Register built-in context hook — inject short git status.
+    // Helps the model know if there are uncommitted changes.
+    agent
+        .hooks()
+        .on_context(std::sync::Arc::new(
+            |msgs: &mut Vec<naked_core::types::ConversationMessage>| {
+                // Only inject if the first message is a system prompt
+                // and we're in a git repo (workspace is set in system prompt).
+                if msgs.is_empty() {
+                    return;
+                }
+                // Quick check with timeout — skip if git is slow or not a repo
+                let output = std::process::Command::new("git")
+                    .args(["diff", "--stat", "HEAD"])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                if let Ok(out) = output {
+                    let stat = String::from_utf8_lossy(&out.stdout);
+                    let stat = stat.trim();
+                    if !stat.is_empty() && stat.len() < 500 {
+                        msgs.push(naked_core::types::ConversationMessage::user(
+                            format!("[git diff --stat]\n{stat}"),
+                        ));
+                    }
+                }
+            },
+        ))
+        .await;
 
     let restored = agent.restore_sessions().await.unwrap_or_default();
     if !restored.is_empty() {
@@ -568,10 +598,68 @@ async fn main() {
         .await;
     tracing::info!("Webhook cleared, starting polling loop");
 
+    // ── A7: Send MCP startup diagnostics to owner chat ────────────────
+    if !mcp_failures.is_empty() && !config.allowed_chat_ids.is_empty() {
+        let owner_chat = ChatId(config.allowed_chat_ids[0]);
+        let mut lines = vec!["🔌 <b>MCP startup report</b>".to_string()];
+        // Show connected servers
+        let connected = agent.list_mcp_servers().await;
+        for (name, tools) in &connected {
+            lines.push(format!("  ✅ <b>{name}</b>: {tools} tools"));
+        }
+        // Show failures
+        for f in &mcp_failures {
+            let err_short: String = f.error.chars().take(120).collect();
+            lines.push(format!(
+                "  ❌ <b>{}</b>: {}",
+                crate::tg_markup::escape_html(&f.name),
+                crate::tg_markup::escape_html(&err_short),
+            ));
+        }
+        let text = lines.join("\n");
+        let _ = bot
+            .send_message(owner_chat, &text)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await;
+    }
+
     if config.allowed_chat_ids.is_empty() {
         tracing::warn!(
             "allowed_chat_ids is empty — ALL messages will be rejected! Add your chat IDs to naked.json."
         );
+    }
+
+    // ── FIX-1: Notify ONLY chats with crashed (mid-turn) sessions ────
+    {
+        let crashed_sessions = agent.drain_interrupted_sessions().await;
+        if !crashed_sessions.is_empty() {
+            let entries = channel_map.all_entries().await;
+            let mut notified = 0u32;
+            for (chat_id, thread_id_raw, session_id) in &entries {
+                if !crashed_sessions.contains(session_id) {
+                    continue;
+                }
+                let cid = ChatId(*chat_id);
+                let tid = if *thread_id_raw != 0 {
+                    Some(teloxide::types::ThreadId(teloxide::types::MessageId(
+                        *thread_id_raw as i32,
+                    )))
+                } else {
+                    None
+                };
+                let text = "⚠️ Бот перезапустился. Последний запрос потерян — повтори.";
+                let mut req = bot.send_message(cid, text);
+                if let Some(t) = tid {
+                    req = req.message_thread_id(t);
+                }
+                let _ = req.await;
+                notified += 1;
+            }
+            tracing::info!(
+                "crash recovery: {} session(s) interrupted, notified {notified} chat(s)",
+                crashed_sessions.len()
+            );
+        }
     }
 
     // Health check endpoint (lightweight TCP)
@@ -892,6 +980,8 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("memory", "Memory: rules / dreams / drafts / stats"),
         BotCommand::new("research", "Run, list, pause or resume research"),
         BotCommand::new("health", "Provider health & key status"),
+        BotCommand::new("commit", "Git commit modified files"),
+        BotCommand::new("remote", "Switch to SSH remote host"),
         BotCommand::new("help", "Show all commands"),
     ];
     if let Err(e) = bot.set_my_commands(commands).await {

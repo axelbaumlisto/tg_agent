@@ -377,7 +377,7 @@ impl AgentCore {
             reasoning: self.config.research.reasoning.clone(),
             provider_capabilities: self.config.providers.clone(),
             enforce_model_capabilities: self.config.enforce_model_capabilities,
-            model_health: Some(self.model_health.clone()),
+            model_health: Some(self.provider_svc.health()),
             run_events: Some(self.research.run_events.clone()),
         };
         let runner: Arc<dyn research::AgentRunner> =

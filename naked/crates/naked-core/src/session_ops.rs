@@ -6,50 +6,46 @@ impl AgentCore {
     /// Record the current author for an upcoming turn. Used by the memory tool
     /// to resolve `scope=user` without an explicit `user_id`. `None` clears it.
     pub async fn set_session_sender(&self, session_id: &str, sender_id: Option<String>) {
-        let mut map = self.session_senders.write().await;
-        match sender_id {
-            Some(id) if !id.is_empty() => {
-                map.insert(session_id.to_string(), id);
-            }
-            _ => {
-                map.remove(session_id);
-            }
-        }
+        self.ss.set_session_sender(session_id, sender_id).await
     }
 
     /// Look up the currently-recorded author for this session, if any.
     pub async fn session_sender(&self, session_id: &str) -> Option<String> {
-        self.session_senders.read().await.get(session_id).cloned()
+        self.ss.session_sender(session_id).await
     }
 
     /// Connect to configured MCP servers.
-    pub async fn init_mcp(&self) {
+    /// Connect to all configured MCP servers.
+    /// Returns a list of servers that failed to connect (empty = all ok).
+    pub async fn init_mcp(&self) -> Vec<crate::mcp::client::McpConnectFailure> {
         let servers = self.config.mcp_server_list();
-        if !servers.is_empty() {
-            {
-                let old = self.mcp_registry.read().await;
-                old.close_all().await;
-            }
-            let registry = McpRegistry::connect_all(&servers).await;
-            tracing::info!(
-                "MCP: {} tools from {} servers",
-                registry.all_tools().len(),
-                registry.servers().len()
-            );
-            *self.mcp_registry.write().await = registry;
+        if servers.is_empty() {
+            return Vec::new();
         }
+        {
+            let old = self.mcp_registry.read().await;
+            old.close_all().await;
+        }
+        let result = McpRegistry::connect_all_with_diagnostics(&servers).await;
+        tracing::info!(
+            "MCP: {} tools from {} servers",
+            result.registry.all_tools().len(),
+            result.registry.servers().len()
+        );
+        *self.mcp_registry.write().await = result.registry;
+        result.failures
     }
 
     /// Borrow the underlying session store. Exposed for operator commands
     /// (`vacuum-sessions`, future `gc` task) that need to walk all sessions
     /// without going through the in-memory cache.
     pub fn store(&self) -> Arc<dyn SessionStore> {
-        self.store.clone()
+        self.ss.store.clone()
     }
 
     /// Load per-session config.json if it exists.
     pub fn load_session_config_pub(&self, session_id: &str) -> SessionConfig {
-        let path = self.store.session_root(session_id).join("config.json");
+        let path = self.ss.store.session_root(session_id).join("config.json");
         if path.exists() {
             match SessionConfig::from_file(&path) {
                 Ok(sc) => {
@@ -194,31 +190,9 @@ Keep each section concise. Preserve exact paths and identifiers.";
     /// Public so out-of-loop callers (CLI gatekeeper, validators) can
     /// pin a non-default provider per call without rebuilding the
     /// whole agent.
+    /// Resolve a provider by name. Delegates to ProviderService.
     pub async fn provider_for(&self, provider_name: &str) -> Arc<dyn Provider> {
-        if provider_name.is_empty() || provider_name == self.config.default_provider {
-            return self.provider.clone();
-        }
-
-        if let Some(cached) = self.provider_cache.read().await.get(provider_name) {
-            return cached.clone();
-        }
-
-        let built: Arc<dyn Provider> = if let Some(pc) = self.config.providers.get(provider_name)
-            && let Ok(resolved) = pc.resolved()
-        {
-            Arc::from(create_provider(provider_name, resolved))
-        } else {
-            tracing::warn!(
-                "session requests provider '{provider_name}' not in catalog, using default"
-            );
-            return self.provider.clone();
-        };
-
-        self.provider_cache
-            .write()
-            .await
-            .insert(provider_name.to_string(), built.clone());
-        built
+        self.provider_svc.resolve(provider_name).await
     }
 
     /// Connect any extra MCP servers needed by a session (additive over global).
@@ -306,7 +280,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let session = Session::new(workspace.to_path_buf(), full_prompt, metadata);
         let id = session.id.clone();
 
-        if let Err(e) = self.store.save(&session).await {
+        if let Err(e) = self.ss.store.save(&session).await {
             tracing::error!("failed to persist new session: {e}");
         }
 
@@ -314,7 +288,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let sc = self.load_session_config_pub(&id);
         let effective = self.config.merge_session(&sc);
 
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.ss.sessions.write().await;
         let mut session = session;
         session.metadata.provider = effective.provider;
         session.metadata.model = effective.model;
@@ -354,11 +328,12 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let sc = self.load_session_config_pub(session_id);
         let effective = self.config.merge_session(&sc);
 
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.ss.sessions.write().await;
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
         session.state = SessionState::Active;
+        let _ = self.ss.store.mark_active(session_id).await;
 
         // Update metadata to match effective config (model/provider may change between turns)
         session.metadata.provider = effective.provider.clone();
@@ -400,109 +375,35 @@ Keep each section concise. Preserve exact paths and identifiers.";
         }
         session.updated_at = chrono::Utc::now();
 
-        // Background memory classification (non-blocking, fire-and-forget).
-        //
-        // By default the hit lands in *today's draft file*, NOT durable
-        // `MEMORY.md`. The daily digest later promotes it iff the same
-        // rule re-appears across `promote_min_repeat_days` days. This
-        // turns the classifier into a low-precision, high-recall feeder
-        // for the scoring gate instead of a one-shot writer.
-        //
-        // Toggle with `memory.auto_classify_to_drafts = false` to fall
-        // back to direct writes (legacy behaviour).
+        // Background memory classification (non-blocking).
         {
-            let ws = session.workspace.clone();
-            let mdl = model.clone();
-            let msg = classifier_text.clone();
-            // Use the session's provider — not the global default — so the
-            // model name is valid for the API endpoint. (Bug: using
-            // self.provider sent "kimi-for-coding" to qwen → 404.)
             let provider_ref = self.provider_for(&provider_name).await;
             let sender_id = self.session_sender(session_id).await;
-            let to_drafts = self.config.memory.auto_classify_to_drafts;
-            tokio::spawn(async move {
-                let provider_arc: std::sync::Arc<dyn Provider> = provider_ref;
-                let Some(result) =
-                    memory::classifier::classify(&*provider_arc, &mdl, &msg, sender_id.as_deref())
-                        .await
-                else {
-                    return;
-                };
-
-                if to_drafts {
-                    let entry = memory::types::MemoryEntry::new(
-                        result.memory_type,
-                        result.content.clone(),
-                        "auto_classify",
-                        result.scope.clone(),
-                    );
-                    match memory::store::MarkdownMemoryStore::append_daily(&ws, &entry, true) {
-                        Ok(true) => tracing::info!(
-                            scope = %result.scope,
-                            ty = %result.memory_type,
-                            "memory auto-captured to drafts: {}",
-                            result.content
-                        ),
-                        Ok(false) => {
-                            tracing::debug!("memory auto-capture (drafts): duplicate skipped")
-                        }
-                        Err(e) => tracing::warn!("memory auto-capture (drafts) write failed: {e}"),
-                    }
-                } else {
-                    match memory::service::MemoryService::store(
-                        &ws,
-                        result.scope,
-                        result.memory_type,
-                        &result.content,
-                        "auto",
-                    ) {
-                        Ok(true) => tracing::info!(
-                            "memory auto-captured: [{}] {}",
-                            result.memory_type,
-                            result.content
-                        ),
-                        Ok(false) => tracing::debug!("memory auto-capture: duplicate skipped"),
-                        Err(e) => tracing::warn!("memory auto-capture write failed: {e}"),
-                    }
-                }
-            });
+            crate::turn::spawn_memory_classify(
+                provider_ref,
+                model.clone(),
+                classifier_text.clone(),
+                session.workspace.clone(),
+                sender_id,
+                self.config.memory.auto_classify_to_drafts,
+            );
         }
 
-        let needs_compact = session.history.needs_compaction();
-        let compact_text = if needs_compact {
-            session.history.messages_for_compaction(4)
-        } else {
-            None
-        };
-        let previous_summary = session
-            .history
-            .last_compaction_summary()
-            .map(|s| s.to_string());
-        let (read_files, modified_files) = if needs_compact {
-            session.history.files_in_compaction_range(4)
-        } else {
-            (vec![], vec![])
-        };
-        let before_msgs = session.history.message_count();
-        let workspace_for_compaction = session.workspace.clone();
+        let ci = crate::turn::gather_compaction_data(session);
 
         // Drop sessions lock before LLM call to avoid blocking other requests
         drop(sessions);
 
         // LLM-based compaction with deterministic fallback
-        let llm_summary = if let Some(text_for_llm) = compact_text {
-            tracing::info!(before_msgs, "attempting LLM-based compaction");
+        let llm_summary = if let Some(text_for_llm) = ci.compact_text {
+            tracing::info!(ci.before_msgs, "attempting LLM-based compaction");
             let provider_arc = self.provider_for(&provider_name).await;
 
-            // Pre-compaction flush: ask the model (silent turn) to extract
-            // any rules-of-thumb / corrections from the history we are
-            // about to discard, and append them to the project's daily
-            // draft file. Best-effort; never blocks compaction.
             if self.config.memory.daily_enabled && self.config.memory.pre_compaction_flush {
                 memory::digest::pre_compaction_flush(
                     &*provider_arc,
                     &model,
-                    &workspace_for_compaction,
+                    &ci.workspace,
                     &memory::types::MemoryScope::Project,
                     &text_for_llm,
                 )
@@ -513,25 +414,12 @@ Keep each section concise. Preserve exact paths and identifiers.";
                 &*provider_arc,
                 &model,
                 &text_for_llm,
-                previous_summary.as_deref(),
+                ci.previous_summary.as_deref(),
             )
             .await
             {
                 Ok(mut summary) => {
-                    // Append file tracking
-                    if !read_files.is_empty() || !modified_files.is_empty() {
-                        summary.push_str("\n\n<read-files>\n");
-                        for f in &read_files {
-                            summary.push_str(f);
-                            summary.push('\n');
-                        }
-                        summary.push_str("</read-files>\n<modified-files>\n");
-                        for f in &modified_files {
-                            summary.push_str(f);
-                            summary.push('\n');
-                        }
-                        summary.push_str("</modified-files>");
-                    }
+                    crate::turn::append_file_tags(&mut summary, &ci.read_files, &ci.modified_files);
                     tracing::info!("LLM compaction succeeded");
                     Some(summary)
                 }
@@ -545,31 +433,28 @@ Keep each section concise. Preserve exact paths and identifiers.";
         };
 
         // Re-acquire sessions lock to apply compaction
-        let mut sessions = self.sessions.write().await;
+        let mut sessions = self.ss.sessions.write().await;
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
 
-        let compacted = if needs_compact {
-            if let Some(summary) = llm_summary {
-                session.history.set_compaction_summary(summary.clone());
-                session.history.compact_with_llm_summary(&summary, 4);
-                session.history.set_last_input_tokens(None);
-            } else {
-                session.history.auto_compact();
-            }
-            let after = session.history.message_count();
-            Some((before_msgs, after))
+        let compacted = if ci.needs_compact {
+            crate::turn::apply_compaction(session, llm_summary.as_deref(), ci.before_msgs)
         } else {
             None
         };
 
         if let Some((before, after)) = compacted {
+            let summary_hint = llm_summary.as_ref()
+                .and_then(|s| crate::turn::extract_summary_hint(s));
+            let files_count = ci.read_files.len() + ci.modified_files.len();
             tracing::info!("context compacted: {before} msgs -> {after} msgs");
             let _ = tx
                 .send(AgentEvent::ContextCompacted {
                     before_msgs: before,
                     after_msgs: after,
+                    summary_hint,
+                    files_count,
                 })
                 .await;
             // After compaction, older turns (and any image blocks they
@@ -577,7 +462,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             // session's artifacts dir to reclaim disk for images that no
             // JSONL line still references. Never block the user reply on
             // GC failures — log and move on.
-            match self.store.gc_orphan_image_artifacts(session_id).await {
+            match self.ss.store.gc_orphan_image_artifacts(session_id).await {
                 Ok(n) if n > 0 => {
                     tracing::info!(
                         removed = n,
@@ -599,59 +484,34 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let original_system_prompt = history.system_prompt().to_string();
 
         // Inject per-session prompt.md as context (if present)
-        let session_root = self.store.session_root(session_id);
+        let session_root = self.ss.store.session_root(session_id);
         let prompt_path = effective
             .system_prompt_path
             .as_ref()
             .map(|p| session_root.join(p))
             .unwrap_or_else(|| session_root.join("prompt.md"));
-        if let Ok(extra) = tokio::fs::read_to_string(&prompt_path).await {
-            let trimmed = extra.trim();
-            if !trimmed.is_empty() {
-                history.inject_system_context(&format!("\n\n[Session instructions]\n{trimmed}"));
-            }
-        }
+        crate::turn::inject_session_prompt(&mut history, &prompt_path).await;
 
-        // Inject persistent memory rules into system prompt (plus the active
-        // author's per-user rules when a Telegram sender is set for this turn).
+        // Inject persistent memory rules + per-user rules.
         let sender_for_rules = self.session_sender(session_id).await;
-        let memory_rules = memory::service::MemoryService::load_rules_for(
+        crate::turn::inject_memory_rules(
+            &mut history,
             &session.workspace,
             sender_for_rules.as_deref(),
         );
-        if !memory_rules.is_empty() {
-            history.inject_system_context(&format!("\n\n{memory_rules}"));
-        }
 
-        // "Recent shift": surface the last few days of un-promoted draft
-        // memory entries so the model sees fresh context without waiting
-        // for a daily-digest promotion. Cheap (just reads ≤2 small md
-        // files per scope) and bumps the recall counter as a side
-        // effect, which feeds promotion scoring.
-        if self.config.memory.daily_enabled {
-            let mut shift_blocks: Vec<String> = Vec::new();
-            if let Some(b) = memory::daily::recent_shift_block(
-                &session.workspace,
-                &memory::types::MemoryScope::Project,
-                &self.config.memory,
-            ) {
-                shift_blocks.push(b);
-            }
-            if let Some(sender) = sender_for_rules.as_deref()
-                && let Some(b) = memory::daily::recent_shift_block(
-                    &session.workspace,
-                    &memory::types::MemoryScope::User(sender.to_string()),
-                    &self.config.memory,
-                )
-            {
-                shift_blocks.push(b);
-            }
-            if !shift_blocks.is_empty() {
-                history.inject_system_context(&format!("\n\n{}", shift_blocks.join("\n\n")));
-            }
-        }
+        // Recent memory drafts ("shift") for fresh context.
+        crate::turn::inject_memory_shift(
+            &mut history,
+            &session.workspace,
+            sender_for_rules.as_deref(),
+            &self.config.memory,
+        );
 
-        let artifacts = self.store.artifacts_dir(session_id);
+        // B9: Inject file tracker context.
+        crate::turn::inject_file_context(&mut history, &session.files);
+
+        let artifacts = self.ss.store.artifacts_dir(session_id);
         if let Err(e) = tokio::fs::create_dir_all(&artifacts).await {
             tracing::warn!("could not create artifacts dir: {e}");
         }
@@ -662,19 +522,9 @@ Keep each section concise. Preserve exact paths and identifiers.";
             session.workspace.clone()
         };
 
-        // Per-provider max_tokens / temperature (provider-level override > session > global)
-        let eff_max_tokens = self
-            .config
-            .providers
-            .get(&provider_name)
-            .and_then(|pc| pc.max_tokens)
-            .unwrap_or(effective.max_tokens);
-        let eff_temperature = self
-            .config
-            .providers
-            .get(&provider_name)
-            .and_then(|pc| pc.temperature)
-            .or(effective.temperature);
+        // Per-provider max_tokens / temperature.
+        let (eff_max_tokens, eff_temperature) =
+            crate::turn::resolve_generation_params(&self.config, &provider_name, &effective);
 
         let loop_config = LoopConfig {
             max_iterations: effective.max_iterations,
@@ -684,47 +534,29 @@ Keep each section concise. Preserve exact paths and identifiers.";
             temperature: eff_temperature,
             reasoning: effective.reasoning.clone(),
             provider: provider_name.clone(),
-            health: Some(self.model_health.clone()),
+            health: Some(self.provider_svc.health()),
         };
 
         let session_workspace = session.workspace.clone();
 
         let cancel = CancellationToken::new();
-        self.cancels
+        self.ss.cancels
             .write()
             .await
             .insert(session_id.to_string(), cancel.clone());
         drop(sessions);
 
         // Validate model belongs to provider before making any API calls.
-        if let Some(pc) = self.config.providers.get(&provider_name) {
-            let valid = pc.models.iter().any(|x| x == &model)
-                || pc.model_aliases.contains_key(&model)
-                || pc.model_aliases.values().any(|v| v == &model);
-            if !valid {
-                let available: Vec<_> = pc
-                    .models
-                    .iter()
-                    .chain(pc.model_aliases.keys())
-                    .take(6)
-                    .cloned()
-                    .collect();
-                let err_msg = format!(
-                    "Model '{}' not found on provider '{}'. Try: {}",
-                    model,
-                    provider_name,
-                    available.join(", ")
-                );
-                let _ = tx.send(AgentEvent::Error(err_msg)).await;
-                let _ = tx.send(AgentEvent::Idle).await;
-                if let Some(s) = self.sessions.write().await.get_mut(session_id) {
-                    s.state = SessionState::Idle;
-                }
-                return Ok(AgentHandle {
-                    events: rx,
-                    permissions: perm_tx,
-                });
+        if let Some(err_msg) = crate::turn::validate_model(&self.config, &provider_name, &model) {
+            let _ = tx.send(AgentEvent::Error(err_msg)).await;
+            let _ = tx.send(AgentEvent::Idle).await;
+            if let Some(s) = self.ss.sessions.write().await.get_mut(session_id) {
+                s.state = SessionState::Idle;
             }
+            return Ok(AgentHandle {
+                events: rx,
+                permissions: perm_tx,
+            });
         }
 
         // Per-session provider (falls back to global if unchanged)
@@ -740,11 +572,14 @@ Keep each section concise. Preserve exact paths and identifiers.";
                 &session_workspace,
             )
             .await;
+        // B6: Run context hooks before the LLM call.
+        self.hooks.run_context_hooks(history.messages_mut()).await;
+
         let agent_loop = AgentLoop::new(provider_to_box(&session_provider), tools, loop_config);
 
         let session_id_owned = session_id.to_string();
-        let sessions_ref = self.sessions.clone();
-        let store_ref = self.store.clone();
+        let sessions_ref = self.ss.sessions.clone();
+        let store_ref = self.ss.store.clone();
 
         // Every turn gets a span with (session_id, provider, model). All
         // events emitted from `agent_loop.run` — tool calls, usage, errors
@@ -764,38 +599,16 @@ Keep each section concise. Preserve exact paths and identifiers.";
                 let result = agent_loop
                     .run(&mut history, tx.clone(), cancel, Some(perm_rx))
                     .await;
-                match &result {
-                    Ok(usage) => {
-                        crate::types::TURN_COMPLETED_COUNT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::info!(
-                            "turn complete [{}]: {} tokens",
-                            session_id_owned,
-                            usage.total_tokens()
-                        );
-                        if usage.input_tokens > 0 {
-                            history.set_last_input_tokens(usage.input_tokens);
-                        }
-                    }
-                    Err(e) => {
-                        crate::types::TURN_ERROR_COUNT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::error!("turn error [{}]: {e}", session_id_owned);
-                        let _ = tx.send(AgentEvent::Error(e.to_string())).await;
-                    }
-                }
-
-                // Merge mutated history back into the session and persist
-                history.restore_system_prompt(original_system_prompt);
-                let mut sessions = sessions_ref.write().await;
-                if let Some(session) = sessions.get_mut(&session_id_owned) {
-                    session.history = history;
-                    session.state = SessionState::Idle;
-                    session.updated_at = chrono::Utc::now();
-                    if let Err(e) = store_ref.save(session).await {
-                        tracing::error!("failed to persist session [{}]: {e}", session_id_owned);
-                    }
-                }
+                crate::turn::persist_turn_result(
+                    &session_id_owned,
+                    history,
+                    original_system_prompt,
+                    &result,
+                    &sessions_ref,
+                    &*store_ref,
+                    &tx,
+                )
+                .await;
             }
             .instrument(turn_span),
         );
@@ -807,16 +620,12 @@ Keep each section concise. Preserve exact paths and identifiers.";
     }
 
     pub async fn is_session_active(&self, session_id: &str) -> bool {
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .is_some_and(|s| s.state == SessionState::Active)
+        self.ss.is_session_active(session_id).await
     }
 
     /// Append a user message to the session history without starting a new turn.
     pub async fn queue_message(&self, session_id: &str, text: &str) {
-        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
             session.history.push_user(text);
         }
     }
@@ -825,7 +634,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     /// starting a new turn. Used when the bot is busy and a new media-bearing
     /// message arrives mid-turn.
     pub async fn queue_message_multimodal(&self, session_id: &str, blocks: Vec<ContentBlock>) {
-        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
             session.history.push_user_multimodal(blocks);
         }
     }
@@ -833,7 +642,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     /// Trigger history compaction for a session. Returns (before, after) message counts.
     /// No-op if compaction not needed.
     pub async fn compact_session(&self, session_id: &str) -> Option<(usize, usize)> {
-        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
             session.history.auto_compact()
         } else {
             None
@@ -841,10 +650,10 @@ Keep each section concise. Preserve exact paths and identifiers.";
     }
 
     pub async fn abort(&self, session_id: &str) {
-        if let Some(cancel) = self.cancels.read().await.get(session_id) {
+        if let Some(cancel) = self.ss.cancels.read().await.get(session_id) {
             cancel.cancel();
         }
-        if let Some(session) = self.sessions.write().await.get_mut(session_id) {
+        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
             session.state = SessionState::Idle;
         }
     }
@@ -860,7 +669,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             return;
         }
         let (workspace, transcript, provider_name, model) = {
-            let sessions = self.sessions.read().await;
+            let sessions = self.ss.sessions.read().await;
             let Some(session) = sessions.get(session_id) else {
                 return;
             };
@@ -901,11 +710,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     /// this to scope project-memory queries to the same directory the
     /// agent was talking from.
     pub async fn session_workspace(&self, session_id: &str) -> Option<std::path::PathBuf> {
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .map(|s| s.workspace.clone())
+        self.ss.session_workspace(session_id).await
     }
 
     /// Paged variant of `list_sessions`. Sorts by `updated_at` descending
@@ -916,18 +721,14 @@ Keep each section concise. Preserve exact paths and identifiers.";
     /// Intended for CLI `/sessions --skip N --limit M` and future UI
     /// paging where listing 500 stale sessions would be useless.
     pub async fn list_sessions_paged(&self, skip: usize, limit: usize) -> Vec<SessionSummary> {
-        let sessions = self.sessions.read().await;
-        let mut summaries: Vec<SessionSummary> = sessions.values().map(|s| s.summary()).collect();
-        // Newest first — operators almost always want the recent tail.
-        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        summaries.into_iter().skip(skip).take(limit).collect()
+        self.ss.list_sessions_paged(skip, limit).await
     }
 
     pub async fn restore_sessions(&self) -> Result<Vec<String>> {
-        let summaries = self.store.list().await?;
+        let summaries = self.ss.store.list().await?;
         let mut restored = Vec::new();
         for summary in summaries {
-            match self.store.load(&summary.id).await {
+            match self.ss.store.load(&summary.id).await {
                 Ok(Some(mut session)) => {
                     // Apply per-session config.json overrides (provider/model)
                     let sc = self.load_session_config_pub(&session.id);
@@ -936,7 +737,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
                     session.metadata.model = effective.model;
 
                     restored.push(session.id.clone());
-                    self.sessions
+                    self.ss.sessions
                         .write()
                         .await
                         .insert(session.id.clone(), session);
@@ -963,15 +764,15 @@ Keep each section concise. Preserve exact paths and identifiers.";
         session_id: &str,
         branch_name: Option<String>,
     ) -> Result<String> {
-        let sessions = self.sessions.read().await;
+        let sessions = self.ss.sessions.read().await;
         let parent = sessions
             .get(session_id)
             .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
         let forked = parent.fork(branch_name);
         let new_id = forked.id.clone();
-        self.store.save(&forked).await?;
+        self.ss.store.save(&forked).await?;
         drop(sessions);
-        self.sessions.write().await.insert(new_id.clone(), forked);
+        self.ss.sessions.write().await.insert(new_id.clone(), forked);
         Ok(new_id)
     }
 
@@ -1064,141 +865,38 @@ Keep each section concise. Preserve exact paths and identifiers.";
         model: &str,
         workspace: &Path,
     ) -> ToolRegistry {
-        let sub_agent = SubAgentTool::new(
-            provider.clone(),
-            model.to_string(),
-            self.config.tool_timeout_secs,
-            self.config.exa_api_keys.clone(),
+        let sender_id = self.session_sender(session_id).await;
+
+        let mut tools = crate::tool::factory::core_tools(
+            &crate::tool::factory::CoreToolCtx {
+                config: &self.config,
+                remote_ctx: &self.remote_ctx,
+                agent_registry: &self.agent_registry,
+                search: &self.search,
+                provider,
+                model,
+                workspace,
+                sender_id,
+            },
         )
-        .with_registry(self.agent_registry.clone());
+        .await;
 
-        let mut tools: Vec<Box<dyn tool::Tool>> = vec![
-            Box::new(BashTool::new(self.config.tool_timeout_secs)),
-            Box::new(ReadFileTool),
-            Box::new(WriteFileTool),
-            Box::new(EditFileTool),
-            Box::new(GlobSearchTool),
-            Box::new(GrepSearchTool),
-            Box::new(sub_agent),
-            Box::new(AgentStatusTool::new(self.agent_registry.clone())),
-            Box::new(AgentStopTool::new(self.agent_registry.clone())),
-            Box::new(WebSearchTool::new(
-                self.search.exa_key_pool.clone(),
-                self.search.tavily_key_pool.clone(),
-                self.search.serpapi_key_pool.clone(),
-            )),
-            Box::new(WebFetchTool::with_components(
-                self.search.cloud_scraper.clone(),
-                self.search.host_policy.clone(),
-            )),
-            Box::new(WebFetchTlsTool::new()),
-            Box::new(WebFetchWaybackTool::new()),
-            Box::new({
-                let ctx = tool::memory::MemoryContext::new();
-                ctx.set_user_id(self.session_sender(session_id).await);
-                MemoryTool::with_context(workspace.to_path_buf(), ctx)
-            }),
-        ];
+        tools.extend(crate::tool::factory::research_tools(
+            &self.config,
+            &self.research,
+            &self.self_ref,
+        ));
 
-        // Research tools. Always registered so the `/research ask` flow can
-        // call `research_status` from any session — but `research_save`,
-        // `research_list`, and `research_save_cursor` early-return with an
-        // error unless `research_context` is set (coordinator does this for
-        // the turn and clears it after).
-        if self.config.research.enabled {
-            tools.push(Box::new(ResearchSaveTool::new(
-                self.research.store.clone(),
-                self.research.context.clone(),
-                self.config.research.gatekeeper.clone(),
-            )));
-            tools.push(Box::new(ResearchListTool::new(
-                self.research.store.clone(),
-                self.research.context.clone(),
-            )));
-            tools.push(Box::new(ResearchSaveCursorTool::new(
-                self.research.store.clone(),
-                self.research.context.clone(),
-            )));
-            tools.push(Box::new(ResearchStatusTool::new(
-                self.research.store.clone(),
-            )));
+        tools.extend(crate::tool::factory::skill_tools(&effective.skill_roots));
 
-            // High-level orchestration tools (usable from any chat turn)
-            tools.push(Box::new(ResearchCreateTool::new(
-                self.research.store.clone(),
-                self.config.research.clone(),
-            )));
-            tools.push(Box::new(ResearchListSpecsTool::new(
-                self.research.store.clone(),
-                self.config.research.clone(),
-            )));
-            tools.push(Box::new(ResearchMetricsTool::new(
-                self.research.store.clone(),
-            )));
-            tools.push(Box::new(ResearchHelpTool::new(
-                self.config.research.clone(),
-            )));
-            tools.push(Box::new(ResearchFindingsTool::new(
-                self.research.store.clone(),
-            )));
-            tools.push(Box::new(ResearchSetTargetTool::new(
-                self.research.store.clone(),
-                self.research.context.clone(),
-            )));
-            if let Some(weak) = self.self_ref.read().unwrap().clone() {
-                tools.push(Box::new(ResearchLaunchTool::new(weak.clone())));
-                tools.push(Box::new(ResearchUpdateSpecTool::new(weak.clone())));
-                tools.push(Box::new(ResearchSetScheduleTool::new(weak.clone())));
-                tools.push(Box::new(ResearchPauseTool::new(weak.clone())));
-                tools.push(Box::new(ResearchResumeTool::new(weak)));
-            }
-        }
-
-        let skill_roots = &effective.skill_roots;
-        tracing::debug!("skill_roots: {:?}", skill_roots);
-        let resolver = SkillResolver::new(skill_roots.clone());
-        let available = resolver.list();
-        tracing::info!(
-            "Skills: {} found in {} roots",
-            available.len(),
-            skill_roots.len()
+        let session_mcp = self.session_mcp_servers(session_id, effective).await;
+        tools.extend(
+            crate::tool::factory::mcp_tools(&self.mcp_registry, &session_mcp).await,
         );
-        for (name, hit) in &available {
-            tracing::debug!("  skill: {name} -> {}", hit.path.display());
-        }
-        let orphans = resolver.find_orphans();
-        if !orphans.is_empty() {
-            tracing::warn!(
-                "Skills: {} directory(ies) in skill_roots have NO SKILL.{{json,md,toml}} manifest — \
-                 invisible to the `Skill` tool. Add a manifest or remove the directory:",
-                orphans.len()
-            );
-            for (root, path) in &orphans {
-                tracing::warn!(
-                    "  orphan skill dir: {} (root: {})",
-                    path.display(),
-                    root.display()
-                );
-            }
-        }
-        tools.push(Box::new(SkillTool::new(resolver, &available)));
 
-        // Global MCP servers
-        let mcp_reg = self.mcp_registry.read().await;
-        for server in mcp_reg.servers() {
-            tools.extend(McpToolWrapper::wrap_all(Arc::clone(server)));
-        }
-
-        // Per-session MCP servers (additive)
-        let extra = self.session_mcp_servers(session_id, effective).await;
-        for server in &extra {
-            tools.extend(McpToolWrapper::wrap_all(Arc::clone(server)));
-        }
-
-        // Append extra tools injected by the embedding binary.
-        for factory in self.extra_tool_factories.read().await.iter() {
-            tools.push(factory());
-        }
+        tools.extend(
+            crate::tool::factory::extra_tools(&self.extra_tool_factories).await,
+        );
 
         ToolRegistry::new(tools)
     }

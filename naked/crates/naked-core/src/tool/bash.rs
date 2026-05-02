@@ -163,14 +163,43 @@ pub fn classify_bash(command: &str) -> BashRisk {
     }
 }
 
+/// Block commands that would restart/kill the bot's own process.
+fn is_self_destructive(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    let patterns = [
+        "systemctl restart naked",
+        "systemctl stop naked",
+        "systemctl kill naked",
+        "systemctl --user restart naked",
+        "systemctl --user stop naked",
+        "systemctl --user kill naked",
+        "kill -9",
+        "kill -KILL",
+        "pkill naked",
+        "killall naked",
+    ];
+    patterns.iter().any(|p| lower.contains(&p.to_lowercase()))
+}
+
 pub struct BashTool {
     timeout: Duration,
+    /// B7: Optional remote ops. When set, commands run via SSH.
+    ops: Option<std::sync::Arc<dyn super::ops::ToolOps>>,
 }
 
 impl BashTool {
     pub fn new(timeout_secs: u64) -> Self {
         Self {
             timeout: Duration::from_secs(timeout_secs),
+            ops: None,
+        }
+    }
+
+    /// Create with remote ops (SSH execution).
+    pub fn with_ops(timeout_secs: u64, ops: std::sync::Arc<dyn super::ops::ToolOps>) -> Self {
+        Self {
+            timeout: Duration::from_secs(timeout_secs),
+            ops: Some(ops),
         }
     }
 }
@@ -230,43 +259,110 @@ impl Tool for BashTool {
             }
         };
 
+        // Block commands that would kill/restart the bot itself.
+        if is_self_destructive(&input.command) {
+            return ToolResult {
+                output: "Blocked: this command would restart/kill the bot process. \
+                         Use the operator's terminal instead."
+                    .into(),
+                is_error: true,
+            };
+        }
+
         let timeout = input
             .timeout
             .map(Duration::from_secs)
             .unwrap_or(self.timeout);
 
-        let result = tokio::time::timeout(timeout, async {
-            tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(&input.command)
-                .current_dir(cwd)
-                .output()
-                .await
-        })
-        .await;
+        // B7: Dispatch to remote ops or local execution.
+        enum ExecOutcome {
+            Ok { stdout: Vec<u8>, stderr: Vec<u8>, success: bool },
+            ExecErr(String),
+            Timeout,
+        }
 
-        match result {
-            Ok(Ok(output)) => {
+        let outcome = if let Some(ref ops) = self.ops {
+            match ops.exec(&input.command, cwd, timeout.as_secs()).await {
+                Ok(r) => ExecOutcome::Ok {
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                    success: r.exit_code == 0,
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => ExecOutcome::Timeout,
+                Err(e) => ExecOutcome::ExecErr(e.to_string()),
+            }
+        } else {
+            match tokio::time::timeout(timeout, async {
+                tokio::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&input.command)
+                    .current_dir(cwd)
+                    .output()
+                    .await
+            })
+            .await
+            {
+                Ok(Ok(output)) => ExecOutcome::Ok {
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    success: output.status.success(),
+                },
+                Ok(Err(e)) => ExecOutcome::ExecErr(e.to_string()),
+                Err(_) => ExecOutcome::Timeout,
+            }
+        };
+
+        match outcome {
+            ExecOutcome::Ok { stdout: out_bytes, stderr: err_bytes, success } => {
+                let output_success = success;
                 const MAX_STREAM: usize = 16_384;
-                let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout), MAX_STREAM);
-                let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr), MAX_STREAM);
-                let combined = if stderr.is_empty() {
+                let raw_stdout = String::from_utf8_lossy(&out_bytes);
+                let raw_stderr = String::from_utf8_lossy(&err_bytes);
+                let total_bytes = raw_stdout.len() + raw_stderr.len();
+                let total_lines = raw_stdout.lines().count() + raw_stderr.lines().count();
+                let is_truncated = raw_stdout.len() > MAX_STREAM || raw_stderr.len() > MAX_STREAM;
+
+                let stdout = truncate_output(&raw_stdout, MAX_STREAM);
+                let stderr = truncate_output(&raw_stderr, MAX_STREAM);
+                let mut combined = if stderr.is_empty() {
                     stdout
                 } else if stdout.is_empty() {
                     stderr
                 } else {
                     format!("{stdout}\n--- stderr ---\n{stderr}")
                 };
+
+                // B8: Save full output to temp file when truncated so
+                // the agent can read_file it if it needs the full context.
+                if is_truncated {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    combined.hash(&mut hasher);
+                    let hash = format!("{:x}", hasher.finish());
+                    let hash = &hash[..8];
+                    let path = format!("/tmp/naked_bash_{hash}.log");
+                    let full = if raw_stderr.is_empty() {
+                        raw_stdout.to_string()
+                    } else {
+                        format!("{raw_stdout}\n--- stderr ---\n{raw_stderr}")
+                    };
+                    let _ = std::fs::write(&path, &full);
+                    combined.push_str(&format!(
+                        "\n\n[truncated: {total_lines} lines, {total_bytes} bytes total. \
+                         Full output: {path}]"
+                    ));
+                }
+
                 ToolResult {
                     output: combined,
-                    is_error: !output.status.success(),
+                    is_error: !output_success,
                 }
             }
-            Ok(Err(e)) => ToolResult {
+            ExecOutcome::ExecErr(e) => ToolResult {
                 output: format!("Failed to execute: {e}"),
                 is_error: true,
             },
-            Err(_) => ToolResult {
+            ExecOutcome::Timeout => ToolResult {
                 output: format!("Command timed out after {}s", timeout.as_secs()),
                 is_error: true,
             },
@@ -427,4 +523,67 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.output.trim().contains(dir.path().to_str().unwrap()));
     }
+
+    #[test]
+    fn blocks_systemctl_restart() {
+        assert!(is_self_destructive(
+            "systemctl --user restart naked-tg.service"
+        ));
+        assert!(is_self_destructive("systemctl restart naked-tg"));
+        assert!(is_self_destructive(
+            "cargo build && systemctl --user restart naked-tg.service"
+        ));
+    }
+
+    #[test]
+    fn blocks_kill_commands() {
+        assert!(is_self_destructive("kill -9 12345"));
+        assert!(is_self_destructive("pkill naked-tg"));
+        assert!(is_self_destructive("killall naked"));
+    }
+
+    #[test]
+    fn allows_normal_commands() {
+        assert!(!is_self_destructive("ls -la"));
+        assert!(!is_self_destructive("cargo build --release"));
+        assert!(!is_self_destructive("cargo test"));
+        assert!(!is_self_destructive("systemctl status naked-tg"));
+        assert!(!is_self_destructive(
+            "cat /etc/systemd/system/naked-tg.service"
+        ));
+    }
 }
+
+    #[tokio::test]
+    async fn execute_large_output_saves_to_file() {
+        let tool = BashTool::new(10);
+        // Generate output larger than MAX_STREAM (16KB)
+        let input = serde_json::json!({
+            "command": "seq 1 2000 | while read n; do echo \"line_$n padding_data_to_make_it_bigger_0123456789\"; done"
+        });
+        let result = tool
+            .execute(input, std::path::Path::new("/tmp"))
+            .await;
+        assert!(!result.is_error, "command should succeed");
+        // Output should mention truncation and temp file
+        assert!(
+            result.output.contains("[truncated:"),
+            "should contain truncation note, got: {}",
+            &result.output[result.output.len().saturating_sub(200)..]
+        );
+        assert!(
+            result.output.contains("/tmp/naked_bash_"),
+            "should contain temp file path, got: {}",
+            &result.output[result.output.len().saturating_sub(200)..]
+        );
+        // Temp file should exist
+        let path_start = result.output.find("/tmp/naked_bash_").unwrap();
+        let path_end = result.output[path_start..].find(']').unwrap() + path_start;
+        let path = &result.output[path_start..path_end];
+        assert!(
+            std::path::Path::new(path).exists(),
+            "temp file should exist: {path}"
+        );
+        // Clean up
+        let _ = std::fs::remove_file(path);
+    }

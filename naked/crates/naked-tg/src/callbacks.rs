@@ -417,6 +417,25 @@ pub(crate) async fn handle_callback(
                 bot.answer_callback_query(q.id.clone()).await?;
             }
         }
+        // ── A3: Error action callbacks ────────────────────────────
+        "err" if parts.len() >= 2 => {
+            let action = parts[1];
+            match action {
+                "retry" => {
+                    bot.answer_callback_query(q.id.clone())
+                        .text("🔄 Отправь сообщение ещё раз — переотправлю")
+                        .await?;
+                }
+                "switch" => {
+                    bot.answer_callback_query(q.id.clone())
+                        .text("🔀 Используй /model для смены")
+                        .await?;
+                }
+                _ => {
+                    bot.answer_callback_query(q.id.clone()).await?;
+                }
+            }
+        }
         _ => {
             bot.answer_callback_query(q.id.clone()).await?;
         }
@@ -431,7 +450,7 @@ async fn build_model_keyboard(
     current_model: &str,
     page: usize,
 ) -> Vec<Vec<InlineKeyboardButton>> {
-    let models = agent.provider_models(prov).await;
+    let models = agent.provider_models(prov);
     let scope: Vec<String> = config.model_scope.iter().map(|s| s.to_string()).collect();
     let filtered = naked_tg::tg_markup::filter_models_by_scope(&models, &scope);
     let page_size = 8;

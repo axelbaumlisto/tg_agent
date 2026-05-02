@@ -189,6 +189,49 @@ pub(crate) async fn handle_command(
                 lines.push(format!("<b>Cost:</b> <code>${cost:.4}</code>"));
             }
 
+            // B4: Session ID (short)
+            lines.push(format!("<b>Session:</b> <code>{}</code>", &sid[..8]));
+
+            // B4: MCP status
+            let mcp_servers = agent.list_mcp_servers().await;
+            if !mcp_servers.is_empty() {
+                let mcp_info: Vec<String> = mcp_servers
+                    .iter()
+                    .map(|(name, n)| format!("{name}({n})"))
+                    .collect();
+                lines.push(format!("<b>MCP:</b> {}", mcp_info.join(", ")));
+            }
+
+            // B4: Skills count
+            lines.push(format!(
+                "<b>Skills:</b> {} loaded",
+                agent.list_skills().len()
+            ));
+
+            // B6: Hooks count
+            let (ctx_hooks, tool_hooks) = agent.hooks().count().await;
+            if ctx_hooks > 0 || tool_hooks > 0 {
+                lines.push(format!(
+                    "<b>Hooks:</b> {} context, {} tool",
+                    ctx_hooks, tool_hooks
+                ));
+            }
+
+            // B3: File tracking
+            let (read_files, modified_files) = agent.session_file_stats(&sid).await;
+            if !modified_files.is_empty() {
+                lines.push(format!(
+                    "<b>Modified:</b> {} file(s)",
+                    modified_files.len()
+                ));
+            }
+            if !read_files.is_empty() {
+                lines.push(format!(
+                    "<b>Read:</b> {} file(s)",
+                    read_files.len()
+                ));
+            }
+
             let kb = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
                 teloxide::types::InlineKeyboardButton::callback("🤖 Model", "cmd:model"),
                 teloxide::types::InlineKeyboardButton::callback("💭 Reasoning", "cmd:reasoning"),
@@ -637,6 +680,125 @@ pub(crate) async fn handle_command(
         }
         "/memory" => {
             handle_memory_cmd(bot, agent, channel_map, &ctx, text, cmd_word).await?;
+        }
+        // C5: Git commit with optional message
+        "/commit" => {
+            let sid = match channel_map.get(chat_id, tid).await {
+                Some(s) => s,
+                None => {
+                    reply_text(bot, &ctx, "No active session.").await?;
+                    return Ok(true);
+                }
+            };
+            let (_, modified_files) = agent.session_file_stats(&sid).await;
+            if modified_files.is_empty() {
+                reply_text(bot, &ctx, "No files modified in this session.").await?;
+                return Ok(true);
+            }
+
+            // Extract commit message from command text or auto-generate
+            let user_msg = text.strip_prefix("/commit").unwrap_or("").trim();
+            let workspace = match agent.session_workspace(&sid).await { Some(w) => w, None => { reply_text(bot, &ctx, "Session has no workspace.").await?; return Ok(true); } };
+            let ws = workspace.to_string_lossy();
+
+            // Check if inside a git repo
+            let git_check = tokio::process::Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(&workspace)
+                .output()
+                .await;
+            if !git_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                reply_text(bot, &ctx, &format!("Not a git repo: {ws}")).await?;
+                return Ok(true);
+            }
+
+            // git add modified files
+            for f in &modified_files {
+                let _ = tokio::process::Command::new("git")
+                    .args(["add", f])
+                    .current_dir(&workspace)
+                    .output()
+                    .await;
+            }
+
+            // Commit with message
+            let msg = if user_msg.is_empty() {
+                format!(
+                    "auto: modified {} file(s)\n\nFiles:\n{}",
+                    modified_files.len(),
+                    modified_files.join("\n")
+                )
+            } else {
+                user_msg.to_string()
+            };
+
+            let commit_result = tokio::process::Command::new("git")
+                .args(["commit", "-m", &msg])
+                .current_dir(&workspace)
+                .output()
+                .await;
+
+            match commit_result {
+                Ok(output) if output.status.success() => {
+                    let out = String::from_utf8_lossy(&output.stdout);
+                    let short: String = out.lines().next().unwrap_or("committed").to_string();
+                    reply_text(bot, &ctx, &format!("✅ {short}")).await?;
+                }
+                Ok(output) => {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    let short: String = err.chars().take(200).collect();
+                    reply_text(bot, &ctx, &format!("❌ git commit failed: {short}")).await?;
+                }
+                Err(e) => {
+                    reply_text(bot, &ctx, &format!("❌ git error: {e}")).await?;
+                }
+            }
+        }
+        // B7: Remote execution context
+        "/remote" => {
+            let args = text.strip_prefix("/remote").unwrap_or("").trim();
+            let remote_ctx = agent.remote_context();
+
+            if args.is_empty() || args == "status" {
+                let label = remote_ctx.label().await;
+                reply_text(bot, &ctx, &format!("🌐 Target: <b>{label}</b>\n\n\
+                    /remote &lt;host&gt; — switch to SSH\n\
+                    /remote off — back to local")).await?;
+            } else if args == "off" || args == "local" {
+                remote_ctx.set_local().await;
+                reply_text(bot, &ctx, "🌐 Switched to <b>local</b>").await?;
+            } else {
+                // args = host, optionally "host key=/path/to/key"
+                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                let host = parts[0].to_string();
+                let key = parts.get(1)
+                    .and_then(|s| s.strip_prefix("key="))
+                    .map(|s| s.to_string());
+
+                // Quick connectivity test
+                let test = tokio::process::Command::new("ssh")
+                    .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"])
+                    .args(key.as_ref().map(|k| vec!["-i", k]).unwrap_or_default())
+                    .arg(&host)
+                    .arg("echo ok")
+                    .output()
+                    .await;
+
+                match test {
+                    Ok(out) if out.status.success() => {
+                        remote_ctx.set_ssh(host.clone(), key).await;
+                        reply_text(bot, &ctx, &format!("🌐 Connected to <b>{host}</b>")).await?;
+                    }
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        let short: String = err.chars().take(200).collect();
+                        reply_text(bot, &ctx, &format!("❌ SSH to {host} failed: {short}")).await?;
+                    }
+                    Err(e) => {
+                        reply_text(bot, &ctx, &format!("❌ SSH error: {e}")).await?;
+                    }
+                }
+            }
         }
         _ => {
             return Ok(false);

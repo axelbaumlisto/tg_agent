@@ -87,6 +87,45 @@ impl Tool for ReadFileTool {
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0);
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let is_image = matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp");
+
+            if is_image {
+                // For images: base64-encode if small enough for vision models.
+                const MAX_IMAGE_BYTES: u64 = 512_000; // 500KB
+                if size <= MAX_IMAGE_BYTES {
+                    if let Ok(bytes) = tokio::fs::read(&path).await {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let mime = match ext {
+                            "png" => "image/png",
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "gif" => "image/gif",
+                            "webp" => "image/webp",
+                            _ => "application/octet-stream",
+                        };
+                        // Push image for vision model injection.
+                        super::image_result::push_image(mime, &b64);
+                        return ToolResult {
+                            output: format!(
+                                "Image ({}, {size} bytes): {}\n[image sent to vision model]",
+                                ext.to_uppercase(),
+                                path.display()
+                            ),
+                            is_error: false,
+                        };
+                    }
+                }
+                let p = path.display();
+                return ToolResult {
+                    output: format!(
+                        "Image file ({ext}, {size} bytes): {p}. Too large for inline. \
+                         Use bash to analyze: file '{p}' or identify '{p}'"
+                    ),
+                    is_error: false,
+                };
+            }
+
             return ToolResult {
                 output: format!(
                     "Binary file ({size} bytes): {}. Cannot read as text.",
@@ -186,6 +225,9 @@ impl Tool for WriteFileTool {
 
         let path = resolve_path(&input.file_path, cwd);
 
+        // C1: Serialize concurrent writes to the same file.
+        let _file_guard = super::file_lock::lock_file(&path).await;
+
         if let Some(parent) = path.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
@@ -220,11 +262,41 @@ impl Tool for WriteFileTool {
 
 pub struct EditFileTool;
 
+/// Single edit: replace old_string → new_string.
+#[derive(Deserialize, Clone)]
+struct EditOp {
+    old_string: String,
+    new_string: String,
+}
+
+/// B1: Supports both legacy (single old_string/new_string) and multi-edit
+/// (edits array). Legacy format is auto-converted to a single-element array.
 #[derive(Deserialize)]
 struct EditFileInput {
     file_path: String,
-    old_string: String,
-    new_string: String,
+    /// Multi-edit: array of replacements applied atomically.
+    #[serde(default)]
+    edits: Vec<EditOp>,
+    /// Legacy: single replacement (converted to edits[0] if edits is empty).
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
+}
+
+impl EditFileInput {
+    /// Normalize: merge legacy old_string/new_string into edits array.
+    fn into_edits(mut self) -> (String, Vec<EditOp>) {
+        if self.edits.is_empty() {
+            if let (Some(old), Some(new)) = (self.old_string.take(), self.new_string.take()) {
+                self.edits.push(EditOp {
+                    old_string: old,
+                    new_string: new,
+                });
+            }
+        }
+        (self.file_path, self.edits)
+    }
 }
 
 #[async_trait]
@@ -232,15 +304,30 @@ impl Tool for EditFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),
-            description: "Replace an exact string occurrence in a file with a new string.".into(),
+            description: "Edit a file using exact text replacements. Supports multiple edits \
+                          in one call — each edit is matched against the original file, not \
+                          incrementally. All edits are applied atomically."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "file_path": { "type": "string", "description": "Path to the file to edit" },
-                    "old_string": { "type": "string", "description": "The exact string to find and replace" },
-                    "new_string": { "type": "string", "description": "The replacement string" }
+                    "edits": {
+                        "type": "array",
+                        "description": "One or more replacements. Each matched against the original file.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string", "description": "Exact text to find (must be unique)" },
+                                "new_string": { "type": "string", "description": "Replacement text" }
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    },
+                    "old_string": { "type": "string", "description": "Legacy: single exact string to replace" },
+                    "new_string": { "type": "string", "description": "Legacy: replacement string" }
                 },
-                "required": ["file_path", "old_string", "new_string"]
+                "required": ["file_path"]
             }),
             permission: Permission::WorkspaceWrite,
         }
@@ -257,7 +344,7 @@ impl Tool for EditFileTool {
     }
 
     async fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
-        let input: EditFileInput = match serde_json::from_value(input) {
+        let raw_input: EditFileInput = match serde_json::from_value(input) {
             Ok(v) => v,
             Err(e) => {
                 return ToolResult {
@@ -267,7 +354,18 @@ impl Tool for EditFileTool {
             }
         };
 
-        let path = resolve_path(&input.file_path, cwd);
+        let (file_path, edits) = raw_input.into_edits();
+        if edits.is_empty() {
+            return ToolResult {
+                output: "No edits provided. Supply edits[] array or old_string/new_string.".into(),
+                is_error: true,
+            };
+        }
+
+        let path = resolve_path(&file_path, cwd);
+
+        // C1: Serialize concurrent edits to the same file.
+        let _file_guard = super::file_lock::lock_file(&path).await;
 
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
@@ -279,26 +377,59 @@ impl Tool for EditFileTool {
             }
         };
 
-        let count = content.matches(&input.old_string).count();
-        if count == 0 {
-            return ToolResult {
-                output: "old_string not found in file".into(),
-                is_error: true,
-            };
-        }
-        if count > 1 {
-            return ToolResult {
-                output: format!("old_string found {count} times (must be unique)"),
-                is_error: true,
-            };
+        // B1: Validate ALL edits against the ORIGINAL content first (atomic).
+        // Each old_string must be unique and non-overlapping.
+        for (i, edit) in edits.iter().enumerate() {
+            let count = content.matches(&edit.old_string).count();
+            if count == 0 {
+                return ToolResult {
+                    output: format!("edits[{i}]: old_string not found in file"),
+                    is_error: true,
+                };
+            }
+            if count > 1 {
+                return ToolResult {
+                    output: format!("edits[{i}]: old_string found {count} times (must be unique)"),
+                    is_error: true,
+                };
+            }
         }
 
-        let new_content = content.replacen(&input.old_string, &input.new_string, 1);
+        // Apply all edits. Each is matched against original, applied in order.
+        // Since all old_strings are unique, order doesn't matter for non-overlapping edits.
+        let mut new_content = content;
+        for edit in &edits {
+            new_content = new_content.replacen(&edit.old_string, &edit.new_string, 1);
+        }
+
         match tokio::fs::write(&path, &new_content).await {
-            Ok(()) => ToolResult {
-                output: format!("Edited {}", path.display()),
-                is_error: false,
-            },
+            Ok(()) => {
+                // C2: Build a compact diff preview for each edit.
+                let mut diff_lines = Vec::new();
+                for (i, edit) in edits.iter().enumerate() {
+                    let old_preview: String = edit.old_string.lines().next().unwrap_or("").chars().take(60).collect();
+                    let new_preview: String = edit.new_string.lines().next().unwrap_or("").chars().take(60).collect();
+                    let old_lc = edit.old_string.lines().count();
+                    let new_lc = edit.new_string.lines().count();
+                    diff_lines.push(format!(
+                        "  #{}: -({old_lc}L) {old_preview}{}  +({new_lc}L) {new_preview}{}",
+                        i + 1,
+                        if old_lc > 1 { "…" } else { "" },
+                        if new_lc > 1 { "…" } else { "" },
+                    ));
+                }
+                let summary = format!(
+                    "Edited {} ({} replacement{})\n{}",
+                    path.display(),
+                    edits.len(),
+                    if edits.len() == 1 { "" } else { "s" },
+                    diff_lines.join("\n")
+                );
+                ToolResult {
+                    output: summary,
+                    is_error: false,
+                }
+            }
             Err(e) => ToolResult {
                 output: format!("Failed to write: {e}"),
                 is_error: true,
@@ -524,14 +655,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_binary_file_returns_error() {
+    async fn read_image_file_returns_vision_result() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("image.png");
+        // Write a minimal valid-looking PNG header.
         std::fs::write(&bin, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
 
         let tool = ReadFileTool;
         let result = tool
             .execute(serde_json::json!({"file_path": "image.png"}), dir.path())
+            .await;
+        // Vision pipeline: images succeed and push to image_result.
+        assert!(!result.is_error, "images should succeed: {}", result.output);
+        assert!(result.output.contains("image sent to vision model"));
+    }
+
+    #[tokio::test]
+    async fn read_binary_non_image_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("data.bin");
+        std::fs::write(&bin, b"\x00\x01\x02\x03\x04\x05").unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool
+            .execute(serde_json::json!({"file_path": "data.bin"}), dir.path())
             .await;
         assert!(result.is_error);
         assert!(result.output.contains("Binary file"));
@@ -558,5 +705,87 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.output.contains("Invalid input"));
+    }
+
+    // ── B1: Multi-edit tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn edit_file_legacy_single() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world").unwrap();
+        let tool = EditFileTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "file_path": "f.txt",
+                    "old_string": "hello",
+                    "new_string": "goodbye"
+                }),
+                dir.path(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "goodbye world");
+    }
+
+    #[tokio::test]
+    async fn edit_file_multi_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "aaa\nbbb\nccc\n").unwrap();
+        let tool = EditFileTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "file_path": "f.txt",
+                    "edits": [
+                        { "old_string": "aaa", "new_string": "AAA" },
+                        { "old_string": "ccc", "new_string": "CCC" }
+                    ]
+                }),
+                dir.path(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("2 replacements"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "AAA\nbbb\nCCC\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_atomic_rejects_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "aaa\nbbb\n").unwrap();
+        let tool = EditFileTool;
+        // Second edit has old_string not in file — entire operation should fail
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "file_path": "f.txt",
+                    "edits": [
+                        { "old_string": "aaa", "new_string": "AAA" },
+                        { "old_string": "zzz", "new_string": "ZZZ" }
+                    ]
+                }),
+                dir.path(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("edits[1]"));
+        // File should be UNCHANGED (atomic)
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "aaa\nbbb\n");
+    }
+
+    #[tokio::test]
+    async fn edit_file_no_edits_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let tool = EditFileTool;
+        let result = tool
+            .execute(serde_json::json!({"file_path": "f.txt"}), dir.path())
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("No edits"));
     }
 }

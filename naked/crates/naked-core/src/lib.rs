@@ -5,6 +5,8 @@ pub mod agent_store;
 pub mod agent_validator;
 pub mod config;
 pub mod error;
+pub mod hooks;
+pub mod active_turns;
 #[path = "history_mod/mod.rs"]
 pub mod history;
 pub mod keys;
@@ -19,10 +21,12 @@ pub mod research;
 mod research_ops;
 pub mod scrape;
 pub mod search;
+pub mod services;
 pub mod session;
 mod session_ops;
 pub mod skill;
 pub mod tool;
+pub mod turn;
 pub mod types;
 
 #[cfg(test)]
@@ -41,36 +45,21 @@ use error::{AgentError, Result};
 use keys::pool::KeyPool;
 use loop_::{AgentLoop, LoopConfig};
 use mcp::client::{McpRegistry, McpServer};
-use mcp::wrapper::McpToolWrapper;
 use provider::Provider;
 use provider::anthropic::AnthropicProvider;
 use provider::copilot::CopilotProvider;
 use provider::openai_compat::OpenAiCompatProvider;
 use provider::resilient::ResilientProvider;
 use research::{
-    CoordinatorConfig, FsResearchStore, ResearchContext, ResearchCoordinator, ResearchCreateTool,
-    ResearchFindingsTool, ResearchHelpTool, ResearchLaunchTool, ResearchListSpecsTool,
-    ResearchListTool, ResearchMetricsTool, ResearchPauseTool, ResearchResumeTool,
-    ResearchSaveCursorTool, ResearchSaveTool, ResearchSetScheduleTool, ResearchSetTargetTool,
-    ResearchSpec, ResearchStatusTool, ResearchStore, ResearchUpdateSpecTool, RunRecord, RunReport,
+    CoordinatorConfig, FsResearchStore, ResearchContext, ResearchCoordinator,
+    ResearchSpec, ResearchStore, RunRecord, RunReport,
     VerifiedRunReport, new_research_id, parse_provider_model_pair,
 };
 use session::jsonl_store::JsonlSessionStore;
 use session::store::SessionStore;
 use session::{Session, SessionMetadata, SessionState, SessionSummary};
 use skill::resolver::SkillResolver;
-use skill::tool::SkillTool;
-use tool::agent_control::{AgentStatusTool, AgentStopTool};
-use tool::bash::BashTool;
-use tool::file_ops::{EditFileTool, ReadFileTool, WriteFileTool};
-use tool::memory::MemoryTool;
 use tool::registry::ToolRegistry;
-use tool::search::{GlobSearchTool, GrepSearchTool};
-use tool::sub_agent::SubAgentTool;
-use tool::web_fetch::WebFetchTool;
-use tool::web_fetch_tls::WebFetchTlsTool;
-use tool::web_fetch_wayback::WebFetchWaybackTool;
-use tool::web_search::WebSearchTool;
 use types::{AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
 
 /// What to push to history at the start of a turn. Internal — public callers
@@ -225,20 +214,12 @@ pub(crate) struct SearchState {
 
 pub struct AgentCore {
     config: Config,
-    provider: Arc<dyn Provider>,
-    store: Arc<dyn SessionStore>,
     mcp_registry: Arc<RwLock<McpRegistry>>,
-    /// Per-provider-name cache so we don't rebuild the same provider on every turn.
-    provider_cache: RwLock<HashMap<String, Arc<dyn Provider>>>,
+
     /// Per-session MCP servers (connected lazily from session config.json).
     session_mcp: RwLock<HashMap<String, Vec<Arc<McpServer>>>>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
-    cancels: RwLock<HashMap<String, CancellationToken>>,
     agent_registry: AgentRegistry,
-    /// Optional per-session "current author" (Telegram user id). Set by the
-    /// channel before a turn runs and consumed by the memory tool to implement
-    /// `scope=user` without guessing.
-    session_senders: RwLock<HashMap<String, String>>,
+
     research: ResearchState,
     /// Weak self-reference so orchestration tools (e.g. `research_launch`) can
     /// upgrade to `Arc<Self>` and call methods like `run_research`. Set once via
@@ -250,21 +231,28 @@ pub struct AgentCore {
     /// Empty when no `agent_dirs` exist on disk — that's a valid
     /// config for hosts that build roles programmatically.
     agent_store: Arc<agent_store::AgentStore>,
-    /// Runtime health tracker (Phase 3). Shared across every agent loop
-    /// spawned by this core so the 24h rolling window is
-    /// process-global, and its durable jsonl survives restarts.
-    /// Constructed in [`AgentCore::new`] from `config.model_health`.
-    model_health: Arc<crate::model_catalog::ModelHealth>,
+
     search: SearchState,
     /// Extra tools injected by the embedding binary (e.g. naked-tg).
     /// Appended to every session's tool registry after the built-in
     /// tools. Factory closures produce fresh instances per session.
     extra_tool_factories: RwLock<ExtraToolFactories>,
+    /// B7: Remote execution context (local by default, switchable to SSH).
+    remote_ctx: tool::remote::RemoteContext,
+    /// B6: Hook registry for context and tool call interception.
+    hooks: hooks::HookRegistry,
+    /// Step 4: Provider service (owns provider, cache, health).
+    /// Gradually replacing direct access to `provider`, `provider_cache`, `model_health`.
+    pub(crate) provider_svc: Arc<services::ProviderService>,
+    /// Session state (owns sessions, cancels, store, senders).
+    /// Methods on SessionState replace direct field access.
+    pub(crate) ss: Arc<services::session_state::SessionState>,
 }
 
 impl AgentCore {
     pub fn new(config: Config, provider: Box<dyn Provider>) -> Self {
-        let store = Arc::new(JsonlSessionStore::new(config.session_dir_abs()));
+        let session_dir = config.session_dir_abs();
+        let store = Arc::new(JsonlSessionStore::new(session_dir.clone()));
         let research_root = config
             .research
             .storage_dir
@@ -303,20 +291,19 @@ impl AgentCore {
         let cloud_scraper = build_cloud_scraper();
         let host_policy = Arc::new(crate::scrape::host_policy::HostPolicy::new());
 
+        // Clone for ProviderService before moving into Self.
+        let provider_arc: Arc<dyn Provider> = Arc::from(provider);
+        let config_arc = Arc::new(config.clone());
+
+
         Self {
             config,
-            provider: Arc::from(provider),
-            store,
             mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
-            provider_cache: RwLock::new(HashMap::new()),
+
             session_mcp: RwLock::new(HashMap::new()),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            cancels: RwLock::new(HashMap::new()),
             agent_registry: AgentRegistry::new(),
-            session_senders: RwLock::new(HashMap::new()),
             self_ref: std::sync::RwLock::new(None),
             agent_store,
-            model_health,
             research: ResearchState {
                 store: research_store,
                 context: ResearchContext::new(),
@@ -333,14 +320,37 @@ impl AgentCore {
                 host_policy,
             },
             extra_tool_factories: RwLock::new(Vec::new()),
+            remote_ctx: tool::remote::RemoteContext::new(),
+            hooks: hooks::HookRegistry::new(),
+            provider_svc: Arc::new(services::ProviderService::new(
+                provider_arc,
+                model_health,
+                config_arc,
+            )),
+            ss: Arc::new(services::session_state::SessionState::new(store)),
         }
+    }
+
+    /// B7: Get the remote execution context.
+    pub fn remote_context(&self) -> &tool::remote::RemoteContext {
+        &self.remote_ctx
+    }
+
+    /// Load session IDs that were mid-turn when the process crashed.
+    pub async fn drain_interrupted_sessions(&self) -> Vec<String> {
+        self.ss.store.drain_interrupted().await
+    }
+
+    /// B6: Get the hook registry.
+    pub fn hooks(&self) -> &hooks::HookRegistry {
+        &self.hooks
     }
 
     /// Shared runtime health tracker. Exposed so telemetry surfaces
     /// (Phase 3 Prometheus exporter, `/model health` CLI) can query
     /// rolling counters without round-tripping through the coordinator.
     pub fn model_health(&self) -> Arc<crate::model_catalog::ModelHealth> {
-        self.model_health.clone()
+        self.provider_svc.health()
     }
 
     /// Shared catalog of disk-loaded agent roles. Use
@@ -440,7 +450,46 @@ impl AgentCore {
     /// the agent uses for its own loop, so token budgets and rate limits
     /// stay shared.
     pub fn provider(&self) -> Arc<dyn Provider> {
-        self.provider.clone()
+        self.provider_svc.default_provider()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trait impls — compile-time contracts (plan-solid-core-v4, Step 1)
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl services::ProviderResolver for AgentCore {
+    async fn resolve_provider(&self, name: &str) -> Arc<dyn Provider> {
+        self.provider_for(name).await
+    }
+    fn default_provider_model(&self) -> (String, String) {
+        self.default_provider_model()
+    }
+}
+
+#[async_trait::async_trait]
+impl services::SessionManager for AgentCore {
+    async fn create_session(&self, workspace: &Path) -> String {
+        self.create_session(workspace).await
+    }
+    async fn send_prompt(&self, session_id: &str, text: &str) -> Result<AgentHandle> {
+        self.send_prompt(session_id, text).await
+    }
+    async fn is_session_active(&self, session_id: &str) -> bool {
+        self.is_session_active(session_id).await
+    }
+    async fn abort(&self, session_id: &str) {
+        self.abort(session_id).await
+    }
+    async fn list_sessions(&self) -> Vec<session::SessionSummary> {
+        self.list_sessions().await
+    }
+    async fn session_total_usage(&self, session_id: &str) -> types::TurnUsage {
+        self.session_total_usage(session_id).await
+    }
+    async fn session_provider_model(&self, session_id: &str) -> (String, String) {
+        self.session_provider_model(session_id).await
     }
 }
 

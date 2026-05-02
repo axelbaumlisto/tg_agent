@@ -1,6 +1,8 @@
 //! Streaming response handler + CompositeView.
 
+mod handlers;
 mod helpers;
+pub(crate) use handlers::ViewAction;
 pub(crate) use helpers::*;
 
 use super::*;
@@ -593,6 +595,9 @@ pub(crate) async fn stream_response(
     let mut last_sent = String::new();
     let mut html_broken = false;
     let mut aborted_for_switch = false;
+    let mut last_event_at = tokio::time::Instant::now();
+    let mut stall_warned = false;
+    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
     loop {
         let event = tokio::select! {
@@ -605,35 +610,31 @@ pub(crate) async fn stream_response(
 
         let mut force_flush = false;
 
+        // FIX-3: Detect stalled agent (no events for 90s).
+        if event.is_some() {
+            last_event_at = tokio::time::Instant::now();
+            stall_warned = false;
+        } else if !stall_warned && last_event_at.elapsed() > STALL_TIMEOUT {
+            stall_warned = true;
+            view.tool_lines.push(
+                "⏳ Бот не отвечает >90s — возможно завис. /stop для отмены.".to_string(),
+            );
+            dirty = true;
+            force_flush = true;
+        }
+
         if let Some(event) = event {
             match event {
                 AgentEvent::ThinkingDelta(t) => {
-                    view.in_thinking = true;
-                    view.phase = "thinking";
-                    if view.thinking.len() < MAX_THINKING_BYTES {
-                        view.thinking.push_str(&t);
-                    }
-                    dirty = true;
+                    dirty = handlers::handle_thinking_delta(&mut view, &t) != ViewAction::Clean;
                 }
                 AgentEvent::TextDelta(t) => {
-                    view.in_thinking = false;
-                    view.phase = "generating";
-                    if view.response_text.len() < MAX_RESPONSE_BYTES {
-                        view.response_text.push_str(&t);
-                    }
-                    dirty = true;
+                    dirty = handlers::handle_text_delta(&mut view, &t) != ViewAction::Clean;
                 }
                 AgentEvent::ToolStart { name, input, .. } => {
-                    view.in_thinking = false;
-                    view.phase = "tool use";
-                    let preview = format_input_preview(&input, 200);
-                    if view.tool_lines.len() >= TOOL_WINDOW * 4 {
-                        view.tool_lines.drain(..view.tool_lines.len() - TOOL_WINDOW);
-                    }
-                    view.tool_lines
-                        .push(format!("🔧 <b>{}</b>({preview})…", escape_html(&name)));
+                    let action = handlers::handle_tool_start(&mut view, &name, &input);
                     dirty = true;
-                    force_flush = true;
+                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::ToolEnd {
                     name,
@@ -641,18 +642,17 @@ pub(crate) async fn stream_response(
                     output,
                     ..
                 } => {
-                    let icon = match state {
-                        naked_core::types::ToolState::Completed => "✅",
-                        naked_core::types::ToolState::Error => "❌",
-                    };
-                    let title = truncate_str(&output, 80);
-                    view.tool_lines.push(format!(
-                        "{icon} <b>{}</b> — {}",
-                        escape_html(&name),
-                        escape_html(&title)
-                    ));
+                    let is_error = matches!(state, naked_core::types::ToolState::Error);
+                    let (action, detail_msg) = handlers::handle_tool_end(&mut view, &name, is_error, &output);
+                    if let Some(msg) = detail_msg {
+                        let _ = bot
+                            .send_message(ctx.chat_id, &msg)
+                            .maybe_thread(ctx.thread_id)
+                            .parse_mode(teloxide::types::ParseMode::Html)
+                            .await;
+                    }
                     dirty = true;
-                    force_flush = true;
+                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::PermissionRequest {
                     call_id,
@@ -706,42 +706,40 @@ pub(crate) async fn stream_response(
                 AgentEvent::ContextCompacted {
                     before_msgs,
                     after_msgs,
+                    summary_hint,
+                    files_count,
                 } => {
-                    let note = format!(
-                        "📦 контекст был сжат: {} сообщений → {}",
-                        before_msgs, after_msgs
+                    let note = handlers::handle_compaction(
+                        before_msgs, after_msgs, files_count,
+                        summary_hint.as_deref(),
                     );
                     let _ = bot
                         .send_message(ctx.chat_id, &note)
                         .maybe_thread(ctx.thread_id)
                         .maybe_reply_to(ctx.reply_to)
+                        .parse_mode(teloxide::types::ParseMode::Html)
                         .await;
                 }
                 AgentEvent::Heartbeat => {
-                    view.tick += 1;
+                    handlers::handle_heartbeat(&mut view);
                     dirty = true;
                 }
                 AgentEvent::SubAgentProgress {
                     agent_id,
                     event: sa_ev,
                 } => {
-                    apply_sub_agent_event(&mut view, agent_id, sa_ev);
+                    let action = handlers::handle_sub_agent(&mut view, agent_id, sa_ev);
                     dirty = true;
-                    force_flush = true;
+                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::UsageUpdate(u) => {
-                    view.usage = Some(u);
+                    handlers::handle_usage(&mut view, u);
                     dirty = true;
                 }
                 AgentEvent::Error(e) => {
-                    let pretty = format_provider_error(&e, &view.model_tag);
-                    if !view.response_text.is_empty() {
-                        view.response_text.push('\n');
-                    }
-                    view.response_text.push_str(&pretty);
-                    view.had_provider_error = true;
+                    let action = handlers::handle_error(&mut view, &e);
                     dirty = true;
-                    force_flush = true;
+                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::Idle => break,
             }
@@ -801,6 +799,19 @@ pub(crate) async fn stream_response(
 
     let final_html = view.render_final();
     send_final(bot.clone(), ctx, placeholder, &final_html, &view).await;
+
+    // ── A3: Send error card with retry button if provider failed ────
+    if view.had_provider_error {
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("🔄 Retry", "err:retry".to_string()),
+            InlineKeyboardButton::callback("🔀 Switch model", "err:switch".to_string()),
+        ]]);
+        let _ = bot
+            .send_message(ctx.chat_id, "⚠️ Ответ содержит ошибку провайдера. Повторить?")
+            .maybe_thread(ctx.thread_id)
+            .reply_markup(keyboard)
+            .await;
+    }
 
     // Deliver any files queued by telegram_attach tool.
     let attachments: Vec<naked_tg::tg_attach::StagedAttachment> =
@@ -988,7 +999,8 @@ pub(crate) async fn ask_permission(
     };
     let preview = format_input_preview(input, 200);
     let text = format!(
-        "🔐 <b>Permission required</b> [{level}]\n\n<b>{}</b>({preview})",
+        "🔐 <b>{}</b> [{level}]({preview})\n\
+         <i>💡 /yolo = авто-approve | read_file/search — авто</i>",
         escape_html(tool_name),
     );
 
@@ -1022,6 +1034,21 @@ pub(crate) async fn ask_permission(
         Ok(Ok(allowed)) => allowed,
         _ => {
             pending.write().await.remove(call_id);
+            // FIX-2: Notify user that permission timed out.
+            if let Ok(msg) = &sent {
+                let _ = bot
+                    .edit_message_text(
+                        ctx.chat_id,
+                        msg.id,
+                        format!(
+                            "⏱ <b>{}</b> — время ожидания истекло ({}s). Запрос отменён.",
+                            escape_html(tool_name),
+                            PERMISSION_TIMEOUT.as_secs()
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await;
+            }
             false
         }
     }

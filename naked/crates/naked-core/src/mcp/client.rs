@@ -138,6 +138,19 @@ impl McpServer {
     }
 }
 
+/// Diagnostic info about an MCP server that failed to connect.
+#[derive(Debug, Clone)]
+pub struct McpConnectFailure {
+    pub name: String,
+    pub error: String,
+}
+
+/// Result of connecting to all MCP servers.
+pub struct McpConnectResult {
+    pub registry: McpRegistry,
+    pub failures: Vec<McpConnectFailure>,
+}
+
 /// Registry of all connected MCP servers and their tools.
 pub struct McpRegistry {
     servers: Vec<Arc<McpServer>>,
@@ -150,9 +163,13 @@ impl McpRegistry {
         }
     }
 
-    /// Connect to all configured MCP servers. Logs errors but continues.
-    pub async fn connect_all(configs: &[McpServerConfig]) -> Self {
+    /// Connect to all configured MCP servers. Returns both successes and
+    /// failures so callers can notify users about broken servers.
+    pub async fn connect_all_with_diagnostics(
+        configs: &[McpServerConfig],
+    ) -> McpConnectResult {
         let mut servers = Vec::new();
+        let mut failures = Vec::new();
         for config in configs {
             match McpServer::connect(config).await {
                 Ok(server) => {
@@ -164,11 +181,25 @@ impl McpRegistry {
                     servers.push(Arc::new(server));
                 }
                 Err(e) => {
-                    tracing::warn!("MCP server '{}' failed to connect: {e}", config.name);
+                    let msg = format!("{e}");
+                    tracing::warn!("MCP server '{}' failed to connect: {msg}", config.name);
+                    failures.push(McpConnectFailure {
+                        name: config.name.clone(),
+                        error: msg,
+                    });
                 }
             }
         }
-        Self { servers }
+        McpConnectResult {
+            registry: Self { servers },
+            failures,
+        }
+    }
+
+    /// Connect to all configured MCP servers. Logs errors but continues.
+    /// Use [`connect_all_with_diagnostics`] when you need failure info.
+    pub async fn connect_all(configs: &[McpServerConfig]) -> Self {
+        Self::connect_all_with_diagnostics(configs).await.registry
     }
 
     /// Connect using pre-built servers (for testing).

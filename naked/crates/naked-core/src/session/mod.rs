@@ -4,12 +4,62 @@ pub mod store;
 pub mod turn_invariants;
 pub mod usage;
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::history::ConversationHistory;
 
 use self::usage::UsageTracker;
+
+/// Tracks which files were accessed during a session.
+/// Used by compaction to include `<read-files>` and `<modified-files>`
+/// in the summary so context survives across compaction boundaries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileTracker {
+    pub read: HashSet<String>,
+    pub written: HashSet<String>,
+    pub edited: HashSet<String>,
+}
+
+impl FileTracker {
+    /// Record a file operation from a tool call.
+    pub fn record_tool(&mut self, tool_name: &str, input: &serde_json::Value) {
+        let path = input
+            .get("file_path")
+            .or_else(|| input.get("path"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        match (tool_name, path) {
+            ("read_file", Some(p)) => { self.read.insert(p); }
+            ("write_file", Some(p)) => { self.written.insert(p); }
+            ("edit_file", Some(p)) => { self.edited.insert(p); }
+            _ => {}
+        }
+    }
+
+    /// Files only read (not modified).
+    pub fn read_only(&self) -> Vec<&str> {
+        self.read
+            .iter()
+            .filter(|p| !self.written.contains(*p) && !self.edited.contains(*p))
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    /// All modified files (written + edited).
+    pub fn modified(&self) -> Vec<&str> {
+        self.written
+            .union(&self.edited)
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.written.is_empty() && self.edited.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +119,12 @@ pub struct Session {
     pub fork_info: Option<ForkInfo>,
     pub state: SessionState,
     pub metadata: SessionMetadata,
+    /// B3: Track files read/written/edited for compaction summaries.
+    pub files: FileTracker,
+    /// Number of messages last written to disk. Used for incremental save:
+    /// if message_count > persisted_len → append-only (fast).
+    /// if message_count <= persisted_len → full rewrite (compaction happened).
+    pub(crate) persisted_msg_count: usize,
 }
 
 impl Session {
@@ -88,6 +144,8 @@ impl Session {
             fork_info: None,
             state: SessionState::Idle,
             metadata,
+            files: FileTracker::default(),
+            persisted_msg_count: 0,
         }
     }
 
@@ -107,6 +165,8 @@ impl Session {
             }),
             state: SessionState::Idle,
             metadata: self.metadata.clone(),
+            files: self.files.clone(),
+            persisted_msg_count: 0,
         }
     }
 
@@ -280,5 +340,51 @@ mod tests {
         assert_eq!(json, "\"active\"");
         let parsed: SessionState = serde_json::from_str("\"sleeping\"").unwrap();
         assert_eq!(parsed, SessionState::Sleeping);
+    }
+}
+
+#[cfg(test)]
+mod file_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn record_and_classify() {
+        let mut ft = FileTracker::default();
+        ft.record_tool("read_file", &serde_json::json!({"file_path": "src/main.rs"}));
+        ft.record_tool("edit_file", &serde_json::json!({"file_path": "src/lib.rs"}));
+        ft.record_tool("write_file", &serde_json::json!({"file_path": "new.rs"}));
+        ft.record_tool("read_file", &serde_json::json!({"file_path": "src/lib.rs"}));
+        ft.record_tool("bash", &serde_json::json!({"command": "ls"}));
+
+        assert_eq!(ft.read.len(), 2); // main.rs, lib.rs
+        assert_eq!(ft.edited.len(), 1); // lib.rs
+        assert_eq!(ft.written.len(), 1); // new.rs
+
+        // read_only excludes modified
+        let ro = ft.read_only();
+        assert!(ro.contains(&"src/main.rs"));
+        assert!(!ro.contains(&"src/lib.rs")); // also edited
+
+        // modified = written + edited
+        let modified = ft.modified();
+        assert!(modified.contains(&"src/lib.rs"));
+        assert!(modified.contains(&"new.rs"));
+        assert!(!modified.contains(&"src/main.rs"));
+    }
+
+    #[test]
+    fn empty_tracker() {
+        let ft = FileTracker::default();
+        assert!(ft.is_empty());
+        assert!(ft.read_only().is_empty());
+        assert!(ft.modified().is_empty());
+    }
+
+    #[test]
+    fn path_field_variants() {
+        let mut ft = FileTracker::default();
+        // Some tools use "path" instead of "file_path"
+        ft.record_tool("read_file", &serde_json::json!({"path": "readme.md"}));
+        assert!(ft.read.contains("readme.md"));
     }
 }
