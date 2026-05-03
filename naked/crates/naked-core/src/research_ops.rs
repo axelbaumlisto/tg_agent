@@ -22,21 +22,40 @@ impl AgentCore {
         if seeds.is_empty() {
             seeds = self.config.research.default_sources.clone();
         }
+        // Schedule defaults from config:
+        // - default_cron takes priority over default_interval_seconds
+        // - auto_first_run = true → run_at = now (scheduler picks up next tick)
+        // - default_interval_seconds = 0 → no schedule (manual only)
+        let rcfg = &self.config.research;
+        let cron = rcfg.default_cron.clone();
+        let interval = if cron.is_some() {
+            None // cron takes priority
+        } else if rcfg.default_interval_seconds > 0 {
+            Some(rcfg.default_interval_seconds)
+        } else {
+            None
+        };
+        let run_at = if rcfg.auto_first_run {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+
         let spec = ResearchSpec {
             id: new_research_id(topic),
             topic: topic.trim().to_string(),
             sources: seeds,
-            interval_seconds: None,
-            run_at: None,
-            cron: None,
+            interval_seconds: interval,
+            run_at,
+            cron,
             task_timeout_seconds: None,
             session_id,
             chat_id,
             thread_id,
-            provider: self.config.research.provider.clone(),
-            model: self.config.research.model.clone(),
-            max_iterations: Some(self.config.research.max_iterations),
-            max_wall_seconds: Some(self.config.research.max_wall_seconds),
+            provider: rcfg.provider.clone(),
+            model: rcfg.model.clone(),
+            max_iterations: Some(rcfg.max_iterations),
+            max_wall_seconds: Some(rcfg.max_wall_seconds),
             created_at: chrono::Utc::now(),
             paused: false,
             pause_reason: None,

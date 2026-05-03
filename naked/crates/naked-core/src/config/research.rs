@@ -75,9 +75,19 @@ pub struct ResearchConfig {
     #[serde(default = "default_true")]
     pub schedule_enabled: bool,
     /// Default interval for scheduled runs when the spec doesn't override.
-    /// Only used when creating a new timer. Default: 21600 (6 hours).
+    /// Applied to new specs at creation time. Default: 21600 (6 hours).
+    /// Set to 0 to create specs without a schedule (manual only).
     #[serde(default = "default_schedule_interval")]
     pub default_interval_seconds: u64,
+    /// Default cron expression for new specs. Takes priority over
+    /// `default_interval_seconds` when set. Example: `"0 10 * * *"`.
+    #[serde(default)]
+    pub default_cron: Option<String>,
+    /// Trigger the first run immediately when a spec is created.
+    /// Sets `run_at = now` so the scheduler picks it up on the next tick.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub auto_first_run: bool,
     /// Post a summary of new findings to the spec's `chat_id` after a
     /// scheduled run if `new_findings > 0`. Default: `true`.
     #[serde(default = "default_true")]
@@ -341,6 +351,8 @@ impl Default for ResearchConfig {
             allowed_tools: None,
             schedule_enabled: true,
             default_interval_seconds: default_schedule_interval(),
+            default_cron: None,
+            auto_first_run: true,
             notify_on_new_findings: true,
             verify_by_default: true,
             reasoning: None,

@@ -327,4 +327,89 @@ mod provider_ops_tests {
         // No skill_roots configured → empty
         assert!(skills.is_empty());
     }
+
+    // ── Research auto-scheduling tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn create_research_gets_default_interval() {
+        let tc = TestCore::build();
+        // Config default: default_interval_seconds = 21600
+        let spec = tc.core
+            .create_research("test topic", vec![], None, None, None)
+            .await
+            .expect("create_research");
+        assert_eq!(
+            spec.interval_seconds,
+            Some(tc.core.config().research.default_interval_seconds),
+            "new spec should inherit default_interval_seconds from config"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_research_auto_first_run() {
+        let tc = TestCore::build();
+        // Config default: auto_first_run = true
+        assert!(tc.core.config().research.auto_first_run);
+        let spec = tc.core
+            .create_research("test first run", vec![], None, None, None)
+            .await
+            .expect("create_research");
+        assert!(
+            spec.run_at.is_some(),
+            "auto_first_run=true should set run_at"
+        );
+        // run_at should be very recent (within last 5 seconds)
+        let age = chrono::Utc::now() - spec.run_at.unwrap();
+        assert!(age.num_seconds() < 5, "run_at should be ~now");
+    }
+
+    #[tokio::test]
+    async fn create_research_cron_overrides_interval() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.workspace = tmp.path().join("workspace");
+        config.session_dir = tmp.path().join("sessions");
+        config.research.storage_dir = Some(tmp.path().join("research"));
+        config.default_provider = "noop".into();
+        config.default_model = "noop-model".into();
+        config.research.default_cron = Some("0 10 * * *".into());
+        config.research.default_interval_seconds = 21600;
+
+        let core = Arc::new(AgentCore::new(config, Box::new(NoopProvider)));
+        core.init_self_ref();
+
+        let spec = core
+            .create_research("cron test", vec![], None, None, None)
+            .await
+            .expect("create_research");
+        assert_eq!(spec.cron.as_deref(), Some("0 10 * * *"));
+        assert_eq!(
+            spec.interval_seconds, None,
+            "cron should take priority, interval should be None"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_research_zero_interval_means_manual() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.workspace = tmp.path().join("workspace");
+        config.session_dir = tmp.path().join("sessions");
+        config.research.storage_dir = Some(tmp.path().join("research"));
+        config.default_provider = "noop".into();
+        config.default_model = "noop-model".into();
+        config.research.default_interval_seconds = 0;
+        config.research.auto_first_run = false;
+
+        let core = Arc::new(AgentCore::new(config, Box::new(NoopProvider)));
+        core.init_self_ref();
+
+        let spec = core
+            .create_research("manual only", vec![], None, None, None)
+            .await
+            .expect("create_research");
+        assert_eq!(spec.interval_seconds, None);
+        assert_eq!(spec.cron, None);
+        assert_eq!(spec.run_at, None);
+    }
 }
