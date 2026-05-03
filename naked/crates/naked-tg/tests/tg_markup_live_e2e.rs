@@ -125,7 +125,7 @@ async fn run_prompt(provider: Box<dyn Provider>, model: &str, prompt: &str) -> O
 
     let result = tokio::time::timeout(
         Duration::from_secs(90),
-        agent.run(&mut history, tx, cancel, None),
+        agent.run(&mut history, tx, cancel, None, None),
     )
     .await;
 

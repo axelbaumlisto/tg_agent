@@ -7,7 +7,8 @@ use crate::history::ConversationHistory;
 use crate::provider::{ChatRequest, Provider};
 use crate::tool::registry::ToolRegistry;
 use crate::types::{
-    AgentEvent, ContentBlock, Permission, PermissionResponse, StreamChunk, ToolState, TurnUsage,
+    AgentEvent, ContentBlock, Permission, PermissionResponse, SteerMessage, StreamChunk, ToolState,
+    TurnUsage,
 };
 
 const MAX_STREAM_RETRIES: usize = 3;
@@ -118,6 +119,7 @@ impl AgentLoop {
         tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
         mut permission_rx: Option<mpsc::Receiver<PermissionResponse>>,
+        mut steer_rx: Option<mpsc::Receiver<SteerMessage>>,
     ) -> Result<TurnUsage> {
         let mut cumulative_usage = TurnUsage::default();
 
@@ -132,10 +134,27 @@ impl AgentLoop {
         // of empty responses (the actual `glm-5-turbo` failure mode) are
         // capped.
         let mut empty_content_attempts: usize = 0;
+        // Pending steer messages not yet flushed to history.
+        // Kept as a vec so edits can replace by msg_id before drain.
+        let mut pending_steers: Vec<SteerMessage> = Vec::new();
+        // msg_ids already flushed to history (for edit-after-drain detection).
+        let mut delivered_msg_ids: std::collections::HashSet<i32> =
+            std::collections::HashSet::new();
+
         'outer: for _iteration in 0..limit {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
+
+            // Drain steer messages between iterations.
+            Self::drain_steers(
+                &mut steer_rx,
+                &mut pending_steers,
+                &mut delivered_msg_ids,
+                history,
+                &tx,
+            )
+            .await;
 
             let messages = history.to_api_messages();
             let system = history.system_prompt().to_string();
@@ -473,6 +492,16 @@ impl AgentLoop {
 
             // Execute gated tools sequentially (require permission).
             for (id, name, input) in gated_calls {
+                // Drain steer messages between sequential tool calls.
+                Self::drain_steers(
+                    &mut steer_rx,
+                    &mut pending_steers,
+                    &mut delivered_msg_ids,
+                    history,
+                    &tx,
+                )
+                .await;
+
                 let perm = self
                     .tools
                     .get(&name)
@@ -566,6 +595,66 @@ impl AgentLoop {
             .await;
         Err(AgentError::MaxIterations(self.config.max_iterations))
     }
+
+    /// Drain all pending steer messages from the channel, merge them into
+    /// a single user message, and push it to history.
+    ///
+    /// Edit semantics: if `is_edit` and the msg_id is still in the pending
+    /// queue, replace in-place. If already delivered to history, add a
+    /// `[correction]` prefix so the LLM knows the user changed their mind.
+    async fn drain_steers(
+        steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
+        pending: &mut Vec<SteerMessage>,
+        delivered: &mut std::collections::HashSet<i32>,
+        history: &mut ConversationHistory,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let rx = match steer_rx.as_mut() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        // Collect new messages from the channel.
+        while let Ok(msg) = rx.try_recv() {
+            if msg.is_edit {
+                // Try to replace in pending queue.
+                if let Some(existing) = pending.iter_mut().find(|m| m.msg_id == msg.msg_id) {
+                    existing.text = msg.text;
+                    continue;
+                }
+                // Already delivered to LLM — send as correction.
+                if delivered.contains(&msg.msg_id) {
+                    pending.push(SteerMessage {
+                        msg_id: msg.msg_id,
+                        text: format!("[correction] {}", msg.text),
+                        is_edit: false,
+                    });
+                    continue;
+                }
+            }
+            pending.push(msg);
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        // Merge all pending into ONE user message.
+        let combined: String = pending
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // Track delivered msg_ids.
+        for m in pending.iter() {
+            delivered.insert(m.msg_id);
+        }
+        pending.clear();
+
+        history.push_user(&combined);
+        let _ = tx.send(AgentEvent::SteerReceived { text: combined }).await;
+    }
 }
 
 #[cfg(test)]
@@ -573,7 +662,7 @@ mod tests {
     use super::*;
     use crate::provider::{ChatRequest, Provider};
     use crate::tool::Tool;
-    use crate::types::{Permission, ToolSpec};
+    use crate::types::{Permission, Role, ToolSpec};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -692,7 +781,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(
             matches!(result, Err(AgentError::Provider(_))),
             "exhausted-retry 0-token turn must surface as Provider error, not silent Ok; got {result:?}"
@@ -741,7 +830,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(
             result.is_ok(),
             "retry-after-empty must return Ok; got {result:?}"
@@ -792,7 +881,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(
             result.is_ok(),
             "two empties + text must still succeed at the edge of the retry budget; got {result:?}"
@@ -821,7 +910,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(result.is_ok());
 
         let mut events = Vec::new();
@@ -863,7 +952,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(result.is_ok());
 
         let mut events = Vec::new();
@@ -900,7 +989,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 
@@ -942,7 +1031,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(matches!(result, Err(AgentError::MaxIterations(3))));
     }
 
@@ -962,7 +1051,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
-        let result = agent_loop.run(&mut history, tx, cancel, None).await;
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
         assert!(matches!(result, Err(AgentError::Provider(_))));
 
         let mut events = Vec::new();
@@ -992,7 +1081,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = agent_loop
-            .run(&mut history, tx, cancel, None)
+            .run(&mut history, tx, cancel, None, None)
             .await
             .unwrap();
         assert_eq!(result.input_tokens, 100);
@@ -1014,7 +1103,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         agent_loop
-            .run(&mut history, tx, cancel, None)
+            .run(&mut history, tx, cancel, None, None)
             .await
             .unwrap();
 
@@ -1045,7 +1134,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         agent_loop
-            .run(&mut history, tx, cancel, None)
+            .run(&mut history, tx, cancel, None, None)
             .await
             .unwrap();
 
@@ -1086,7 +1175,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         agent_loop
-            .run(&mut history, tx, cancel, None)
+            .run(&mut history, tx, cancel, None, None)
             .await
             .unwrap();
 
@@ -1151,7 +1240,7 @@ mod tests {
 
         let loop_handle = tokio::spawn(async move {
             agent_loop
-                .run(&mut history, tx, cancel, Some(perm_rx))
+                .run(&mut history, tx, cancel, Some(perm_rx), None)
                 .await
         });
 
@@ -1203,7 +1292,7 @@ mod tests {
 
         let loop_handle = tokio::spawn(async move {
             agent_loop
-                .run(&mut history, tx, cancel, Some(perm_rx))
+                .run(&mut history, tx, cancel, Some(perm_rx), None)
                 .await
         });
 
@@ -1287,7 +1376,7 @@ mod tests {
         let mut history = ConversationHistory::new(String::new());
         history.push_user("test");
 
-        let _ = agent_loop.run(&mut history, tx, cancel, None).await;
+        let _ = agent_loop.run(&mut history, tx, cancel, None, None).await;
 
         // Collect events
         let mut saw_deny = false;
@@ -1300,5 +1389,268 @@ mod tests {
             }
         }
         assert!(saw_deny, "policy denial should emit ToolEnd with error");
+    }
+
+    // ── Steer tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn steer_message_injected_between_iterations() {
+        // Provider: iteration 1 calls a tool, iteration 2 returns text.
+        // We send a steer message between them and verify it appears in history.
+        let provider = MockProvider::new(vec![
+            // Iteration 1: tool call
+            vec![
+                StreamChunk::ToolUse {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text": "hi"}),
+                },
+                StreamChunk::Done,
+            ],
+            // Iteration 2: text response (after steer)
+            vec![
+                StreamChunk::Text("got your steer".into()),
+                StreamChunk::Done,
+            ],
+        ]);
+
+        let agent_loop = make_loop(provider, vec![Box::new(EchoTool)]);
+        let mut history = ConversationHistory::new("sys".into());
+        history.push_user("do something");
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+
+        // Pre-load steer message (will be drained at iteration boundary).
+        steer_tx
+            .send(SteerMessage {
+                msg_id: 42,
+                text: "change direction".into(),
+                is_edit: false,
+            })
+            .await
+            .unwrap();
+
+        let result = agent_loop
+            .run(&mut history, tx, cancel, None, Some(steer_rx))
+            .await;
+        assert!(result.is_ok());
+
+        // Verify steer text is in the history as a user message.
+        let msgs = history.messages();
+        let steer_in_history = msgs
+            .iter()
+            .any(|m| m.role == Role::User && m.text_content().contains("change direction"));
+        assert!(steer_in_history, "steer message must appear in history");
+
+        // Verify SteerReceived event was emitted.
+        let mut saw_steer = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(&ev, AgentEvent::SteerReceived { text } if text.contains("change direction"))
+            {
+                saw_steer = true;
+            }
+        }
+        assert!(saw_steer, "SteerReceived event must be emitted");
+    }
+
+    #[tokio::test]
+    async fn steer_multiple_merged_into_one() {
+        // Three steer messages should be merged into a single user message.
+        let provider = MockProvider::new(vec![
+            vec![
+                StreamChunk::ToolUse {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text":"x"}),
+                },
+                StreamChunk::Done,
+            ],
+            vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
+        ]);
+
+        let agent_loop = make_loop(provider, vec![Box::new(EchoTool)]);
+        let mut history = ConversationHistory::new("sys".into());
+        history.push_user("go");
+
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+
+        for (id, text) in [(1, "msg one"), (2, "msg two"), (3, "msg three")] {
+            steer_tx
+                .send(SteerMessage {
+                    msg_id: id,
+                    text: text.into(),
+                    is_edit: false,
+                })
+                .await
+                .unwrap();
+        }
+
+        let result = agent_loop
+            .run(&mut history, tx, cancel, None, Some(steer_rx))
+            .await;
+        assert!(result.is_ok());
+
+        // Count user messages that contain steer text.
+        let steer_msgs: Vec<_> = history
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User && m.text_content().contains("msg one"))
+            .collect();
+        assert_eq!(
+            steer_msgs.len(),
+            1,
+            "3 steer messages must be merged into 1 user message"
+        );
+        let combined = steer_msgs[0].text_content();
+        assert!(combined.contains("msg one"));
+        assert!(combined.contains("msg two"));
+        assert!(combined.contains("msg three"));
+    }
+
+    #[tokio::test]
+    async fn steer_edit_replaces_in_pending_queue() {
+        // Send msg_id=10, then edit msg_id=10 before drain.
+        let provider = MockProvider::new(vec![
+            vec![
+                StreamChunk::ToolUse {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text":"x"}),
+                },
+                StreamChunk::Done,
+            ],
+            vec![StreamChunk::Text("done".into()), StreamChunk::Done],
+        ]);
+
+        let agent_loop = make_loop(provider, vec![Box::new(EchoTool)]);
+        let mut history = ConversationHistory::new("sys".into());
+        history.push_user("start");
+
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+
+        // Original
+        steer_tx
+            .send(SteerMessage {
+                msg_id: 10,
+                text: "find cafes".into(),
+                is_edit: false,
+            })
+            .await
+            .unwrap();
+        // Edit
+        steer_tx
+            .send(SteerMessage {
+                msg_id: 10,
+                text: "find bars".into(),
+                is_edit: true,
+            })
+            .await
+            .unwrap();
+
+        let result = agent_loop
+            .run(&mut history, tx, cancel, None, Some(steer_rx))
+            .await;
+        assert!(result.is_ok());
+
+        let all_text: String = history
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text_content())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !all_text.contains("find cafes"),
+            "original must be replaced by edit"
+        );
+        assert!(all_text.contains("find bars"), "edited text must appear");
+    }
+
+    #[tokio::test]
+    async fn steer_edit_after_drain_adds_correction() {
+        // Test drain_steers directly: drain once (delivers msg_id=20),
+        // then edit msg_id=20 arrives → must appear as [correction].
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+        let mut opt_rx = Some(steer_rx);
+        let mut pending: Vec<SteerMessage> = Vec::new();
+        let mut delivered = std::collections::HashSet::new();
+        let mut history = ConversationHistory::new("sys".into());
+        history.push_user("go");
+        let (tx, _rx) = mpsc::channel(64);
+
+        // Send original.
+        steer_tx
+            .send(SteerMessage {
+                msg_id: 20,
+                text: "original direction".into(),
+                is_edit: false,
+            })
+            .await
+            .unwrap();
+
+        // Drain 1: delivers msg_id=20.
+        AgentLoop::drain_steers(&mut opt_rx, &mut pending, &mut delivered, &mut history, &tx).await;
+
+        let user_msgs: Vec<_> = history
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text_content())
+            .collect();
+        assert!(
+            user_msgs.iter().any(|t| t.contains("original direction")),
+            "original must be delivered"
+        );
+        assert!(
+            delivered.contains(&20),
+            "msg_id=20 must be in delivered set"
+        );
+
+        // Now send an edit of msg_id=20.
+        steer_tx
+            .send(SteerMessage {
+                msg_id: 20,
+                text: "corrected direction".into(),
+                is_edit: true,
+            })
+            .await
+            .unwrap();
+
+        // Drain 2: edit of already-delivered msg_id=20.
+        AgentLoop::drain_steers(&mut opt_rx, &mut pending, &mut delivered, &mut history, &tx).await;
+
+        let all_text: String = history
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .map(|m| m.text_content())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            all_text.contains("[correction] corrected direction"),
+            "edit after drain must appear as correction; got: {all_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_no_channel_works() {
+        // Passing None for steer_rx should work (backward compat).
+        let provider = MockProvider::new(vec![vec![
+            StreamChunk::Text("hello".into()),
+            StreamChunk::Done,
+        ]]);
+        let agent_loop = make_loop(provider, vec![]);
+        let mut history = ConversationHistory::new("sys".into());
+        history.push_user("hi");
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+        assert!(result.is_ok());
     }
 }

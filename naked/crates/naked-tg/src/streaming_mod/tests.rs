@@ -1067,27 +1067,7 @@ mod resilience_tests {
         assert!(!msg.contains("secret"), "JSON should be stripped: {msg}");
     }
 
-    // ── parse_retry_after ───────────────────────────────────────────
-
-    #[test]
-    fn parse_retry_after_seconds() {
-        assert_eq!(parse_retry_after("retry after 30s"), Some(30));
-        assert_eq!(parse_retry_after("Retry after 5 seconds"), Some(5));
-    }
-
-    #[test]
-    fn parse_retry_after_in_error_message() {
-        assert_eq!(
-            parse_retry_after("rate limited, retry after 60 seconds"),
-            Some(60)
-        );
-    }
-
-    #[test]
-    fn parse_retry_after_none() {
-        assert_eq!(parse_retry_after("some random error"), None);
-        assert_eq!(parse_retry_after(""), None);
-    }
+    // parse_retry_after tests moved to rate_limit.rs
 
     // ── format_input_preview ────────────────────────────────────────
 

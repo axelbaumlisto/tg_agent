@@ -163,6 +163,7 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
     let AgentHandle {
         mut events,
         permissions,
+        steer: _,
     } = handle;
 
     let spinning = Arc::new(AtomicBool::new(true));
@@ -318,6 +319,9 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
                 eprintln!(
                     "\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m"
                 );
+            }
+            AgentEvent::SteerReceived { text } => {
+                eprintln!("\x1b[36m[steer: {text}]\x1b[0m");
             }
             AgentEvent::UsageUpdate(u) => {
                 last_usage = Some(u);

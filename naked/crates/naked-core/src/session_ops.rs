@@ -323,6 +323,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     async fn dispatch_turn(&self, session_id: &str, push: UserPush) -> Result<AgentHandle> {
         let (tx, rx) = mpsc::channel(64);
         let (perm_tx, perm_rx) = mpsc::channel::<PermissionResponse>(4);
+        let (steer_tx, steer_rx) = mpsc::channel::<crate::types::SteerMessage>(16);
 
         // Load per-session config overlay (re-read each turn so edits take effect)
         let sc = self.load_session_config_pub(session_id);
@@ -558,6 +559,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             return Ok(AgentHandle {
                 events: rx,
                 permissions: perm_tx,
+                steer: steer_tx,
             });
         }
 
@@ -599,7 +601,13 @@ Keep each section concise. Preserve exact paths and identifiers.";
         tokio::spawn(
             async move {
                 let result = agent_loop
-                    .run(&mut history, tx.clone(), cancel, Some(perm_rx))
+                    .run(
+                        &mut history,
+                        tx.clone(),
+                        cancel,
+                        Some(perm_rx),
+                        Some(steer_rx),
+                    )
                     .await;
                 crate::turn::persist_turn_result(
                     &session_id_owned,
@@ -618,6 +626,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         Ok(AgentHandle {
             events: rx,
             permissions: perm_tx,
+            steer: steer_tx,
         })
     }
 

@@ -334,7 +334,8 @@ mod provider_ops_tests {
     async fn create_research_gets_default_interval() {
         let tc = TestCore::build();
         // Config default: default_interval_seconds = 21600
-        let spec = tc.core
+        let spec = tc
+            .core
             .create_research("test topic", vec![], None, None, None)
             .await
             .expect("create_research");
@@ -350,7 +351,8 @@ mod provider_ops_tests {
         let tc = TestCore::build();
         // Config default: auto_first_run = true
         assert!(tc.core.config().research.auto_first_run);
-        let spec = tc.core
+        let spec = tc
+            .core
             .create_research("test first run", vec![], None, None, None)
             .await
             .expect("create_research");
@@ -366,14 +368,19 @@ mod provider_ops_tests {
     #[tokio::test]
     async fn create_research_cron_overrides_interval() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut config = Config::default();
-        config.workspace = tmp.path().join("workspace");
-        config.session_dir = tmp.path().join("sessions");
-        config.research.storage_dir = Some(tmp.path().join("research"));
-        config.default_provider = "noop".into();
-        config.default_model = "noop-model".into();
-        config.research.default_cron = Some("0 10 * * *".into());
-        config.research.default_interval_seconds = 21600;
+        let config = Config {
+            workspace: tmp.path().join("workspace"),
+            session_dir: tmp.path().join("sessions"),
+            research: crate::config::ResearchConfig {
+                storage_dir: Some(tmp.path().join("research")),
+                default_cron: Some("0 10 * * *".into()),
+                default_interval_seconds: 21600,
+                ..Default::default()
+            },
+            default_provider: "noop".into(),
+            default_model: "noop-model".into(),
+            ..Default::default()
+        };
 
         let core = Arc::new(AgentCore::new(config, Box::new(NoopProvider)));
         core.init_self_ref();
@@ -392,14 +399,19 @@ mod provider_ops_tests {
     #[tokio::test]
     async fn create_research_zero_interval_means_manual() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut config = Config::default();
-        config.workspace = tmp.path().join("workspace");
-        config.session_dir = tmp.path().join("sessions");
-        config.research.storage_dir = Some(tmp.path().join("research"));
-        config.default_provider = "noop".into();
-        config.default_model = "noop-model".into();
-        config.research.default_interval_seconds = 0;
-        config.research.auto_first_run = false;
+        let config = Config {
+            workspace: tmp.path().join("workspace"),
+            session_dir: tmp.path().join("sessions"),
+            research: crate::config::ResearchConfig {
+                storage_dir: Some(tmp.path().join("research")),
+                default_interval_seconds: 0,
+                auto_first_run: false,
+                ..Default::default()
+            },
+            default_provider: "noop".into(),
+            default_model: "noop-model".into(),
+            ..Default::default()
+        };
 
         let core = Arc::new(AgentCore::new(config, Box::new(NoopProvider)));
         core.init_self_ref();

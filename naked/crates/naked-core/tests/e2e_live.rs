@@ -193,7 +193,7 @@ async fn run_prompt(
     let cancel = CancellationToken::new();
 
     let timeout = Duration::from_secs(120);
-    let result = tokio::time::timeout(timeout, agent.run(history, tx, cancel, None)).await;
+    let result = tokio::time::timeout(timeout, agent.run(history, tx, cancel, None, None)).await;
 
     match result {
         Ok(Ok(_usage)) => {}
@@ -404,7 +404,7 @@ async fn run_prompt_with_tools(
     let cancel = CancellationToken::new();
 
     let timeout = Duration::from_secs(120);
-    let result = tokio::time::timeout(timeout, agent.run(history, tx, cancel, None)).await;
+    let result = tokio::time::timeout(timeout, agent.run(history, tx, cancel, None, None)).await;
 
     match result {
         Ok(Ok(_usage)) => {}
@@ -2065,7 +2065,7 @@ async fn run_load_session(
 
         let result = tokio::time::timeout(
             Duration::from_secs(180),
-            agent.run(&mut history, tx, cancel, None),
+            agent.run(&mut history, tx, cancel, None, None),
         )
         .await;
 
@@ -3733,7 +3733,7 @@ async fn t54_retry_backoff_timing() {
     let cancel = CancellationToken::new();
 
     let start = std::time::Instant::now();
-    let result = agent.run(&mut history, tx, cancel, None).await;
+    let result = agent.run(&mut history, tx, cancel, None, None).await;
     let elapsed = start.elapsed();
 
     assert!(result.is_err(), "should fail after retries");
@@ -3981,8 +3981,11 @@ async fn t61_permission_request_outside_workspace() {
     let cancel = CancellationToken::new();
     let (perm_tx, perm_rx) = mpsc::channel(4);
 
-    let loop_handle =
-        tokio::spawn(async move { agent.run(&mut history, tx, cancel, Some(perm_rx)).await });
+    let loop_handle = tokio::spawn(async move {
+        agent
+            .run(&mut history, tx, cancel, Some(perm_rx), None)
+            .await
+    });
 
     let mut saw_permission = false;
     let mut perm_was_dangerous = false;
@@ -4184,7 +4187,8 @@ async fn t62_emergency_compaction_then_continue_working() {
     let (tx, mut rx) = mpsc::channel(128);
     let cancel = CancellationToken::new();
 
-    let loop_handle = tokio::spawn(async move { agent.run(&mut history, tx, cancel, None).await });
+    let loop_handle =
+        tokio::spawn(async move { agent.run(&mut history, tx, cancel, None, None).await });
 
     let mut saw_compaction = false;
     let mut compaction_before = 0;
@@ -4390,7 +4394,8 @@ async fn t63_emergency_compaction_minimal_history_returns_error() {
     let (tx, mut rx) = mpsc::channel(64);
     let cancel = CancellationToken::new();
 
-    let loop_handle = tokio::spawn(async move { agent.run(&mut history, tx, cancel, None).await });
+    let loop_handle =
+        tokio::spawn(async move { agent.run(&mut history, tx, cancel, None, None).await });
 
     // Drain events
     while let Some(ev) = rx.recv().await {
@@ -5457,7 +5462,7 @@ async fn run_research_prompt(
     });
 
     let start = std::time::Instant::now();
-    let result = agent.run(history, agent_tx, cancel, None).await;
+    let result = agent.run(history, agent_tx, cancel, None, None).await;
 
     match &result {
         Ok(usage) => eprintln!("  usage: {} tokens", usage.total_tokens()),
@@ -6274,7 +6279,7 @@ async fn t92_heartbeat_during_tool_execution() {
     let cancel = CancellationToken::new();
 
     let start = std::time::Instant::now();
-    let result = agent.run(&mut history, tx, cancel, None).await;
+    let result = agent.run(&mut history, tx, cancel, None, None).await;
     let elapsed = start.elapsed();
 
     eprintln!("  elapsed: {:.1}s", elapsed.as_secs_f64());

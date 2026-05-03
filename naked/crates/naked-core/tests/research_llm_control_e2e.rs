@@ -263,7 +263,7 @@ async fn run_turn(setup: TestSetup, prompt: &str) -> (TurnResult, Arc<AgentCore>
     let (tx, mut rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
     let timeout = Duration::from_secs(120);
-    let _ = tokio::time::timeout(timeout, agent.run(&mut history, tx, cancel, None)).await;
+    let _ = tokio::time::timeout(timeout, agent.run(&mut history, tx, cancel, None, None)).await;
 
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {

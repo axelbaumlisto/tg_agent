@@ -97,9 +97,13 @@ impl AgentRunner for ScriptedRunner {
             let _ = tx.send(AgentEvent::Idle).await;
         });
         Ok((
-            AgentHandle {
-                events: rx,
-                permissions: perm_tx,
+            {
+                let (steer_tx, _) = tokio::sync::mpsc::channel(1);
+                AgentHandle {
+                    events: rx,
+                    permissions: perm_tx,
+                    steer: steer_tx,
+                }
             },
             "test-provider".into(),
             "test-model".into(),

@@ -429,34 +429,57 @@ pub(crate) async fn handle_message(
         };
 
     if agent.is_session_active(&session_id).await {
-        match multimodal_blocks {
-            Some(blocks) => agent.queue_message_multimodal(&session_id, blocks).await,
-            None => agent.queue_message(&session_id, &text).await,
-        }
-        // Increment queued message counter for status preview.
-        {
-            let key = (ctx.chat_id.0, ctx.raw_thread_id());
-            let map = QUEUE_COUNTS.read().await;
-            if let Some(counter) = map.get(&key) {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = (ctx.chat_id.0, ctx.raw_thread_id());
+
+        // Try to steer the active turn (inject message into running loop).
+        let steered = {
+            let map = STEER_SENDERS.read().await;
+            if let Some(steer_tx) = map.get(&key) {
+                let steer_msg = naked_core::types::SteerMessage {
+                    msg_id: msg.id.0,
+                    text: text.clone(),
+                    is_edit: false,
+                };
+                steer_tx.try_send(steer_msg).is_ok()
+            } else {
+                false
             }
-        }
-        let qcount = {
-            let key = (ctx.chat_id.0, ctx.raw_thread_id());
-            let map = QUEUE_COUNTS.read().await;
-            map.get(&key)
-                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(0)
         };
-        let note = if qcount > 0 {
-            format!("⏳ +{qcount} in queue")
+
+        if steered {
+            bot.send_message(ctx.chat_id, "\u{21a9}\u{fe0f} Steering")
+                .maybe_thread(ctx.thread_id)
+                .maybe_reply_to(ctx.reply_to)
+                .await?;
         } else {
-            "⏳ Queued".into()
-        };
-        bot.send_message(ctx.chat_id, note)
-            .maybe_thread(ctx.thread_id)
-            .maybe_reply_to(ctx.reply_to)
-            .await?;
+            // Steer channel not available — fall back to queue.
+            match multimodal_blocks {
+                Some(blocks) => agent.queue_message_multimodal(&session_id, blocks).await,
+                None => agent.queue_message(&session_id, &text).await,
+            }
+            // Increment queued message counter for status preview.
+            {
+                let map = QUEUE_COUNTS.read().await;
+                if let Some(counter) = map.get(&key) {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let qcount = {
+                let map = QUEUE_COUNTS.read().await;
+                map.get(&key)
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0)
+            };
+            let note = if qcount > 0 {
+                format!("⏳ +{qcount} in queue")
+            } else {
+                "⏳ Queued".into()
+            };
+            bot.send_message(ctx.chat_id, note)
+                .maybe_thread(ctx.thread_id)
+                .maybe_reply_to(ctx.reply_to)
+                .await?;
+        }
         return Ok(());
     }
 

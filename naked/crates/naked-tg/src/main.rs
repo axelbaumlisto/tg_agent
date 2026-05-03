@@ -860,32 +860,62 @@ async fn main() {
                         continue;
                     }
                 };
-                tracing::info!(
-                    chat_id = msg.chat.id.0,
-                    msg_id = msg.id.0,
-                    "Dispatching edited_message as new message"
-                );
-                let deps = BotDeps {
-                    bot: bot.clone(),
-                    agent: agent.clone(),
-                    channel_map: channel_map.clone(),
-                    config: config.clone(),
-                    pending_perms: pending_perms.clone(),
-                    http_client: http_client.clone(),
-                    base_url: base_url.clone(),
-                    rate_limiter: rate_limiter.clone(),
-                    attribution_flag: attribution_flag.clone(),
-                    bot_token: bot_token_arc.clone(),
-                    bot_identity: bot_identity.clone(),
-                    tg_attach_queue: tg_attach_queue.clone(),
-                };
-                let permit = task_tracker.clone();
-                tokio::spawn(async move {
-                    let _permit = permit.acquire().await;
-                    if let Err(e) = deps.handle(msg, Vec::new()).await {
-                        tracing::error!("handle edited_message error: {e}");
+                let chat_id_raw = msg.chat.id.0;
+                let tid_raw = msg.thread_id.map(|t| t.0.0);
+                let msg_id = msg.id.0;
+                let edit_text = msg.text().or(msg.caption()).unwrap_or_default().to_string();
+
+                // If a turn is actively streaming for this chat,
+                // inject as steer edit rather than a new message.
+                let steer_key = (chat_id_raw, tid_raw);
+                let steered = {
+                    let map = STEER_SENDERS.read().await;
+                    if let Some(tx) = map.get(&steer_key) {
+                        tx.try_send(naked_core::types::SteerMessage {
+                            msg_id,
+                            text: edit_text.clone(),
+                            is_edit: true,
+                        })
+                        .is_ok()
+                    } else {
+                        false
                     }
-                });
+                };
+
+                if steered {
+                    tracing::info!(
+                        chat_id = chat_id_raw,
+                        msg_id,
+                        "edited_message routed as steer edit"
+                    );
+                } else {
+                    tracing::info!(
+                        chat_id = chat_id_raw,
+                        msg_id,
+                        "Dispatching edited_message as new message"
+                    );
+                    let deps = BotDeps {
+                        bot: bot.clone(),
+                        agent: agent.clone(),
+                        channel_map: channel_map.clone(),
+                        config: config.clone(),
+                        pending_perms: pending_perms.clone(),
+                        http_client: http_client.clone(),
+                        base_url: base_url.clone(),
+                        rate_limiter: rate_limiter.clone(),
+                        attribution_flag: attribution_flag.clone(),
+                        bot_token: bot_token_arc.clone(),
+                        bot_identity: bot_identity.clone(),
+                        tg_attach_queue: tg_attach_queue.clone(),
+                    };
+                    let permit = task_tracker.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit.acquire().await;
+                        if let Err(e) = deps.handle(msg, Vec::new()).await {
+                            tracing::error!("handle edited_message error: {e}");
+                        }
+                    });
+                }
             }
             if let Some(cb_val) = upd.get("callback_query") {
                 tracing::info!("Dispatching callback_query");
@@ -1127,6 +1157,13 @@ static MODEL_SWITCHES: LazyLock<tokio::sync::RwLock<ModelSwitchMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 type QueueCountMap = HashMap<(i64, Option<i32>), Arc<std::sync::atomic::AtomicUsize>>;
 static QUEUE_COUNTS: LazyLock<tokio::sync::RwLock<QueueCountMap>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+
+/// Steer senders: (chat_id, thread_id) → Sender<SteerMessage>.
+/// Populated when a streaming turn starts, removed when it ends.
+type SteerSenderMap =
+    HashMap<(i64, Option<i32>), tokio::sync::mpsc::Sender<naked_core::types::SteerMessage>>;
+pub(crate) static STEER_SENDERS: LazyLock<tokio::sync::RwLock<SteerSenderMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
 /// Global rate limiter instance — accessible from commands.rs for /metrics.

@@ -32,18 +32,6 @@ pub(crate) fn truncate_str(s: &str, max_chars: usize) -> String {
     s.to_string()
 }
 
-/// Parse "Retry after Xs" from Telegram error string.
-pub(crate) fn parse_retry_after(err: &str) -> Option<u64> {
-    let s = err.to_lowercase();
-    if let Some(pos) = s.find("retry after") {
-        let after = &s[pos + 12..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse().ok()
-    } else {
-        None
-    }
-}
-
 /// Strip `class="language-..."` from `<code>` tags.
 /// Telegram `editMessageText` rejects attributes during streaming preview
 /// but accepts them in `sendMessage` (final render).

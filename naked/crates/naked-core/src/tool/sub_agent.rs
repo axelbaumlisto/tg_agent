@@ -253,7 +253,7 @@ impl Tool for SubAgentTool {
             }
         });
 
-        let result = agent.run(&mut history, tx, cancel, None).await;
+        let result = agent.run(&mut history, tx, cancel, None, None).await;
 
         // Wait for the forwarder to drain remaining events.
         drop(fwd_handle);

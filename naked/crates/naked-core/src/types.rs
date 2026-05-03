@@ -295,6 +295,10 @@ pub enum AgentEvent {
         /// Number of tracked files (read + modified).
         files_count: usize,
     },
+    /// A steer message from the user was injected into the active turn.
+    SteerReceived {
+        text: String,
+    },
     Error(String),
     Idle,
 }
@@ -316,10 +320,22 @@ pub struct PermissionResponse {
     pub allowed: bool,
 }
 
-/// Returned by `AgentCore::send_prompt` — events channel + permission reply channel.
+/// A user message injected into an active turn to steer the agent.
+#[derive(Debug, Clone)]
+pub struct SteerMessage {
+    /// Telegram message id (used for edit-replacement in the pending queue).
+    pub msg_id: i32,
+    /// The user's text.
+    pub text: String,
+    /// `true` when this is an edit of a previously sent steer message.
+    pub is_edit: bool,
+}
+
+/// Returned by `AgentCore::send_prompt` — events channel + permission/steer reply channels.
 pub struct AgentHandle {
     pub events: tokio::sync::mpsc::Receiver<AgentEvent>,
     pub permissions: tokio::sync::mpsc::Sender<PermissionResponse>,
+    pub steer: tokio::sync::mpsc::Sender<SteerMessage>,
 }
 
 // -- Usage -------------------------------------------------------------------

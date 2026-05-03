@@ -533,9 +533,17 @@ pub(crate) async fn stream_response(
     let AgentHandle {
         mut events,
         permissions,
+        steer,
     } = handle;
     let chat_id_raw = ctx.chat_id.0;
     let tid = ctx.raw_thread_id();
+    let chat_key_for_steer = (chat_id_raw, tid);
+
+    // Store steer sender so message_handler can reach us.
+    STEER_SENDERS
+        .write()
+        .await
+        .insert(chat_key_for_steer, steer);
 
     tracing::debug!(
         chat_id = chat_id_raw,
@@ -590,7 +598,6 @@ pub(crate) async fn stream_response(
         .insert(chat_key, queue_counter.clone());
 
     let mut view = CompositeView::new(model_tag, queue_counter);
-    let mut last_edit = tokio::time::Instant::now();
     let mut dirty = false;
     let mut last_sent = String::new();
     let mut html_broken = false;
@@ -599,16 +606,21 @@ pub(crate) async fn stream_response(
     let mut stall_warned = false;
     const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+    // Fixed-interval ticker for streaming flushes.
+    // The actual rate limiting happens inside RATE_LIMITER.edit() — the
+    // ticker just decides when to ATTEMPT a flush.
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(2_400));
+    flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    flush_interval.tick().await; // consume first immediate tick
+
     loop {
         let event = tokio::select! {
             ev = events.recv() => match ev {
                 Some(e) => Some(e),
                 None => break,
             },
-            _ = tokio::time::sleep(rate_limiter.gap(chat_key).await) => None,
+            _ = flush_interval.tick() => None,
         };
-
-        let mut force_flush = false;
 
         // FIX-3: Detect stalled agent (no events for 90s).
         if event.is_some() {
@@ -619,9 +631,9 @@ pub(crate) async fn stream_response(
             view.tool_lines
                 .push("⏳ Бот не отвечает >90s — возможно завис. /stop для отмены.".to_string());
             dirty = true;
-            force_flush = true;
         }
 
+        let has_event = event.is_some();
         if let Some(event) = event {
             match event {
                 AgentEvent::ThinkingDelta(t) => {
@@ -631,9 +643,8 @@ pub(crate) async fn stream_response(
                     dirty = handlers::handle_text_delta(&mut view, &t) != ViewAction::Clean;
                 }
                 AgentEvent::ToolStart { name, input, .. } => {
-                    let action = handlers::handle_tool_start(&mut view, &name, &input);
+                    let _ = handlers::handle_tool_start(&mut view, &name, &input);
                     dirty = true;
-                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::ToolEnd {
                     name,
@@ -642,7 +653,7 @@ pub(crate) async fn stream_response(
                     ..
                 } => {
                     let is_error = matches!(state, naked_core::types::ToolState::Error);
-                    let (action, detail_msg) =
+                    let (_, detail_msg) =
                         handlers::handle_tool_end(&mut view, &name, is_error, &output);
                     if let Some(msg) = detail_msg {
                         let _ = bot
@@ -652,7 +663,6 @@ pub(crate) async fn stream_response(
                             .await;
                     }
                     dirty = true;
-                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::PermissionRequest {
                     call_id,
@@ -660,7 +670,7 @@ pub(crate) async fn stream_response(
                     input,
                     permission,
                 } => {
-                    rate_limiter.acquire(chat_key).await;
+                    // Flush before showing permission dialog.
                     let _ = flush_live(
                         &bot,
                         ctx.chat_id,
@@ -730,18 +740,23 @@ pub(crate) async fn stream_response(
                     agent_id,
                     event: sa_ev,
                 } => {
-                    let action = handlers::handle_sub_agent(&mut view, agent_id, sa_ev);
+                    let _ = handlers::handle_sub_agent(&mut view, agent_id, sa_ev);
                     dirty = true;
-                    force_flush = action == ViewAction::DirtyFlush;
                 }
                 AgentEvent::UsageUpdate(u) => {
                     handlers::handle_usage(&mut view, u);
                     dirty = true;
                 }
-                AgentEvent::Error(e) => {
-                    let action = handlers::handle_error(&mut view, &e);
+                AgentEvent::SteerReceived { text } => {
+                    view.tool_lines.push(format!(
+                        "\u{21a9}\u{fe0f} <i>Steer: {}</i>",
+                        crate::fmt_utils::escape_html_min(&text)
+                    ));
                     dirty = true;
-                    force_flush = action == ViewAction::DirtyFlush;
+                }
+                AgentEvent::Error(e) => {
+                    let _ = handlers::handle_error(&mut view, &e);
+                    dirty = true;
                 }
                 AgentEvent::Idle => break,
             }
@@ -756,45 +771,51 @@ pub(crate) async fn stream_response(
             break;
         }
 
-        // Tick spinner + flush via adaptive rate limiter.
-        let current_gap = rate_limiter.gap(chat_key).await;
-        if force_flush || last_edit.elapsed() >= current_gap {
+        // Proactive flush: only on tick interval, never faster.
+        // The interval ticker fires in select! above → event=None.
+        // On event: just set dirty. On tick: flush if dirty.
+        let is_tick = !has_event; // tick = no event received, interval fired
+        if is_tick {
+            // Tick fired — time to flush.
             view.tick += 1;
-            dirty = true;
-        }
+            if dirty {
+                flush_live(
+                    &bot,
+                    ctx.chat_id,
+                    placeholder,
+                    &view,
+                    &mut last_sent,
+                    &mut html_broken,
+                )
+                .await;
+                dirty = false;
 
-        if dirty && last_edit.elapsed() >= current_gap {
-            rate_limiter.acquire(chat_key).await;
-            let ok = flush_live(
-                &bot,
-                ctx.chat_id,
-                placeholder,
-                &view,
-                &mut last_sent,
-                &mut html_broken,
-            )
-            .await;
-            if ok {
-                rate_limiter.report_ok(chat_key).await;
-            } else {
-                rate_limiter.report_429(chat_key, None).await;
+                // If the rate limiter has this chat blocked (429),
+                // stretch the ticker to avoid hammering.
+                let backoff = rate_limiter.streaming_interval(ctx.chat_id.0).await;
+                if backoff > flush_interval.period() {
+                    flush_interval = tokio::time::interval(backoff);
+                    flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    flush_interval.tick().await;
+                }
             }
-            last_edit = tokio::time::Instant::now();
-            dirty = false;
         }
     }
 
+    // No unregister needed — the global limiter tracks per-chat state.
+
     typing_cancel.cancel();
 
-    // Deregister model-switch state and queue counter.
+    // Deregister model-switch state, queue counter, and steer sender.
     MODEL_SWITCHES.write().await.remove(&chat_key);
     QUEUE_COUNTS.write().await.remove(&chat_key);
+    STEER_SENDERS.write().await.remove(&chat_key_for_steer);
 
     if aborted_for_switch {
         // Don't send final — the turn was interrupted.
         // Edit placeholder to indicate switch in progress.
-        let _ = bot
-            .edit_message_text(ctx.chat_id, placeholder, "⚡ Switching model…")
+        RATE_LIMITER
+            .edit_plain(&bot, ctx.chat_id, placeholder, "⚡ Switching model…")
             .await;
         return;
     }
@@ -873,43 +894,16 @@ pub(crate) async fn edit_with_retry(
     text: &str,
     parse_html: bool,
 ) -> bool {
-    let modes: &[bool] = if parse_html { &[true, false] } else { &[false] };
-
-    for &use_html in modes {
-        for attempt in 0..3 {
-            let result = if use_html {
-                bot.edit_message_text(chat_id, msg_id, text)
-                    .parse_mode(ParseMode::Html)
-                    .await
-            } else {
-                bot.edit_message_text(chat_id, msg_id, text).await
-            };
-            match result {
-                Ok(_) => return true,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if let Some(wait) = parse_retry_after(&err_str) {
-                        let wait = wait.min(60);
-                        tracing::warn!(
-                            attempt,
-                            wait,
-                            use_html,
-                            "final edit rate-limited, waiting {wait}s"
-                        );
-                        tokio::time::sleep(Duration::from_secs(wait + 1)).await;
-                        continue;
-                    }
-                    if use_html && attempt == 0 {
-                        tracing::warn!("final edit (HTML) failed: {e}, falling back to plain text");
-                        break;
-                    }
-                    tracing::error!("final edit failed: {e}");
-                    return false;
-                }
-            }
+    let rl = &*RATE_LIMITER;
+    if parse_html {
+        if rl.edit_html(bot, chat_id, msg_id, text).await {
+            return true;
         }
+        // HTML failed — try plain text
+        let plain = strip_html_tags(text);
+        return rl.edit_plain(bot, chat_id, msg_id, &plain).await;
     }
-    false
+    rl.edit_plain(bot, chat_id, msg_id, text).await
 }
 
 pub(crate) async fn send_final(
@@ -1041,17 +1035,13 @@ pub(crate) async fn ask_permission(
             pending.write().await.remove(call_id);
             // FIX-2: Notify user that permission timed out.
             if let Ok(msg) = &sent {
-                let _ = bot
-                    .edit_message_text(
-                        ctx.chat_id,
-                        msg.id,
-                        format!(
-                            "⏱ <b>{}</b> — время ожидания истекло ({}s). Запрос отменён.",
-                            escape_html(tool_name),
-                            PERMISSION_TIMEOUT.as_secs()
-                        ),
-                    )
-                    .parse_mode(ParseMode::Html)
+                let text = format!(
+                    "⏱ <b>{}</b> — время ожидания истекло ({}s). Запрос отменён.",
+                    escape_html(tool_name),
+                    PERMISSION_TIMEOUT.as_secs()
+                );
+                RATE_LIMITER
+                    .edit_html(bot, ctx.chat_id, msg.id, &text)
                     .await;
             }
             false
@@ -1142,43 +1132,27 @@ pub(crate) async fn flush_live(
     }
     *last_sent = trimmed.clone();
 
-    // If HTML was previously rejected, go straight to plain text
+    // All edits go through the global rate limiter.
+    let rl = &*RATE_LIMITER;
+
     if *html_broken {
         let plain = strip_html_tags(&trimmed);
-        let _ = bot.edit_message_text(chat_id, msg_id, &plain).await;
+        rl.edit_plain(bot, chat_id, msg_id, &plain).await;
         return true;
     }
 
-    let result = bot
-        .edit_message_text(chat_id, msg_id, &trimmed)
-        .parse_mode(ParseMode::Html)
-        .await;
-    match result {
-        Ok(_) => true,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("429") || err_str.contains("Too Many Requests") {
-                tracing::debug!("rate-limited on live edit");
-                *last_sent = String::new();
-                false
-            } else if err_str.contains("not modified") {
-                true
-            } else if err_str.contains("can't parse entities")
-                || err_str.contains("Unsupported start tag")
-                || err_str.contains("Can't find end tag")
-            {
-                // HTML rejected — fall back to plain text for rest of stream
-                tracing::warn!("HTML preview rejected, switching to plain text: {e}");
-                *html_broken = true;
-                let plain = strip_html_tags(&trimmed);
-                let _ = bot.edit_message_text(chat_id, msg_id, &plain).await;
-                true
-            } else {
-                tracing::warn!("edit_message_text error: {e}");
-                true
-            }
+    let ok = rl.edit_html(bot, chat_id, msg_id, &trimmed).await;
+    if !ok {
+        // Rate limiter returned false — either 429 (parked) or HTML error.
+        // Try plain text as fallback.
+        let plain = strip_html_tags(&trimmed);
+        if !rl.edit_plain(bot, chat_id, msg_id, &plain).await {
+            *last_sent = String::new(); // force retry next tick
+            return false;
         }
+        *html_broken = true;
     }
+    true
 }
 
 #[cfg(test)]

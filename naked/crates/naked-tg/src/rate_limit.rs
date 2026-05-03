@@ -1,67 +1,246 @@
-//! Adaptive per-chat Telegram rate limiter.
+//! Global Telegram edit rate limiter — 429 unreachable by construction.
 //!
-//! Telegram Bot API limits:
-//! - ~30 msg/edits per chat per minute
-//! - ~30 msg/sec globally
-//! - 429 responses include `retry_after` seconds
+//! **Every** `edit_message_text` call in the bot MUST go through
+//! [`RateLimiter::edit`] instead of calling the Bot API directly.
+//! This ensures a single rolling-window budget per `chat_id` (TG's
+//! actual rate-limit boundary) regardless of how many threads,
+//! streaming sessions, callbacks, or one-shot edits share that chat.
 //!
-//! This limiter tracks per-chat + global sliding windows and adapts
-//! the edit interval on 429 (backoff) and success (recovery).
-//! Never panics or drops — just delays.
-//!
-//! Design: single struct, no I/O, no Telegram API dependency.
+//! On 429: the limiter parks ALL edits for that chat for the full
+//! `Retry-After` duration. No retry loops, no cascading bans.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use teloxide::prelude::*;
+use teloxide::types::{MessageId, ParseMode};
 use tokio::sync::Mutex;
 
-/// Conservative per-chat limit (Telegram allows ~30).
-const PER_CHAT_PER_MIN: usize = 25;
-/// Global bot-wide limit per minute.
-const GLOBAL_PER_MIN: usize = 200;
-/// Floor for adaptive edit gap (ms).
-pub const MIN_GAP_MS: u64 = 2_000;
-/// Ceiling for adaptive edit gap (ms).
-pub const MAX_GAP_MS: u64 = 15_000;
-/// Starting edit gap (ms).
-const DEFAULT_GAP_MS: u64 = 2_500;
-/// On success: gap *= RECOVERY (shrink toward floor).
-const RECOVERY: f64 = 0.85;
-/// On 429: gap *= BACKOFF (grow toward ceiling).
-const BACKOFF: f64 = 2.0;
+/// TG allows ~30 edits/min/chat. We budget 25 to stay safe.
+const BUDGET: u32 = 25;
+/// 60s / 25 = 2.4s minimum gap between edits to the same chat.
+const MIN_GAP: Duration = Duration::from_millis(2_400);
+/// Hard ceiling — even under backoff, never wait longer than this.
+const MAX_GAP: Duration = Duration::from_secs(120);
 
-/// Chat identifier: (chat_id, thread_id).
-pub type ChatKey = (i64, Option<i32>);
-
-struct PerChat {
-    window: VecDeque<tokio::time::Instant>,
-    gap_ms: u64,
-    last: Option<tokio::time::Instant>,
-}
-
-impl PerChat {
-    fn new() -> Self {
-        Self {
-            window: VecDeque::new(),
-            gap_ms: DEFAULT_GAP_MS,
-            last: None,
-        }
-    }
-
-    fn prune(&mut self, now: tokio::time::Instant) {
-        let cutoff = now - Duration::from_secs(60);
-        while self.window.front().is_some_and(|&t| t < cutoff) {
-            self.window.pop_front();
-        }
-    }
-}
-
-/// Adaptive rate limiter. Cheap to clone (Arc inside).
+/// Global rate limiter. One instance shared by the entire bot.
+///
+/// Tracks edits per **chat_id** (not per thread/message).
+/// Streaming tickers, callbacks, commands — all go through [`Self::edit`].
 #[derive(Clone)]
 pub struct RateLimiter {
-    chats: Arc<Mutex<HashMap<ChatKey, PerChat>>>,
-    global: Arc<Mutex<VecDeque<tokio::time::Instant>>>,
+    inner: Arc<Mutex<State>>,
+}
+
+struct ChatState {
+    /// When the last edit was sent (or attempted).
+    last_edit: Instant,
+    /// If we got a 429, don't try again until this instant.
+    blocked_until: Option<Instant>,
+    /// How many edits in the current rolling window.
+    window_edits: Vec<Instant>,
+}
+
+impl ChatState {
+    fn new() -> Self {
+        Self {
+            last_edit: Instant::now() - Duration::from_secs(10),
+            blocked_until: None,
+            window_edits: Vec::new(),
+        }
+    }
+
+    /// Prune edits older than 60s from the rolling window.
+    fn prune_window(&mut self) {
+        let cutoff = Instant::now() - Duration::from_secs(60);
+        self.window_edits.retain(|t| *t > cutoff);
+    }
+
+    /// How long until the next edit is allowed.
+    fn time_until_allowed(&mut self) -> Duration {
+        // If TG told us to wait, respect it.
+        if let Some(until) = self.blocked_until {
+            let now = Instant::now();
+            if until > now {
+                return until - now;
+            }
+            self.blocked_until = None;
+        }
+
+        self.prune_window();
+
+        // If we've used the budget, wait until the oldest edit falls out of the window.
+        if self.window_edits.len() as u32 >= BUDGET {
+            let oldest = self.window_edits[0];
+            let expires = oldest + Duration::from_secs(60);
+            let now = Instant::now();
+            if expires > now {
+                return expires - now;
+            }
+        }
+
+        // Enforce minimum gap from last edit.
+        let since_last = self.last_edit.elapsed();
+        if since_last < MIN_GAP {
+            return MIN_GAP - since_last;
+        }
+
+        Duration::ZERO
+    }
+
+    fn record_edit(&mut self) {
+        let now = Instant::now();
+        self.last_edit = now;
+        self.window_edits.push(now);
+    }
+
+    fn record_429(&mut self, retry_after_secs: u64) {
+        let wait = Duration::from_secs(retry_after_secs.clamp(1, MAX_GAP.as_secs()));
+        self.blocked_until = Some(Instant::now() + wait);
+    }
+}
+
+struct State {
+    chats: HashMap<i64, ChatState>,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(State {
+                chats: HashMap::new(),
+            })),
+        }
+    }
+
+    /// The **only** way to edit a message. Waits for the rate limit
+    /// window, sends the edit, and handles 429 transparently.
+    ///
+    /// Returns `true` if the edit succeeded, `false` if it was dropped
+    /// (429 + backoff).
+    pub async fn edit(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        msg_id: MessageId,
+        text: &str,
+        html: bool,
+    ) -> bool {
+        let cid = chat_id.0;
+
+        // Wait for our turn.
+        let wait = {
+            let mut state = self.inner.lock().await;
+            let cs = state.chats.entry(cid).or_insert_with(ChatState::new);
+            cs.time_until_allowed()
+        };
+        if wait > Duration::ZERO {
+            // If blocked for a long time, just drop this edit (stale UI update).
+            if wait > Duration::from_secs(30) {
+                tracing::debug!(
+                    chat = cid,
+                    wait_ms = wait.as_millis() as u64,
+                    "rate_limit: dropping edit (backoff too long)"
+                );
+                return false;
+            }
+            tokio::time::sleep(wait).await;
+        }
+
+        // Send.
+        let result = if html {
+            bot.edit_message_text(chat_id, msg_id, text)
+                .parse_mode(ParseMode::Html)
+                .await
+        } else {
+            bot.edit_message_text(chat_id, msg_id, text).await
+        };
+
+        let mut state = self.inner.lock().await;
+        let cs = state.chats.entry(cid).or_insert_with(ChatState::new);
+
+        match result {
+            Ok(_) => {
+                cs.record_edit();
+                true
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                // Parse "Retry after Xs" or "retry after Xs"
+                if let Some(secs) = parse_retry_after(&err_str) {
+                    tracing::warn!(
+                        chat = cid,
+                        retry_after = secs,
+                        "rate_limit: 429, parking chat"
+                    );
+                    cs.record_429(secs);
+                } else {
+                    // Non-rate-limit error (message not modified, chat not found, etc).
+                    // Still count as an edit attempt for window purposes.
+                    cs.record_edit();
+                    tracing::debug!(chat = cid, err = %err_str, "rate_limit: edit failed (non-429)");
+                }
+                false
+            }
+        }
+    }
+
+    /// Convenience: edit with HTML parse mode.
+    pub async fn edit_html(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        msg_id: MessageId,
+        text: &str,
+    ) -> bool {
+        self.edit(bot, chat_id, msg_id, text, true).await
+    }
+
+    /// Convenience: edit as plain text.
+    pub async fn edit_plain(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        msg_id: MessageId,
+        text: &str,
+    ) -> bool {
+        self.edit(bot, chat_id, msg_id, text, false).await
+    }
+
+    /// Current interval for a streaming ticker (used by streaming_mod).
+    /// Based on how many active streaming sessions share the same chat_id.
+    pub async fn streaming_interval(&self, chat_id: i64) -> Duration {
+        let state = self.inner.lock().await;
+        let cs = match state.chats.get(&chat_id) {
+            Some(cs) => cs,
+            None => return MIN_GAP,
+        };
+        if let Some(until) = cs.blocked_until.filter(|u| *u > Instant::now()) {
+            return until - Instant::now();
+        }
+        MIN_GAP
+    }
+
+    /// Check if a chat is currently in 429 backoff.
+    pub async fn is_blocked(&self, chat_id: i64) -> bool {
+        let state = self.inner.lock().await;
+        state
+            .chats
+            .get(&chat_id)
+            .and_then(|cs| cs.blocked_until)
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    /// Stats for /metrics.
+    pub async fn active_count(&self) -> usize {
+        let state = self.inner.lock().await;
+        state.chats.len()
+    }
+
+    /// Current interval for display.
+    pub async fn interval(&self) -> Duration {
+        MIN_GAP
+    }
 }
 
 impl Default for RateLimiter {
@@ -70,226 +249,116 @@ impl Default for RateLimiter {
     }
 }
 
-impl RateLimiter {
-    pub fn new() -> Self {
-        Self {
-            chats: Arc::new(Mutex::new(HashMap::new())),
-            global: Arc::new(Mutex::new(VecDeque::new())),
-        }
-    }
-
-    /// Block until both per-chat and global limits allow a call.
-    /// Returns the current gap for this chat.
-    pub async fn acquire(&self, chat: ChatKey) -> Duration {
-        loop {
-            // ── Global ──
-            {
-                let mut g = self.global.lock().await;
-                let now = tokio::time::Instant::now();
-                let cutoff = now - Duration::from_secs(60);
-                while g.front().is_some_and(|&t| t < cutoff) {
-                    g.pop_front();
-                }
-                if g.len() >= GLOBAL_PER_MIN {
-                    let wait = *g.front().expect("len >= 1") + Duration::from_secs(60);
-                    drop(g);
-                    tokio::time::sleep_until(wait).await;
-                    continue;
-                }
-            }
-
-            // ── Per-chat ──
-            let mut chats = self.chats.lock().await;
-            let pc = chats.entry(chat).or_insert_with(PerChat::new);
-            let now = tokio::time::Instant::now();
-            pc.prune(now);
-
-            if pc.window.len() >= PER_CHAT_PER_MIN {
-                let wait = *pc.window.front().expect("len >= 1") + Duration::from_secs(60);
-                drop(chats);
-                tokio::time::sleep_until(wait).await;
-                continue;
-            }
-
-            // ── Adaptive gap ──
-            let gap = Duration::from_millis(pc.gap_ms);
-            if let Some(last) = pc.last {
-                let since = now.duration_since(last);
-                if since < gap {
-                    drop(chats);
-                    tokio::time::sleep(gap - since).await;
-                    continue;
-                }
-            }
-
-            // Record
-            pc.window.push_back(now);
-            pc.last = Some(now);
-            let out = Duration::from_millis(pc.gap_ms);
-            drop(chats);
-            self.global.lock().await.push_back(now);
-            return out;
-        }
-    }
-
-    /// Successful call — shrink gap toward floor.
-    pub async fn report_ok(&self, chat: ChatKey) {
-        let mut chats = self.chats.lock().await;
-        if let Some(pc) = chats.get_mut(&chat) {
-            pc.gap_ms = ((pc.gap_ms as f64 * RECOVERY) as u64).max(MIN_GAP_MS);
-        }
-    }
-
-    /// 429 received — grow gap toward ceiling.
-    pub async fn report_429(&self, chat: ChatKey, retry_after: Option<u64>) {
-        let mut chats = self.chats.lock().await;
-        let pc = chats.entry(chat).or_insert_with(PerChat::new);
-        if let Some(secs) = retry_after {
-            pc.gap_ms = (secs * 1000 / PER_CHAT_PER_MIN as u64)
-                .max(pc.gap_ms)
-                .min(MAX_GAP_MS);
-        } else {
-            pc.gap_ms = ((pc.gap_ms as f64 * BACKOFF) as u64).min(MAX_GAP_MS);
-        }
-    }
-
-    /// Current gap for a chat (non-blocking peek).
-    /// Current gap for a chat (non-blocking peek).
-    pub async fn gap(&self, chat: ChatKey) -> Duration {
-        let chats = self.chats.lock().await;
-        Duration::from_millis(
-            chats
-                .get(&chat)
-                .map(|pc| pc.gap_ms)
-                .unwrap_or(DEFAULT_GAP_MS),
-        )
-    }
-
-    /// Snapshot for /metrics display.
-    pub async fn stats(&self) -> RateLimiterStats {
-        let chats = self.chats.lock().await;
-        let global = self.global.lock().await;
-        RateLimiterStats {
-            active_chats: chats.len(),
-            global_calls_last_min: global.len(),
-            chat_gaps: chats
-                .iter()
-                .map(|(k, v)| (*k, v.gap_ms, v.window.len()))
-                .collect(),
-        }
-    }
+/// Parse "Retry after Xs" from a Telegram error string.
+fn parse_retry_after(err: &str) -> Option<u64> {
+    let lower = err.to_lowercase();
+    let idx = lower.find("retry after")?;
+    let after = &err[idx + "retry after".len()..];
+    let num: String = after
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
 }
 
-/// Metrics snapshot from the rate limiter.
-#[derive(Debug)]
-pub struct RateLimiterStats {
-    pub active_chats: usize,
-    pub global_calls_last_min: usize,
-    /// (chat_key, current_gap_ms, calls_in_window)
-    pub chat_gaps: Vec<(ChatKey, u64, usize)>,
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn first_acquire_is_instant() {
-        let rl = RateLimiter::new();
-        let t0 = tokio::time::Instant::now();
-        let _ = rl.acquire((1, None)).await;
-        assert!(t0.elapsed() < Duration::from_millis(50));
-    }
-
-    #[tokio::test]
-    async fn second_acquire_waits_gap() {
-        let rl = RateLimiter::new();
-        let chat = (1, None);
-        let _ = rl.acquire(chat).await;
-        let t0 = tokio::time::Instant::now();
-        let _ = rl.acquire(chat).await;
-        assert!(
-            t0.elapsed() >= Duration::from_millis(MIN_GAP_MS - 200),
-            "waited {:?}",
-            t0.elapsed()
+    #[test]
+    fn parse_retry_after_telegram_format() {
+        assert_eq!(parse_retry_after("Retry after 56s"), Some(56));
+        assert_eq!(
+            parse_retry_after("Too Many Requests: retry after 28"),
+            Some(28)
         );
+        assert_eq!(parse_retry_after("retry after 3"), Some(3));
+        assert_eq!(parse_retry_after("some other error"), None);
     }
 
     #[tokio::test]
-    async fn different_chats_dont_block() {
+    async fn fresh_chat_no_wait() {
         let rl = RateLimiter::new();
-        let _ = rl.acquire((1, None)).await;
-        let t0 = tokio::time::Instant::now();
-        let _ = rl.acquire((2, None)).await;
-        assert!(t0.elapsed() < Duration::from_millis(100));
+        // A brand new chat should have zero wait after the first MIN_GAP from init.
+        // We init last_edit to 10s ago, so no wait.
+        let wait = {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.entry(123).or_insert_with(ChatState::new);
+            cs.time_until_allowed()
+        };
+        assert_eq!(wait, Duration::ZERO);
     }
 
     #[tokio::test]
-    async fn backoff_grows_gap() {
+    async fn min_gap_enforced() {
         let rl = RateLimiter::new();
-        let chat = (1, None);
-        let before = rl.gap(chat).await;
-        rl.report_429(chat, None).await;
-        let after = rl.gap(chat).await;
-        assert!(after > before, "{after:?} should > {before:?}");
-    }
-
-    #[tokio::test]
-    async fn recovery_shrinks_gap() {
-        let rl = RateLimiter::new();
-        let chat = (1, None);
-        rl.report_429(chat, None).await;
-        let backed = rl.gap(chat).await;
-        rl.report_ok(chat).await;
-        let recovered = rl.gap(chat).await;
-        assert!(recovered < backed, "{recovered:?} should < {backed:?}");
-    }
-
-    #[tokio::test]
-    async fn gap_floor() {
-        let rl = RateLimiter::new();
-        let chat = (1, None);
-        for _ in 0..50 {
-            rl.report_ok(chat).await;
+        {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.entry(123).or_insert_with(ChatState::new);
+            cs.record_edit(); // just edited
         }
-        let gap = rl.gap(chat).await;
-        assert!(gap >= Duration::from_millis(MIN_GAP_MS), "floor: {gap:?}");
+        let wait = {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.get_mut(&123).unwrap();
+            cs.time_until_allowed()
+        };
+        // Should be close to MIN_GAP (2.4s)
+        assert!(wait > Duration::from_millis(2_000));
+        assert!(wait <= MIN_GAP);
     }
 
     #[tokio::test]
-    async fn gap_ceiling() {
+    async fn backoff_429() {
         let rl = RateLimiter::new();
-        let chat = (1, None);
-        for _ in 0..50 {
-            rl.report_429(chat, None).await;
+        {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.entry(123).or_insert_with(ChatState::new);
+            cs.record_429(10);
         }
-        let gap = rl.gap(chat).await;
-        assert!(gap <= Duration::from_millis(MAX_GAP_MS), "ceiling: {gap:?}");
+        let wait = {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.get_mut(&123).unwrap();
+            cs.time_until_allowed()
+        };
+        // Should be close to 10s
+        assert!(wait > Duration::from_secs(9));
+        assert!(wait <= Duration::from_secs(11));
     }
 
     #[tokio::test]
-    async fn retry_after_respected() {
+    async fn budget_exhaustion_waits() {
         let rl = RateLimiter::new();
-        let chat = (1, None);
-        rl.report_429(chat, Some(30)).await;
-        let gap = rl.gap(chat).await;
-        assert!(gap >= Duration::from_millis(1_000), "retry_after: {gap:?}");
+        {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.entry(123).or_insert_with(ChatState::new);
+            // Fill the budget
+            for _ in 0..BUDGET {
+                cs.window_edits.push(Instant::now());
+            }
+            cs.last_edit = Instant::now() - Duration::from_secs(10); // no min_gap issue
+        }
+        let wait = {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.get_mut(&123).unwrap();
+            cs.time_until_allowed()
+        };
+        // Should wait until oldest edit falls out of 60s window (~60s)
+        assert!(wait > Duration::from_secs(50));
     }
 
     #[tokio::test]
-    async fn concurrent_chats_fair() {
+    async fn is_blocked_after_429() {
         let rl = RateLimiter::new();
-        // 3 chats each acquire — all should succeed quickly
-        let t0 = tokio::time::Instant::now();
-        let (a, b, c) = tokio::join!(
-            rl.acquire((1, None)),
-            rl.acquire((2, None)),
-            rl.acquire((3, None)),
-        );
-        assert!(t0.elapsed() < Duration::from_millis(200));
-        // All returned reasonable gaps
-        assert!(a >= Duration::from_millis(MIN_GAP_MS));
-        assert!(b >= Duration::from_millis(MIN_GAP_MS));
-        assert!(c >= Duration::from_millis(MIN_GAP_MS));
+        {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.entry(123).or_insert_with(ChatState::new);
+            cs.record_429(30);
+        }
+        assert!(rl.is_blocked(123).await);
     }
 }

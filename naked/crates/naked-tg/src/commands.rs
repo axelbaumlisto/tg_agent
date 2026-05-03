@@ -261,20 +261,16 @@ pub(crate) async fn handle_command(
         }
         "/metrics" => {
             let snap = crate::metrics::snapshot();
-            let rl_stats = (*RATE_LIMITER).stats().await;
+            let active = (*RATE_LIMITER).active_count().await;
+            let interval = (*RATE_LIMITER).interval().await;
             let mut text = snap.render_text();
             text.push_str(&format!(
-                "\n\nRate limiter:\n\
+                "\n\nRate limiter (proactive):\n\
                  • active chats: {}\n\
-                 • global calls/min: {}",
-                rl_stats.active_chats, rl_stats.global_calls_last_min,
+                 • edit interval: {}ms",
+                active,
+                interval.as_millis(),
             ));
-            for (key, gap_ms, calls) in &rl_stats.chat_gaps {
-                text.push_str(&format!(
-                    "\n  chat {}: gap={}ms, calls/min={}",
-                    key.0, gap_ms, calls
-                ));
-            }
             reply_text(bot, &ctx, text).await?;
         }
         "/compact" => {

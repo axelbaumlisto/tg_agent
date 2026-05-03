@@ -1422,10 +1422,12 @@ mod tests {
                     let _ = tx.send(AgentEvent::Idle).await;
                 }
             });
+            let (steer_tx, _steer_rx) = tokio::sync::mpsc::channel(1);
             Ok((
                 AgentHandle {
                     events: rx,
                     permissions: perm_tx,
+                    steer: steer_tx,
                 },
                 "test-provider".into(),
                 "test-model".into(),
@@ -1570,9 +1572,11 @@ mod tests {
         // first iteration and return without consuming any event.
         let (_perm_tx, _perm_rx) = tokio::sync::mpsc::channel(1);
         let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(8);
+        let (steer_tx2, _steer_rx2) = tokio::sync::mpsc::channel(1);
         let mut handle = AgentHandle {
             events: ev_rx,
             permissions: _perm_tx,
+            steer: steer_tx2,
         };
         // Push some events; they must be ignored.
         ev_tx.send(AgentEvent::TextDelta("a".into())).await.unwrap();
