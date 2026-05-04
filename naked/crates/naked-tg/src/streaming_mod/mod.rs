@@ -28,6 +28,12 @@ pub(crate) struct CompositeView {
     tick: usize,
     phase: &'static str,
     started_at: std::time::Instant,
+    /// When the currently running tool started (for per-tool timer).
+    tool_started_at: Option<std::time::Instant>,
+    /// Name of the currently running tool.
+    active_tool: Option<String>,
+    /// Last few lines of stdout/stderr from the running tool.
+    tool_output: Option<String>,
     /// Live count of messages queued while this turn is active.
     queue_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Set when a provider error occurs — used to show retry buttons after final.
@@ -46,6 +52,9 @@ impl CompositeView {
             sub_agent_order: Vec::new(),
             response_text: String::new(),
             usage: None,
+            tool_started_at: None,
+            active_tool: None,
+            tool_output: None,
             model_tag,
             tick: 0,
             phase: "thinking",
@@ -114,6 +123,33 @@ impl CompositeView {
         let start = self.tool_lines.len().saturating_sub(TOOL_WINDOW);
         for line in &self.tool_lines[start..] {
             parts.push(line.clone());
+        }
+
+        // ── Active tool with per-tool timer + stdout preview ─────
+        if let (Some(name), Some(started)) = (&self.active_tool, &self.tool_started_at) {
+            let secs = started.elapsed().as_secs();
+            let timer = if secs < 60 {
+                format!("{secs}s")
+            } else {
+                format!("{}:{:02}", secs / 60, secs % 60)
+            };
+            parts.push(format!(
+                "\u{1f527} <b>{}</b> \u{23f1} {timer}",
+                escape_html(name)
+            ));
+            if let Some(out) = &self.tool_output {
+                for line in out
+                    .lines()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    let trimmed = if line.len() > 80 { &line[..80] } else { line };
+                    parts.push(format!("  <code>{}</code>", escape_html(trimmed)));
+                }
+            }
         }
 
         self.render_sub_agent_lines(&mut parts);
@@ -745,6 +781,10 @@ pub(crate) async fn stream_response(
                 }
                 AgentEvent::UsageUpdate(u) => {
                     handlers::handle_usage(&mut view, u);
+                    dirty = true;
+                }
+                AgentEvent::ToolOutput { chunk, .. } => {
+                    view.tool_output = Some(chunk);
                     dirty = true;
                 }
                 AgentEvent::SteerReceived { text } => {

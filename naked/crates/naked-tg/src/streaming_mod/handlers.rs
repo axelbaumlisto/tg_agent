@@ -56,6 +56,10 @@ pub(crate) fn handle_tool_start(
     }
     view.tool_lines
         .push(format!("🔧 <b>{}</b>({preview})…", escape_html(name)));
+    // Track active tool for per-tool timer + stdout preview.
+    view.active_tool = Some(name.to_string());
+    view.tool_started_at = Some(std::time::Instant::now());
+    view.tool_output = None;
     ViewAction::DirtyFlush
 }
 
@@ -66,6 +70,11 @@ pub(crate) fn handle_tool_end(
     is_error: bool,
     output: &str,
 ) -> (ViewAction, Option<String>) {
+    // Clear active tool — it's done.
+    view.active_tool = None;
+    view.tool_started_at = None;
+    view.tool_output = None;
+
     let icon = if is_error { "❌" } else { "✅" };
     let budget = if is_error { 500 } else { 80 };
     let title = truncate_str(output, budget);

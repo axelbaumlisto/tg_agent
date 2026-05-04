@@ -320,6 +320,12 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
                     "\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m"
                 );
             }
+            AgentEvent::ToolOutput { chunk, .. } => {
+                // Show last line of bash output inline:
+                if let Some(last) = chunk.lines().last() {
+                    eprint!("\r\x1b[2K\x1b[90m  > {last}\x1b[0m");
+                }
+            }
             AgentEvent::SteerReceived { text } => {
                 eprintln!("\x1b[36m[steer: {text}]\x1b[0m");
             }

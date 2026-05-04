@@ -295,6 +295,11 @@ pub enum AgentEvent {
         /// Number of tracked files (read + modified).
         files_count: usize,
     },
+    /// Partial stdout/stderr from a running tool (e.g. bash).
+    ToolOutput {
+        call_id: String,
+        chunk: String,
+    },
     /// A steer message from the user was injected into the active turn.
     SteerReceived {
         text: String,

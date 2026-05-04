@@ -202,6 +202,27 @@ impl BashTool {
             ops: Some(ops),
         }
     }
+
+    /// Parse + validate input. Shared by execute() and execute_with_progress().
+    fn parse_input(&self, input: serde_json::Value) -> Result<(BashInput, Duration), ToolResult> {
+        let input: BashInput = serde_json::from_value(input).map_err(|e| ToolResult {
+            output: format!("Invalid input: {e}"),
+            is_error: true,
+        })?;
+        if is_self_destructive(&input.command) {
+            return Err(ToolResult {
+                output: "Blocked: this command would restart/kill the bot process. \
+                         Use the operator's terminal instead."
+                    .into(),
+                is_error: true,
+            });
+        }
+        let timeout = input
+            .timeout
+            .map(Duration::from_secs)
+            .unwrap_or(self.timeout);
+        Ok((input, timeout))
+    }
 }
 
 #[derive(Deserialize)]
@@ -249,30 +270,10 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
-        let input: BashInput = match serde_json::from_value(input) {
+        let (input, timeout) = match self.parse_input(input) {
             Ok(v) => v,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("Invalid input: {e}"),
-                    is_error: true,
-                };
-            }
+            Err(e) => return e,
         };
-
-        // Block commands that would kill/restart the bot itself.
-        if is_self_destructive(&input.command) {
-            return ToolResult {
-                output: "Blocked: this command would restart/kill the bot process. \
-                         Use the operator's terminal instead."
-                    .into(),
-                is_error: true,
-            };
-        }
-
-        let timeout = input
-            .timeout
-            .map(Duration::from_secs)
-            .unwrap_or(self.timeout);
 
         // B7: Dispatch to remote ops or local execution.
         enum ExecOutcome {
@@ -374,6 +375,155 @@ impl Tool for BashTool {
                 output: format!("Command timed out after {}s", timeout.as_secs()),
                 is_error: true,
             },
+        }
+    }
+
+    async fn execute_with_progress(
+        &self,
+        input: serde_json::Value,
+        cwd: &Path,
+        progress: tokio::sync::mpsc::Sender<crate::types::AgentEvent>,
+    ) -> ToolResult {
+        // For remote ops, fall back to non-streaming execute.
+        if self.ops.is_some() {
+            return self.execute(input, cwd).await;
+        }
+
+        let (input, timeout_dur) = match self.parse_input(input) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+        use tokio::io::AsyncBufReadExt;
+        use tokio::process::Command;
+
+        let mut child = match Command::new("bash")
+            .arg("-c")
+            .arg(&input.command)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult {
+                    output: format!("Failed to spawn bash: {e}"),
+                    is_error: true,
+                };
+            }
+        };
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        // Merge stdout + stderr into a single stream, keep last N lines as tail.
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(256);
+
+        // Reader tasks:
+        let tx1 = line_tx.clone();
+        let stdout_task = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if tx1.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let tx2 = line_tx;
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if tx2.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Collector: accumulate all output + send ToolOutput every 2s.
+        const TAIL_LINES: usize = 5;
+        const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+        const MAX_COLLECTED: usize = 512 * 1024; // 512KB max
+
+        let mut all_lines: Vec<String> = Vec::new();
+        let mut total_bytes: usize = 0;
+        let mut last_progress = std::time::Instant::now();
+        let call_id = String::new(); // We don't have call_id here, use empty.
+
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+
+        loop {
+            tokio::select! {
+                line = line_rx.recv() => {
+                    match line {
+                        Some(l) => {
+                            total_bytes += l.len() + 1;
+                            if total_bytes < MAX_COLLECTED {
+                                all_lines.push(l);
+                            }
+                            // Send progress every PROGRESS_INTERVAL:
+                            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                                let tail: String = all_lines
+                                    .iter()
+                                    .rev()
+                                    .take(TAIL_LINES)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let _ = progress
+                                    .send(crate::types::AgentEvent::ToolOutput {
+                                        call_id: call_id.clone(),
+                                        chunk: tail,
+                                    })
+                                    .await;
+                                last_progress = std::time::Instant::now();
+                            }
+                        }
+                        None => break, // Both readers done.
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = child.kill().await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return ToolResult {
+                        output: format!("Command timed out after {}s", timeout_dur.as_secs()),
+                        is_error: true,
+                    };
+                }
+            }
+        }
+
+        // Wait for child to exit.
+        let status = child.wait().await;
+        stdout_task.abort();
+        stderr_task.abort();
+
+        let success = status.map(|s| s.success()).unwrap_or(false);
+        let raw = all_lines.join("\n");
+        const MAX_STREAM: usize = 16_384;
+        let output = truncate_output(&raw, MAX_STREAM);
+
+        let total_lines = all_lines.len();
+        let mut combined = output;
+        if total_bytes > MAX_STREAM || total_lines > 500 {
+            combined.push_str(&format!(
+                "\n[{total_lines} lines, {total_bytes} bytes total\
+                 {}]",
+                if total_bytes > MAX_STREAM {
+                    ", truncated"
+                } else {
+                    ""
+                }
+            ));
+        }
+
+        ToolResult {
+            output: combined,
+            is_error: !success,
         }
     }
 }
