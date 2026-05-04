@@ -1173,7 +1173,8 @@ pub(crate) static RATE_LIMITER: LazyLock<naked_tg::rate_limit::RateLimiter> =
 mod commands;
 mod fmt_utils;
 use commands::{
-    drop_slash_for_persona, get_or_create_session, handle_command, launch_research_run_with_ui,
+    drop_slash_for_persona, get_or_create_session, handle_command,
+    research::launch_research_run_with_ui,
 };
 
 // ── Formatting helpers ──────────────────────────────────────────────────────

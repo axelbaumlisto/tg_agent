@@ -83,6 +83,14 @@ pub(crate) fn handle_tool_end(
         escape_html(name),
         escape_html(&title)
     ));
+    // Show first 2 lines of error output inline so user sees what broke:
+    if is_error {
+        for line in output.lines().take(2) {
+            let trimmed = if line.len() > 100 { &line[..100] } else { line };
+            view.tool_lines
+                .push(format!("  <code>{}</code>", escape_html(trimmed)));
+        }
+    }
     let detail_msg = if is_error && output.len() > 500 {
         let detail = truncate_str(output, 2000);
         Some(format!(

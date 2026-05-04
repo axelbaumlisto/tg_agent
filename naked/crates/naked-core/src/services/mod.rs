@@ -84,6 +84,26 @@ impl EventSink for ChannelEventSink {
 }
 
 // ---------------------------------------------------------------------------
+// ToolBuilder — construct per-session tool registries
+// ---------------------------------------------------------------------------
+
+/// Build a tool registry for a specific session.
+///
+/// Decouples session_ops from the concrete tool construction pipeline
+/// (core tools, research tools, skills, MCP, extras).
+#[async_trait]
+pub trait ToolBuilder: Send + Sync {
+    async fn build_registry(
+        &self,
+        session_id: &str,
+        effective: &crate::EffectiveSessionConfig,
+        provider: &Arc<dyn Provider>,
+        model: &str,
+        workspace: &std::path::Path,
+    ) -> crate::tool::registry::ToolRegistry;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -108,5 +128,12 @@ mod tests {
         drop(rx);
         let sink = ChannelEventSink::new(tx);
         assert!(sink.send_event(AgentEvent::Heartbeat).is_err());
+    }
+
+    /// Compile-time check: AgentCore implements ToolBuilder.
+    #[test]
+    fn agent_core_implements_tool_builder() {
+        fn _assert<T: super::ToolBuilder>() {}
+        _assert::<crate::AgentCore>();
     }
 }

@@ -919,6 +919,21 @@ Keep each section concise. Preserve exact paths and identifiers.";
     // store by construction, which is cheap (no network, one directory).
 }
 
+#[async_trait::async_trait]
+impl crate::services::ToolBuilder for AgentCore {
+    async fn build_registry(
+        &self,
+        session_id: &str,
+        effective: &crate::EffectiveSessionConfig,
+        provider: &std::sync::Arc<dyn crate::provider::Provider>,
+        model: &str,
+        workspace: &std::path::Path,
+    ) -> crate::tool::registry::ToolRegistry {
+        self.build_tool_registry_for(session_id, effective, provider, model, workspace)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -639,8 +639,7 @@ pub(crate) async fn stream_response(
     let mut html_broken = false;
     let mut aborted_for_switch = false;
     let mut last_event_at = tokio::time::Instant::now();
-    let mut stall_warned = false;
-    const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+    let mut stall_level: u8 = 0; // 0=none, 1=warned 60s, 2=critical 120s
 
     // Fixed-interval ticker for streaming flushes.
     // The actual rate limiting happens inside RATE_LIMITER.edit() — the
@@ -661,12 +660,20 @@ pub(crate) async fn stream_response(
         // FIX-3: Detect stalled agent (no events for 90s).
         if event.is_some() {
             last_event_at = tokio::time::Instant::now();
-            stall_warned = false;
-        } else if !stall_warned && last_event_at.elapsed() > STALL_TIMEOUT {
-            stall_warned = true;
-            view.tool_lines
-                .push("⏳ Бот не отвечает >90s — возможно завис. /stop для отмены.".to_string());
-            dirty = true;
+            stall_level = 0;
+        } else {
+            let elapsed = last_event_at.elapsed().as_secs();
+            if stall_level == 0 && elapsed >= 60 {
+                stall_level = 1;
+                view.tool_lines
+                    .push("⚠️ Нет ответа 60с — возможно, зависло".to_string());
+                dirty = true;
+            } else if stall_level == 1 && elapsed >= 120 {
+                stall_level = 2;
+                view.tool_lines
+                    .push("🔴 Зависло 2 мин — /abort чтобы прервать".to_string());
+                dirty = true;
+            }
         }
 
         let has_event = event.is_some();
