@@ -441,3 +441,31 @@ impl AgentCore {
         }
     }
 }
+
+#[cfg(test)]
+mod boundary_tests {
+    #[test]
+    fn research_ops_no_session_access() {
+        let src = include_str!("research_ops.rs");
+        for pattern in [
+            "self.ss.",
+            ".sessions.write",
+            "session_sender",
+            "session_mcp",
+        ] {
+            let hits: Vec<_> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//"))
+                .filter(|(_, l)| !l.contains("pattern"))
+                .filter(|(_, l)| !l.contains("cfg(test)"))
+                .filter(|(_, l)| l.contains(pattern))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "research_ops.rs violates boundary: found '{pattern}' at lines {:?}",
+                hits.iter().map(|(n, _)| n + 1).collect::<Vec<_>>()
+            );
+        }
+    }
+}
