@@ -213,7 +213,7 @@ pub(crate) struct SearchState {
 }
 
 pub struct AgentCore {
-    config: Config,
+    config: arc_swap::ArcSwap<Config>,
     mcp_registry: Arc<RwLock<McpRegistry>>,
 
     /// Per-session MCP servers (connected lazily from session config.json).
@@ -250,6 +250,16 @@ pub struct AgentCore {
 }
 
 impl AgentCore {
+    /// Load current config snapshot. Cheap (Arc clone).
+    pub fn config(&self) -> arc_swap::Guard<std::sync::Arc<Config>> {
+        self.config.load()
+    }
+
+    /// Hot-reload config from a new value.
+    pub fn reload_config(&self, new_config: Config) {
+        self.config.store(std::sync::Arc::new(new_config));
+    }
+
     pub fn new(config: Config, provider: Box<dyn Provider>) -> Self {
         let session_dir = config.session_dir_abs();
         let store = Arc::new(JsonlSessionStore::new(session_dir.clone()));
@@ -296,7 +306,7 @@ impl AgentCore {
         let config_arc = Arc::new(config.clone());
 
         Self {
-            config,
+            config: arc_swap::ArcSwap::from_pointee(config),
             mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
 
             session_mcp: RwLock::new(HashMap::new()),
@@ -457,10 +467,6 @@ impl AgentCore {
     /// obtain a reference back to the core (e.g. `research_launch`).
     pub fn init_self_ref(self: &Arc<Self>) {
         *self.self_ref.write().unwrap() = Some(Arc::downgrade(self));
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.config
     }
 
     /// Expose the research store so CLI / TG handlers can read & write without
@@ -679,10 +685,10 @@ impl research::AgentRunner for AgentCoreResearchRunner {
         // the run record is truthful.
         let effective_provider = provider
             .clone()
-            .unwrap_or_else(|| self.core.config.default_provider.clone());
+            .unwrap_or_else(|| self.core.config().default_provider.clone());
         let effective_model = model
             .clone()
-            .unwrap_or_else(|| self.core.config.default_model.clone());
+            .unwrap_or_else(|| self.core.config().default_model.clone());
 
         Ok((handle, effective_provider, effective_model))
     }

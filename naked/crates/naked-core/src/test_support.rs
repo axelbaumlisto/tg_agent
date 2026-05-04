@@ -9,10 +9,9 @@
 //! Usage:
 //! ```ignore
 //! let tc = TestCore::build();
-//! let sid = tc.core.create_session(tc.workspace()).await;
+//! let sid = tc.core.create_session(&tc.workspace()).await;
 //! ```
 
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -73,8 +72,8 @@ impl TestCore {
         Self { core, _tmp: tmp }
     }
 
-    pub fn workspace(&self) -> &Path {
-        self.core.config().workspace.as_path()
+    pub fn workspace(&self) -> std::path::PathBuf {
+        self.core.config().workspace.clone()
     }
 }
 
@@ -85,14 +84,14 @@ mod tests {
     #[tokio::test]
     async fn test_core_creates_session() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         assert!(!sid.is_empty());
     }
 
     #[tokio::test]
     async fn test_core_list_sessions() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         let sessions = tc.core.list_sessions().await;
         assert!(sessions.iter().any(|s| s.id == sid));
     }
@@ -100,7 +99,7 @@ mod tests {
     #[tokio::test]
     async fn test_core_abort_session() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         tc.core.abort(&sid).await;
         assert!(!tc.core.is_session_active(&sid).await);
     }
@@ -108,7 +107,7 @@ mod tests {
     #[tokio::test]
     async fn test_core_compact_empty_session() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         let result = tc.core.compact_session(&sid).await;
         assert!(result.is_none(), "empty session should not compact");
     }
@@ -116,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn test_core_fork_session() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         let forked = tc.core.fork_session(&sid, Some("test-branch".into())).await;
         assert!(forked.is_ok());
         let fid = forked.unwrap();
@@ -166,7 +165,7 @@ mod session_ops_tests {
     #[tokio::test]
     async fn set_and_get_sender() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         tc.core
             .set_session_sender(&sid, Some("user123".into()))
             .await;
@@ -176,7 +175,7 @@ mod session_ops_tests {
     #[tokio::test]
     async fn sender_cleared() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         tc.core
             .set_session_sender(&sid, Some("user123".into()))
             .await;
@@ -189,7 +188,7 @@ mod session_ops_tests {
         let tc = TestCore::build();
         let sid = tc
             .core
-            .create_session_with_channel(tc.workspace(), "ch42")
+            .create_session_with_channel(&tc.workspace(), "ch42")
             .await;
         assert!(!sid.is_empty());
     }
@@ -197,7 +196,7 @@ mod session_ops_tests {
     #[tokio::test]
     async fn session_workspace_returns_path() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         let ws = tc.core.session_workspace(&sid).await;
         assert!(ws.is_some());
     }
@@ -207,7 +206,7 @@ mod session_ops_tests {
         let tc = TestCore::build();
         for i in 0..5 {
             tc.core
-                .create_session_with_channel(tc.workspace(), &format!("ch{i}"))
+                .create_session_with_channel(&tc.workspace(), &format!("ch{i}"))
                 .await;
         }
         let page1 = tc.core.list_sessions_paged(0, 3).await;
@@ -219,7 +218,7 @@ mod session_ops_tests {
     #[tokio::test]
     async fn queue_message_while_inactive() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         // Queue a message — should not panic even with no active turn
         tc.core.queue_message(&sid, "hello").await;
     }
@@ -227,7 +226,7 @@ mod session_ops_tests {
     #[tokio::test]
     async fn set_channel_id() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         tc.core.set_session_channel_id(&sid, "tg:12345").await;
         let mappings = tc.core.channel_session_mappings().await;
         assert!(mappings.iter().any(|(ch, _)| ch == "tg:12345"));
@@ -236,7 +235,7 @@ mod session_ops_tests {
     #[tokio::test]
     async fn session_total_usage_empty() {
         let tc = TestCore::build();
-        let sid = tc.core.create_session(tc.workspace()).await;
+        let sid = tc.core.create_session(&tc.workspace()).await;
         let usage = tc.core.session_total_usage(&sid).await;
         assert_eq!(usage.input_tokens, 0);
         assert_eq!(usage.output_tokens, 0);

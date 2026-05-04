@@ -18,7 +18,7 @@ impl AgentCore {
     /// Connect to all configured MCP servers.
     /// Returns a list of servers that failed to connect (empty = all ok).
     pub async fn init_mcp(&self) -> Vec<crate::mcp::client::McpConnectFailure> {
-        let servers = self.config.mcp_server_list();
+        let servers = self.config().mcp_server_list();
         if servers.is_empty() {
             return Vec::new();
         }
@@ -183,7 +183,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     }
 
     /// Get or build a provider by name from the global provider catalog.
-    /// Returns the global default if `name` matches `self.config.default_provider`.
+    /// Returns the global default if `name` matches `self.config().default_provider`.
     /// Resolve the named provider from the config catalog, building &
     /// caching it on first request. Empty / unknown names fall back to
     /// the default provider this `AgentCore` was constructed with.
@@ -204,7 +204,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let extra_names: Vec<String> = effective
             .mcp_servers
             .keys()
-            .filter(|name| !self.config.mcp_servers.contains_key(*name))
+            .filter(|name| !self.config().mcp_servers.contains_key(*name))
             .cloned()
             .collect();
 
@@ -245,7 +245,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
     pub async fn create_session_with_channel(&self, workspace: &Path, channel: &str) -> String {
         let system_prompt =
-            prompt::resolve_system_prompt(workspace, self.config.system_prompt_path.as_deref());
+            prompt::resolve_system_prompt(workspace, self.config().system_prompt_path.as_deref());
         let capabilities = self.capabilities_section().await;
         let mut full_prompt = format!(
             "{}\n\n{}\n\n{}",
@@ -253,9 +253,9 @@ Keep each section concise. Preserve exact paths and identifiers.";
             prompt::environment_section(workspace),
             capabilities
         );
-        if self.config.research.enabled {
+        if self.config().research.enabled {
             full_prompt.push_str("\n\n---\n");
-            full_prompt.push_str(&research::briefing::short(&self.config.research));
+            full_prompt.push_str(&research::briefing::short(&self.config().research));
         }
 
         if channel == "telegram" {
@@ -271,8 +271,8 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         let metadata = SessionMetadata {
             name: None,
-            provider: self.config.default_provider.clone(),
-            model: self.config.default_model.clone(),
+            provider: self.config().default_provider.clone(),
+            model: self.config().default_model.clone(),
             channel: channel.into(),
             channel_id: None,
         };
@@ -286,7 +286,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         // Apply per-session config.json overrides to metadata
         let sc = self.load_session_config_pub(&id);
-        let effective = self.config.merge_session(&sc);
+        let effective = self.config().merge_session(&sc);
 
         let mut sessions = self.ss.sessions.write().await;
         let mut session = session;
@@ -327,7 +327,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         // Load per-session config overlay (re-read each turn so edits take effect)
         let sc = self.load_session_config_pub(session_id);
-        let effective = self.config.merge_session(&sc);
+        let effective = self.config().merge_session(&sc);
 
         let mut sessions = self.ss.sessions.write().await;
         let session = sessions
@@ -345,7 +345,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         // Resolve context window: per-session > per-provider > model lookup > global > 128K
         let provider_ctx = self
-            .config
+            .config()
             .providers
             .get(&provider_name)
             .and_then(|pc| pc.context_window);
@@ -386,7 +386,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
                 classifier_text.clone(),
                 session.workspace.clone(),
                 sender_id,
-                self.config.memory.auto_classify_to_drafts,
+                self.config().memory.auto_classify_to_drafts,
             );
         }
 
@@ -400,7 +400,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             tracing::info!(ci.before_msgs, "attempting LLM-based compaction");
             let provider_arc = self.provider_for(&provider_name).await;
 
-            if self.config.memory.daily_enabled && self.config.memory.pre_compaction_flush {
+            if self.config().memory.daily_enabled && self.config().memory.pre_compaction_flush {
                 memory::digest::pre_compaction_flush(
                     &*provider_arc,
                     &model,
@@ -482,36 +482,16 @@ Keep each section concise. Preserve exact paths and identifiers.";
             }
         }
 
-        let mut history = session.history.clone();
-        let original_system_prompt = history.system_prompt().to_string();
-
-        // Inject per-session prompt.md as context (if present)
         let session_root = self.ss.store.session_root(session_id);
-        let prompt_path = effective
-            .system_prompt_path
-            .as_ref()
-            .map(|p| session_root.join(p))
-            .unwrap_or_else(|| session_root.join("prompt.md"));
-        crate::turn::inject_session_prompt(&mut history, &prompt_path).await;
-
-        // Inject persistent memory rules + per-user rules.
         let sender_for_rules = self.session_sender(session_id).await;
-        crate::turn::inject_memory_rules(
-            &mut history,
-            &session.workspace,
+        let (mut history, original_system_prompt) = crate::turn::prepare_history(
+            session,
+            &session_root,
+            &effective,
             sender_for_rules.as_deref(),
-        );
-
-        // Recent memory drafts ("shift") for fresh context.
-        crate::turn::inject_memory_shift(
-            &mut history,
-            &session.workspace,
-            sender_for_rules.as_deref(),
-            &self.config.memory,
-        );
-
-        // B9: Inject file tracker context.
-        crate::turn::inject_file_context(&mut history, &session.files);
+            &self.config().memory,
+        )
+        .await;
 
         let artifacts = self.ss.store.artifacts_dir(session_id);
         if let Err(e) = tokio::fs::create_dir_all(&artifacts).await {
@@ -526,7 +506,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         // Per-provider max_tokens / temperature.
         let (eff_max_tokens, eff_temperature) =
-            crate::turn::resolve_generation_params(&self.config, &provider_name, &effective);
+            crate::turn::resolve_generation_params(&self.config(), &provider_name, &effective);
 
         let loop_config = LoopConfig {
             max_iterations: effective.max_iterations,
@@ -550,7 +530,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         drop(sessions);
 
         // Validate model belongs to provider before making any API calls.
-        if let Some(err_msg) = crate::turn::validate_model(&self.config, &provider_name, &model) {
+        if let Some(err_msg) = crate::turn::validate_model(&self.config(), &provider_name, &model) {
             let _ = tx.send(AgentEvent::Error(err_msg)).await;
             let _ = tx.send(AgentEvent::Idle).await;
             if let Some(s) = self.ss.sessions.write().await.get_mut(session_id) {
@@ -676,7 +656,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     /// summary runs in a background tokio task and never blocks the
     /// caller. No-op when `memory.session_close_summary = false`.
     pub async fn close_session_summary(&self, session_id: &str) {
-        if !self.config.memory.daily_enabled || !self.config.memory.session_close_summary {
+        if !self.config().memory.daily_enabled || !self.config().memory.session_close_summary {
             return;
         }
         let (workspace, transcript, provider_name, model) = {
@@ -743,7 +723,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
                 Ok(Some(mut session)) => {
                     // Apply per-session config.json overrides (provider/model)
                     let sc = self.load_session_config_pub(&session.id);
-                    let effective = self.config.merge_session(&sc);
+                    let effective = self.config().merge_session(&sc);
                     session.metadata.provider = effective.provider;
                     session.metadata.model = effective.model;
 
@@ -793,7 +773,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     }
 
     pub fn list_skills(&self) -> Vec<(String, String)> {
-        let resolver = SkillResolver::new(self.config.skill_roots.clone());
+        let resolver = SkillResolver::new(self.config().skill_roots.clone());
         resolver
             .list()
             .into_iter()
@@ -819,7 +799,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let skills = self.list_skills();
         if !skills.is_empty() {
             let mut s = String::from("Available skills (use the Skill tool to activate):\n");
-            let resolver = SkillResolver::new(self.config.skill_roots.clone());
+            let resolver = SkillResolver::new(self.config().skill_roots.clone());
             for (name, _path) in &skills {
                 let desc = resolver
                     .resolve(name)
@@ -884,7 +864,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         let sender_id = self.session_sender(session_id).await;
 
         let mut tools = crate::tool::factory::core_tools(&crate::tool::factory::CoreToolCtx {
-            config: &self.config,
+            config: &self.config(),
             remote_ctx: &self.remote_ctx,
             agent_registry: &self.agent_registry,
             search: &self.search,
@@ -896,7 +876,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         .await;
 
         tools.extend(crate::tool::factory::research_tools(
-            &self.config,
+            &self.config(),
             &self.research,
             &self.self_ref,
         ));

@@ -15,18 +15,18 @@ impl AgentCore {
         chat_id: Option<i64>,
         thread_id: Option<i32>,
     ) -> Result<ResearchSpec> {
-        if !self.config.research.enabled {
+        if !self.config().research.enabled {
             return Err(AgentError::Config("research subsystem is disabled".into()));
         }
         let mut seeds = sources;
         if seeds.is_empty() {
-            seeds = self.config.research.default_sources.clone();
+            seeds = self.config().research.default_sources.clone();
         }
         // Schedule defaults from config:
         // - default_cron takes priority over default_interval_seconds
         // - auto_first_run = true → run_at = now (scheduler picks up next tick)
         // - default_interval_seconds = 0 → no schedule (manual only)
-        let rcfg = &self.config.research;
+        let rcfg = &self.config().research;
         let cron = rcfg.default_cron.clone();
         let interval = if cron.is_some() {
             None // cron takes priority
@@ -130,7 +130,7 @@ impl AgentCore {
     pub async fn ask_research(&self, id: &str, question: &str) -> Result<String> {
         use tokio_stream::StreamExt;
 
-        if !self.config.research.enabled {
+        if !self.config().research.enabled {
             return Err(AgentError::Config("research subsystem is disabled".into()));
         }
         let q = question.trim();
@@ -181,13 +181,13 @@ impl AgentCore {
         let provider_name = spec
             .provider
             .clone()
-            .or_else(|| self.config.research.provider.clone())
-            .unwrap_or_else(|| self.config.default_provider.clone());
+            .or_else(|| self.config().research.provider.clone())
+            .unwrap_or_else(|| self.config().default_provider.clone());
         let model = spec
             .model
             .clone()
-            .or_else(|| self.config.research.model.clone())
-            .unwrap_or_else(|| self.config.default_model.clone());
+            .or_else(|| self.config().research.model.clone())
+            .unwrap_or_else(|| self.config().default_model.clone());
         let provider = self.provider_for(&provider_name).await;
 
         let system = "You are a research assistant. Answer the user's question \
@@ -283,7 +283,7 @@ impl AgentCore {
         id: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<RunReport> {
-        if !self.config.research.enabled {
+        if !self.config().research.enabled {
             return Err(AgentError::Config("research subsystem is disabled".into()));
         }
         let _permit = acquire_research_permit(&self.research.run_semaphore, id).await?;
@@ -333,7 +333,7 @@ impl AgentCore {
         max_rounds: u32,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<research::VerifiedRunReport> {
-        if !self.config.research.enabled {
+        if !self.config().research.enabled {
             return Err(AgentError::Config("research subsystem is disabled".into()));
         }
         let _permit = acquire_research_permit(&self.research.run_semaphore, id).await?;
@@ -375,7 +375,7 @@ impl AgentCore {
     ) -> Result<()> {
         write_research_memory_link_for(
             self.research.store.as_ref(),
-            &self.config.workspace,
+            &self.config().workspace,
             spec_id,
             run_id,
             verified,
@@ -386,16 +386,16 @@ impl AgentCore {
 
     fn build_coordinator(self: &Arc<Self>) -> ResearchCoordinator {
         let coord_cfg = CoordinatorConfig {
-            default_provider: self.config.research.provider.clone(),
-            default_model: self.config.research.model.clone(),
-            fallback_models: self.config.research.fallback_models.clone(),
-            default_max_iterations: self.config.research.max_iterations,
-            default_max_wall_seconds: self.config.research.max_wall_seconds,
-            workspace: self.config.workspace.clone(),
-            gatekeeper: self.config.research.gatekeeper.clone(),
-            reasoning: self.config.research.reasoning.clone(),
-            provider_capabilities: self.config.providers.clone(),
-            enforce_model_capabilities: self.config.enforce_model_capabilities,
+            default_provider: self.config().research.provider.clone(),
+            default_model: self.config().research.model.clone(),
+            fallback_models: self.config().research.fallback_models.clone(),
+            default_max_iterations: self.config().research.max_iterations,
+            default_max_wall_seconds: self.config().research.max_wall_seconds,
+            workspace: self.config().workspace.clone(),
+            gatekeeper: self.config().research.gatekeeper.clone(),
+            reasoning: self.config().research.reasoning.clone(),
+            provider_capabilities: self.config().providers.clone(),
+            enforce_model_capabilities: self.config().enforce_model_capabilities,
             model_health: Some(self.provider_svc.health()),
             run_events: Some(self.research.run_events.clone()),
         };

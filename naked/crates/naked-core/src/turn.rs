@@ -653,3 +653,34 @@ mod compaction_flow_tests {
         assert!(input.compact_text.is_none());
     }
 }
+
+/// Prepare history for a turn: clone from session, inject prompts + memory + file context.
+pub async fn prepare_history(
+    session: &crate::session::Session,
+    session_root: &std::path::Path,
+    effective: &crate::EffectiveSessionConfig,
+    sender_id: Option<&str>,
+    memory_config: &crate::config::MemoryConfig,
+) -> (ConversationHistory, String) {
+    let mut history = session.history.clone();
+    let original_system_prompt = history.system_prompt().to_string();
+
+    // Inject per-session prompt.md
+    let prompt_path = effective
+        .system_prompt_path
+        .as_ref()
+        .map(|p| session_root.join(p))
+        .unwrap_or_else(|| session_root.join("prompt.md"));
+    inject_session_prompt(&mut history, &prompt_path).await;
+
+    // Memory rules + per-user rules
+    inject_memory_rules(&mut history, &session.workspace, sender_id);
+
+    // Recent memory drafts
+    inject_memory_shift(&mut history, &session.workspace, sender_id, memory_config);
+
+    // File tracker context
+    inject_file_context(&mut history, &session.files);
+
+    (history, original_system_prompt)
+}

@@ -51,10 +51,24 @@ pub(crate) async fn cmd_reload(
 ) -> Result<(), teloxide::RequestError> {
     let chat_id = ctx.chat_id.0;
     let tid = ctx.raw_thread_id();
+
+    // Hot-reload naked.json config:
+    match Config::load() {
+        Ok(new_config) => {
+            agent.reload_config(new_config);
+            tracing::info!("config hot-reloaded via /reload");
+        }
+        Err(e) => {
+            reply_text(bot, ctx, format!("⚠️ Config reload failed: {e}")).await?;
+            return Ok(());
+        }
+    }
+
+    // Also refresh skills + MCP:
     agent.refresh_skills_and_mcp().await;
     let skills = agent.list_skills();
     let reply = format!(
-        "✅ Reloaded.\n• skills: {}\n• Use /metrics for more.",
+        "✅ Reloaded config + skills.\n• skills: {}\n• Use /metrics for more.",
         skills.len()
     );
     reply_text(bot, ctx, reply).await?;

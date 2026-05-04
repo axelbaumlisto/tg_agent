@@ -27,7 +27,7 @@ impl AgentCore {
         model: Option<&str>,
     ) -> Result<()> {
         if let Some(p) = provider
-            && !self.config.providers.contains_key(p)
+            && !self.config().providers.contains_key(p)
         {
             return Err(AgentError::ProviderNotConfigured(p.to_string()));
         }
@@ -43,8 +43,8 @@ impl AgentCore {
                         .get(session_id)
                         .map(|s| s.metadata.provider.clone())
                 })
-                .unwrap_or_else(|| self.config.default_provider.clone());
-            if let Some(pc) = self.config.providers.get(&target_provider) {
+                .unwrap_or_else(|| self.config().default_provider.clone());
+            if let Some(pc) = self.config().providers.get(&target_provider) {
                 let valid = pc.models.iter().any(|x| x == m)
                     || pc.model_aliases.contains_key(m)
                     || pc.model_aliases.values().any(|v| v == m);
@@ -90,7 +90,7 @@ impl AgentCore {
             .map_err(|e| AgentError::Session(format!("cannot write config.json: {e}")))?;
 
         // Update in-memory metadata immediately
-        let effective = self.config.merge_session(&sc);
+        let effective = self.config().merge_session(&sc);
         if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
             session.metadata.provider = effective.provider;
             session.metadata.model = effective.model;
@@ -236,7 +236,7 @@ impl AgentCore {
 
     pub async fn session_provider_model(&self, session_id: &str) -> (String, String) {
         let sc = self.load_session_config_pub(session_id);
-        let effective = self.config.merge_session(&sc);
+        let effective = self.config().merge_session(&sc);
         (effective.provider, effective.model)
     }
 
