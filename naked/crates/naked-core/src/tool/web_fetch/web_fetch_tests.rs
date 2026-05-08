@@ -1,4 +1,8 @@
-use super::*;
+use serde_json::json;
+
+use super::WebFetchTool;
+use super::extract::{drop_block, extract_hrefs, html_to_text};
+use crate::tool::Tool;
 
 #[test]
 fn drop_block_removes_scripts_and_styles() {
