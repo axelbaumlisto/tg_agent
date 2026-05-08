@@ -34,6 +34,9 @@ enum MockResponse {
     Chunks(Vec<StreamChunk>),
     /// Return `Err(AgentError::Provider(msg))` — simulates a connect-level error.
     ConnectErr(String),
+    /// Return `Err(AgentError::ProviderTyped(err))` — simulates a typed
+    /// provider-level error (e.g. `ContextWindowExceeded`). Used by G6.
+    ConnectErrTyped(naked_core::provider::error::ProviderError),
 }
 
 /// Scriptable test provider following the same pattern as the private
@@ -82,6 +85,7 @@ impl Provider for MockProvider {
             match &self.responses[idx] {
                 MockResponse::Chunks(chunks) => Ok(Box::pin(tokio_stream::iter(chunks.clone()))),
                 MockResponse::ConnectErr(msg) => Err(AgentError::Provider(msg.clone())),
+                MockResponse::ConnectErrTyped(err) => Err(AgentError::ProviderTyped(err.clone())),
             }
         } else {
             // Fallback: return text so the loop terminates naturally.
@@ -487,7 +491,11 @@ async fn g5_three_empty_streams_exhausts_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g6_context_overflow_triggers_compaction_then_succeeds() {
     let provider = MockProvider::new(vec![
-        MockResponse::ConnectErr("prompt is too long".into()),
+        MockResponse::ConnectErrTyped(
+            naked_core::provider::error::ProviderError::ContextWindowExceeded {
+                message: "prompt is too long".into(),
+            },
+        ),
         MockResponse::Chunks(vec![
             StreamChunk::Usage(TurnUsage {
                 input_tokens: 5,

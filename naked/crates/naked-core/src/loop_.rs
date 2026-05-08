@@ -264,11 +264,12 @@ impl AgentLoop {
                 let mut stream = match connect_result {
                     Ok(s) => s,
                     Err(e) => {
-                        let err_str = e.to_string().to_lowercase();
-                        if err_str.contains("prompt is too long")
-                            || err_str.contains("context_length_exceeded")
-                            || err_str.contains("maximum context length")
-                        {
+                        if matches!(
+                            &e,
+                            AgentError::ProviderTyped(
+                                crate::provider::error::ProviderError::ContextWindowExceeded { .. }
+                            )
+                        ) {
                             let before = history.message_count();
                             if before <= 3 {
                                 return Err(e);

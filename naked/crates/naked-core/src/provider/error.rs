@@ -18,6 +18,13 @@ pub enum FallbackHint {
     None,
 }
 
+/// Sentinel strings that indicate the prompt exceeded the model's context window.
+const CONTEXT_SENTINELS: &[&str] = &[
+    "prompt is too long",
+    "context_length_exceeded",
+    "maximum context length",
+];
+
 /// Structured provider error. Transport-layer adapters (`reqwest`, etc.)
 /// convert raw responses into one of these variants via [`ProviderError::from_http`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +51,10 @@ pub enum ProviderError {
     },
     /// Server error (5xx) — transient, retry with same key.
     ServerError { status: u16, body: String },
+    /// Provider rejected the request because the prompt exceeds the model's
+    /// context window. Triggers emergency compaction in the loop instead of
+    /// a user-visible error.
+    ContextWindowExceeded { message: String },
     /// Serialization failure (JSON encode/decode).
     Serialize { context: String, source: String },
     /// MCP protocol error.
@@ -89,10 +100,7 @@ impl ProviderError {
                 status,
                 body: truncate(body, 512),
             },
-            _ => ProviderError::Other {
-                status,
-                body: truncate(body, 512),
-            },
+            _ => classify_provider_body(status, body),
         }
     }
 
@@ -147,6 +155,28 @@ impl ProviderError {
     }
 }
 
+/// Classify a raw HTTP error body that does NOT fall into a known status-based
+/// bucket (i.e. the caller already handled 401/402/404/429/5xx). Returns
+/// [`ProviderError::ContextWindowExceeded`] when the body matches a known
+/// sentinel, otherwise [`ProviderError::Other`].
+///
+/// Used by [`ProviderError::from_llm_http`]'s fallback arm and by transport-
+/// layer adapters that wrap network errors directly (e.g. `anthropic.rs`,
+/// `openai_compat.rs`, `copilot.rs`).
+pub fn classify_provider_body(status: u16, body: &str) -> ProviderError {
+    let lower = body.to_ascii_lowercase();
+    if CONTEXT_SENTINELS.iter().any(|s| lower.contains(*s)) {
+        ProviderError::ContextWindowExceeded {
+            message: truncate(body, 512),
+        }
+    } else {
+        ProviderError::Other {
+            status,
+            body: truncate(body, 512),
+        }
+    }
+}
+
 fn extract_retry_seconds(lower: &str) -> Option<u64> {
     if let Some(pos) = lower.find("retry after") {
         let after = &lower[pos + 12..];
@@ -195,6 +225,9 @@ impl std::fmt::Display for ProviderError {
             }
             ProviderError::ServerError { status, body } => {
                 write!(f, "server error ({status}): {body}")
+            }
+            ProviderError::ContextWindowExceeded { message } => {
+                write!(f, "context window exceeded: {message}")
             }
             ProviderError::Serialize { context, source } => {
                 write!(f, "serialize {context}: {source}")
@@ -328,5 +361,44 @@ mod tests {
         let s = "———"; // 9 bytes
         let result = truncate(s, 4);
         assert_eq!(result, "—…"); // 3 bytes + ellipsis
+    }
+
+    // ── Context-window sentinel classification ───────────────────────
+
+    #[test]
+    fn context_sentinel_prompt_too_long() {
+        let e = classify_provider_body(400, r#"{"error":"prompt is too long"}"#);
+        assert!(matches!(e, ProviderError::ContextWindowExceeded { .. }));
+    }
+
+    #[test]
+    fn context_sentinel_context_length_exceeded() {
+        let e = classify_provider_body(400, r#"{"error":{"code":"context_length_exceeded"}}"#);
+        assert!(matches!(e, ProviderError::ContextWindowExceeded { .. }));
+    }
+
+    #[test]
+    fn context_sentinel_maximum_context_length() {
+        let e = classify_provider_body(400, "This model's maximum context length is 4096 tokens");
+        assert!(matches!(e, ProviderError::ContextWindowExceeded { .. }));
+    }
+
+    #[test]
+    fn context_sentinel_case_insensitive() {
+        let e = classify_provider_body(400, "PROMPT IS TOO LONG for this model");
+        assert!(matches!(e, ProviderError::ContextWindowExceeded { .. }));
+    }
+
+    #[test]
+    fn context_sentinel_non_match_stays_other() {
+        let e = classify_provider_body(400, "invalid request body");
+        assert!(matches!(e, ProviderError::Other { status: 400, .. }));
+    }
+
+    #[test]
+    fn from_llm_http_routes_context_sentinel() {
+        // 200 status (not in the matched ranges) + sentinel body → CWE
+        let e = ProviderError::from_llm_http(200, "prompt is too long", "gpt-4");
+        assert!(matches!(e, ProviderError::ContextWindowExceeded { .. }));
     }
 }

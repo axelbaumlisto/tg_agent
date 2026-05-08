@@ -128,10 +128,7 @@ impl Provider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| {
-                AgentError::ProviderTyped(super::error::ProviderError::Other {
-                    status: 0,
-                    body: e.to_string(),
-                })
+                AgentError::ProviderTyped(super::error::classify_provider_body(0, &e.to_string()))
             })?;
 
         if !response.status().is_success() {
