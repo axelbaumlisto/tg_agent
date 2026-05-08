@@ -28,6 +28,45 @@ const MAX_EMPTY_CONTENT_RETRIES: usize = 2;
 /// to come back fast. Doubles per attempt (250 → 500).
 const EMPTY_CONTENT_BASE_DELAY_MS: u64 = 250;
 
+/// Tracks how many consecutive empty-content responses have been seen and
+/// computes the back-off delay for each retry. Extracted from [`AgentLoop::run`]
+/// to keep the inline logic brief.
+struct EmptyContentBudget {
+    attempts: usize,
+    backoff: Backoff,
+}
+
+impl EmptyContentBudget {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            backoff: Backoff {
+                base_ms: EMPTY_CONTENT_BASE_DELAY_MS,
+                max_attempts: MAX_EMPTY_CONTENT_RETRIES,
+            },
+        }
+    }
+
+    /// Returns `Some(delay)` to retry after, or `None` to give up.
+    /// Increments the internal attempt counter on each retry.
+    fn next_delay(&mut self) -> Option<std::time::Duration> {
+        if self.attempts >= self.backoff.max_attempts {
+            return None;
+        }
+        let d = self.backoff.delay(self.attempts);
+        self.attempts += 1;
+        Some(d)
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+    }
+
+    fn count(&self) -> usize {
+        self.attempts
+    }
+}
+
 pub struct LoopConfig {
     pub max_iterations: usize,
     pub cwd: std::path::PathBuf,
@@ -179,12 +218,12 @@ impl AgentLoop {
         } else {
             self.config.max_iterations
         };
-        // Counts consecutive empty-content responses across iterations.
+        // Tracks consecutive empty-content responses across iterations.
         // Reset whenever an iteration produces real content so a normal
         // tool-use loop never accidentally exhausts the budget; only bursts
         // of empty responses (the actual `glm-5-turbo` failure mode) are
         // capped.
-        let mut empty_content_attempts: usize = 0;
+        let mut empty_budget = EmptyContentBudget::new();
         // Pending steer messages not yet flushed to history.
         // Kept as a vec so edits can replace by msg_id before drain.
         let mut pending_steers: Vec<SteerMessage> = Vec::new();
@@ -213,48 +252,7 @@ impl AgentLoop {
 
             // Checkpoint-restart cycle: if token usage exceeds threshold,
             // archive old messages and restart with fresh context.
-            if let Some(ref cycle_cfg) = self.config.cycle_config {
-                let est = history.estimated_tokens() as u64;
-                if crate::session::cycle::should_advance_cycle(est, cycle_cfg)
-                    && let Some(ref data_dir) = self.config.data_dir
-                {
-                    let session_id = self.config.session_id.as_deref().unwrap_or("unknown");
-                    let cycle_num = history.cycle_count();
-                    let checkpoint = crate::session::cycle::build_checkpoint(
-                        cycle_num,
-                        history.messages(),
-                        est,
-                        None, // TODO: pass working_set when available
-                        cycle_cfg,
-                    );
-                    if let Ok(archive_path) = crate::session::cycle::write_archive(
-                        data_dir,
-                        session_id,
-                        cycle_num,
-                        history.messages(),
-                    ) {
-                        let restart_prompt = crate::session::cycle::build_restart_prompt(
-                            &checkpoint,
-                            history.system_prompt(),
-                        );
-                        let archived_count = history.message_count();
-                        history.clear_for_cycle_restart(&restart_prompt);
-                        tracing::info!(
-                            cycle = cycle_num,
-                            archived = archived_count,
-                            path = %archive_path.display(),
-                            "cycle restart: archived and restarted"
-                        );
-                        let _ = tx
-                            .send(AgentEvent::CycleRestarted {
-                                cycle_number: cycle_num,
-                                archived_messages: archived_count,
-                                archive_path: archive_path.display().to_string(),
-                            })
-                            .await;
-                    }
-                }
-            }
+            self.advance_cycle_if_needed(history, &tx).await?;
 
             let request = self.build_chat_request(history);
 
@@ -279,18 +277,12 @@ impl AgentLoop {
             // return without polluting history (which would cause the
             // "dirty-session 0-tok refusal" loop on subsequent turns).
             if outcome.empty {
-                if empty_content_attempts < MAX_EMPTY_CONTENT_RETRIES {
-                    empty_content_attempts += 1;
+                if let Some(delay) = empty_budget.next_delay() {
                     crate::types::EMPTY_CONTENT_RETRY_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let backoff = crate::retry::Backoff {
-                        base_ms: EMPTY_CONTENT_BASE_DELAY_MS,
-                        max_attempts: MAX_EMPTY_CONTENT_RETRIES,
-                    };
-                    let delay = backoff.delay(empty_content_attempts - 1);
                     tracing::warn!(
                         "provider returned empty content (retry {}/{}, backoff {}ms)",
-                        empty_content_attempts,
+                        empty_budget.count(),
                         MAX_EMPTY_CONTENT_RETRIES,
                         delay.as_millis(),
                     );
@@ -299,7 +291,7 @@ impl AgentLoop {
                 }
                 let msg = format!(
                     "provider returned no content {} times in a row (no text, no reasoning, no tool calls)",
-                    empty_content_attempts + 1,
+                    empty_budget.count() + 1,
                 );
                 tracing::warn!("{msg}");
                 let _ = tx.send(AgentEvent::Error(msg.clone())).await;
@@ -319,7 +311,7 @@ impl AgentLoop {
             // Reset the empty-content budget once we got real content.
             // This means a transient hiccup at iteration N doesn't starve
             // retries at iteration N+5.
-            empty_content_attempts = 0;
+            empty_budget.reset();
             let TurnStreamOutcome {
                 blocks,
                 tool_calls,
@@ -904,6 +896,63 @@ impl AgentLoop {
             turn_usage,
             empty,
         })
+    }
+
+    /// If estimated tokens cross the cycle threshold, archive history
+    /// and reset for a new cycle. No-op when cycle_config is None.
+    /// Returns Ok(true) if a restart happened, Ok(false) otherwise.
+    async fn advance_cycle_if_needed(
+        &self,
+        history: &mut ConversationHistory,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<bool> {
+        let cycle_cfg = match self.config.cycle_config.as_ref() {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        let est = history.estimated_tokens() as u64;
+        if !crate::session::cycle::should_advance_cycle(est, cycle_cfg) {
+            return Ok(false);
+        }
+        let data_dir = match self.config.data_dir.as_ref() {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+        let session_id = self.config.session_id.as_deref().unwrap_or("unknown");
+        let cycle_num = history.cycle_count();
+        let checkpoint = crate::session::cycle::build_checkpoint(
+            cycle_num,
+            history.messages(),
+            est,
+            None, // TODO: pass working_set when available
+            cycle_cfg,
+        );
+        if let Ok(archive_path) = crate::session::cycle::write_archive(
+            data_dir,
+            session_id,
+            cycle_num,
+            history.messages(),
+        ) {
+            let restart_prompt =
+                crate::session::cycle::build_restart_prompt(&checkpoint, history.system_prompt());
+            let archived_count = history.message_count();
+            history.clear_for_cycle_restart(&restart_prompt);
+            tracing::info!(
+                cycle = cycle_num,
+                archived = archived_count,
+                path = %archive_path.display(),
+                "cycle restart: archived and restarted"
+            );
+            let _ = tx
+                .send(AgentEvent::CycleRestarted {
+                    cycle_number: cycle_num,
+                    archived_messages: archived_count,
+                    archive_path: archive_path.display().to_string(),
+                })
+                .await;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn drain_steers(
