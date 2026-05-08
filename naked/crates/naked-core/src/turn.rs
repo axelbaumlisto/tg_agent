@@ -742,6 +742,7 @@ pub(crate) fn build_loop_config(
         session_id: Some(session_id.to_string()),
         data_dir: Some(session_dir.to_path_buf()),
         working_set: None,
+        observer: std::sync::Arc::new(crate::loop_observer::TracingObserver),
     }
 }
 

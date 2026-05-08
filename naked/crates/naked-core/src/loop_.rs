@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgentError, Result};
 use crate::history::ConversationHistory;
+use crate::loop_observer::{LoopObserver, RetryKind, TracingObserver};
 use crate::provider::{ChatRequest, Provider};
 use crate::retry::Backoff;
 use crate::tool::registry::ToolRegistry;
@@ -97,6 +98,8 @@ pub struct LoopConfig {
     pub data_dir: Option<std::path::PathBuf>,
     /// Shared working set for file tracking across turns.
     pub working_set: Option<std::sync::Arc<std::sync::Mutex<crate::working_set::WorkingSet>>>,
+    /// Observer for business events (DIP). Defaults to [`TracingObserver`].
+    pub observer: std::sync::Arc<dyn LoopObserver>,
 }
 
 impl Default for LoopConfig {
@@ -116,6 +119,7 @@ impl Default for LoopConfig {
             session_id: None,
             data_dir: None,
             working_set: None,
+            observer: std::sync::Arc::new(TracingObserver),
         }
     }
 }
@@ -280,11 +284,12 @@ impl AgentLoop {
                 if let Some(delay) = empty_budget.next_delay() {
                     crate::types::EMPTY_CONTENT_RETRY_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(
-                        "provider returned empty content (retry {}/{}, backoff {}ms)",
+                    self.config.observer.on_retry(
+                        RetryKind::EmptyContent,
                         empty_budget.count(),
                         MAX_EMPTY_CONTENT_RETRIES,
-                        delay.as_millis(),
+                        delay.as_millis() as u64,
+                        "",
                     );
                     tokio::time::sleep(delay).await;
                     continue 'outer;
@@ -293,7 +298,7 @@ impl AgentLoop {
                     "provider returned no content {} times in a row (no text, no reasoning, no tool calls)",
                     empty_budget.count() + 1,
                 );
-                tracing::warn!("{msg}");
+                self.config.observer.on_giveup(&msg);
                 let _ = tx.send(AgentEvent::Error(msg.clone())).await;
                 let _ = tx.send(AgentEvent::Idle).await;
                 self.config.record_health(
@@ -707,12 +712,11 @@ impl AgentLoop {
                         }
                         for round in 0..5 {
                             let keep = (history.message_count() / 3).clamp(2, 6);
-                            tracing::warn!(
+                            self.config.observer.on_compact_round(
                                 round,
                                 keep,
-                                msgs = history.message_count(),
-                                est_tokens = history.estimated_tokens(),
-                                "emergency compaction round"
+                                history.message_count(),
+                                history.estimated_tokens(),
                             );
                             history.compact(keep);
                             if history.estimated_tokens()
@@ -722,7 +726,7 @@ impl AgentLoop {
                             }
                         }
                         let after = history.message_count();
-                        tracing::warn!("emergency compaction done: {before} -> {after} msgs");
+                        self.config.observer.on_compact_done(before, after);
                         let _ = tx
                             .send(AgentEvent::ContextCompacted {
                                 before_msgs: before,
@@ -739,11 +743,12 @@ impl AgentLoop {
                             max_attempts: MAX_STREAM_RETRIES + 1,
                         }
                         .delay(retry);
-                        tracing::warn!(
-                            "stream_chat connect error (retry {}/{}, backoff {}ms): {e}",
+                        self.config.observer.on_retry(
+                            RetryKind::Connect,
                             retry + 1,
                             MAX_STREAM_RETRIES,
-                            delay.as_millis()
+                            delay.as_millis() as u64,
+                            &e.to_string(),
                         );
                         tokio::time::sleep(delay).await;
                         continue;
@@ -841,11 +846,12 @@ impl AgentLoop {
                         max_attempts: MAX_STREAM_RETRIES + 1,
                     }
                     .delay(retry);
-                    tracing::warn!(
-                        "mid-stream error (retry {}/{}, backoff {}ms): {e}",
+                    self.config.observer.on_retry(
+                        RetryKind::MidStream,
                         retry + 1,
                         MAX_STREAM_RETRIES,
-                        delay.as_millis()
+                        delay.as_millis() as u64,
+                        &e,
                     );
                     tokio::time::sleep(delay).await;
                     continue;
@@ -937,11 +943,10 @@ impl AgentLoop {
                 crate::session::cycle::build_restart_prompt(&checkpoint, history.system_prompt());
             let archived_count = history.message_count();
             history.clear_for_cycle_restart(&restart_prompt);
-            tracing::info!(
-                cycle = cycle_num,
-                archived = archived_count,
-                path = %archive_path.display(),
-                "cycle restart: archived and restarted"
+            self.config.observer.on_cycle_restart(
+                cycle_num as u64,
+                archived_count,
+                &archive_path.display().to_string(),
             );
             let _ = tx
                 .send(AgentEvent::CycleRestarted {
