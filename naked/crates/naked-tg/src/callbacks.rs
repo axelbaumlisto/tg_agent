@@ -452,7 +452,7 @@ async fn build_model_keyboard(
 ) -> Vec<Vec<InlineKeyboardButton>> {
     let models = agent.provider_models(prov);
     let scope: Vec<String> = config.model_scope.iter().map(|s| s.to_string()).collect();
-    let filtered = naked_tg::tg_markup::filter_models_by_scope(&models, &scope);
+    let filtered = naked_tg::model_glob::filter_models_by_scope(&models, &scope);
     let page_size = 8;
     let total_pages = filtered.len().div_ceil(page_size);
     let page = page.min(total_pages.saturating_sub(1));
@@ -480,7 +480,7 @@ async fn build_model_keyboard(
                 label
             };
             vec![InlineKeyboardButton::callback(
-                naked_tg::tg_markup::truncate_button(&mark, 56),
+                naked_tg::markup::truncate_button(&mark, 56),
                 format!("sm:{m}"),
             )]
         })

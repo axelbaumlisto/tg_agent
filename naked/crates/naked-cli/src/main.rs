@@ -320,6 +320,15 @@ async fn run_turn(handle: AgentHandle) -> Result<()> {
                     "\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m"
                 );
             }
+            AgentEvent::CycleRestarted {
+                cycle_number,
+                archived_messages,
+                archive_path,
+            } => {
+                eprintln!(
+                    "\x1b[36m[cycle restart #{cycle_number}: {archived_messages} messages archived → {archive_path}]\x1b[0m"
+                );
+            }
             AgentEvent::ToolOutput { chunk, .. } => {
                 // Show last line of bash output inline:
                 if let Some(last) = chunk.lines().last() {

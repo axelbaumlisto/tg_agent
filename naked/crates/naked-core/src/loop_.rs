@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AgentError, Result};
 use crate::history::ConversationHistory;
 use crate::provider::{ChatRequest, Provider};
+use crate::retry::Backoff;
 use crate::tool::registry::ToolRegistry;
 use crate::types::{
     AgentEvent, ContentBlock, Permission, PermissionResponse, SteerMessage, StreamChunk, ToolState,
@@ -45,6 +46,18 @@ pub struct LoopConfig {
     /// so the selector can quarantine misbehaving pairs across
     /// restarts. `None` disables recording entirely.
     pub health: Option<std::sync::Arc<crate::model_catalog::ModelHealth>>,
+    /// Optional token tracker — records (model, in, out) per turn.
+    pub token_tracker: Option<crate::token_tracker::TokenTracker>,
+    /// Optional audit directory — logs tool calls to JSONL.
+    pub audit_dir: Option<std::path::PathBuf>,
+    /// Checkpoint-restart cycle configuration.
+    pub cycle_config: Option<crate::session::cycle::CycleConfig>,
+    /// Session id for cycle archive naming.
+    pub session_id: Option<String>,
+    /// Data directory for cycle archives (e.g. state/data).
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Shared working set for file tracking across turns.
+    pub working_set: Option<std::sync::Arc<std::sync::Mutex<crate::working_set::WorkingSet>>>,
 }
 
 impl Default for LoopConfig {
@@ -58,6 +71,12 @@ impl Default for LoopConfig {
             reasoning: None,
             provider: String::new(),
             health: None,
+            token_tracker: None,
+            audit_dir: None,
+            cycle_config: None,
+            session_id: None,
+            data_dir: None,
+            working_set: None,
         }
     }
 }
@@ -86,16 +105,35 @@ pub struct AgentLoop {
     tools: ToolRegistry,
     config: LoopConfig,
     policy: Box<dyn crate::tool::policy::ToolPolicy>,
+    approval_cache: crate::tool::approval_cache::ApprovalCache,
 }
 
 impl AgentLoop {
     pub fn new(provider: Box<dyn Provider>, tools: ToolRegistry, config: LoopConfig) -> Self {
+        let own_source = Self::detect_own_source_dir(&config.cwd);
         Self {
             provider,
             tools,
             config,
-            policy: Box::new(crate::tool::policy::DefaultPolicy),
+            policy: Box::new(crate::tool::policy::default_pipeline(own_source)),
+            approval_cache: crate::tool::approval_cache::ApprovalCache::new(),
         }
+    }
+
+    /// Detect the bot's own source directory from the workspace path.
+    /// If cwd contains a `crates/naked-core/` directory, that's our source tree.
+    fn detect_own_source_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+        // Walk up from cwd looking for our Cargo workspace with naked-core
+        let mut dir = cwd.to_path_buf();
+        for _ in 0..5 {
+            if dir.join("crates/naked-core/src").is_dir() {
+                return Some(dir.join("crates"));
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        None
     }
 
     /// Create with a custom tool policy.
@@ -110,6 +148,7 @@ impl AgentLoop {
             tools,
             config,
             policy,
+            approval_cache: crate::tool::approval_cache::ApprovalCache::new(),
         }
     }
 
@@ -146,6 +185,10 @@ impl AgentLoop {
                 return Err(AgentError::Cancelled);
             }
 
+            // Per-iteration guard — blocks identical repeated calls and
+            // halts after too many consecutive failures.
+            let mut loop_guard = crate::loop_guard::LoopGuard::default();
+
             // Drain steer messages between iterations.
             Self::drain_steers(
                 &mut steer_rx,
@@ -156,21 +199,56 @@ impl AgentLoop {
             )
             .await;
 
-            let messages = history.to_api_messages();
-            let system = history.system_prompt().to_string();
+            // Checkpoint-restart cycle: if token usage exceeds threshold,
+            // archive old messages and restart with fresh context.
+            if let Some(ref cycle_cfg) = self.config.cycle_config {
+                let est = history.estimated_tokens() as u64;
+                if crate::session::cycle::should_advance_cycle(est, cycle_cfg)
+                    && let Some(ref data_dir) = self.config.data_dir
+                {
+                    let session_id = self.config.session_id.as_deref().unwrap_or("unknown");
+                    let cycle_num = history.cycle_count();
+                    let checkpoint = crate::session::cycle::build_checkpoint(
+                        cycle_num,
+                        history.messages(),
+                        est,
+                        None, // TODO: pass working_set when available
+                        cycle_cfg,
+                    );
+                    if let Ok(archive_path) = crate::session::cycle::write_archive(
+                        data_dir,
+                        session_id,
+                        cycle_num,
+                        history.messages(),
+                    ) {
+                        let restart_prompt = crate::session::cycle::build_restart_prompt(
+                            &checkpoint,
+                            history.system_prompt(),
+                        );
+                        let archived_count = history.message_count();
+                        history.clear_for_cycle_restart(&restart_prompt);
+                        tracing::info!(
+                            cycle = cycle_num,
+                            archived = archived_count,
+                            path = %archive_path.display(),
+                            "cycle restart: archived and restarted"
+                        );
+                        let _ = tx
+                            .send(AgentEvent::CycleRestarted {
+                                cycle_number: cycle_num,
+                                archived_messages: archived_count,
+                                archive_path: archive_path.display().to_string(),
+                            })
+                            .await;
+                    }
+                }
+            }
 
-            let request = ChatRequest {
-                model: self.config.model.clone(),
-                system,
-                messages,
-                tools: self.tools.schemas_json(),
-                max_tokens: self.config.max_tokens,
-                temperature: self.config.temperature,
-                reasoning: self.config.reasoning.clone(),
-            };
+            let request = self.build_chat_request(history);
 
             let mut text_acc = String::new();
             let mut thinking_acc = String::new();
+            let mut in_fake_tool = false;
             let mut blocks: Vec<ContentBlock> = Vec::new();
             let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
             let mut turn_usage: Option<TurnUsage> = None;
@@ -224,13 +302,18 @@ impl AgentLoop {
                             continue 'outer;
                         }
                         if retry < MAX_STREAM_RETRIES {
-                            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(retry as u32);
+                            let delay = Backoff {
+                                base_ms: BASE_RETRY_DELAY_MS,
+                                max_attempts: MAX_STREAM_RETRIES + 1,
+                            }
+                            .delay(retry);
                             tracing::warn!(
-                                "stream_chat connect error (retry {}/{}, backoff {delay}ms): {e}",
+                                "stream_chat connect error (retry {}/{}, backoff {}ms): {e}",
                                 retry + 1,
-                                MAX_STREAM_RETRIES
+                                MAX_STREAM_RETRIES,
+                                delay.as_millis()
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                         self.config.record_health(
@@ -262,8 +345,14 @@ impl AgentLoop {
 
                     match chunk {
                         StreamChunk::Text(t) => {
-                            let _ = tx.send(AgentEvent::TextDelta(t.clone())).await;
-                            text_acc.push_str(&t);
+                            let cleaned =
+                                crate::stream_filter::filter_fake_tool_delta(&t, &mut in_fake_tool);
+                            if !cleaned.is_empty() {
+                                let _ = tx.send(AgentEvent::TextDelta(cleaned.clone())).await;
+                                text_acc.push_str(&cleaned);
+                            } else if !t.is_empty() {
+                                tracing::debug!("stream_filter: scrubbed fake tool wrapper");
+                            }
                         }
                         StreamChunk::Thinking(t) => {
                             let _ = tx.send(AgentEvent::ThinkingDelta(t.clone())).await;
@@ -299,6 +388,9 @@ impl AgentLoop {
                             cumulative_usage.output_tokens += u.output_tokens;
                             cumulative_usage.cache_read_tokens += u.cache_read_tokens;
                             cumulative_usage.cache_write_tokens += u.cache_write_tokens;
+                            if let Some(ref tracker) = self.config.token_tracker {
+                                tracker.record(&self.config.model, u.input_tokens, u.output_tokens);
+                            }
                             turn_usage = Some(u.clone());
                             let _ = tx.send(AgentEvent::UsageUpdate(u)).await;
                         }
@@ -312,13 +404,18 @@ impl AgentLoop {
 
                 if let Some(e) = mid_stream_error {
                     if tool_calls.is_empty() && retry < MAX_STREAM_RETRIES {
-                        let delay = BASE_RETRY_DELAY_MS * 2u64.pow(retry as u32);
+                        let delay = Backoff {
+                            base_ms: BASE_RETRY_DELAY_MS,
+                            max_attempts: MAX_STREAM_RETRIES + 1,
+                        }
+                        .delay(retry);
                         tracing::warn!(
-                            "mid-stream error (retry {}/{}, backoff {delay}ms): {e}",
+                            "mid-stream error (retry {}/{}, backoff {}ms): {e}",
                             retry + 1,
-                            MAX_STREAM_RETRIES
+                            MAX_STREAM_RETRIES,
+                            delay.as_millis()
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                     let _ = tx.send(AgentEvent::Error(e.clone())).await;
@@ -327,7 +424,9 @@ impl AgentLoop {
                         None,
                         Some(e.clone()),
                     );
-                    return Err(AgentError::Provider(e));
+                    return Err(AgentError::ProviderTyped(
+                        crate::provider::error::ProviderError::Other { status: 0, body: e },
+                    ));
                 }
 
                 stream_ok = true;
@@ -343,7 +442,12 @@ impl AgentLoop {
                     None,
                     Some("stream retries exhausted".into()),
                 );
-                return Err(AgentError::Provider("stream retries exhausted".into()));
+                return Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Other {
+                        status: 0,
+                        body: "stream retries exhausted".into(),
+                    },
+                ));
             }
 
             if !thinking_acc.is_empty() {
@@ -368,14 +472,18 @@ impl AgentLoop {
                     empty_content_attempts += 1;
                     crate::types::EMPTY_CONTENT_RETRY_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let delay =
-                        EMPTY_CONTENT_BASE_DELAY_MS * 2u64.pow((empty_content_attempts - 1) as u32);
+                    let backoff = crate::retry::Backoff {
+                        base_ms: EMPTY_CONTENT_BASE_DELAY_MS,
+                        max_attempts: MAX_EMPTY_CONTENT_RETRIES,
+                    };
+                    let delay = backoff.delay(empty_content_attempts - 1);
                     tracing::warn!(
-                        "provider returned empty content (retry {}/{}, backoff {delay}ms)",
+                        "provider returned empty content (retry {}/{}, backoff {}ms)",
                         empty_content_attempts,
                         MAX_EMPTY_CONTENT_RETRIES,
+                        delay.as_millis(),
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    tokio::time::sleep(delay).await;
                     continue 'outer;
                 }
                 let msg = format!(
@@ -390,7 +498,12 @@ impl AgentLoop {
                     None,
                     Some(msg.clone()),
                 );
-                return Err(AgentError::Provider(msg));
+                return Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Other {
+                        status: 0,
+                        body: msg,
+                    },
+                ));
             }
             // Reset the empty-content budget once we got real content.
             // This means a transient hiccup at iteration N doesn't starve
@@ -409,25 +522,8 @@ impl AgentLoop {
                 return Ok(cumulative_usage);
             }
 
-            // Classify tool calls via policy (Step 2: no permission rules in loop).
-            use crate::tool::policy::ToolDecision;
-            let mut readonly_batch: Vec<(String, String, serde_json::Value)> = Vec::new();
-            let mut gated_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
-            let mut denied_calls: Vec<(String, String, String)> = Vec::new(); // (id, name, reason)
-
-            for (id, name, input) in tool_calls {
-                let perm = self
-                    .tools
-                    .get(&name)
-                    .map(|t| t.effective_permission(&input, &self.config.cwd))
-                    .unwrap_or(Permission::Dangerous);
-
-                match self.policy.classify(&name, &input, &self.config.cwd, perm) {
-                    ToolDecision::Execute => readonly_batch.push((id, name, input)),
-                    ToolDecision::AskUser(_) => gated_calls.push((id, name, input)),
-                    ToolDecision::Deny(reason) => denied_calls.push((id, name, reason)),
-                }
-            }
+            let (readonly_batch, gated_calls, denied_calls) =
+                self.classify_tool_calls(tool_calls, &mut loop_guard);
 
             // Emit denied tool results.
             for (id, name, reason) in denied_calls {
@@ -444,30 +540,16 @@ impl AgentLoop {
 
             // Execute read-only tools in parallel (no permission needed).
             if !readonly_batch.is_empty() {
-                let futs: Vec<_> = readonly_batch
-                    .iter()
-                    .map(|(id, name, input)| {
-                        let id = id.clone();
-                        let name = name.clone();
-                        let input = input.clone();
-                        let cwd = self.config.cwd.clone();
-                        let tools = &self.tools;
-                        let progress = tx.clone();
-                        async move {
-                            let result = tools
-                                .execute_with_progress(&name, input, &cwd, progress)
-                                .await;
-                            (id, name, result)
-                        }
-                    })
-                    .collect();
-
-                let results = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        return Err(AgentError::Cancelled);
-                    }
-                    r = futures_util::future::join_all(futs) => r,
-                };
+                let results = Self::execute_readonly_batch(
+                    &self.tools,
+                    &readonly_batch,
+                    &self.config.cwd,
+                    &cancel,
+                    &tx,
+                    &mut steer_rx,
+                    &mut pending_steers,
+                )
+                .await?;
                 for (id, name, result) in results {
                     let state = if result.is_error {
                         ToolState::Error
@@ -477,16 +559,20 @@ impl AgentLoop {
                     let _ = tx
                         .send(AgentEvent::ToolEnd {
                             call_id: id.clone(),
-                            name,
+                            name: name.clone(),
                             state,
                             output: result.output.clone(),
                         })
                         .await;
-                    history.push_tool_result(&id, &result.output, result.is_error);
-                    // Inject any images produced by the tool.
-                    for (mime, b64) in crate::tool::image_result::drain_images() {
-                        history.push_image(&mime, &b64);
-                    }
+                    Self::push_tool_outcome(
+                        history,
+                        &mut loop_guard,
+                        &id,
+                        &name,
+                        &result.output,
+                        result.is_error,
+                        history.context_window_tokens() as u64,
+                    );
                 }
             }
 
@@ -508,7 +594,20 @@ impl AgentLoop {
                     .map(|t| t.effective_permission(&input, &self.config.cwd))
                     .unwrap_or(Permission::Dangerous);
 
-                let allowed = if let Some(ref mut prx) = permission_rx {
+                // Check approval cache before prompting user:
+                let fp = crate::tool::approval_cache::fingerprint(&name, &input);
+                let cached = self.approval_cache.is_approved(&fp);
+
+                let allowed = if cached {
+                    // Previously approved fingerprint — auto-approve.
+                    let _ = tx
+                        .send(AgentEvent::ToolOutput {
+                            call_id: id.clone(),
+                            chunk: format!("\u{2705} auto-approved (cached: {fp})"),
+                        })
+                        .await;
+                    true
+                } else if let Some(ref mut prx) = permission_rx {
                     let _ = tx
                         .send(AgentEvent::PermissionRequest {
                             call_id: id.clone(),
@@ -518,7 +617,12 @@ impl AgentLoop {
                         })
                         .await;
                     match prx.recv().await {
-                        Some(resp) if resp.call_id == id => resp.allowed,
+                        Some(resp) if resp.call_id == id => {
+                            if resp.allowed {
+                                self.approval_cache.approve(&fp);
+                            }
+                            resp.allowed
+                        }
                         _ => false,
                     }
                 } else {
@@ -538,55 +642,48 @@ impl AgentLoop {
                     continue;
                 }
 
-                let progress_tx = tx.clone();
-                let heartbeat_tx = tx.clone();
-                let heartbeat_cancel = CancellationToken::new();
-                let hb_token = heartbeat_cancel.clone();
-
-                let hb_handle = tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = hb_token.cancelled() => break,
-                            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-                                let _ = heartbeat_tx.send(AgentEvent::Heartbeat).await;
-                            }
-                        }
-                    }
-                });
-
-                let tool_fut =
-                    self.tools
-                        .execute_with_progress(&name, input, &self.config.cwd, progress_tx);
-
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        heartbeat_cancel.cancel();
-                        let _ = hb_handle.await;
-                        return Err(AgentError::Cancelled);
-                    }
-                    r = tool_fut => r,
-                };
-
-                heartbeat_cancel.cancel();
-                let _ = hb_handle.await;
+                let result = self
+                    .execute_tool_with_heartbeat(
+                        &name,
+                        input,
+                        &id,
+                        &cancel,
+                        &tx,
+                        &mut steer_rx,
+                        &mut pending_steers,
+                    )
+                    .await?;
 
                 let state = if result.is_error {
                     ToolState::Error
                 } else {
                     ToolState::Completed
                 };
+                // Audit gated tool execution:
+                if let Some(ref dir) = self.config.audit_dir {
+                    crate::audit::log_event(
+                        dir,
+                        "tool_exec",
+                        serde_json::json!({"tool": &name, "error": result.is_error}),
+                    );
+                }
                 let _ = tx
                     .send(AgentEvent::ToolEnd {
                         call_id: id.clone(),
-                        name,
+                        name: name.clone(),
                         state,
                         output: result.output.clone(),
                     })
                     .await;
-                history.push_tool_result(&id, &result.output, result.is_error);
-                for (mime, b64) in crate::tool::image_result::drain_images() {
-                    history.push_image(&mime, &b64);
-                }
+                Self::push_tool_outcome(
+                    history,
+                    &mut loop_guard,
+                    &id,
+                    &name,
+                    &result.output,
+                    result.is_error,
+                    history.context_window_tokens() as u64,
+                );
             }
         }
 
@@ -602,6 +699,163 @@ impl AgentLoop {
     /// Edit semantics: if `is_edit` and the msg_id is still in the pending
     /// queue, replace in-place. If already delivered to history, add a
     /// `[correction]` prefix so the LLM knows the user changed their mind.
+    /// Classify tool calls into readonly / gated / denied batches.
+    /// Execute read-only tools in parallel, cancellable.
+    async fn execute_readonly_batch(
+        tools: &ToolRegistry,
+        batch: &[(String, String, serde_json::Value)],
+        cwd: &std::path::Path,
+        cancel: &CancellationToken,
+        tx: &mpsc::Sender<AgentEvent>,
+        steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
+        pending_steers: &mut Vec<SteerMessage>,
+    ) -> Result<Vec<(String, String, crate::types::ToolResult)>> {
+        let futs: Vec<_> = batch
+            .iter()
+            .map(|(id, name, input)| {
+                let id = id.clone();
+                let name = name.clone();
+                let input = input.clone();
+                let cwd = cwd.to_path_buf();
+                let progress = tx.clone();
+                async move {
+                    let result = tools
+                        .execute_with_progress(&name, input, &cwd, progress)
+                        .await;
+                    (id, name, result)
+                }
+            })
+            .collect();
+
+        let join = futures_util::future::join_all(futs);
+        let mut join = std::pin::pin!(join);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+                r = &mut join => return Ok(r),
+                msg = async {
+                    match steer_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(msg) = msg {
+                        pending_steers.push(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn classify_tool_calls(
+        &self,
+        tool_calls: Vec<(String, String, serde_json::Value)>,
+        guard: &mut crate::loop_guard::LoopGuard,
+    ) -> (
+        Vec<(String, String, serde_json::Value)>,
+        Vec<(String, String, serde_json::Value)>,
+        Vec<(String, String, String)>,
+    ) {
+        use crate::tool::policy::ToolDecision;
+        let mut readonly_batch = Vec::new();
+        let mut gated_calls = Vec::new();
+        let mut denied_calls = Vec::new();
+
+        for (id, name, input) in tool_calls {
+            if let crate::loop_guard::AttemptDecision::Block(reason) =
+                guard.record_attempt(&name, &input)
+            {
+                denied_calls.push((id, name, reason));
+                continue;
+            }
+            let perm = self
+                .tools
+                .get(&name)
+                .map(|t| t.effective_permission(&input, &self.config.cwd))
+                .unwrap_or(Permission::Dangerous);
+            match self.policy.classify(&name, &input, &self.config.cwd, perm) {
+                ToolDecision::Execute => readonly_batch.push((id, name, input)),
+                ToolDecision::AskUser(_) => gated_calls.push((id, name, input)),
+                ToolDecision::Deny(reason) => denied_calls.push((id, name, reason)),
+            }
+        }
+
+        // WorkingSet: observe tool calls before execution.
+        if let Some(ref ws) = self.config.working_set
+            && let Ok(mut ws) = ws.lock()
+        {
+            for (_, name, input) in readonly_batch.iter().chain(gated_calls.iter()) {
+                ws.observe_tool(name, input);
+            }
+        }
+
+        (readonly_batch, gated_calls, denied_calls)
+    }
+
+    /// Build the ChatRequest for the current turn.
+    fn build_chat_request(&self, history: &ConversationHistory) -> ChatRequest {
+        let messages = history.to_api_messages();
+        let system = history.system_prompt().to_string();
+        let reasoning = {
+            let base = self.config.reasoning.clone();
+            if base.as_deref() == Some("auto") {
+                let last_msg = history
+                    .messages()
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == crate::types::Role::User)
+                    .and_then(|m| m.blocks.first())
+                    .and_then(|b| {
+                        if let crate::types::ContentBlock::Text { text } = b {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("");
+                let effort = crate::auto_reasoning::select(false, last_msg);
+                Some(effort.label().to_string())
+            } else {
+                base
+            }
+        };
+        ChatRequest {
+            model: self.config.model.clone(),
+            system,
+            messages,
+            tools: self.tools.schemas_json(),
+            max_tokens: self.config.max_tokens,
+            temperature: self.config.temperature,
+            reasoning,
+        }
+    }
+
+    /// Record a tool result in history with context-aware truncation and
+    /// loop-guard tracking.  Centralises the pattern that was duplicated
+    /// across readonly-batch and gated-tool execution paths.
+    fn push_tool_outcome(
+        history: &mut crate::history::ConversationHistory,
+        guard: &mut crate::loop_guard::LoopGuard,
+        id: &str,
+        name: &str,
+        output: &str,
+        is_error: bool,
+        context_window: u64,
+    ) {
+        let compacted =
+            crate::tool::large_output::route_large_output_aware(output, name, context_window);
+        history.push_tool_result(id, &compacted, is_error);
+        let ok = !is_error;
+        if let crate::loop_guard::OutcomeDecision::Halt(msg) = guard.record_outcome(name, ok) {
+            tracing::warn!("loop_guard halt ({name}): {msg}");
+            history.push_tool_result(&format!("guard_{id}"), &msg, true);
+        }
+        for (mime, b64) in crate::tool::image_result::drain_images() {
+            history.push_image(&mime, &b64);
+        }
+    }
+
     async fn drain_steers(
         steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
         pending: &mut Vec<SteerMessage>,
@@ -655,1002 +909,76 @@ impl AgentLoop {
         history.push_user(&combined);
         let _ = tx.send(AgentEvent::SteerReceived { text: combined }).await;
     }
+
+    /// Execute a single tool call with heartbeat, cancellation, and steer handling.
+    ///
+    /// Encapsulates the heartbeat-spawn + tokio::select! + cleanup pattern
+    /// that was previously inlined in `run()` at 10 levels of nesting.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool_with_heartbeat(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        call_id: &str,
+        cancel: &CancellationToken,
+        tx: &mpsc::Sender<AgentEvent>,
+        steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
+        pending_steers: &mut Vec<SteerMessage>,
+    ) -> Result<crate::types::ToolResult> {
+        let heartbeat_tx = tx.clone();
+        let heartbeat_cancel = CancellationToken::new();
+        let hb_token = heartbeat_cancel.clone();
+
+        let hb_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = hb_token.cancelled() => break,
+                    _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
+                        let _ = heartbeat_tx.send(AgentEvent::Heartbeat).await;
+                    }
+                }
+            }
+        });
+
+        let progress_tx = tx.clone();
+        let tool_fut = self
+            .tools
+            .execute_with_progress(name, input, &self.config.cwd, progress_tx);
+
+        let result = {
+            tokio::pin!(tool_fut);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        heartbeat_cancel.cancel();
+                        let _ = hb_handle.await;
+                        return Err(AgentError::Cancelled);
+                    }
+                    r = &mut tool_fut => break r,
+                    msg = async {
+                        match steer_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(msg) = msg {
+                            let _ = tx.send(AgentEvent::ToolOutput {
+                                call_id: call_id.to_string(),
+                                chunk: format!("\u{21a9}\u{fe0f} Steer queued: {}", &msg.text[..msg.text.len().min(60)]),
+                            }).await;
+                            pending_steers.push(msg);
+                        }
+                    }
+                }
+            }
+        };
+
+        heartbeat_cancel.cancel();
+        let _ = hb_handle.await;
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::{ChatRequest, Provider};
-    use crate::tool::Tool;
-    use crate::types::{Permission, Role, ToolSpec};
-    use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct MockProvider {
-        responses: Vec<Vec<StreamChunk>>,
-        call_count: AtomicUsize,
-    }
-
-    impl MockProvider {
-        fn new(responses: Vec<Vec<StreamChunk>>) -> Self {
-            Self {
-                responses,
-                call_count: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for MockProvider {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
-        fn models(&self) -> Vec<crate::types::ModelInfo> {
-            vec![]
-        }
-
-        async fn stream_chat(
-            &self,
-            _request: ChatRequest,
-        ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>>
-        {
-            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
-            let chunks = if idx < self.responses.len() {
-                self.responses[idx].clone()
-            } else {
-                vec![StreamChunk::Text("fallback".into()), StreamChunk::Done]
-            };
-            Ok(Box::pin(tokio_stream::iter(chunks)))
-        }
-    }
-
-    struct EchoTool;
-
-    #[async_trait::async_trait]
-    impl Tool for EchoTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec {
-                name: "echo".into(),
-                description: "Echo input".into(),
-                parameters: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
-                permission: Permission::ReadOnly,
-            }
-        }
-
-        async fn execute(
-            &self,
-            input: serde_json::Value,
-            _cwd: &std::path::Path,
-        ) -> crate::types::ToolResult {
-            let text = input["text"].as_str().unwrap_or("no text");
-            crate::types::ToolResult {
-                output: format!("echoed: {text}"),
-                is_error: false,
-            }
-        }
-    }
-
-    fn make_loop(provider: MockProvider, tools: Vec<Box<dyn Tool>>) -> AgentLoop {
-        AgentLoop::new(
-            Box::new(provider),
-            crate::tool::registry::ToolRegistry::new(tools),
-            LoopConfig {
-                max_iterations: 10,
-                cwd: std::path::PathBuf::from("/tmp"),
-                model: "mock".into(),
-                max_tokens: 1024,
-                temperature: None,
-                reasoning: None,
-                provider: String::new(),
-                health: None,
-            },
-        )
-    }
-
-    #[tokio::test]
-    async fn loop_zero_token_turn_does_not_pollute_history() {
-        // Regression for the "dirty-session 0-tok refusal" class of bugs.
-        // Providers like glm-5-turbo can close a stream with no text, no
-        // reasoning, and no tool calls. The loop tolerates a few of these
-        // (see `loop_empty_then_text_retries_and_succeeds`) but if every
-        // attempt comes back empty we must still surface an error WITHOUT
-        // polluting history (otherwise every subsequent turn sees
-        // `{role:assistant, content:[]}` and refuses in a loop).
-        //
-        // The provider is wired to return three identical empty streams
-        // (initial + `MAX_EMPTY_CONTENT_RETRIES` retries) so the budget is
-        // exhausted before we hit the MockProvider fallback.
-        let empty_stream = || {
-            vec![
-                StreamChunk::Usage(TurnUsage {
-                    input_tokens: 42,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                }),
-                StreamChunk::Done,
-            ]
-        };
-        let provider = MockProvider::new(vec![empty_stream(), empty_stream(), empty_stream()]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-        let msgs_before = history.message_count();
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(
-            matches!(result, Err(AgentError::Provider(_))),
-            "exhausted-retry 0-token turn must surface as Provider error, not silent Ok; got {result:?}"
-        );
-        assert_eq!(
-            history.message_count(),
-            msgs_before,
-            "empty assistant must NOT be appended to history"
-        );
-
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Error(s) if s.contains("no content"))),
-            "must emit an explanatory Error event; got events: {events:?}"
-        );
-        assert!(
-            events.iter().any(|e| matches!(e, AgentEvent::Idle)),
-            "must still emit Idle so the UI flushes"
-        );
-    }
-
-    #[tokio::test]
-    async fn loop_empty_then_text_retries_and_succeeds() {
-        // Targeted regression for `glm-5-turbo`-style transient empty
-        // responses: the loop must transparently retry and surface the
-        // text from the second attempt, returning Ok without exposing
-        // an Error event for the (recovered) hiccup.
-        let provider = MockProvider::new(vec![
-            // attempt 1: empty stream
-            vec![StreamChunk::Done],
-            // attempt 2 (retry): real text
-            vec![
-                StreamChunk::Text("hi after retry".into()),
-                StreamChunk::Done,
-            ],
-        ]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("ping");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(
-            result.is_ok(),
-            "retry-after-empty must return Ok; got {result:?}"
-        );
-
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-        let has_error = events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error(s) if s.contains("no content")));
-        assert!(
-            !has_error,
-            "recovered empty-content turn must NOT emit a final Error event; got events: {events:?}"
-        );
-        let text_combined: String = events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::TextDelta(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            text_combined, "hi after retry",
-            "second-attempt text must be delivered to the UI"
-        );
-    }
-
-    #[tokio::test]
-    async fn loop_two_empty_then_text_succeeds_at_budget_edge() {
-        // Verify the budget itself: `MAX_EMPTY_CONTENT_RETRIES = 2` means
-        // we tolerate up to 2 retries (so 3 attempts total). Two empties
-        // followed by text must still succeed — exhausting the retry
-        // budget on the very last attempt.
-        let provider = MockProvider::new(vec![
-            vec![StreamChunk::Done],
-            vec![StreamChunk::Done],
-            vec![
-                StreamChunk::Text("third time lucky".into()),
-                StreamChunk::Done,
-            ],
-        ]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("ping");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(
-            result.is_ok(),
-            "two empties + text must still succeed at the edge of the retry budget; got {result:?}"
-        );
-
-        let mut text_combined = String::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::TextDelta(t) = ev {
-                text_combined.push_str(&t);
-            }
-        }
-        assert_eq!(text_combined, "third time lucky");
-    }
-
-    #[tokio::test]
-    async fn loop_text_only_response() {
-        let provider = MockProvider::new(vec![vec![
-            StreamChunk::Text("Hello ".into()),
-            StreamChunk::Text("world".into()),
-            StreamChunk::Done,
-        ]]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(result.is_ok());
-
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-
-        let text_events: Vec<_> = events
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::TextDelta(_)))
-            .collect();
-        assert_eq!(text_events.len(), 2);
-
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Idle)));
-
-        assert_eq!(history.message_count(), 2);
-        assert_eq!(history.messages()[1].text_content(), "Hello world");
-    }
-
-    #[tokio::test]
-    async fn loop_tool_use_flow() {
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::ToolUse {
-                    id: "call1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text": "ping"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("Done!".into()), StreamChunk::Done],
-        ]);
-
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-        let agent_loop = make_loop(provider, tools);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("test");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(result.is_ok());
-
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolStart { .. }))
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolEnd { .. }))
-        );
-
-        // 1:user, 2:assistant(tool_use), 3:tool_result, 4:assistant(text)
-        assert_eq!(history.message_count(), 4);
-    }
-
-    #[tokio::test]
-    async fn loop_cancellation() {
-        let provider = MockProvider::new(vec![vec![
-            StreamChunk::Text("start".into()),
-            StreamChunk::Done,
-        ]]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(matches!(result, Err(AgentError::Cancelled)));
-    }
-
-    #[tokio::test]
-    async fn loop_max_iterations() {
-        // Provider always returns tool use, forcing infinite loop
-        let responses: Vec<Vec<StreamChunk>> = (0..15)
-            .map(|i| {
-                vec![
-                    StreamChunk::ToolUse {
-                        id: format!("c{i}"),
-                        name: "echo".into(),
-                        input: serde_json::json!({"text": "loop"}),
-                    },
-                    StreamChunk::Done,
-                ]
-            })
-            .collect();
-
-        let provider = MockProvider::new(responses);
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-        let agent_loop = AgentLoop::new(
-            Box::new(provider),
-            crate::tool::registry::ToolRegistry::new(tools),
-            LoopConfig {
-                max_iterations: 3,
-                cwd: std::path::PathBuf::from("/tmp"),
-                model: "mock".into(),
-                max_tokens: 1024,
-                temperature: None,
-                reasoning: None,
-                provider: String::new(),
-                health: None,
-            },
-        );
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(matches!(result, Err(AgentError::MaxIterations(3))));
-    }
-
-    #[tokio::test]
-    async fn loop_provider_error() {
-        // Must provide enough error responses for all retry attempts (MAX_STREAM_RETRIES + 1)
-        let provider = MockProvider::new(vec![
-            vec![StreamChunk::Error("API overloaded".into())],
-            vec![StreamChunk::Error("API overloaded".into())],
-            vec![StreamChunk::Error("API overloaded".into())],
-            vec![StreamChunk::Error("API overloaded".into())],
-        ]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(matches!(result, Err(AgentError::Provider(_))));
-
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
-    }
-
-    #[tokio::test]
-    async fn loop_usage_accumulates() {
-        let provider = MockProvider::new(vec![vec![
-            StreamChunk::Usage(TurnUsage {
-                input_tokens: 100,
-                output_tokens: 50,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            }),
-            StreamChunk::Text("ok".into()),
-            StreamChunk::Done,
-        ]]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let result = agent_loop
-            .run(&mut history, tx, cancel, None, None)
-            .await
-            .unwrap();
-        assert_eq!(result.input_tokens, 100);
-        assert_eq!(result.output_tokens, 50);
-    }
-
-    #[tokio::test]
-    async fn loop_thinking_events_emitted() {
-        let provider = MockProvider::new(vec![vec![
-            StreamChunk::Thinking("let me think...".into()),
-            StreamChunk::Text("answer".into()),
-            StreamChunk::Done,
-        ]]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        agent_loop
-            .run(&mut history, tx, cancel, None, None)
-            .await
-            .unwrap();
-
-        let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ThinkingDelta(t) if t == "let me think..."))
-        );
-    }
-
-    #[tokio::test]
-    async fn loop_thinking_saved_to_history() {
-        let provider = MockProvider::new(vec![vec![
-            StreamChunk::Thinking("step 1\n".into()),
-            StreamChunk::Thinking("step 2".into()),
-            StreamChunk::Text("answer".into()),
-            StreamChunk::Done,
-        ]]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        agent_loop
-            .run(&mut history, tx, cancel, None, None)
-            .await
-            .unwrap();
-
-        assert_eq!(history.message_count(), 2);
-        let assistant_msg = &history.messages()[1];
-        assert_eq!(assistant_msg.blocks.len(), 2);
-        assert!(matches!(
-            &assistant_msg.blocks[0],
-            ContentBlock::Thinking { text } if text == "step 1\nstep 2"
-        ));
-        assert!(matches!(
-            &assistant_msg.blocks[1],
-            ContentBlock::Text { text } if text == "answer"
-        ));
-    }
-
-    #[tokio::test]
-    async fn loop_thinking_flushed_before_tool_use() {
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::Thinking("reasoning".into()),
-                StreamChunk::ToolUse {
-                    id: "c1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text": "hi"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("done".into()), StreamChunk::Done],
-        ]);
-
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-        let agent_loop = make_loop(provider, tools);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("test");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        agent_loop
-            .run(&mut history, tx, cancel, None, None)
-            .await
-            .unwrap();
-
-        // msg 0: user, msg 1: assistant(thinking + tool_use), msg 2: tool_result, msg 3: assistant(text)
-        let first_assistant = &history.messages()[1];
-        assert!(matches!(
-            &first_assistant.blocks[0],
-            ContentBlock::Thinking { text } if text == "reasoning"
-        ));
-        assert!(matches!(
-            &first_assistant.blocks[1],
-            ContentBlock::ToolUse { name, .. } if name == "echo"
-        ));
-    }
-
-    #[tokio::test]
-    async fn loop_permission_denied_skips_tool() {
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::ToolUse {
-                    id: "call1".into(),
-                    name: "danger".into(),
-                    input: serde_json::json!({"cmd": "rm -rf"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
-        ]);
-
-        struct DangerTool;
-        #[async_trait::async_trait]
-        impl Tool for DangerTool {
-            fn spec(&self) -> ToolSpec {
-                ToolSpec {
-                    name: "danger".into(),
-                    description: "Dangerous".into(),
-                    parameters: serde_json::json!({"type":"object"}),
-                    permission: Permission::Dangerous,
-                }
-            }
-            async fn execute(
-                &self,
-                _input: serde_json::Value,
-                _cwd: &std::path::Path,
-            ) -> crate::types::ToolResult {
-                crate::types::ToolResult {
-                    output: "executed".into(),
-                    is_error: false,
-                }
-            }
-        }
-
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DangerTool)];
-        let agent_loop = make_loop(provider, tools);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("do it");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        let (perm_tx, perm_rx) = mpsc::channel(4);
-
-        let loop_handle = tokio::spawn(async move {
-            agent_loop
-                .run(&mut history, tx, cancel, Some(perm_rx), None)
-                .await
-        });
-
-        let mut saw_permission_request = false;
-        while let Some(ev) = rx.recv().await {
-            if let AgentEvent::PermissionRequest { call_id, .. } = &ev {
-                saw_permission_request = true;
-                let _ = perm_tx
-                    .send(crate::types::PermissionResponse {
-                        call_id: call_id.clone(),
-                        allowed: false,
-                    })
-                    .await;
-            }
-            if matches!(ev, AgentEvent::Idle) {
-                break;
-            }
-        }
-
-        assert!(saw_permission_request);
-        let result = loop_handle.await.unwrap();
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn loop_permission_allowed_executes_tool() {
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::ToolUse {
-                    id: "call1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text": "safe"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("done".into()), StreamChunk::Done],
-        ]);
-
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
-        let agent_loop = make_loop(provider, tools);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("test");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-
-        // EchoTool has Permission::ReadOnly, so no permission request should be emitted
-        let (_, perm_rx) = mpsc::channel(4);
-
-        let loop_handle = tokio::spawn(async move {
-            agent_loop
-                .run(&mut history, tx, cancel, Some(perm_rx), None)
-                .await
-        });
-
-        let mut saw_perm_request = false;
-        let mut saw_tool_end = false;
-        while let Some(ev) = rx.recv().await {
-            if matches!(ev, AgentEvent::PermissionRequest { .. }) {
-                saw_perm_request = true;
-            }
-            if matches!(ev, AgentEvent::ToolEnd { .. }) {
-                saw_tool_end = true;
-            }
-            if matches!(ev, AgentEvent::Idle) {
-                break;
-            }
-        }
-
-        assert!(
-            !saw_perm_request,
-            "ReadOnly tool should not ask for permission"
-        );
-        assert!(saw_tool_end, "tool should have been executed");
-        let result = loop_handle.await.unwrap();
-        assert!(result.is_ok());
-    }
-
-    // -- Step 2: ToolPolicy tests ------------------------------------------------
-
-    /// Policy that denies the echo tool.
-    struct DenyEchoPolicy;
-    impl crate::tool::policy::ToolPolicy for DenyEchoPolicy {
-        fn classify(
-            &self,
-            name: &str,
-            _input: &serde_json::Value,
-            _cwd: &std::path::Path,
-            permission: Permission,
-        ) -> crate::tool::policy::ToolDecision {
-            if name == "echo" {
-                return crate::tool::policy::ToolDecision::Deny("echo denied by policy".into());
-            }
-            match permission {
-                Permission::ReadOnly => crate::tool::policy::ToolDecision::Execute,
-                p => crate::tool::policy::ToolDecision::AskUser(p),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn loop_policy_deny_blocks_tool() {
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::ToolUse {
-                    id: "c1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text": "hello"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
-        ]);
-
-        let agent_loop = AgentLoop::with_policy(
-            Box::new(provider),
-            crate::tool::registry::ToolRegistry::new(vec![Box::new(EchoTool)]),
-            LoopConfig {
-                max_iterations: 10,
-                cwd: std::path::PathBuf::from("/tmp"),
-                model: "mock".into(),
-                max_tokens: 1024,
-                temperature: None,
-                reasoning: None,
-                provider: String::new(),
-                health: None,
-            },
-            Box::new(DenyEchoPolicy),
-        );
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let mut history = ConversationHistory::new(String::new());
-        history.push_user("test");
-
-        let _ = agent_loop.run(&mut history, tx, cancel, None, None).await;
-
-        // Collect events
-        let mut saw_deny = false;
-        while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::ToolEnd { output, state, .. } = ev
-                && output.contains("denied by policy")
-                && state == ToolState::Error
-            {
-                saw_deny = true;
-            }
-        }
-        assert!(saw_deny, "policy denial should emit ToolEnd with error");
-    }
-
-    // ── Steer tests ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn steer_message_injected_between_iterations() {
-        // Provider: iteration 1 calls a tool, iteration 2 returns text.
-        // We send a steer message between them and verify it appears in history.
-        let provider = MockProvider::new(vec![
-            // Iteration 1: tool call
-            vec![
-                StreamChunk::ToolUse {
-                    id: "t1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text": "hi"}),
-                },
-                StreamChunk::Done,
-            ],
-            // Iteration 2: text response (after steer)
-            vec![
-                StreamChunk::Text("got your steer".into()),
-                StreamChunk::Done,
-            ],
-        ]);
-
-        let agent_loop = make_loop(provider, vec![Box::new(EchoTool)]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("do something");
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let (steer_tx, steer_rx) = mpsc::channel(16);
-
-        // Pre-load steer message (will be drained at iteration boundary).
-        steer_tx
-            .send(SteerMessage {
-                msg_id: 42,
-                text: "change direction".into(),
-                is_edit: false,
-            })
-            .await
-            .unwrap();
-
-        let result = agent_loop
-            .run(&mut history, tx, cancel, None, Some(steer_rx))
-            .await;
-        assert!(result.is_ok());
-
-        // Verify steer text is in the history as a user message.
-        let msgs = history.messages();
-        let steer_in_history = msgs
-            .iter()
-            .any(|m| m.role == Role::User && m.text_content().contains("change direction"));
-        assert!(steer_in_history, "steer message must appear in history");
-
-        // Verify SteerReceived event was emitted.
-        let mut saw_steer = false;
-        while let Ok(ev) = rx.try_recv() {
-            if matches!(&ev, AgentEvent::SteerReceived { text } if text.contains("change direction"))
-            {
-                saw_steer = true;
-            }
-        }
-        assert!(saw_steer, "SteerReceived event must be emitted");
-    }
-
-    #[tokio::test]
-    async fn steer_multiple_merged_into_one() {
-        // Three steer messages should be merged into a single user message.
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::ToolUse {
-                    id: "t1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text":"x"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
-        ]);
-
-        let agent_loop = make_loop(provider, vec![Box::new(EchoTool)]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("go");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let (steer_tx, steer_rx) = mpsc::channel(16);
-
-        for (id, text) in [(1, "msg one"), (2, "msg two"), (3, "msg three")] {
-            steer_tx
-                .send(SteerMessage {
-                    msg_id: id,
-                    text: text.into(),
-                    is_edit: false,
-                })
-                .await
-                .unwrap();
-        }
-
-        let result = agent_loop
-            .run(&mut history, tx, cancel, None, Some(steer_rx))
-            .await;
-        assert!(result.is_ok());
-
-        // Count user messages that contain steer text.
-        let steer_msgs: Vec<_> = history
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User && m.text_content().contains("msg one"))
-            .collect();
-        assert_eq!(
-            steer_msgs.len(),
-            1,
-            "3 steer messages must be merged into 1 user message"
-        );
-        let combined = steer_msgs[0].text_content();
-        assert!(combined.contains("msg one"));
-        assert!(combined.contains("msg two"));
-        assert!(combined.contains("msg three"));
-    }
-
-    #[tokio::test]
-    async fn steer_edit_replaces_in_pending_queue() {
-        // Send msg_id=10, then edit msg_id=10 before drain.
-        let provider = MockProvider::new(vec![
-            vec![
-                StreamChunk::ToolUse {
-                    id: "t1".into(),
-                    name: "echo".into(),
-                    input: serde_json::json!({"text":"x"}),
-                },
-                StreamChunk::Done,
-            ],
-            vec![StreamChunk::Text("done".into()), StreamChunk::Done],
-        ]);
-
-        let agent_loop = make_loop(provider, vec![Box::new(EchoTool)]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("start");
-
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let (steer_tx, steer_rx) = mpsc::channel(16);
-
-        // Original
-        steer_tx
-            .send(SteerMessage {
-                msg_id: 10,
-                text: "find cafes".into(),
-                is_edit: false,
-            })
-            .await
-            .unwrap();
-        // Edit
-        steer_tx
-            .send(SteerMessage {
-                msg_id: 10,
-                text: "find bars".into(),
-                is_edit: true,
-            })
-            .await
-            .unwrap();
-
-        let result = agent_loop
-            .run(&mut history, tx, cancel, None, Some(steer_rx))
-            .await;
-        assert!(result.is_ok());
-
-        let all_text: String = history
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .map(|m| m.text_content())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            !all_text.contains("find cafes"),
-            "original must be replaced by edit"
-        );
-        assert!(all_text.contains("find bars"), "edited text must appear");
-    }
-
-    #[tokio::test]
-    async fn steer_edit_after_drain_adds_correction() {
-        // Test drain_steers directly: drain once (delivers msg_id=20),
-        // then edit msg_id=20 arrives → must appear as [correction].
-        let (steer_tx, steer_rx) = mpsc::channel(16);
-        let mut opt_rx = Some(steer_rx);
-        let mut pending: Vec<SteerMessage> = Vec::new();
-        let mut delivered = std::collections::HashSet::new();
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("go");
-        let (tx, _rx) = mpsc::channel(64);
-
-        // Send original.
-        steer_tx
-            .send(SteerMessage {
-                msg_id: 20,
-                text: "original direction".into(),
-                is_edit: false,
-            })
-            .await
-            .unwrap();
-
-        // Drain 1: delivers msg_id=20.
-        AgentLoop::drain_steers(&mut opt_rx, &mut pending, &mut delivered, &mut history, &tx).await;
-
-        let user_msgs: Vec<_> = history
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .map(|m| m.text_content())
-            .collect();
-        assert!(
-            user_msgs.iter().any(|t| t.contains("original direction")),
-            "original must be delivered"
-        );
-        assert!(
-            delivered.contains(&20),
-            "msg_id=20 must be in delivered set"
-        );
-
-        // Now send an edit of msg_id=20.
-        steer_tx
-            .send(SteerMessage {
-                msg_id: 20,
-                text: "corrected direction".into(),
-                is_edit: true,
-            })
-            .await
-            .unwrap();
-
-        // Drain 2: edit of already-delivered msg_id=20.
-        AgentLoop::drain_steers(&mut opt_rx, &mut pending, &mut delivered, &mut history, &tx).await;
-
-        let all_text: String = history
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .map(|m| m.text_content())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        assert!(
-            all_text.contains("[correction] corrected direction"),
-            "edit after drain must appear as correction; got: {all_text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn steer_no_channel_works() {
-        // Passing None for steer_rx should work (backward compat).
-        let provider = MockProvider::new(vec![vec![
-            StreamChunk::Text("hello".into()),
-            StreamChunk::Done,
-        ]]);
-        let agent_loop = make_loop(provider, vec![]);
-        let mut history = ConversationHistory::new("sys".into());
-        history.push_user("hi");
-        let (tx, _rx) = mpsc::channel(64);
-        let cancel = CancellationToken::new();
-        let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
-        assert!(result.is_ok());
-    }
-}
+#[path = "loop__tests.rs"]
+mod tests;

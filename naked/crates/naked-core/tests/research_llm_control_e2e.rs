@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use naked_core::AgentCore;
+use naked_core::PatchField;
 use naked_core::ResearchPatch;
 use naked_core::config::{Config, ResearchConfig};
 use naked_core::history::ConversationHistory;
@@ -191,7 +192,7 @@ async fn seed_spec(core: &Arc<AgentCore>, topic: &str, interval: Option<u64>) ->
         .expect("seed create_research");
     if let Some(secs) = interval {
         let patch = ResearchPatch {
-            interval_seconds: Some(Some(secs)),
+            interval_seconds: PatchField::Set(secs),
             ..Default::default()
         };
         core.update_research(&spec.id, patch)
@@ -251,10 +252,8 @@ async fn run_turn(setup: TestSetup, prompt: &str) -> (TurnResult, Arc<AgentCore>
         cwd,
         model: model.clone(),
         max_tokens: 1024,
-        temperature: None,
         reasoning: Some("off".into()),
-        provider: String::new(),
-        health: None,
+        ..Default::default()
     };
     let agent = AgentLoop::new(provider, tools, cfg);
 

@@ -112,7 +112,7 @@ pub(crate) async fn cmd_status(
     let usage = agent.session_total_usage(&sid).await;
     let (_, _, cost) = usage.estimate_cost(&format!("{prov}/{model}"));
 
-    use naked_tg::tg_markup::format_tokens;
+    use naked_tg::markup::format_tokens;
     let mut lines = vec![
         format!(
             "<b>Model:</b> <code>{}/{}</code>",
@@ -150,6 +150,14 @@ pub(crate) async fn cmd_status(
             "<b>Context:</b> ~{} / {}{pct}",
             format_tokens(est as u64),
             format_tokens(cw as u64),
+        ));
+        // Coherence state:
+        let ratio = est as f32 / cw.max(1) as f32;
+        let coh = naked_core::coherence::from_capacity(ratio);
+        lines.push(format!(
+            "<b>Health:</b> {} {}",
+            coh.emoji(),
+            crate::fmt_utils::escape_html_min(coh.label()),
         ));
     }
     let (read_files, modified_files) = agent.session_file_stats(&sid).await;
@@ -198,5 +206,19 @@ pub(crate) async fn cmd_compact(
     } else {
         reply_text(bot, ctx, "No active session.").await?;
     }
+    Ok(())
+}
+
+pub(crate) async fn cmd_usage(
+    bot: &Bot,
+    agent: &Arc<AgentCore>,
+    ctx: &ChatCtx,
+) -> Result<(), teloxide::RequestError> {
+    let summary = agent.token_tracker.summary();
+    let text = format!(
+        "<b>Token Usage</b>\n<pre>{}</pre>",
+        crate::fmt_utils::escape_html_min(&summary)
+    );
+    reply_html(bot, ctx, &text).await?;
     Ok(())
 }

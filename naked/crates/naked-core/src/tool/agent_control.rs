@@ -58,23 +58,14 @@ impl Tool for AgentStatusTool {
                         entry.last_tool.as_deref().unwrap_or("-"),
                         elapsed,
                     );
-                    ToolResult {
-                        output,
-                        is_error: false,
-                    }
+                    ToolResult::ok(output)
                 }
-                None => ToolResult {
-                    output: format!("Agent '{id}' not found"),
-                    is_error: true,
-                },
+                None => ToolResult::err(format!("Agent '{id}' not found")),
             }
         } else {
             let agents = self.registry.list_all().await;
             if agents.is_empty() {
-                return ToolResult {
-                    output: "No sub-agents have been started in this session.".into(),
-                    is_error: false,
-                };
+                return ToolResult::ok("No sub-agents have been started in this session.");
             }
 
             let mut lines = Vec::with_capacity(agents.len() + 1);
@@ -87,10 +78,7 @@ impl Tool for AgentStatusTool {
                     e.agent_id, e.status, elapsed, e.tokens, tool_info, e.prompt_preview
                 ));
             }
-            ToolResult {
-                output: lines.join("\n"),
-                is_error: false,
-            }
+            ToolResult::ok(lines.join("\n"))
         }
     }
 }
@@ -132,23 +120,14 @@ impl Tool for AgentStopTool {
         let agent_id = match input.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => {
-                return ToolResult {
-                    output: "Error: 'agent_id' is required".into(),
-                    is_error: true,
-                };
+                return ToolResult::err("Error: 'agent_id' is required");
             }
         };
 
         if self.registry.cancel(agent_id).await {
-            ToolResult {
-                output: format!("Agent '{agent_id}' cancellation requested"),
-                is_error: false,
-            }
+            ToolResult::ok(format!("Agent '{agent_id}' cancellation requested"))
         } else {
-            ToolResult {
-                output: format!("Agent '{agent_id}' not found or already finished"),
-                is_error: true,
-            }
+            ToolResult::err(format!("Agent '{agent_id}' not found or already finished"))
         }
     }
 }

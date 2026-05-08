@@ -1,6 +1,21 @@
 //! Prompt building, report generation, agent briefs, run records.
 
-use super::*;
+#[allow(unused_imports)]
+use super::ResearchCoordinator;
+#[allow(unused_imports)]
+use super::ResearchSpec;
+#[allow(unused_imports)]
+use super::RunRecord;
+#[allow(unused_imports)]
+use super::RunReport;
+#[allow(unused_imports)]
+use super::StopReason;
+#[allow(unused_imports)]
+use super::VerificationSummary;
+#[allow(unused_imports)]
+use crate::error::Result;
+#[allow(unused_imports)]
+use chrono::Utc;
 
 impl ResearchCoordinator {
     /// Compose the agent-facing prompt. Short but dense: spec topic, source

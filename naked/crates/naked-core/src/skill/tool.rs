@@ -113,10 +113,7 @@ impl SkillTool {
         let content = match tokio::fs::read_to_string(&hit.path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult {
-                    output: format!("Failed to read {}: {e}", hit.path.display()),
-                    is_error: true,
-                };
+                return ToolResult::err(format!("Failed to read {}: {e}", hit.path.display()));
             }
         };
         let description = parse_skill_description(&content);
@@ -127,10 +124,7 @@ impl SkillTool {
             "description": description,
             "prompt": content,
         });
-        ToolResult {
-            output: serde_json::to_string_pretty(&result).unwrap_or_default(),
-            is_error: false,
-        }
+        ToolResult::ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
 
     /// Legacy `SKILL.toml` branch — render a markdown manual and
@@ -147,20 +141,14 @@ impl SkillTool {
         let raw = match tokio::fs::read_to_string(&hit.path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult {
-                    output: format!("Failed to read {}: {e}", hit.path.display()),
-                    is_error: true,
-                };
+                return ToolResult::err(format!("Failed to read {}: {e}", hit.path.display()));
             }
         };
         let Some(manifest) = super::toml_legacy::TomlSkillManifest::parse(&raw) else {
-            return ToolResult {
-                output: format!(
-                    "Failed to parse {} as legacy SKILL.toml",
-                    hit.path.display()
-                ),
-                is_error: true,
-            };
+            return ToolResult::err(format!(
+                "Failed to parse {} as legacy SKILL.toml",
+                hit.path.display()
+            ));
         };
         let manual = manifest.render_manual();
         let description = manifest.short_description();
@@ -173,10 +161,7 @@ impl SkillTool {
             "form": "toml_legacy",
             "prompt": manual,
         });
-        ToolResult {
-            output: serde_json::to_string_pretty(&result).unwrap_or_default(),
-            is_error: false,
-        }
+        ToolResult::ok(serde_json::to_string_pretty(&result).unwrap_or_default())
     }
 
     /// JSON branch — parse `SkillSpec`, dispatch by mode.
@@ -189,19 +174,16 @@ impl SkillTool {
         let raw = match tokio::fs::read_to_string(&hit.path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult {
-                    output: format!("Failed to read {}: {e}", hit.path.display()),
-                    is_error: true,
-                };
+                return ToolResult::err(format!("Failed to read {}: {e}", hit.path.display()));
             }
         };
         let spec: SkillSpec = match serde_json::from_str(&raw) {
             Ok(s) => s,
             Err(e) => {
-                return ToolResult {
-                    output: format!("Failed to parse {} as SkillSpec: {e}", hit.path.display()),
-                    is_error: true,
-                };
+                return ToolResult::err(format!(
+                    "Failed to parse {} as SkillSpec: {e}",
+                    hit.path.display()
+                ));
             }
         };
 
@@ -228,31 +210,22 @@ impl SkillTool {
                     "mode": "advisory",
                     "prompt": body,
                 });
-                ToolResult {
-                    output: serde_json::to_string_pretty(&result).unwrap_or_default(),
-                    is_error: false,
-                }
+                ToolResult::ok(serde_json::to_string_pretty(&result).unwrap_or_default())
             }
             SkillMode::Executable | SkillMode::Hybrid => {
                 let dispatcher = self.dispatcher.read().await.clone();
                 let Some(dispatcher) = dispatcher else {
-                    return ToolResult {
-                        output: format!(
-                            "Skill `{skill_name}` is `{:?}` but no tool dispatcher is wired. \
-                             Install one via SkillTool::install_dispatcher (see \
-                             skill::tool docs) before invoking executable / hybrid skills.",
-                            spec.mode
-                        ),
-                        is_error: true,
-                    };
+                    return ToolResult::err(format!(
+                        "Skill `{skill_name}` is `{:?}` but no tool dispatcher is wired. \
+                         Install one via SkillTool::install_dispatcher (see \
+                         skill::tool docs) before invoking executable / hybrid skills.",
+                        spec.mode
+                    ));
                 };
                 let bundle = match execute_skill(&spec, dispatcher.as_ref(), &arg_context).await {
                     Ok(b) => b,
                     Err(e) => {
-                        return ToolResult {
-                            output: format!("Skill `{skill_name}` failed: {e}"),
-                            is_error: true,
-                        };
+                        return ToolResult::err(format!("Skill `{skill_name}` failed: {e}"));
                     }
                 };
                 let mode_label = if matches!(spec.mode, SkillMode::Hybrid) {
@@ -273,10 +246,7 @@ impl SkillTool {
                 {
                     payload["prompt"] = serde_json::Value::String(after.clone());
                 }
-                ToolResult {
-                    output: serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                    is_error: false,
-                }
+                ToolResult::ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
             }
         }
     }
@@ -326,20 +296,14 @@ impl Tool for SkillTool {
         let input: SkillInput = match serde_json::from_value(input) {
             Ok(v) => v,
             Err(e) => {
-                return ToolResult {
-                    output: format!("Invalid input: {e}"),
-                    is_error: true,
-                };
+                return ToolResult::err(format!("Invalid input: {e}"));
             }
         };
 
         let hit = match self.resolver.resolve(&input.skill) {
             Some(p) => p,
             None => {
-                return ToolResult {
-                    output: format!("Skill '{}' not found", input.skill),
-                    is_error: true,
-                };
+                return ToolResult::err(format!("Skill '{}' not found", input.skill));
             }
         };
 
@@ -456,10 +420,10 @@ mod tests {
     impl SkillToolDispatcher for CountingDispatcher {
         async fn execute(&self, name: &str, _input: serde_json::Value) -> ToolResult {
             *self.n.lock().unwrap() += 1;
-            self.canned.get(name).cloned().unwrap_or(ToolResult {
-                output: format!("no canned response for {name}"),
-                is_error: true,
-            })
+            self.canned
+                .get(name)
+                .cloned()
+                .unwrap_or(ToolResult::err(format!("no canned response for {name}")))
         }
     }
 
@@ -478,13 +442,7 @@ mod tests {
         );
         let tool = make_tool(tmp.path());
         let mut canned = HashMap::new();
-        canned.insert(
-            "x".into(),
-            ToolResult {
-                output: r#"{"answer":42}"#.into(),
-                is_error: false,
-            },
-        );
+        canned.insert("x".into(), ToolResult::ok(r#"{"answer":42}"#));
         let dispatcher = Arc::new(CountingDispatcher {
             n: Mutex::new(0),
             canned,
@@ -520,13 +478,7 @@ mod tests {
         );
         let tool = make_tool(tmp.path());
         let mut canned = HashMap::new();
-        canned.insert(
-            "x".into(),
-            ToolResult {
-                output: "ok".into(),
-                is_error: false,
-            },
-        );
+        canned.insert("x".into(), ToolResult::ok("ok"));
         tool.install_dispatcher(Arc::new(CountingDispatcher {
             n: Mutex::new(0),
             canned,

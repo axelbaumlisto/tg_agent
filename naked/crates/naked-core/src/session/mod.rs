@@ -1,4 +1,6 @@
+pub(crate) mod artifacts;
 pub mod budget;
+pub mod cycle;
 pub mod jsonl_store;
 pub mod store;
 pub mod turn_invariants;
@@ -127,6 +129,8 @@ pub struct Session {
     pub metadata: SessionMetadata,
     /// B3: Track files read/written/edited for compaction summaries.
     pub files: FileTracker,
+    /// Working set: recently active files for context awareness.
+    pub working_set: crate::working_set::WorkingSet,
     /// Number of messages last written to disk. Used for incremental save:
     /// if message_count > persisted_len → append-only (fast).
     /// if message_count <= persisted_len → full rewrite (compaction happened).
@@ -151,6 +155,7 @@ impl Session {
             state: SessionState::Idle,
             metadata,
             files: FileTracker::default(),
+            working_set: crate::working_set::WorkingSet::new(),
             persisted_msg_count: 0,
         }
     }
@@ -172,6 +177,7 @@ impl Session {
             state: SessionState::Idle,
             metadata: self.metadata.clone(),
             files: self.files.clone(),
+            working_set: self.working_set.clone(),
             persisted_msg_count: 0,
         }
     }

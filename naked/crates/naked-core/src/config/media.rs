@@ -1,6 +1,15 @@
 //! Telegram media configuration.
 
-use super::*;
+#[allow(unused_imports)]
+use super::ProviderConfig;
+#[allow(unused_imports)]
+use super::expand_env;
+#[allow(unused_imports)]
+use crate::error::Result;
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use std::collections::HashMap;
 
 /// Runtime settings for Telegram media processing. All sub-sections are
 /// optional — a missing vision/audio config degrades gracefully to "path only".
@@ -278,5 +287,32 @@ impl AudioProviderCfg {
 impl VisionProviderCfg {
     pub fn resolved_api_key(&self) -> Result<String> {
         expand_env(&self.api_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_media_config_parses() {
+        let json = "{}";
+        let cfg: TgMediaConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.audio.is_none());
+        assert!(cfg.vision.is_none());
+    }
+
+    #[test]
+    fn default_limits_sane() {
+        let limits = MediaLimits::default();
+        assert!(limits.photo_max_bytes > 0);
+    }
+
+    #[test]
+    fn vision_capable_model_detection() {
+        let cfg = TgMediaConfig::default();
+        assert!(cfg.is_vision_capable_model("gpt-4o"));
+        assert!(cfg.is_vision_capable_model("grok-2-vision"));
+        assert!(!cfg.is_vision_capable_model("gpt-3.5-turbo"));
     }
 }

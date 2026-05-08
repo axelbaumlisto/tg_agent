@@ -20,10 +20,12 @@ use crate::skill::tool::SkillTool;
 use crate::tool::Tool;
 use crate::tool::agent_control::{AgentStatusTool, AgentStopTool};
 use crate::tool::bash::BashTool;
+use crate::tool::fff_tools::FffState;
 use crate::tool::file_ops::{EditFileTool, ReadFileTool, WriteFileTool};
 use crate::tool::memory::MemoryTool;
 use crate::tool::remote::RemoteContext;
-use crate::tool::search::{GlobSearchTool, GrepSearchTool};
+// Old search tools replaced by fff (SIMD + frecency):
+// use crate::tool::search::{GlobSearchTool, GrepSearchTool};
 use crate::tool::sub_agent::SubAgentTool;
 use crate::tool::web_fetch::WebFetchTool;
 use crate::tool::web_fetch_tls::WebFetchTlsTool;
@@ -40,6 +42,8 @@ pub(crate) struct CoreToolCtx<'a> {
     pub model: &'a str,
     pub workspace: &'a Path,
     pub sender_id: Option<String>,
+    pub todo_list: &'a crate::tool::todo_tool::TodoList,
+    pub plan_state: &'a crate::tool::plan_tool::PlanState,
 }
 
 /// Build core tools: bash, file ops, search, web, memory, sub-agent.
@@ -62,13 +66,17 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
     let memory_ctx = crate::tool::memory::MemoryContext::new();
     memory_ctx.set_user_id(ctx.sender_id.clone());
 
+    // fff-powered search engine (SIMD + frecency):
+    let fff_state = FffState::new(ctx.workspace);
+
     vec![
         bash_tool,
         Box::new(ReadFileTool),
         Box::new(WriteFileTool),
         Box::new(EditFileTool),
-        Box::new(GlobSearchTool),
-        Box::new(GrepSearchTool),
+        // fff-powered search (SIMD + frecency + git-aware):
+        Box::new(crate::tool::fff_tools::FffFindTool::new(&fff_state)),
+        Box::new(crate::tool::fff_tools::FffGrepTool::new(&fff_state)),
         Box::new(sub_agent),
         Box::new(AgentStatusTool::new(ctx.agent_registry.clone())),
         Box::new(AgentStopTool::new(ctx.agent_registry.clone())),
@@ -87,6 +95,22 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
             ctx.workspace.to_path_buf(),
             memory_ctx,
         )),
+        Box::new(super::remember::RememberTool::new(
+            &std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".naked/memory"),
+        )),
+        Box::new(super::test_runner::RunTestsTool),
+        Box::new(super::git_tools::GitLogTool),
+        Box::new(super::git_tools::GitDiffTool),
+        Box::new(super::apply_patch::ApplyPatchTool),
+        Box::new(super::diagnostics::DiagnosticsTool),
+        Box::new(super::validate_data::ValidateDataTool),
+        Box::new(super::todo_tool::TodoTool::new(ctx.todo_list.clone())),
+        Box::new(super::plan_tool::PlanTool::new(ctx.plan_state.clone())),
+        Box::new(super::review_tool::ReviewTool),
+        Box::new(super::recall_archive::RecallArchiveTool::new(
+            ctx.config.session_dir.clone(),
+        )),
     ]
 }
 
@@ -97,6 +121,7 @@ pub(crate) fn research_tools(
     self_ref: &std::sync::RwLock<Option<std::sync::Weak<AgentCore>>>,
 ) -> Vec<Box<dyn Tool>> {
     use crate::research::ops_tool::*;
+    use crate::research::ops_tool_extra::*;
     use crate::research::tool::*;
 
     if !config.research.enabled {
@@ -136,11 +161,13 @@ pub(crate) fn research_tools(
     ];
 
     if let Some(weak) = self_ref.read().expect("self_ref lock").clone() {
-        tools.push(Box::new(ResearchLaunchTool::new(weak.clone())));
-        tools.push(Box::new(ResearchUpdateSpecTool::new(weak.clone())));
-        tools.push(Box::new(ResearchSetScheduleTool::new(weak.clone())));
-        tools.push(Box::new(ResearchPauseTool::new(weak.clone())));
-        tools.push(Box::new(ResearchResumeTool::new(weak)));
+        // Upcast Weak<AgentCore> → Weak<dyn ResearchRunner> for ISP
+        let runner_weak: std::sync::Weak<dyn crate::research::ResearchRunner> = weak;
+        tools.push(Box::new(ResearchLaunchTool::new(runner_weak.clone())));
+        tools.push(Box::new(ResearchUpdateSpecTool::new(runner_weak.clone())));
+        tools.push(Box::new(ResearchSetScheduleTool::new(runner_weak.clone())));
+        tools.push(Box::new(ResearchPauseTool::new(runner_weak.clone())));
+        tools.push(Box::new(ResearchResumeTool::new(runner_weak)));
     }
 
     tools

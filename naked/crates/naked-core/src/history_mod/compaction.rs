@@ -1,6 +1,13 @@
 //! Compaction helpers — summary generation, file tracking, turn-safe cuts.
 
-use super::*;
+#[allow(unused_imports)]
+use super::ContentBlock;
+#[allow(unused_imports)]
+use super::ConversationMessage;
+#[allow(unused_imports)]
+use super::Role;
+#[allow(unused_imports)]
+use super::{COMPACT_PREAMBLE, COMPACT_RECENT_NOTE, COMPACT_RESUME_INSTRUCTION};
 
 /// Build the structured `<summary>` from a slice of removed messages.
 pub(crate) fn summarize_messages(messages: &[ConversationMessage]) -> String {

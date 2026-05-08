@@ -21,24 +21,11 @@ use serde_json::{Value, json};
 use crate::config::ResearchConfig;
 use crate::tool::Tool;
 use crate::types::{Permission, ToolResult, ToolSpec};
-use crate::{AgentCore, ResearchPatch};
+use crate::{PatchField, ResearchPatch};
 
 use super::spec::{ResearchSpec, new_research_id};
 use super::store::ResearchStore;
-use super::tool::{ResearchContext, parse_listing_date};
-
-fn ok(msg: impl Into<String>) -> ToolResult {
-    ToolResult {
-        output: msg.into(),
-        is_error: false,
-    }
-}
-fn err(msg: impl Into<String>) -> ToolResult {
-    ToolResult {
-        output: msg.into(),
-        is_error: true,
-    }
-}
+use super::tool::parse_listing_date;
 
 // ─── research_create ────────────────────────────────────────────────────────
 
@@ -86,7 +73,7 @@ impl Tool for ResearchCreateTool {
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let topic = match input.get("topic").and_then(|v| v.as_str()) {
             Some(t) if !t.trim().is_empty() => t.trim(),
-            _ => return err("missing or empty `topic`"),
+            _ => return ToolResult::err("missing or empty `topic`"),
         };
         let sources: Vec<String> = input
             .get("sources")
@@ -119,15 +106,17 @@ impl Tool for ResearchCreateTool {
         };
 
         match self.store.create_spec(&spec).await {
-            Ok(()) => ok(json!({
-                "id": spec.id,
-                "topic": spec.topic,
-                "sources": sources,
-                "hint": "Use research_launch to start a deep background run, or \
-                         research_set_target to research inline in this chat."
-            })
-            .to_string()),
-            Err(e) => err(format!("failed to create spec: {e}")),
+            Ok(()) => ToolResult::ok(
+                json!({
+                    "id": spec.id,
+                    "topic": spec.topic,
+                    "sources": sources,
+                    "hint": "Use research_launch to start a deep background run, or \
+                             research_set_target to research inline in this chat."
+                })
+                .to_string(),
+            ),
+            Err(e) => ToolResult::err(format!("failed to create spec: {e}")),
         }
     }
 }
@@ -169,10 +158,10 @@ impl Tool for ResearchListSpecsTool {
     async fn execute(&self, _input: Value, _cwd: &Path) -> ToolResult {
         let specs = match self.store.list_specs().await {
             Ok(s) => s,
-            Err(e) => return err(format!("failed to list specs: {e}")),
+            Err(e) => return ToolResult::err(format!("failed to list specs: {e}")),
         };
         if specs.is_empty() {
-            return ok("No research specs defined. Use research_create to start one.");
+            return ToolResult::ok("No research specs defined. Use research_create to start one.");
         }
 
         let mut items = Vec::with_capacity(specs.len());
@@ -218,7 +207,7 @@ impl Tool for ResearchListSpecsTool {
                 "created_at": s.created_at.to_rfc3339(),
             }));
         }
-        ok(Value::Array(items).to_string())
+        ToolResult::ok(Value::Array(items).to_string())
     }
 }
 
@@ -274,7 +263,7 @@ impl Tool for ResearchMetricsTool {
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
-            _ => return err("missing `spec_id`"),
+            _ => return ToolResult::err("missing `spec_id`"),
         };
         let runs_limit = input
             .get("runs_limit")
@@ -285,7 +274,7 @@ impl Tool for ResearchMetricsTool {
 
         let spec = match self.store.load_spec(spec_id).await {
             Ok(s) => s,
-            Err(e) => return err(format!("spec `{spec_id}` not found: {e}")),
+            Err(e) => return ToolResult::err(format!("spec `{spec_id}` not found: {e}")),
         };
         let total = self.store.count_findings(spec_id).await.unwrap_or(0);
         let runs = self
@@ -335,20 +324,22 @@ impl Tool for ResearchMetricsTool {
             })
             .collect();
 
-        ok(json!({
-            "spec_id": spec.id,
-            "topic": spec.topic,
-            "paused": spec.paused,
-            "sources": spec.sources,
-            "schedule": {
-                "interval_seconds": spec.interval_seconds,
-            },
-            "total_findings": total,
-            "fresh_findings_count": fresh_findings_count,
-            "runs": runs_json,
-            "report_excerpt": report_excerpt,
-        })
-        .to_string())
+        ToolResult::ok(
+            json!({
+                "spec_id": spec.id,
+                "topic": spec.topic,
+                "paused": spec.paused,
+                "sources": spec.sources,
+                "schedule": {
+                    "interval_seconds": spec.interval_seconds,
+                },
+                "total_findings": total,
+                "fresh_findings_count": fresh_findings_count,
+                "runs": runs_json,
+                "report_excerpt": report_excerpt,
+            })
+            .to_string(),
+        )
     }
 }
 
@@ -401,7 +392,7 @@ impl Tool for ResearchFindingsTool {
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id,
-            _ => return err("missing `spec_id`"),
+            _ => return ToolResult::err("missing `spec_id`"),
         };
         let fresh_only = input
             .get("fresh_only")
@@ -414,12 +405,12 @@ impl Tool for ResearchFindingsTool {
         let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
 
         if self.store.load_spec(spec_id).await.is_err() {
-            return err(format!("spec `{spec_id}` not found"));
+            return ToolResult::err(format!("spec `{spec_id}` not found"));
         }
 
         let all = match self.store.list_findings(spec_id, None).await {
             Ok(f) => f,
-            Err(e) => return err(format!("failed to load findings: {e}")),
+            Err(e) => return ToolResult::err(format!("failed to load findings: {e}")),
         };
 
         let latest_run_id = if fresh_only {
@@ -476,28 +467,30 @@ impl Tool for ResearchFindingsTool {
             .as_ref()
             .map(|rid| all.iter().filter(|f| f.run_id == *rid).count());
 
-        ok(json!({
-            "spec_id": spec_id,
-            "total_findings": total,
-            "fresh_findings": fresh_count,
-            "showing": shown,
-            "skipped_stale": skipped_stale,
-            "max_age_days": max_age_days,
-            "findings": filtered,
-        })
-        .to_string())
+        ToolResult::ok(
+            json!({
+                "spec_id": spec_id,
+                "total_findings": total,
+                "fresh_findings": fresh_count,
+                "showing": shown,
+                "skipped_stale": skipped_stale,
+                "max_age_days": max_age_days,
+                "findings": filtered,
+            })
+            .to_string(),
+        )
     }
 }
 
 // ─── research_launch ────────────────────────────────────────────────────────
 
 pub struct ResearchLaunchTool {
-    core: Weak<AgentCore>,
+    runner: Weak<dyn super::ResearchRunner>,
 }
 
 impl ResearchLaunchTool {
-    pub fn new(core: Weak<AgentCore>) -> Self {
-        Self { core }
+    pub fn new(runner: Weak<dyn super::ResearchRunner>) -> Self {
+        Self { runner }
     }
 }
 
@@ -530,24 +523,23 @@ impl Tool for ResearchLaunchTool {
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
-            _ => return err("missing `spec_id`"),
+            _ => return ToolResult::err("missing `spec_id`"),
         };
 
-        let core = match self.core.upgrade() {
+        let runner = match self.runner.upgrade() {
             Some(c) => c,
-            None => return err("agent core is no longer available"),
+            None => return ToolResult::err("agent core is no longer available"),
         };
 
-        if let Err(e) = core.load_research(&spec_id).await {
-            return err(format!("spec `{spec_id}` not found: {e}"));
+        if let Err(e) = runner.load_research(&spec_id).await {
+            return ToolResult::err(format!("spec `{spec_id}` not found: {e}"));
         }
 
         let id = spec_id.clone();
-        let verify = core.config().research.verify_by_default;
-        let max_rounds = core.config().research.gatekeeper.max_rounds;
+        let (verify, max_rounds) = runner.research_verify_config();
         tokio::spawn(async move {
             if verify {
-                match core.run_research_verified(&id, max_rounds).await {
+                match runner.run_research_verified(&id, max_rounds).await {
                     Ok(vr) => {
                         let r = &vr.last_run;
                         tracing::info!(
@@ -570,7 +562,7 @@ impl Tool for ResearchLaunchTool {
                     }
                 }
             } else {
-                match core.run_research(&id).await {
+                match runner.run_research(&id).await {
                     Ok(r) => {
                         tracing::info!(
                             spec_id = %id,
@@ -597,13 +589,15 @@ impl Tool for ResearchLaunchTool {
             "The run is executing in the background (10-20 min). \
              Use research_findings to check results when done."
         };
-        ok(json!({
-            "status": "launched",
-            "spec_id": spec_id,
-            "verified": verify,
-            "hint": hint,
-        })
-        .to_string())
+        ToolResult::ok(
+            json!({
+                "status": "launched",
+                "spec_id": spec_id,
+                "verified": verify,
+                "hint": hint,
+            })
+            .to_string(),
+        )
     }
 }
 
@@ -612,12 +606,12 @@ impl Tool for ResearchLaunchTool {
 /// LLM-facing partial-update tool. Maps to [`AgentCore::update_research`].
 /// Every parameter is optional; absent ones leave the spec unchanged.
 pub struct ResearchUpdateSpecTool {
-    core: Weak<AgentCore>,
+    runner: Weak<dyn super::ResearchRunner>,
 }
 
 impl ResearchUpdateSpecTool {
-    pub fn new(core: Weak<AgentCore>) -> Self {
-        Self { core }
+    pub fn new(runner: Weak<dyn super::ResearchRunner>) -> Self {
+        Self { runner }
     }
 }
 
@@ -672,11 +666,11 @@ impl Tool for ResearchUpdateSpecTool {
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
-            _ => return err("missing `spec_id`"),
+            _ => return ToolResult::err("missing `spec_id`"),
         };
-        let core = match self.core.upgrade() {
+        let runner = match self.runner.upgrade() {
             Some(c) => c,
-            None => return err("agent core is no longer available"),
+            None => return ToolResult::err("agent core is no longer available"),
         };
 
         let mut patch = ResearchPatch::default();
@@ -699,14 +693,14 @@ impl Tool for ResearchUpdateSpecTool {
         }
         // interval_seconds: missing → no-op, null → clear, integer → set
         if input.get("clear_schedule").and_then(|v| v.as_bool()) == Some(true) {
-            patch.interval_seconds = Some(None);
+            patch.interval_seconds = PatchField::Clear;
         } else if let Some(v) = input.get("interval_seconds") {
             if v.is_null() {
-                patch.interval_seconds = Some(None);
+                patch.interval_seconds = PatchField::Clear;
             } else if let Some(n) = v.as_u64() {
-                patch.interval_seconds = Some(Some(n));
+                patch.interval_seconds = PatchField::Set(n);
             } else {
-                return err("`interval_seconds` must be an integer or null");
+                return ToolResult::err("`interval_seconds` must be an integer or null");
             }
         }
         if let Some(p) = input.get("provider").and_then(|v| v.as_str()) {
@@ -717,590 +711,46 @@ impl Tool for ResearchUpdateSpecTool {
         }
         if let Some(v) = input.get("max_iterations") {
             if v.is_null() {
-                patch.max_iterations = Some(None);
+                patch.max_iterations = PatchField::Clear;
             } else if let Some(n) = v.as_u64() {
-                patch.max_iterations = Some(Some(n as u32));
+                patch.max_iterations = PatchField::Set(n as u32);
             }
         }
         if let Some(v) = input.get("max_wall_seconds") {
             if v.is_null() {
-                patch.max_wall_seconds = Some(None);
+                patch.max_wall_seconds = PatchField::Clear;
             } else if let Some(n) = v.as_u64() {
-                patch.max_wall_seconds = Some(Some(n));
+                patch.max_wall_seconds = PatchField::Set(n);
             }
         }
 
-        let updated = match core.update_research(&spec_id, patch).await {
+        let updated = match runner.update_research(&spec_id, patch).await {
             Ok(s) => s,
-            Err(e) => return err(format!("failed to update spec: {e}")),
+            Err(e) => return ToolResult::err(format!("failed to update spec: {e}")),
         };
 
         if let Some(p) = input.get("paused").and_then(|v| v.as_bool())
-            && let Err(e) = core.set_research_paused(&spec_id, p).await
+            && let Err(e) = runner.set_research_paused(&spec_id, p).await
         {
-            return err(format!("paused flag updated failed: {e}"));
+            return ToolResult::err(format!("paused flag updated failed: {e}"));
         }
 
         // Re-load to reflect the paused flag too.
-        let final_spec = core.load_research(&spec_id).await.ok().unwrap_or(updated);
+        let final_spec = runner.load_research(&spec_id).await.ok().unwrap_or(updated);
 
-        ok(json!({
-            "id": final_spec.id,
-            "topic": final_spec.topic,
-            "sources": final_spec.sources,
-            "interval_seconds": final_spec.interval_seconds,
-            "provider": final_spec.provider,
-            "model": final_spec.model,
-            "max_iterations": final_spec.max_iterations,
-            "max_wall_seconds": final_spec.max_wall_seconds,
-            "paused": final_spec.paused,
-        })
-        .to_string())
-    }
-}
-
-// ─── research_pause / research_resume ───────────────────────────────────────
-
-/// Pause a research spec. Paused specs are skipped by the in-process
-/// scheduler but `/research run` and `research_launch` still work — pausing
-/// only affects automatic background runs.
-pub struct ResearchPauseTool {
-    core: Weak<AgentCore>,
-}
-
-impl ResearchPauseTool {
-    pub fn new(core: Weak<AgentCore>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for ResearchPauseTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "research_pause".into(),
-            description: "Pause a research spec — the background scheduler \
-                          will stop launching it on its interval. Manual runs \
-                          via /research run or research_launch still work."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "spec_id": { "type": "string", "description": "Spec id to pause" }
-                },
-                "required": ["spec_id"]
-            }),
-            permission: Permission::WorkspaceWrite,
-        }
-    }
-
-    async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
-        let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => return err("missing `spec_id`"),
-        };
-        let core = match self.core.upgrade() {
-            Some(c) => c,
-            None => return err("agent core is no longer available"),
-        };
-        if let Err(e) = core.set_research_paused(&spec_id, true).await {
-            return err(format!("failed to pause: {e}"));
-        }
-        ok(json!({ "spec_id": spec_id, "paused": true }).to_string())
-    }
-}
-
-/// Resume a paused research spec — re-arms the scheduler immediately.
-pub struct ResearchResumeTool {
-    core: Weak<AgentCore>,
-}
-
-impl ResearchResumeTool {
-    pub fn new(core: Weak<AgentCore>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for ResearchResumeTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "research_resume".into(),
-            description: "Resume a paused research spec — re-arms the \
-                          background scheduler immediately. No-op if the spec \
-                          was not paused."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "spec_id": { "type": "string", "description": "Spec id to resume" }
-                },
-                "required": ["spec_id"]
-            }),
-            permission: Permission::WorkspaceWrite,
-        }
-    }
-
-    async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
-        let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => return err("missing `spec_id`"),
-        };
-        let core = match self.core.upgrade() {
-            Some(c) => c,
-            None => return err("agent core is no longer available"),
-        };
-        if let Err(e) = core.set_research_paused(&spec_id, false).await {
-            return err(format!("failed to resume: {e}"));
-        }
-        ok(json!({ "spec_id": spec_id, "paused": false }).to_string())
-    }
-}
-
-// ─── research_set_schedule ──────────────────────────────────────────────────
-
-/// Thin tool dedicated to schedule/pause changes — exists alongside
-/// [`ResearchUpdateSpecTool`] to give the LLM a more discoverable, narrower
-/// surface for the common "change schedule" / "pause for now" intents.
-///
-/// Semantics:
-/// - `interval_seconds: integer` — set polling interval to N seconds.
-/// - `interval_seconds: null`    — clear schedule (one-shot only).
-/// - `interval_seconds` omitted  — leave schedule unchanged.
-/// - `enabled: true`             — unpause (resume scheduling).
-/// - `enabled: false`            — pause (skip scheduled runs).
-/// - `enabled` omitted           — leave pause flag unchanged.
-///
-/// At least one of `interval_seconds` / `enabled` must be present.
-pub struct ResearchSetScheduleTool {
-    core: Weak<AgentCore>,
-}
-
-impl ResearchSetScheduleTool {
-    pub fn new(core: Weak<AgentCore>) -> Self {
-        Self { core }
-    }
-}
-
-#[async_trait]
-impl Tool for ResearchSetScheduleTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "research_set_schedule".into(),
-            description: "Set or clear the schedule of a research spec, and/or toggle \
-                          whether the scheduler runs it. `interval_seconds: null` clears \
-                          the schedule; `enabled: false` pauses; `enabled: true` resumes. \
-                          The in-process scheduler is re-armed immediately after the change."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "spec_id": { "type": "string", "description": "Spec id to update" },
-                    "interval_seconds": {
-                        "type": ["integer", "null"],
-                        "description": "Polling interval in seconds. Use null to clear; \
-                                        omit to leave schedule unchanged."
-                    },
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "true → unpause / resume; false → pause. Omit to \
-                                        leave the pause flag unchanged."
-                    }
-                },
-                "required": ["spec_id"]
-            }),
-            permission: Permission::WorkspaceWrite,
-        }
-    }
-
-    async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
-        let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => return err("missing `spec_id`"),
-        };
-        let core = match self.core.upgrade() {
-            Some(c) => c,
-            None => return err("agent core is no longer available"),
-        };
-
-        let interval_field = input.get("interval_seconds");
-        let enabled = input.get("enabled").and_then(|v| v.as_bool());
-
-        if interval_field.is_none() && enabled.is_none() {
-            return err("at least one of `interval_seconds` or `enabled` must be provided");
-        }
-
-        // Apply schedule first (if requested).
-        if let Some(v) = interval_field {
-            let interval_patch = if v.is_null() {
-                Some(None)
-            } else if let Some(n) = v.as_u64() {
-                Some(Some(n))
-            } else {
-                return err("`interval_seconds` must be an integer or null");
-            };
-            let patch = ResearchPatch {
-                interval_seconds: interval_patch,
-                ..Default::default()
-            };
-            if let Err(e) = core.update_research(&spec_id, patch).await {
-                return err(format!("failed to update schedule: {e}"));
-            }
-        }
-
-        // Then apply pause flag (if requested).
-        if let Some(en) = enabled
-            && let Err(e) = core.set_research_paused(&spec_id, !en).await
-        {
-            return err(format!("failed to toggle pause flag: {e}"));
-        }
-
-        let final_spec = match core.load_research(&spec_id).await {
-            Ok(s) => s,
-            Err(e) => return err(format!("failed to reload spec: {e}")),
-        };
-        ok(json!({
-            "spec_id": final_spec.id,
-            "interval_seconds": final_spec.interval_seconds,
-            "paused": final_spec.paused,
-        })
-        .to_string())
-    }
-}
-
-// ─── research_set_target ────────────────────────────────────────────────────
-
-pub struct ResearchSetTargetTool {
-    store: Arc<dyn ResearchStore>,
-    context: ResearchContext,
-}
-
-impl ResearchSetTargetTool {
-    pub fn new(store: Arc<dyn ResearchStore>, context: ResearchContext) -> Self {
-        Self { store, context }
-    }
-}
-
-#[async_trait]
-impl Tool for ResearchSetTargetTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "research_set_target".into(),
-            description: "Enter inline research mode: sets the active research context so \
-                          that subsequent research_save calls in this chat turn persist \
-                          findings to the given spec. Pass an empty spec_id to clear. \
-                          A clear with zero saves in the current run is REJECTED unless \
-                          you pass `force: true` — this prevents the most common idle \
-                          failure where the agent visits pages but never persists data. \
-                          If genuinely nothing fits the spec (rare), pass force=true with \
-                          a brief note explaining why nothing qualified."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "spec_id": {
-                        "type": "string",
-                        "description": "Research spec id to target, or empty string to clear"
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Bypass the zero-saves clear guard. Use only when \
-                            the page truly contained no qualifying listings."
-                    },
-                    "note": {
-                        "type": "string",
-                        "description": "Optional one-line explanation for an empty clear \
-                            (logged to the waterfall as a Note event)."
-                    }
-                },
-                "required": ["spec_id"]
-            }),
-            permission: Permission::WorkspaceWrite,
-        }
-    }
-
-    async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
-        let spec_id = input
-            .get("spec_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        let force = input
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let note = input
-            .get("note")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-
-        if spec_id.is_empty() {
-            // Guard against the most common idle-failure mode: agent
-            // burns its tool budget on web_fetch / browser_navigate,
-            // then "wraps up" by clearing the target without ever
-            // calling `research_save`. Refuse, unless `force` is set.
-            let saves = self.context.save_count();
-            if saves == 0 && !force {
-                let active_id = self.context.id().unwrap_or_default();
-                if let Some(reg) = self.context.run_events() {
-                    reg.push(
-                        &active_id,
-                        super::run_events::RunEvent::new(
-                            super::run_events::EventKind::Note,
-                            "research_set_target(clear) refused: zero saves so far".to_string(),
-                        ),
-                    )
-                    .await;
-                }
-                return err("Cannot clear research context with 0 findings saved. \
-                     You browsed pages but never called `research_save`. \
-                     Save findings now from the pages you've already opened: \
-                     for each qualifying listing call \
-                     `research_save({\"url\":..., \"title\":..., \"price\":..., \
-                     \"listing_date\":..., \"excerpt\":..., \"source_content\":...})`. \
-                     If you genuinely found nothing qualifying (rare — re-check), \
-                     retry with `{\"spec_id\":\"\", \"force\": true, \
-                     \"note\": \"why nothing matched\"}`."
-                    .to_string());
-            }
-            // Mirror the explicit empty-clear into the waterfall so the
-            // operator can see WHY a run produced no findings.
-            if let Some(reg) = self.context.run_events() {
-                let active_id = self.context.id().unwrap_or_default();
-                let label = if let Some(n) = note {
-                    format!("agent cleared target (force, saves={saves}): {n}")
-                } else {
-                    format!("agent cleared target (saves={saves})")
-                };
-                reg.push(
-                    &active_id,
-                    super::run_events::RunEvent::new(super::run_events::EventKind::Note, label),
-                )
-                .await;
-            }
-            self.context.set_id(None);
-            self.context.set_run_id(None);
-            self.context.reset_saves();
-            return ok("Research context cleared. research_save is no longer active.");
-        }
-
-        if let Err(e) = self.store.load_spec(spec_id).await {
-            return err(format!("spec `{spec_id}` not found: {e}"));
-        }
-
-        let total = self.store.count_findings(spec_id).await.unwrap_or(0);
-
-        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-        self.context.set_id(Some(spec_id.to_string()));
-        self.context.set_run_id(Some(run_id.clone()));
-        // Fresh bind → fresh save counter. The caller of this tool
-        // explicitly opens a new logical run, so previous successes
-        // shouldn't satisfy the clear-guard later.
-        self.context.reset_saves();
-
-        ok(json!({
-            "status": "active",
-            "spec_id": spec_id,
-            "run_id": run_id,
-            "existing_findings": total,
-            "hint": "Now use web_fetch to browse pages, then research_save to persist \
-                     each finding. Call research_set_target with empty spec_id when done. \
-                     The clear is refused if you call it with 0 saves — pass force=true \
-                     ONLY when nothing on the visited pages qualified for the spec."
-        })
-        .to_string())
-    }
-}
-
-// ─── research_help ──────────────────────────────────────────────────────────
-
-/// Read-only tool that returns a structured markdown explanation of how the
-/// research subsystem works (scheduler, semaphore, verification, storage,
-/// every other research tool). Use when the user asks "how does research
-/// work" / "as it works" / "explain scheduling". For state of a *specific*
-/// research prefer [`ResearchMetricsTool`] — `research_help` is meant for
-/// the architecture-level question, not the per-spec status one.
-pub struct ResearchHelpTool {
-    config: ResearchConfig,
-}
-
-impl ResearchHelpTool {
-    pub fn new(config: ResearchConfig) -> Self {
-        Self { config }
-    }
-}
-
-#[async_trait]
-impl Tool for ResearchHelpTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "research_help".into(),
-            description: "Return a structured markdown guide explaining how the research \
-                          subsystem works: scheduling, concurrency cap, gatekeeper verification, \
-                          storage layout, and every research_* tool. Use ONLY for general \
-                          'how does the system work' questions — for the current state of a \
-                          specific spec, use research_metrics instead."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }),
-            permission: Permission::ReadOnly,
-        }
-    }
-
-    async fn execute(&self, _input: Value, _cwd: &Path) -> ToolResult {
-        ok(super::briefing::full(&self.config))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! Integration-style tests for the research-ops tool surface. These
-    //! pin the system-level safety guards we rely on to keep the agent
-    //! honest — most importantly: `research_set_target` must refuse a
-    //! "clear without saving anything" cleanup so we never again ship a
-    //! run where the model burned 30 tool calls and produced 0 findings.
-    use super::*;
-    use crate::research::store::FsResearchStore;
-    use chrono::Utc;
-    use tempfile::tempdir;
-
-    fn make_spec(id: &str) -> super::super::spec::ResearchSpec {
-        super::super::spec::ResearchSpec {
-            id: id.into(),
-            topic: "topic".into(),
-            sources: vec![],
-            interval_seconds: None,
-            run_at: None,
-            cron: None,
-            task_timeout_seconds: None,
-            session_id: None,
-            chat_id: None,
-            thread_id: None,
-            provider: None,
-            model: None,
-            max_iterations: None,
-            max_wall_seconds: None,
-            created_at: Utc::now(),
-            paused: false,
-            pause_reason: None,
-        }
-    }
-
-    fn cwd() -> std::path::PathBuf {
-        std::env::current_dir().unwrap()
-    }
-
-    async fn setup() -> (
-        tempfile::TempDir,
-        std::sync::Arc<dyn ResearchStore>,
-        ResearchContext,
-    ) {
-        let tmp = tempdir().unwrap();
-        let store: std::sync::Arc<dyn ResearchStore> =
-            std::sync::Arc::new(FsResearchStore::new(tmp.path().to_path_buf()));
-        let ctx = ResearchContext::new();
-        (tmp, store, ctx)
-    }
-
-    #[tokio::test]
-    async fn set_target_bind_resets_save_count_and_returns_active() {
-        let (_tmp, store, ctx) = setup().await;
-        store.create_spec(&make_spec("s1")).await.unwrap();
-        // Pretend a previous run had saves; rebinding must reset.
-        ctx.note_save();
-        ctx.note_save();
-        assert_eq!(ctx.save_count(), 2);
-
-        let tool = ResearchSetTargetTool::new(store.clone(), ctx.clone());
-        let out = tool
-            .execute(serde_json::json!({"spec_id":"s1"}), &cwd())
-            .await;
-        assert!(!out.is_error, "got: {}", out.output);
-        assert_eq!(
-            ctx.save_count(),
-            0,
-            "fresh bind must reset the save counter so the clear-guard \
-             starts from zero for this run"
-        );
-        assert_eq!(ctx.id().as_deref(), Some("s1"));
-    }
-
-    #[tokio::test]
-    async fn set_target_clear_with_zero_saves_is_rejected() {
-        let (_tmp, store, ctx) = setup().await;
-        store.create_spec(&make_spec("s1")).await.unwrap();
-        ctx.set_id(Some("s1".into()));
-        ctx.set_run_id(Some("run1".into()));
-        ctx.reset_saves();
-
-        let tool = ResearchSetTargetTool::new(store.clone(), ctx.clone());
-        let out = tool
-            .execute(serde_json::json!({"spec_id":""}), &cwd())
-            .await;
-        assert!(
-            out.is_error,
-            "clear with 0 saves must error, but got success: {}",
-            out.output
-        );
-        assert!(
-            out.output.contains("research_save"),
-            "error must point the agent at the save tool: {}",
-            out.output
-        );
-        // Context must remain bound so the agent can recover.
-        assert_eq!(ctx.id().as_deref(), Some("s1"));
-        assert_eq!(ctx.run_id().as_deref(), Some("run1"));
-    }
-
-    #[tokio::test]
-    async fn set_target_clear_with_force_succeeds_even_on_zero_saves() {
-        let (_tmp, store, ctx) = setup().await;
-        store.create_spec(&make_spec("s1")).await.unwrap();
-        ctx.set_id(Some("s1".into()));
-        ctx.set_run_id(Some("run1".into()));
-        ctx.reset_saves();
-
-        let tool = ResearchSetTargetTool::new(store.clone(), ctx.clone());
-        let out = tool
-            .execute(
-                serde_json::json!({
-                    "spec_id":"",
-                    "force": true,
-                    "note": "no listings matched the strict spec on visited pages"
-                }),
-                &cwd(),
-            )
-            .await;
-        assert!(!out.is_error, "force-clear must succeed: {}", out.output);
-        assert_eq!(ctx.id(), None);
-        assert_eq!(ctx.run_id(), None);
-        assert_eq!(ctx.save_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn set_target_clear_with_at_least_one_save_succeeds() {
-        let (_tmp, store, ctx) = setup().await;
-        store.create_spec(&make_spec("s1")).await.unwrap();
-        ctx.set_id(Some("s1".into()));
-        ctx.set_run_id(Some("run1".into()));
-        ctx.reset_saves();
-        // Simulate a successful research_save during the run.
-        ctx.note_save();
-
-        let tool = ResearchSetTargetTool::new(store.clone(), ctx.clone());
-        let out = tool
-            .execute(serde_json::json!({"spec_id":""}), &cwd())
-            .await;
-        assert!(
-            !out.is_error,
-            "clear after a real save must succeed, got: {}",
-            out.output
-        );
-        assert_eq!(ctx.id(), None);
+        ToolResult::ok(
+            json!({
+                "id": final_spec.id,
+                "topic": final_spec.topic,
+                "sources": final_spec.sources,
+                "interval_seconds": final_spec.interval_seconds,
+                "provider": final_spec.provider,
+                "model": final_spec.model,
+                "max_iterations": final_spec.max_iterations,
+                "max_wall_seconds": final_spec.max_wall_seconds,
+                "paused": final_spec.paused,
+            })
+            .to_string(),
+        )
     }
 }

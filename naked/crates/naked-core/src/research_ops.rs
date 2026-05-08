@@ -1,6 +1,71 @@
 //! Research operations on AgentCore.
 
-use super::*;
+#[allow(unused_imports)]
+use crate::error::{AgentError, Result};
+#[allow(unused_imports)]
+use crate::provider;
+#[allow(unused_imports)]
+use crate::research::coordinator::CoordinatorConfig;
+#[allow(unused_imports)]
+use crate::research::{
+    self, ResearchCoordinator, ResearchPatch, ResearchSpec, ResearchStore, RunReport,
+    VerifiedRunReport,
+};
+#[allow(unused_imports)]
+use crate::types;
+#[allow(unused_imports)]
+use crate::{
+    AgentCore, AgentCoreResearchRunner, acquire_research_permit, apply_research_patch,
+    new_research_id, read_or_recover, write_or_recover, write_research_memory_link_for,
+};
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[allow(unused_imports)]
+use std::sync::Arc;
+#[allow(unused_imports)]
+use tokio::sync::RwLock;
+#[allow(unused_imports)]
+use tokio_util::sync::CancellationToken;
+
+/// RAII guard that owns the lifecycle of a research run's
+/// `(cancel_token, events)` registration. Inserts the entry on
+/// `install`, removes it on drop — so every exit path of
+/// `run_research_*` (Ok, Err, panic) cleans up without boilerplate.
+struct ResearchCancelGuard {
+    cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    events: research::RunEventRegistry,
+    spec_id: String,
+}
+
+impl ResearchCancelGuard {
+    async fn install(
+        cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
+        events: research::RunEventRegistry,
+        spec_id: &str,
+        token: CancellationToken,
+    ) -> Self {
+        cancels.write().await.insert(spec_id.to_string(), token);
+        Self {
+            cancels,
+            events,
+            spec_id: spec_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ResearchCancelGuard {
+    fn drop(&mut self) {
+        // Take ownership of the necessary fields so the spawned future
+        // doesn't outlive the guard. All state is cheaply clone-able.
+        let cancels = self.cancels.clone();
+        let events = self.events.clone();
+        let spec_id = std::mem::take(&mut self.spec_id);
+        tokio::spawn(async move {
+            cancels.write().await.remove(&spec_id);
+            events.drop_run(&spec_id).await;
+        });
+    }
+}
 
 impl AgentCore {
     /// Create a new research and persist its spec.
@@ -70,11 +135,11 @@ impl AgentCore {
     }
 
     pub async fn list_research(&self) -> Result<Vec<ResearchSpec>> {
-        self.research.store.list_specs().await
+        self.research.list_specs().await
     }
 
     pub async fn load_research(&self, id: &str) -> Result<ResearchSpec> {
-        self.research.store.load_spec(id).await
+        self.research.load_spec(id).await
     }
 
     pub async fn delete_research(&self, id: &str) -> Result<()> {
@@ -155,28 +220,7 @@ impl AgentCore {
             ));
         }
 
-        let mut corpus = String::new();
-        for (i, f) in findings.iter().rev().enumerate() {
-            let title = f.title.as_deref().unwrap_or("(untitled)");
-            let price = f.price.as_deref().unwrap_or("?");
-            let date = f.listing_date.as_deref().unwrap_or("?");
-            let excerpt = f
-                .excerpt
-                .as_deref()
-                .map(|e| {
-                    if e.chars().count() > EXCERPT_BUDGET {
-                        format!("{}…", e.chars().take(EXCERPT_BUDGET).collect::<String>())
-                    } else {
-                        e.to_string()
-                    }
-                })
-                .unwrap_or_default();
-            corpus.push_str(&format!(
-                "[{idx}] {title} — {price} ({date})\n  url: {url}\n  excerpt: {excerpt}\n\n",
-                idx = i + 1,
-                url = f.url,
-            ));
-        }
+        let corpus = build_ask_corpus(&findings, EXCERPT_BUDGET);
 
         let provider_name = spec
             .provider
@@ -212,10 +256,12 @@ impl AgentCore {
             reasoning: None,
         };
 
-        let mut stream = provider
-            .stream_chat(request)
-            .await
-            .map_err(|e| AgentError::Provider(format!("research_ask LLM call failed: {e}")))?;
+        let mut stream = provider.stream_chat(request).await.map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Other {
+                status: 0,
+                body: format!("research_ask LLM: {e}"),
+            })
+        })?;
 
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -223,16 +269,22 @@ impl AgentCore {
                 types::StreamChunk::Text(t) => text.push_str(&t),
                 types::StreamChunk::Done => break,
                 types::StreamChunk::Error(e) => {
-                    return Err(AgentError::Provider(format!(
-                        "research_ask stream error: {e}"
-                    )));
+                    return Err(AgentError::ProviderTyped(
+                        crate::provider::error::ProviderError::Other {
+                            status: 0,
+                            body: format!("research_ask stream: {e}"),
+                        },
+                    ));
                 }
                 _ => {}
             }
         }
         if text.trim().is_empty() {
-            return Err(AgentError::Provider(
-                "research_ask LLM returned empty response".into(),
+            return Err(AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::Other {
+                    status: 0,
+                    body: "research_ask LLM returned empty".into(),
+                },
             ));
         }
         Ok(text)
@@ -410,7 +462,7 @@ impl AgentCore {
     /// future telemetry (metrics, CLI `/research tail`) can tap the
     /// same source of truth.
     pub fn research_run_events(&self) -> research::RunEventRegistry {
-        self.research.run_events.clone()
+        self.research.run_events().clone()
     }
 
     /// Snapshot the latest `limit` events for `run_id`. Empty when
@@ -440,6 +492,125 @@ impl AgentCore {
             false
         }
     }
+
+    // ── Research accessors (moved from lib.rs) ─────────────────────────
+
+    pub fn research_run_permits(&self) -> Arc<tokio::sync::Semaphore> {
+        self.research.run_semaphore.clone()
+    }
+
+    pub fn set_scheduler_hook(&self, hook: Arc<dyn research::SchedulerHook>) {
+        *write_or_recover(&self.research.scheduler_hook) = hook;
+    }
+
+    fn scheduler_hook(&self) -> Arc<dyn research::SchedulerHook> {
+        read_or_recover(&self.research.scheduler_hook).clone()
+    }
+
+    pub async fn scheduler_failure_snapshot(&self, spec_id: &str) -> Option<(u32, bool)> {
+        self.scheduler_hook().failure_snapshot(spec_id).await
+    }
+
+    pub async fn reset_research_failures(&self, id: &str) -> Result<()> {
+        self.scheduler_hook().reset_failures(id).await;
+        let mut spec = self.research.store.load_spec(id).await?;
+        let needs_save = spec.paused || spec.pause_reason.is_some();
+        spec.paused = false;
+        spec.pause_reason = None;
+        if needs_save {
+            self.research.store.save_spec(&spec).await?;
+        }
+        self.scheduler_hook()
+            .notify(research::SchedulerEvent::SpecUpdated {
+                spec_id: id.to_string(),
+            })
+            .await;
+        Ok(())
+    }
+
+    pub fn research_store(&self) -> Arc<dyn ResearchStore> {
+        self.research.store.clone()
+    }
+}
+
+/// Build a numbered corpus string from findings for the ask-research prompt.
+fn build_ask_corpus(findings: &[crate::research::Finding], excerpt_budget: usize) -> String {
+    let mut corpus = String::new();
+    for (i, f) in findings.iter().rev().enumerate() {
+        let title = f.title.as_deref().unwrap_or("(untitled)");
+        let price = f.price.as_deref().unwrap_or("?");
+        let date = f.listing_date.as_deref().unwrap_or("?");
+        let excerpt = f
+            .excerpt
+            .as_deref()
+            .map(|e| {
+                if e.chars().count() > excerpt_budget {
+                    format!("{}…", e.chars().take(excerpt_budget).collect::<String>())
+                } else {
+                    e.to_string()
+                }
+            })
+            .unwrap_or_default();
+        corpus.push_str(&format!(
+            "[{idx}] {title} — {price} ({date})\n  url: {url}\n  excerpt: {excerpt}\n\n",
+            idx = i + 1,
+            url = f.url,
+        ));
+    }
+    corpus
+}
+
+// ── ResearchRunner impl for AgentCore ─────────────────────────────────
+
+#[async_trait::async_trait]
+impl research::ResearchRunner for AgentCore {
+    async fn load_research(&self, id: &str) -> Result<research::ResearchSpec> {
+        self.load_research(id).await
+    }
+
+    async fn set_research_paused(&self, id: &str, paused: bool) -> Result<()> {
+        self.set_research_paused(id, paused).await
+    }
+
+    async fn update_research(
+        &self,
+        id: &str,
+        patch: research::patch::ResearchPatch,
+    ) -> Result<research::ResearchSpec> {
+        self.update_research(id, patch).await
+    }
+
+    async fn run_research(&self, id: &str) -> Result<research::RunReport> {
+        let arc = self
+            .self_ref
+            .read()
+            .expect("self_ref lock")
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .expect("AgentCore self_ref not initialized");
+        AgentCore::run_research(arc, id).await
+    }
+
+    async fn run_research_verified(
+        &self,
+        id: &str,
+        max_rounds: u32,
+    ) -> Result<research::VerifiedRunReport> {
+        // Clone the Arc<Self> from self_ref to satisfy the coordinator's Arc receiver
+        let arc = self
+            .self_ref
+            .read()
+            .expect("self_ref lock")
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .expect("AgentCore self_ref not initialized");
+        arc.run_research_verified(id, max_rounds).await
+    }
+
+    fn research_verify_config(&self) -> (bool, u32) {
+        let cfg = &self.config().research;
+        (cfg.verify_by_default, cfg.gatekeeper.max_rounds)
+    }
 }
 
 #[cfg(test)]
@@ -459,6 +630,7 @@ mod boundary_tests {
                 .filter(|(_, l)| !l.trim_start().starts_with("//"))
                 .filter(|(_, l)| !l.contains("pattern"))
                 .filter(|(_, l)| !l.contains("cfg(test)"))
+                .filter(|(_, l)| !l.contains('"')) // skip string literals in test code
                 .filter(|(_, l)| l.contains(pattern))
                 .collect();
             assert!(

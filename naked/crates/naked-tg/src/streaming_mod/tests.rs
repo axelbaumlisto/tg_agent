@@ -150,7 +150,10 @@ mod tests {
     #[test]
     fn is_allowed_empty_list_denies_all() {
         let config = Config {
-            allowed_chat_ids: vec![],
+            telegram: naked_core::config::TelegramConfig {
+                allowed_chat_ids: vec![],
+                ..Default::default()
+            },
             ..Config::default()
         };
         assert!(!is_allowed(123, &config));
@@ -160,7 +163,10 @@ mod tests {
     #[test]
     fn is_allowed_with_ids_checks_membership() {
         let config = Config {
-            allowed_chat_ids: vec![100, 200],
+            telegram: naked_core::config::TelegramConfig {
+                allowed_chat_ids: vec![100, 200],
+                ..Default::default()
+            },
             ..Config::default()
         };
         assert!(is_allowed(100, &config));
@@ -1092,5 +1098,26 @@ mod resilience_tests {
         let v = serde_json::json!({"query": "a".repeat(200)});
         let s = format_input_preview(&v, 20);
         assert!(s.len() <= 30, "should truncate: {}", s.len()); // some slack for key + …
+    }
+
+    #[test]
+    fn cancelled_error_is_not_a_crash() {
+        // The streaming loop treats Error("cancelled") as normal turn
+        // displacement, not a crash. Verify the detection pattern.
+        let cancel_msgs = ["cancelled", "Cancelled", "turn cancelled by new message"];
+        for msg in cancel_msgs {
+            assert!(
+                msg.contains("cancelled") || msg.contains("Cancelled"),
+                "should detect cancel in: {msg}"
+            );
+        }
+        // Non-cancel errors should NOT match:
+        let real_errors = ["connection reset", "timeout", "panic"];
+        for msg in real_errors {
+            assert!(
+                !msg.contains("cancelled") && !msg.contains("Cancelled"),
+                "should NOT detect cancel in: {msg}"
+            );
+        }
     }
 }

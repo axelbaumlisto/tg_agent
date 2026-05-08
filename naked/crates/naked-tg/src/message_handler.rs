@@ -447,10 +447,13 @@ pub(crate) async fn handle_message(
         };
 
         if steered {
-            bot.send_message(ctx.chat_id, "\u{21a9}\u{fe0f} Steering")
-                .maybe_thread(ctx.thread_id)
-                .maybe_reply_to(ctx.reply_to)
-                .await?;
+            bot.send_message(
+                ctx.chat_id,
+                "\u{21a9}\u{fe0f} Принято \u{2014} доставлю между шагами",
+            )
+            .maybe_thread(ctx.thread_id)
+            .maybe_reply_to(ctx.reply_to)
+            .await?;
         } else {
             // Steer channel not available — fall back to queue.
             match multimodal_blocks {
@@ -495,6 +498,18 @@ pub(crate) async fn handle_message(
     // across username changes).
     let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
     agent.set_session_sender(&session_id, sender_id).await;
+
+    // Expand @-mentions: @src/main.rs → inject file content.
+    let workspace = agent
+        .session_workspace(&session_id)
+        .await
+        .unwrap_or_default();
+    let (text, mention_ctx) = naked_core::mentions::expand_mentions(&text, &workspace).await;
+    let text = if mention_ctx.is_empty() {
+        text
+    } else {
+        format!("{text}\n{mention_ctx}")
+    };
 
     let send_result = match multimodal_blocks {
         Some(blocks) => {

@@ -46,10 +46,12 @@ impl JsonRpcResponse {
 
     pub fn into_result(self) -> crate::error::Result<serde_json::Value> {
         if let Some(err) = self.error {
-            Err(crate::error::AgentError::Provider(format!(
-                "MCP JSON-RPC error {}: {}",
-                err.code, err.message
-            )))
+            Err(crate::error::AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::Mcp {
+                    context: format!("JSON-RPC error {}", err.code),
+                    source: err.message,
+                },
+            ))
         } else {
             Ok(self.result.unwrap_or(serde_json::Value::Null))
         }

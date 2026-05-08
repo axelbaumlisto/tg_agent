@@ -33,9 +33,15 @@ pub trait Provider: Send + Sync {
         request: ChatRequest,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>>;
 
-    /// Downcast to `ResilientProvider` for health diagnostics. Default: `None`.
-    fn as_resilient(&self) -> Option<&resilient::ResilientProvider> {
-        None
+    /// Number of currently blacklisted keys. Default: 0 (single-key providers).
+    /// Override in `ResilientProvider` to report actual blacklist state.
+    fn blacklisted_key_count(&self) -> usize {
+        0
+    }
+
+    /// Total number of keys this provider was configured with.
+    fn total_key_count(&self) -> usize {
+        1
     }
 }
 
@@ -45,6 +51,30 @@ pub fn tool_spec_to_anthropic_json(spec: &ToolSpec) -> serde_json::Value {
         "description": spec.description,
         "input_schema": spec.parameters,
     })
+}
+
+/// Adapter: wraps `Arc<dyn Provider>` into `Box<dyn Provider>`.
+struct ArcProvider(std::sync::Arc<dyn Provider>);
+
+#[async_trait]
+impl Provider for ArcProvider {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        self.0.models()
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::types::StreamChunk> + Send>>> {
+        self.0.stream_chat(request).await
+    }
+}
+
+/// Convert `Arc<dyn Provider>` to `Box<dyn Provider>` for APIs that need ownership.
+pub(crate) fn provider_to_box(provider: &std::sync::Arc<dyn Provider>) -> Box<dyn Provider> {
+    Box::new(ArcProvider(provider.clone()))
 }
 
 #[cfg(test)]

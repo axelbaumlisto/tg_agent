@@ -9,6 +9,9 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+similar = "2"
+ignore = "0.4"
+regex-lite = "0.1"
 async-trait = { workspace = true }
 tokio-stream = { workspace = true }
 glob = { workspace = true }
@@ -26,12 +29,16 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 toml = "0.8"
 unicode-normalization = "0.1"
+fff-search = "0.7.1"
+fff-query-parser = "0.7.1"
+parking_lot = "0.12.5"
 
 [dev-dependencies]
 proptest = "1"
 tempfile = { workspace = true }
 filetime = "0.2"
 tracing-subscriber = { workspace = true }
+wiremock = "0.6"
 
 [lints]
 workspace = true

@@ -137,7 +137,7 @@ pub(crate) async fn scan_and_dispatch(
             && now >= at
         {
             let patch = ResearchPatch {
-                run_at: Some(None),
+                run_at: PatchField::Clear,
                 ..Default::default()
             };
             if let Err(e) = core.update_research(&spec.id, patch).await {

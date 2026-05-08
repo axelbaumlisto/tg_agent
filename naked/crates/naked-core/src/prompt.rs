@@ -59,7 +59,12 @@ fn try_read_prompt(path: &Path) -> Option<String> {
         return None;
     }
     if trimmed.len() > MAX_INSTRUCTION_FILE_CHARS {
-        Some(trimmed[..MAX_INSTRUCTION_FILE_CHARS].to_string())
+        // Snap to char boundary to avoid panic on multi-byte UTF-8.
+        let mut end = MAX_INSTRUCTION_FILE_CHARS;
+        while end > 0 && !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(trimmed[..end].to_string())
     } else {
         Some(trimmed.to_string())
     }
@@ -376,5 +381,37 @@ mod tests {
         std::fs::write(&long, &content).unwrap();
         let result = try_read_prompt(&long).unwrap();
         assert_eq!(result.len(), MAX_INSTRUCTION_FILE_CHARS);
+    }
+
+    #[test]
+    fn try_read_prompt_truncates_utf8_on_char_boundary() {
+        // Russian text: each char = 2 bytes. Truncation at byte limit
+        // must not land mid-character.
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("long_ru.md");
+        // Fill with 2-byte Cyrillic chars to exceed the limit
+        let content = "П".repeat(MAX_INSTRUCTION_FILE_CHARS); // 2 bytes each = 2x limit
+        std::fs::write(&long, &content).unwrap();
+        let result = try_read_prompt(&long).unwrap();
+        assert!(result.len() <= MAX_INSTRUCTION_FILE_CHARS);
+        // Must be valid UTF-8 and on a char boundary
+        assert!(result.is_char_boundary(result.len()));
+        // Every char is 2 bytes, so length must be even
+        assert_eq!(result.len() % 2, 0);
+    }
+
+    #[test]
+    fn try_read_prompt_truncates_mixed_utf8() {
+        // Mix of 1-byte ASCII and 3-byte em-dash to hit boundary edge cases.
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("mixed.md");
+        // Pattern: "a—" = 4 bytes. Repeat to exceed limit.
+        let pattern = "a—"; // 1 + 3 bytes
+        let content = pattern.repeat(MAX_INSTRUCTION_FILE_CHARS); // way over
+        std::fs::write(&long, &content).unwrap();
+        let result = try_read_prompt(&long).unwrap();
+        assert!(result.len() <= MAX_INSTRUCTION_FILE_CHARS);
+        // Verify it's valid UTF-8 (implicit: it's a String)
+        assert!(result.ends_with('a') || result.ends_with('—'));
     }
 }

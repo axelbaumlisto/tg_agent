@@ -39,14 +39,9 @@ impl Tool for GlobSearchTool {
     }
 
     async fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
-        let input: GlobInput = match serde_json::from_value(input) {
+        let input: GlobInput = match super::parse_tool_input(input) {
             Ok(v) => v,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("Invalid input: {e}"),
-                    is_error: true,
-                };
-            }
+            Err(e) => return e,
         };
 
         let base = input
@@ -81,10 +76,7 @@ impl Tool for GlobSearchTool {
                 }
                 results.sort();
                 if results.is_empty() {
-                    ToolResult {
-                        output: "No files found".into(),
-                        is_error: false,
-                    }
+                    ToolResult::ok("No files found")
                 } else {
                     let mut output = results.join("\n");
                     if truncated {
@@ -92,16 +84,10 @@ impl Tool for GlobSearchTool {
                             "\n\n(truncated — showing first {MAX_GLOB_RESULTS} results)"
                         ));
                     }
-                    ToolResult {
-                        output,
-                        is_error: false,
-                    }
+                    ToolResult::ok(output)
                 }
             }
-            Err(e) => ToolResult {
-                output: format!("Glob error: {e}"),
-                is_error: true,
-            },
+            Err(e) => ToolResult::err(format!("Glob error: {e}")),
         }
     }
 }
@@ -139,14 +125,9 @@ impl Tool for GrepSearchTool {
     }
 
     async fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
-        let input: GrepInput = match serde_json::from_value(input) {
+        let input: GrepInput = match super::parse_tool_input(input) {
             Ok(v) => v,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("Invalid input: {e}"),
-                    is_error: true,
-                };
-            }
+            Err(e) => return e,
         };
 
         let mut cmd = tokio::process::Command::new("rg");
@@ -181,15 +162,9 @@ impl Tool for GrepSearchTool {
                 const MAX_GREP_OUTPUT: usize = 16_384;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if stdout.is_empty() {
-                    ToolResult {
-                        output: "No matches found".into(),
-                        is_error: false,
-                    }
+                    ToolResult::ok("No matches found")
                 } else if stdout.len() <= MAX_GREP_OUTPUT {
-                    ToolResult {
-                        output: stdout.to_string(),
-                        is_error: false,
-                    }
+                    ToolResult::ok(stdout.to_string())
                 } else {
                     let mut end = MAX_GREP_OUTPUT;
                     while end > 0 && !stdout.is_char_boundary(end) {
@@ -199,19 +174,13 @@ impl Tool for GrepSearchTool {
                         end = nl;
                     }
                     let cut = stdout.len() - end;
-                    ToolResult {
-                        output: format!(
-                            "{}\n\n[output truncated — {cut} bytes cut, narrow your search]",
-                            &stdout[..end]
-                        ),
-                        is_error: false,
-                    }
+                    ToolResult::ok(format!(
+                        "{}\n\n[output truncated — {cut} bytes cut, narrow your search]",
+                        &stdout[..end]
+                    ))
                 }
             }
-            Err(e) => ToolResult {
-                output: format!("rg failed: {e}"),
-                is_error: true,
-            },
+            Err(e) => ToolResult::err(format!("rg failed: {e}")),
         }
     }
 }

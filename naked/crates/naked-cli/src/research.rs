@@ -406,7 +406,7 @@ pub(crate) async fn research_cmd(args: &[String]) -> Result<()> {
                 .update_research(
                     &spec.id,
                     naked_core::ResearchPatch {
-                        max_wall_seconds: Some(Some(max_wall)),
+                        max_wall_seconds: naked_core::PatchField::Set(max_wall),
                         ..Default::default()
                     },
                 )

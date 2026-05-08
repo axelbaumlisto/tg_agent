@@ -292,7 +292,7 @@ mod research_ops_tests {
             .await
             .unwrap();
         let patch = crate::ResearchPatch {
-            interval_seconds: Some(Some(3600)),
+            interval_seconds: crate::PatchField::Set(3600),
             ..Default::default()
         };
         let updated = tc.core.update_research(&spec.id, patch).await.unwrap();

@@ -155,10 +155,7 @@ impl ObservationRecorder {
             kind,
             detail: detail.map(|d| truncate_detail(&d)),
         };
-        let _guard = match self.write_lock.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let _guard = crate::lock_or_recover(&self.write_lock);
         if let Err(e) = append_jsonl(&self.path, &event) {
             tracing::warn!(
                 path = %self.path.display(),

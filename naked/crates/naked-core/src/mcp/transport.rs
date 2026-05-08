@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::McpServerConfig;
 use crate::error::{AgentError, Result};
+use crate::provider::error::ProviderError;
 
 use super::protocol::{JsonRpcRequest, JsonRpcResponse};
 
@@ -39,18 +40,25 @@ impl StdioTransport {
             cmd.env(k, &resolved);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AgentError::Provider(format!("MCP spawn '{}': {e}", config.command)))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            AgentError::ProviderTyped(ProviderError::Mcp {
+                context: format!("MCP spawn '{}': {e}", config.command),
+                source: String::new(),
+            })
+        })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AgentError::Provider("MCP process stdin not captured".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AgentError::Provider("MCP process stdout not captured".into()))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            AgentError::ProviderTyped(ProviderError::Mcp {
+                context: "MCP process stdin not captured".into(),
+                source: String::new(),
+            })
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AgentError::ProviderTyped(ProviderError::Mcp {
+                context: "MCP process stdout not captured".into(),
+                source: String::new(),
+            })
+        })?;
 
         if let Some(stderr) = child.stderr.take() {
             let cmd_name = config.command.clone();
@@ -113,14 +121,20 @@ impl McpTransport for StdioTransport {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
-                return Err(AgentError::Provider(
-                    "MCP: response timed out after 60s".into(),
+                return Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Mcp {
+                        context: "response timed out after 60s".into(),
+                        source: String::new(),
+                    },
                 ));
             }
         }
 
         if line.trim().is_empty() {
-            return Err(AgentError::Provider("MCP: empty response".into()));
+            return Err(AgentError::ProviderTyped(ProviderError::Mcp {
+                context: "MCP: empty response".into(),
+                source: String::new(),
+            }));
         }
 
         let resp: JsonRpcResponse = serde_json::from_str(line.trim()).map_err(|e| {

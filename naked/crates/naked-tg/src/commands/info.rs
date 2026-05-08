@@ -54,14 +54,10 @@ pub(crate) async fn cmd_health(
         // Check which keys are alive via quick balance/auth probe
         // For now, show key count + provider status from the resilient wrapper
         let provider = agent.provider_for(name).await;
-        let info = if let Some(rp) = provider.as_resilient() {
-            let bl = rp.blacklisted_count().await;
+        let bl = provider.blacklisted_key_count();
+        let info = if bl > 0 {
             let alive = total - bl;
-            if bl > 0 {
-                format!("⚠️ {alive}/{total} keys ({bl} blacklisted)")
-            } else {
-                format!("✅ {total} key(s)")
-            }
+            format!("⚠️ {alive}/{total} keys ({bl} blacklisted)")
         } else {
             format!("✅ {total} key(s)")
         };

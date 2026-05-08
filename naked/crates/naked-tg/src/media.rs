@@ -102,10 +102,17 @@ pub fn sanitize_filename(raw: &str) -> String {
         // Keep extension if any.
         if let Some(idx) = trimmed.rfind('.') {
             let (stem, ext) = trimmed.split_at(idx);
-            let keep = 120usize.saturating_sub(ext.len()).min(stem.len());
+            let mut keep = 120usize.saturating_sub(ext.len()).min(stem.len());
+            while keep > 0 && !stem.is_char_boundary(keep) {
+                keep -= 1;
+            }
             format!("{}{ext}", &stem[..keep])
         } else {
-            trimmed[..120].to_string()
+            let mut end = 120.min(trimmed.len());
+            while end > 0 && !trimmed.is_char_boundary(end) {
+                end -= 1;
+            }
+            trimmed[..end].to_string()
         }
     } else {
         trimmed
@@ -677,6 +684,29 @@ mod tests {
         let s = sanitize_filename(&name);
         assert!(s.ends_with(".txt"));
         assert!(s.len() <= 120);
+    }
+
+    #[test]
+    fn sanitize_truncates_russian_filename_on_char_boundary() {
+        // Russian chars are 2 bytes each. 120-byte cut could land mid-char.
+        let stem = "Файл".repeat(50); // 200 chars = 400 bytes
+        let name = format!("{stem}.pdf");
+        let s = sanitize_filename(&name);
+        assert!(s.len() <= 120);
+        assert!(s.ends_with(".pdf"));
+        // Must be valid UTF-8 — this implicitly tests char boundary.
+        assert!(s.is_char_boundary(s.len()));
+    }
+
+    #[test]
+    fn sanitize_truncates_no_ext_russian() {
+        let stem = "Отчёт".repeat(50); // 250 chars = 500 bytes, no extension
+        let s = sanitize_filename(&stem);
+        assert!(s.len() <= 120);
+        // Valid UTF-8 string
+        for c in s.chars() {
+            assert!(c.len_utf8() > 0);
+        }
     }
 
     #[test]

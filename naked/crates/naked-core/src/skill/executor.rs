@@ -115,10 +115,7 @@ async fn run_with_retry(
         OnError::Retry { times } => times.saturating_add(1),
         _ => 1,
     };
-    let mut last = ToolResult {
-        output: String::new(),
-        is_error: false,
-    };
+    let mut last = ToolResult::ok(String::new());
     for _ in 0..attempts {
         last = dispatcher.execute(&step.tool, args.clone()).await;
         if !last.is_error {
@@ -269,24 +266,7 @@ mod tests {
             {
                 return queue.remove(0);
             }
-            ToolResult {
-                output: format!("no canned response for {name}"),
-                is_error: true,
-            }
-        }
-    }
-
-    fn ok(s: &str) -> ToolResult {
-        ToolResult {
-            output: s.into(),
-            is_error: false,
-        }
-    }
-
-    fn err(s: &str) -> ToolResult {
-        ToolResult {
-            output: s.into(),
-            is_error: true,
+            ToolResult::err(format!("no canned response for {name}"))
         }
     }
 
@@ -304,8 +284,8 @@ mod tests {
     #[tokio::test]
     async fn happy_path_substitutes_and_captures() {
         let disp = MockDispatcher::new();
-        disp.add_response("fetch", ok(r#"{"page":"hello"}"#));
-        disp.add_response("summ", ok("summary text"));
+        disp.add_response("fetch", ToolResult::ok(r#"{"page":"hello"}"#));
+        disp.add_response("summ", ToolResult::ok("summary text"));
 
         let spec = spec_with_steps(vec![
             SkillStep {
@@ -346,8 +326,8 @@ mod tests {
     #[tokio::test]
     async fn abort_propagates_error() {
         let disp = MockDispatcher::new();
-        disp.add_response("a", ok("ok"));
-        disp.add_response("b", err("boom"));
+        disp.add_response("a", ToolResult::ok("ok"));
+        disp.add_response("b", ToolResult::err("boom"));
 
         let spec = spec_with_steps(vec![
             SkillStep {
@@ -376,8 +356,8 @@ mod tests {
     #[tokio::test]
     async fn continue_records_error_and_keeps_going() {
         let disp = MockDispatcher::new();
-        disp.add_response("flaky", err("nope"));
-        disp.add_response("after", ok("done"));
+        disp.add_response("flaky", ToolResult::err("nope"));
+        disp.add_response("after", ToolResult::ok("done"));
 
         let spec = spec_with_steps(vec![
             SkillStep {
@@ -408,8 +388,8 @@ mod tests {
     #[tokio::test]
     async fn retry_succeeds_on_second_attempt() {
         let disp = MockDispatcher::new();
-        disp.add_response("flaky", err("first"));
-        disp.add_response("flaky", ok("second"));
+        disp.add_response("flaky", ToolResult::err("first"));
+        disp.add_response("flaky", ToolResult::ok("second"));
 
         let spec = spec_with_steps(vec![SkillStep {
             name: None,
@@ -428,9 +408,9 @@ mod tests {
     #[tokio::test]
     async fn retry_exhausts_then_aborts() {
         let disp = MockDispatcher::new();
-        disp.add_response("never", err("a"));
-        disp.add_response("never", err("b"));
-        disp.add_response("never", err("c"));
+        disp.add_response("never", ToolResult::err("a"));
+        disp.add_response("never", ToolResult::err("b"));
+        disp.add_response("never", ToolResult::err("c"));
 
         let spec = spec_with_steps(vec![SkillStep {
             name: None,
@@ -455,7 +435,7 @@ mod tests {
         // so the tool will fail loudly. That's preferable to silently
         // substituting `""` and producing nonsense output.
         let disp = MockDispatcher::new();
-        disp.add_response("echo", ok("ok"));
+        disp.add_response("echo", ToolResult::ok("ok"));
         let spec = spec_with_steps(vec![SkillStep {
             name: None,
             tool: "echo".into(),
@@ -473,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn nested_args_substitute_recursively() {
         let disp = MockDispatcher::new();
-        disp.add_response("nested", ok("ok"));
+        disp.add_response("nested", ToolResult::ok("ok"));
         let spec = spec_with_steps(vec![SkillStep {
             name: None,
             tool: "nested".into(),

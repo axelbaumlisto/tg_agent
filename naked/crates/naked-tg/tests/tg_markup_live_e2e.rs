@@ -18,7 +18,7 @@ use naked_core::tool::file_ops::{EditFileTool, ReadFileTool, WriteFileTool};
 use naked_core::tool::registry::ToolRegistry;
 use naked_core::tool::search::{GlobSearchTool, GrepSearchTool};
 use naked_core::types::AgentEvent;
-use naked_tg::tg_markup::{MAX_TG_MSG, md_to_tg_html, split_html};
+use naked_tg::markup::{MAX_TG_MSG, md_to_tg_html, split_html};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -102,9 +102,7 @@ async fn run_prompt(provider: Box<dyn Provider>, model: &str, prompt: &str) -> O
         model: model.to_string(),
         max_tokens: 2048,
         temperature: Some(0.3),
-        reasoning: None,
-        provider: String::new(),
-        health: None,
+        ..Default::default()
     };
 
     let agent = AgentLoop::new(provider, ToolRegistry::new(tools), config);

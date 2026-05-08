@@ -16,7 +16,9 @@
 //! return an error — never guess which research to write to.
 
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use super::context::ResearchContext;
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, Utc};
@@ -29,233 +31,6 @@ use super::spec::{Cursor, Finding, content_hash, dedup_hash, host_path_hash};
 use super::store::ResearchStore;
 
 const MAX_LISTING_AGE_DAYS: i64 = 90;
-
-/// Ambient "which research is this turn driving?" handle, installed by the
-/// coordinator before it calls the agent and cleared after the turn is done.
-/// Mirrors `tool::memory::MemoryContext` — same pattern, same invariants.
-#[derive(Clone, Default)]
-pub struct ResearchContext {
-    inner: Arc<RwLock<Option<String>>>,
-    run_id: Arc<RwLock<Option<String>>>,
-    /// Optional waterfall sink (installed by `AgentCore` when the
-    /// run-event registry is wired up). `None` in unit tests and CLI
-    /// runs that don't care about the live TG progress stream.
-    run_events: Arc<RwLock<Option<super::run_events::RunEventRegistry>>>,
-    /// Successful `research_save` count for the current run. Reset to 0
-    /// when the context is (re)bound to a fresh `(spec_id, run_id)` and
-    /// inspected by `research_set_target` to refuse a "clear without
-    /// saving anything" — the most common idle-failure mode where the
-    /// agent visits 30+ pages but never persists a single finding.
-    saves: Arc<RwLock<u32>>,
-}
-
-impl ResearchContext {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_id(&self, id: Option<String>) {
-        if let Ok(mut g) = self.inner.write() {
-            *g = id;
-        }
-    }
-
-    pub fn id(&self) -> Option<String> {
-        self.inner.read().ok().and_then(|g| g.clone())
-    }
-
-    pub fn set_run_id(&self, id: Option<String>) {
-        if let Ok(mut g) = self.run_id.write() {
-            *g = id;
-        }
-    }
-
-    pub fn run_id(&self) -> Option<String> {
-        self.run_id.read().ok().and_then(|g| g.clone())
-    }
-
-    /// Attach (or replace) the run-event registry used by tools to
-    /// push waterfall events. Cheap — the registry is `Arc`-wrapped
-    /// internally.
-    pub fn set_run_events(&self, reg: Option<super::run_events::RunEventRegistry>) {
-        if let Ok(mut g) = self.run_events.write() {
-            *g = reg;
-        }
-    }
-
-    pub fn run_events(&self) -> Option<super::run_events::RunEventRegistry> {
-        self.run_events.read().ok().and_then(|g| g.clone())
-    }
-
-    /// Increment the per-run save counter. Called by `ResearchSaveTool`
-    /// after a successful append (skipped saves do not count). Saturates
-    /// at u32::MAX — we only ever check `> 0`.
-    pub fn note_save(&self) {
-        if let Ok(mut g) = self.saves.write() {
-            *g = g.saturating_add(1);
-        }
-    }
-
-    /// Number of successful saves recorded for the current bound run.
-    pub fn save_count(&self) -> u32 {
-        self.saves.read().map(|g| *g).unwrap_or(0)
-    }
-
-    /// Reset the per-run save counter to zero. Called from
-    /// `set_id`/`set_run_id`-like rebind paths so a freshly-acquired
-    /// context starts at 0 saves regardless of what the previous run
-    /// observed.
-    pub fn reset_saves(&self) {
-        if let Ok(mut g) = self.saves.write() {
-            *g = 0;
-        }
-    }
-}
-
-fn err(msg: impl Into<String>) -> ToolResult {
-    ToolResult {
-        output: msg.into(),
-        is_error: true,
-    }
-}
-
-fn ok(msg: impl Into<String>) -> ToolResult {
-    ToolResult {
-        output: msg.into(),
-        is_error: false,
-    }
-}
-
-/// Strip leading/trailing source-attribution lines an LLM tends to add to the
-/// excerpt even when told not to. Targets the most common Vietnamese / English
-/// trailers we see in the wild: `Nguồn: ...`, `Source: ...`, `Posted by ...`,
-/// `đăng N ngày/giờ trước`, `Cập nhật ...`.
-///
-/// Conservative: only drops a *whole line* (or a final clause separated by `—`
-/// / `-` / `|`) that matches one of the known prefixes case-insensitively. We
-/// never edit the body of the text, so a legitimate phone number written
-/// alongside `Source: foo` survives if it's on a different line.
-pub(crate) fn strip_source_attribution(text: &str) -> String {
-    const PREFIXES: &[&str] = &[
-        "nguồn:",
-        "nguon:",
-        "source:",
-        "источник:",
-        "posted by",
-        "đăng bởi",
-        "dang boi",
-        "đăng ngày",
-        "cập nhật",
-        "cap nhat",
-    ];
-    fn looks_like_attribution(line: &str) -> bool {
-        let t = line.trim().to_lowercase();
-        if t.is_empty() {
-            return false;
-        }
-        if PREFIXES.iter().any(|p| t.starts_with(p)) {
-            return true;
-        }
-        // Match relative-time trailers: "đăng 3 ngày trước", "5 giờ trước".
-        (t.contains(" ngày trước") || t.contains(" giờ trước")) && t.split_whitespace().count() <= 6
-    }
-
-    let mut kept: Vec<String> = text
-        .lines()
-        .filter(|l| !looks_like_attribution(l))
-        .map(|l| l.trim_end().to_string())
-        .collect();
-    // Strip a single trailing clause after the last separator if it looks like
-    // attribution: "...rooms — Nguồn: alonhadat.com.vn".
-    if let Some(last) = kept.pop() {
-        let cleaned = ["—", " - ", " | "].iter().fold(last, |acc, sep| {
-            if let Some((head, tail)) = acc.rsplit_once(sep)
-                && looks_like_attribution(tail)
-            {
-                head.trim_end().to_string()
-            } else {
-                acc
-            }
-        });
-        kept.push(cleaned);
-    }
-    kept.join("\n").trim().to_string()
-}
-
-/// Trim free-form agent-provided text to a max length so a single bad excerpt
-/// can't balloon `findings.jsonl` to MB-per-line.
-fn clip(text: &str, max: usize) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.chars().count() <= max {
-        Some(trimmed.to_string())
-    } else {
-        Some(trimmed.chars().take(max).collect::<String>() + "…")
-    }
-}
-
-/// Try to parse a free-form listing date string into a NaiveDate.
-/// Handles: `YYYY-MM-DD`, `DD/MM/YYYY`, `DD-MM-YYYY`, `DD.MM.YYYY`,
-/// relative Vietnamese (`hôm nay`, `hôm qua`, `N ngày trước`), and `unknown`.
-pub fn parse_listing_date(s: &str) -> Option<NaiveDate> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() || s == "unknown" {
-        return None;
-    }
-    let today = Utc::now().date_naive();
-
-    if s.contains("hôm nay") || s == "today" {
-        return Some(today);
-    }
-    if s.contains("hôm qua") || s == "yesterday" {
-        return Some(today - chrono::Duration::days(1));
-    }
-    // "N ngày trước" / "N days ago"
-    if let Some(n) = extract_days_ago(&s) {
-        return Some(today - chrono::Duration::days(n));
-    }
-
-    // ISO: 2026-04-18
-    if let Ok(d) = NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-        return Some(d);
-    }
-    // DD/MM/YYYY
-    if let Ok(d) = NaiveDate::parse_from_str(&s, "%d/%m/%Y") {
-        return Some(d);
-    }
-    // DD-MM-YYYY
-    if let Ok(d) = NaiveDate::parse_from_str(&s, "%d-%m-%Y") {
-        return Some(d);
-    }
-    // DD.MM.YYYY
-    if let Ok(d) = NaiveDate::parse_from_str(&s, "%d.%m.%Y") {
-        return Some(d);
-    }
-    None
-}
-
-fn extract_days_ago(s: &str) -> Option<i64> {
-    // Match patterns like "3 ngày trước", "5 days ago"
-    for word in s.split_whitespace() {
-        if let Ok(n) = word.parse::<i64>()
-            && (s.contains("ngày trước") || s.contains("days ago"))
-        {
-            return Some(n);
-        }
-    }
-    None
-}
-
-/// Check if a listing date is too old (> MAX_LISTING_AGE_DAYS).
-/// Returns `None` if date can't be parsed (let it through — benefit of the doubt).
-fn is_stale(listing_date: Option<&str>) -> Option<bool> {
-    let s = listing_date?;
-    let d = parse_listing_date(s)?;
-    let age = Utc::now().date_naive() - d;
-    Some(age.num_days() > MAX_LISTING_AGE_DAYS)
-}
 
 /// `research_save` — save or update a finding, with configurable quality warnings.
 pub struct ResearchSaveTool {
@@ -304,14 +79,16 @@ impl Tool for ResearchSaveTool {
 
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let Some(id) = self.context.id() else {
-            return err("no active research context — call this tool only inside /research run");
+            return ToolResult::err(
+                "no active research context — call this tool only inside /research run",
+            );
         };
         let url = match input.get("url").and_then(|v| v.as_str()) {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => return err("`url` is required and must be non-empty"),
+            _ => return ToolResult::err("`url` is required and must be non-empty"),
         };
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return err(format!(
+            return ToolResult::err(format!(
                 "`url` must be absolute http(s) — got `{}`",
                 url.chars().take(80).collect::<String>()
             ));
@@ -321,7 +98,7 @@ impl Tool for ResearchSaveTool {
         let listing_date_raw = input.get("listing_date").and_then(|v| v.as_str());
         if let Some(true) = is_stale(listing_date_raw) {
             let date_str = listing_date_raw.unwrap_or("?");
-            return ok(format!(
+            return ToolResult::ok(format!(
                 "{{\"stored\":false,\"skipped\":true,\"reason\":\"listing too old ({date_str}), max {MAX_LISTING_AGE_DAYS} days\"}}"
             ));
         }
@@ -350,7 +127,7 @@ impl Tool for ResearchSaveTool {
                 )
                 .await;
             }
-            return ok(format!(
+            return ToolResult::ok(format!(
                 "{{\"stored\":false,\"skipped\":true,\"reason\":\"captcha_stub (matched `{marker}`) — rerun via Skill(web-browser-playbook) + browser_navigate on {url}\"}}"
             ));
         }
@@ -359,51 +136,7 @@ impl Tool for ResearchSaveTool {
             .context
             .run_id()
             .unwrap_or_else(|| "manual".to_string());
-
-        let excerpt_str = input
-            .get("excerpt")
-            .and_then(|v| v.as_str())
-            .map(strip_source_attribution)
-            .and_then(|s| clip(&s, 2000));
-        let source_content_str = input
-            .get("source_content")
-            .and_then(|v| v.as_str())
-            .and_then(|s| clip(s, 8000));
-
-        // Content fingerprint: prefer source_content (richer), fall back to
-        // excerpt. When both are absent, leaves `content_hash` empty so the
-        // store skips the content-based dedup check.
-        let content_for_hash = content_hash(
-            source_content_str
-                .as_deref()
-                .or(excerpt_str.as_deref())
-                .unwrap_or(""),
-        );
-
-        let finding = Finding {
-            id: uuid::Uuid::new_v4().simple().to_string(),
-            research_id: id.clone(),
-            run_id,
-            url: url.clone(),
-            title: input
-                .get("title")
-                .and_then(|v| v.as_str())
-                .and_then(|s| clip(s, 200)),
-            excerpt: excerpt_str,
-            price: input
-                .get("price")
-                .and_then(|v| v.as_str())
-                .and_then(|s| clip(s, 80)),
-            listing_date: input
-                .get("listing_date")
-                .and_then(|v| v.as_str())
-                .and_then(|s| clip(s, 40)),
-            source_content: source_content_str,
-            dedup_hash: dedup_hash(&url),
-            host_path_hash: host_path_hash(&url),
-            content_hash: content_for_hash,
-            seen_at: Utc::now(),
-        };
+        let finding = build_finding(&id, &run_id, &url, &input);
 
         let mut warnings = Vec::new();
         if finding.listing_date.is_none() && self.gk.require_listing_date {
@@ -467,16 +200,16 @@ impl Tool for ResearchSaveTool {
                     )
                 };
                 if updated {
-                    ok(format!(
+                    ToolResult::ok(format!(
                         "{{\"stored\":true,\"updated\":true,\"total_findings\":{total}{warn_json}}}"
                     ))
                 } else {
-                    ok(format!(
+                    ToolResult::ok(format!(
                         "{{\"stored\":true,\"duplicate\":false,\"total_findings\":{total}{warn_json}}}"
                     ))
                 }
             }
-            Err(e) => err(format!("store error: {e}")),
+            Err(e) => ToolResult::err(format!("store error: {e}")),
         }
     }
 }
@@ -516,7 +249,7 @@ impl Tool for ResearchListTool {
 
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let Some(id) = self.context.id() else {
-            return err("no active research context");
+            return ToolResult::err("no active research context");
         };
         let limit = input
             .get("limit")
@@ -524,16 +257,16 @@ impl Tool for ResearchListTool {
             .map(|n| n.min(200) as usize)
             .unwrap_or(20);
         match self.store.list_findings(&id, Some(limit)).await {
-            Ok(list) if list.is_empty() => ok("(no findings yet)".to_string()),
+            Ok(list) if list.is_empty() => ToolResult::ok("(no findings yet)".to_string()),
             Ok(list) => {
                 let mut out = String::new();
                 for f in list.iter().rev() {
                     let title = f.title.as_deref().unwrap_or("(untitled)");
                     out.push_str(&format!("- {} — {}\n", title, f.url));
                 }
-                ok(out)
+                ToolResult::ok(out)
             }
-            Err(e) => err(format!("store error: {e}")),
+            Err(e) => ToolResult::err(format!("store error: {e}")),
         }
     }
 }
@@ -578,19 +311,19 @@ impl Tool for ResearchSaveCursorTool {
 
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let Some(id) = self.context.id() else {
-            return err("no active research context");
+            return ToolResult::err("no active research context");
         };
         let cursor_val = match input.get("cursor") {
             Some(Value::Object(m)) => m.clone(),
-            _ => return err("`cursor` must be a JSON object"),
+            _ => return ToolResult::err("`cursor` must be a JSON object"),
         };
         let cursor = Cursor {
             data: cursor_val,
             updated_at: None,
         };
         match self.store.save_cursor(&id, &cursor).await {
-            Ok(()) => ok("cursor saved".to_string()),
-            Err(e) => err(format!("store error: {e}")),
+            Ok(()) => ToolResult::ok("cursor saved".to_string()),
+            Err(e) => ToolResult::err(format!("store error: {e}")),
         }
     }
 }
@@ -634,7 +367,7 @@ impl Tool for ResearchStatusTool {
 
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let Some(id) = input.get("research_id").and_then(|v| v.as_str()) else {
-            return err("`research_id` is required");
+            return ToolResult::err("`research_id` is required");
         };
         let limit = input
             .get("finding_limit")
@@ -652,7 +385,7 @@ impl Tool for ResearchStatusTool {
 
         let spec = match self.store.load_spec(id).await {
             Ok(s) => s,
-            Err(e) => return err(format!("unknown research `{id}`: {e}")),
+            Err(e) => return ToolResult::err(format!("unknown research `{id}`: {e}")),
         };
         let runs = self.store.list_runs(id, Some(3)).await.unwrap_or_default();
         let total = self.store.count_findings(id).await.unwrap_or(0);
@@ -732,7 +465,7 @@ impl Tool for ResearchStatusTool {
                 ));
             }
         }
-        ok(out)
+        ToolResult::ok(out)
     }
 }
 
@@ -778,8 +511,6 @@ static BEARER_REDACTORS: once_cell_shim::Lazy<Vec<redact::BearerPattern>> =
         vec![redact::BearerPattern::new("bearer")]
     });
 
-/// Minimal std-only lazy helper so we can avoid pulling in `once_cell` just for
-/// two tables. Mimics `OnceLock<Vec<_>>` behind a `Lazy`-like API.
 mod once_cell_shim {
     use std::sync::OnceLock;
 
@@ -998,229 +729,180 @@ mod redact {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::research::spec::ResearchSpec;
-    use crate::research::store::FsResearchStore;
-    use tempfile::tempdir;
+/// Construct a Finding from tool input.
+fn build_finding(research_id: &str, run_id: &str, url: &str, input: &Value) -> Finding {
+    let excerpt_str = input
+        .get("excerpt")
+        .and_then(|v| v.as_str())
+        .map(strip_source_attribution)
+        .and_then(|s| clip(&s, 2000));
+    let source_content_str = input
+        .get("source_content")
+        .and_then(|v| v.as_str())
+        .and_then(|s| clip(s, 8000));
+    let content_for_hash = content_hash(
+        source_content_str
+            .as_deref()
+            .or(excerpt_str.as_deref())
+            .unwrap_or(""),
+    );
+    Finding {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        research_id: research_id.to_string(),
+        run_id: run_id.to_string(),
+        url: url.to_string(),
+        title: input
+            .get("title")
+            .and_then(|v| v.as_str())
+            .and_then(|s| clip(s, 200)),
+        excerpt: excerpt_str,
+        price: input
+            .get("price")
+            .and_then(|v| v.as_str())
+            .and_then(|s| clip(s, 80)),
+        listing_date: input
+            .get("listing_date")
+            .and_then(|v| v.as_str())
+            .and_then(|s| clip(s, 40)),
+        source_content: source_content_str,
+        dedup_hash: dedup_hash(url),
+        host_path_hash: host_path_hash(url),
+        content_hash: content_for_hash,
+        seen_at: Utc::now(),
+    }
+}
 
-    fn setup() -> (tempfile::TempDir, Arc<dyn ResearchStore>, ResearchContext) {
-        let tmp = tempdir().unwrap();
-        let store: Arc<dyn ResearchStore> =
-            Arc::new(FsResearchStore::new(tmp.path().to_path_buf()));
-        let ctx = ResearchContext::new();
-        (tmp, store, ctx)
+#[cfg(test)]
+#[path = "tool_tests.rs"]
+mod tests;
+
+/// Strip leading/trailing source-attribution lines an LLM tends to add to the
+/// excerpt even when told not to. Targets the most common Vietnamese / English
+/// trailers we see in the wild: `Nguồn: ...`, `Source: ...`, `Posted by ...`,
+/// `đăng N ngày/giờ trước`, `Cập nhật ...`.
+///
+/// Conservative: only drops a *whole line* (or a final clause separated by `—`
+/// / `-` / `|`) that matches one of the known prefixes case-insensitively. We
+/// never edit the body of the text, so a legitimate phone number written
+/// alongside `Source: foo` survives if it's on a different line.
+pub(crate) fn strip_source_attribution(text: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "nguồn:",
+        "nguon:",
+        "source:",
+        "источник:",
+        "posted by",
+        "đăng bởi",
+        "dang boi",
+        "đăng ngày",
+        "cập nhật",
+        "cap nhat",
+    ];
+    fn looks_like_attribution(line: &str) -> bool {
+        let t = line.trim().to_lowercase();
+        if t.is_empty() {
+            return false;
+        }
+        if PREFIXES.iter().any(|p| t.starts_with(p)) {
+            return true;
+        }
+        // Match relative-time trailers: "đăng 3 ngày trước", "5 giờ trước".
+        (t.contains(" ngày trước") || t.contains(" giờ trước")) && t.split_whitespace().count() <= 6
     }
 
-    fn make_spec(id: &str) -> ResearchSpec {
-        ResearchSpec {
-            id: id.into(),
-            topic: "t".into(),
-            sources: vec![],
-            interval_seconds: None,
-            run_at: None,
-            cron: None,
-            task_timeout_seconds: None,
-            session_id: None,
-            chat_id: None,
-            thread_id: None,
-            provider: None,
-            model: None,
-            max_iterations: None,
-            max_wall_seconds: None,
-            created_at: Utc::now(),
-            paused: false,
-            pause_reason: None,
+    let mut kept: Vec<String> = text
+        .lines()
+        .filter(|l| !looks_like_attribution(l))
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    // Strip a single trailing clause after the last separator if it looks like
+    // attribution: "...rooms — Nguồn: alonhadat.com.vn".
+    if let Some(last) = kept.pop() {
+        let cleaned = ["—", " - ", " | "].iter().fold(last, |acc, sep| {
+            if let Some((head, tail)) = acc.rsplit_once(sep)
+                && looks_like_attribution(tail)
+            {
+                head.trim_end().to_string()
+            } else {
+                acc
+            }
+        });
+        kept.push(cleaned);
+    }
+    kept.join("\n").trim().to_string()
+}
+
+/// Trim free-form agent-provided text to a max length so a single bad excerpt
+/// can't balloon `findings.jsonl` to MB-per-line.
+fn clip(text: &str, max: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= max {
+        Some(trimmed.to_string())
+    } else {
+        Some(trimmed.chars().take(max).collect::<String>() + "…")
+    }
+}
+
+/// Try to parse a free-form listing date string into a NaiveDate.
+/// Handles: `YYYY-MM-DD`, `DD/MM/YYYY`, `DD-MM-YYYY`, `DD.MM.YYYY`,
+/// relative Vietnamese (`hôm nay`, `hôm qua`, `N ngày trước`), and `unknown`.
+pub fn parse_listing_date(s: &str) -> Option<NaiveDate> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() || s == "unknown" {
+        return None;
+    }
+    let today = Utc::now().date_naive();
+
+    if s.contains("hôm nay") || s == "today" {
+        return Some(today);
+    }
+    if s.contains("hôm qua") || s == "yesterday" {
+        return Some(today - chrono::Duration::days(1));
+    }
+    // "N ngày trước" / "N days ago"
+    if let Some(n) = extract_days_ago(&s) {
+        return Some(today - chrono::Duration::days(n));
+    }
+
+    // ISO: 2026-04-18
+    if let Ok(d) = NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+        return Some(d);
+    }
+    // DD/MM/YYYY
+    if let Ok(d) = NaiveDate::parse_from_str(&s, "%d/%m/%Y") {
+        return Some(d);
+    }
+    // DD-MM-YYYY
+    if let Ok(d) = NaiveDate::parse_from_str(&s, "%d-%m-%Y") {
+        return Some(d);
+    }
+    // DD.MM.YYYY
+    if let Ok(d) = NaiveDate::parse_from_str(&s, "%d.%m.%Y") {
+        return Some(d);
+    }
+    None
+}
+
+fn extract_days_ago(s: &str) -> Option<i64> {
+    // Match patterns like "3 ngày trước", "5 days ago"
+    for word in s.split_whitespace() {
+        if let Ok(n) = word.parse::<i64>()
+            && (s.contains("ngày trước") || s.contains("days ago"))
+        {
+            return Some(n);
         }
     }
+    None
+}
 
-    #[tokio::test]
-    async fn research_save_stores_and_dedups() {
-        let (_tmp, store, ctx) = setup();
-        store.create_spec(&make_spec("r1")).await.unwrap();
-        ctx.set_id(Some("r1".into()));
-        let tool = ResearchSaveTool::new(store.clone(), ctx.clone(), Default::default());
-
-        let cwd = std::env::current_dir().unwrap();
-        let first = tool
-            .execute(json!({"url":"https://ex.com/a","title":"A"}), &cwd)
-            .await;
-        assert!(!first.is_error);
-        assert!(first.output.contains("\"stored\":true"));
-
-        let dup = tool
-            .execute(
-                json!({"url":"https://ex.com/a?utm_source=x","title":"A updated"}),
-                &cwd,
-            )
-            .await;
-        assert!(!dup.is_error);
-        assert!(dup.output.contains("\"updated\":true"));
-        assert_eq!(store.count_findings("r1").await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn research_save_rejects_missing_context() {
-        let (_tmp, store, ctx) = setup();
-        let tool = ResearchSaveTool::new(store.clone(), ctx, Default::default());
-        let cwd = std::env::current_dir().unwrap();
-        let r = tool.execute(json!({"url":"https://ex.com/a"}), &cwd).await;
-        assert!(r.is_error);
-    }
-
-    #[tokio::test]
-    async fn research_save_rejects_bad_url() {
-        let (_tmp, store, ctx) = setup();
-        store.create_spec(&make_spec("r1")).await.unwrap();
-        ctx.set_id(Some("r1".into()));
-        let tool = ResearchSaveTool::new(store.clone(), ctx, Default::default());
-        let cwd = std::env::current_dir().unwrap();
-        let r = tool.execute(json!({"url":"ftp://x/"}), &cwd).await;
-        assert!(r.is_error);
-        let r2 = tool.execute(json!({"url":""}), &cwd).await;
-        assert!(r2.is_error);
-    }
-
-    #[tokio::test]
-    async fn research_list_shows_recent_entries() {
-        let (_tmp, store, ctx) = setup();
-        store.create_spec(&make_spec("r2")).await.unwrap();
-        ctx.set_id(Some("r2".into()));
-        let save = ResearchSaveTool::new(store.clone(), ctx.clone(), Default::default());
-        let cwd = std::env::current_dir().unwrap();
-        save.execute(json!({"url":"https://ex.com/1","title":"One"}), &cwd)
-            .await;
-        save.execute(json!({"url":"https://ex.com/2","title":"Two"}), &cwd)
-            .await;
-        let list = ResearchListTool::new(store.clone(), ctx)
-            .execute(json!({"limit":10}), &cwd)
-            .await;
-        assert!(!list.is_error);
-        assert!(list.output.contains("https://ex.com/1"));
-        assert!(list.output.contains("https://ex.com/2"));
-    }
-
-    #[tokio::test]
-    async fn research_save_cursor_roundtrip() {
-        let (_tmp, store, ctx) = setup();
-        store.create_spec(&make_spec("r3")).await.unwrap();
-        ctx.set_id(Some("r3".into()));
-        let tool = ResearchSaveCursorTool::new(store.clone(), ctx);
-        let cwd = std::env::current_dir().unwrap();
-        let r = tool
-            .execute(json!({"cursor":{"page":7,"anchor":"abc"}}), &cwd)
-            .await;
-        assert!(!r.is_error, "{}", r.output);
-        let reloaded = store.load_cursor("r3").await.unwrap();
-        assert_eq!(reloaded.data.get("page"), Some(&json!(7)));
-    }
-
-    #[tokio::test]
-    async fn research_status_produces_markdown_for_known_id() {
-        let (_tmp, store, _ctx) = setup();
-        store.create_spec(&make_spec("r4")).await.unwrap();
-        let tool = ResearchStatusTool::new(store.clone());
-        let cwd = std::env::current_dir().unwrap();
-        let r = tool.execute(json!({"research_id":"r4"}), &cwd).await;
-        assert!(!r.is_error);
-        assert!(r.output.contains("Research `r4`"));
-        assert!(r.output.contains("**Total findings:** 0"));
-    }
-
-    #[tokio::test]
-    async fn research_status_rejects_unknown_id() {
-        let (_tmp, store, _ctx) = setup();
-        let tool = ResearchStatusTool::new(store.clone());
-        let cwd = std::env::current_dir().unwrap();
-        let r = tool
-            .execute(json!({"research_id":"does-not-exist"}), &cwd)
-            .await;
-        assert!(r.is_error);
-    }
-
-    #[test]
-    fn strip_attribution_drops_leading_source_lines() {
-        let s = "Nguồn: alonhadat.com.vn, đăng 18/04/2026\n\
-                 2BR, 70m², District 7. Contact: 0912345678";
-        let out = strip_source_attribution(s);
-        assert!(!out.contains("alonhadat"), "got: {out}");
-        assert!(out.contains("0912345678"));
-        assert!(out.starts_with("2BR"));
-    }
-
-    #[test]
-    fn strip_attribution_drops_trailing_clause_after_em_dash() {
-        let s = "70m² fully furnished — Nguồn: chotot.com";
-        let out = strip_source_attribution(s);
-        assert!(!out.to_lowercase().contains("nguồn"));
-        assert!(out.starts_with("70m²"));
-        assert!(out.ends_with("furnished"));
-    }
-
-    #[test]
-    fn strip_attribution_drops_relative_time_trailers() {
-        let s = "Apartment listing\nđăng 3 ngày trước";
-        let out = strip_source_attribution(s);
-        assert!(!out.contains("ngày trước"), "got: {out}");
-        assert_eq!(out.trim(), "Apartment listing");
-    }
-
-    #[test]
-    fn strip_attribution_preserves_unrelated_text() {
-        let s = "First line\nSecond line with phone 0987654321";
-        let out = strip_source_attribution(s);
-        assert_eq!(out, s);
-    }
-
-    #[tokio::test]
-    async fn research_save_strips_source_attribution_from_excerpt() {
-        let (_tmp, store, ctx) = setup();
-        store.create_spec(&make_spec("rs1")).await.unwrap();
-        ctx.set_id(Some("rs1".into()));
-        let tool = ResearchSaveTool::new(store.clone(), ctx, Default::default());
-        let cwd = std::env::current_dir().unwrap();
-        let body = "70m², District 1, fully furnished. Contact Ms. Lan 0912345678 \
-                    (Zalo). Available May 1.";
-        let raw = format!("Nguồn: alonhadat.com.vn, đăng 18/04/2026\n{body}");
-        let r = tool
-            .execute(
-                json!({"url":"https://ex.com/strip","title":"T","price":"$500","excerpt":raw}),
-                &cwd,
-            )
-            .await;
-        assert!(!r.is_error, "{}", r.output);
-        let findings = store.list_findings("rs1", Some(10)).await.unwrap();
-        let stored = findings[0].excerpt.as_deref().unwrap_or("");
-        assert!(!stored.contains("alonhadat"), "got: {stored}");
-        assert!(stored.contains("0912345678"));
-    }
-
-    #[test]
-    fn redact_strips_api_key_and_bearer() {
-        let s = "log: api_key=sk-abc123 done; Authorization: Bearer eyJhbGci OK";
-        let out = scan_and_redact(s);
-        assert!(out.contains("api_key=[redacted]"), "got: {out}");
-        assert!(
-            out.contains("Bearer [redacted]") || out.contains("bearer [redacted]"),
-            "got: {out}"
-        );
-        assert!(!out.contains("sk-abc123"), "got: {out}");
-        assert!(!out.contains("eyJhbGci"), "got: {out}");
-    }
-
-    #[test]
-    fn redact_ignores_unrelated_text() {
-        let s = "normal log line with https://example.com/path and nothing sensitive";
-        let out = scan_and_redact(s);
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn redact_handles_quoted_values() {
-        let s = r#"config: secret="topsecret" and token = "xyz""#;
-        let out = scan_and_redact(s);
-        assert!(!out.contains("topsecret"), "got: {out}");
-        assert!(!out.contains("xyz"), "got: {out}");
-    }
+/// Check if a listing date is too old (> MAX_LISTING_AGE_DAYS).
+/// Returns `None` if date can't be parsed (let it through — benefit of the doubt).
+fn is_stale(listing_date: Option<&str>) -> Option<bool> {
+    let s = listing_date?;
+    let d = parse_listing_date(s)?;
+    let age = Utc::now().date_naive() - d;
+    Some(age.num_days() > MAX_LISTING_AGE_DAYS)
 }

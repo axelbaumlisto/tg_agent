@@ -205,17 +205,12 @@ impl BashTool {
 
     /// Parse + validate input. Shared by execute() and execute_with_progress().
     fn parse_input(&self, input: serde_json::Value) -> Result<(BashInput, Duration), ToolResult> {
-        let input: BashInput = serde_json::from_value(input).map_err(|e| ToolResult {
-            output: format!("Invalid input: {e}"),
-            is_error: true,
-        })?;
+        let input: BashInput = super::parse_tool_input(input)?;
         if is_self_destructive(&input.command) {
-            return Err(ToolResult {
-                output: "Blocked: this command would restart/kill the bot process. \
-                         Use the operator's terminal instead."
-                    .into(),
-                is_error: true,
-            });
+            return Err(ToolResult::err(
+                "Blocked: this command would restart/kill the bot process. \
+                 Use the operator's terminal instead.",
+            ));
         }
         let timeout = input
             .timeout
@@ -319,62 +314,14 @@ impl Tool for BashTool {
 
         match outcome {
             ExecOutcome::Ok {
-                stdout: out_bytes,
-                stderr: err_bytes,
+                stdout,
+                stderr,
                 success,
-            } => {
-                let output_success = success;
-                const MAX_STREAM: usize = 16_384;
-                let raw_stdout = String::from_utf8_lossy(&out_bytes);
-                let raw_stderr = String::from_utf8_lossy(&err_bytes);
-                let total_bytes = raw_stdout.len() + raw_stderr.len();
-                let total_lines = raw_stdout.lines().count() + raw_stderr.lines().count();
-                let is_truncated = raw_stdout.len() > MAX_STREAM || raw_stderr.len() > MAX_STREAM;
-
-                let stdout = truncate_output(&raw_stdout, MAX_STREAM);
-                let stderr = truncate_output(&raw_stderr, MAX_STREAM);
-                let mut combined = if stderr.is_empty() {
-                    stdout
-                } else if stdout.is_empty() {
-                    stderr
-                } else {
-                    format!("{stdout}\n--- stderr ---\n{stderr}")
-                };
-
-                // B8: Save full output to temp file when truncated so
-                // the agent can read_file it if it needs the full context.
-                if is_truncated {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    combined.hash(&mut hasher);
-                    let hash = format!("{:x}", hasher.finish());
-                    let hash = &hash[..8];
-                    let path = format!("/tmp/naked_bash_{hash}.log");
-                    let full = if raw_stderr.is_empty() {
-                        raw_stdout.to_string()
-                    } else {
-                        format!("{raw_stdout}\n--- stderr ---\n{raw_stderr}")
-                    };
-                    let _ = std::fs::write(&path, &full);
-                    combined.push_str(&format!(
-                        "\n\n[truncated: {total_lines} lines, {total_bytes} bytes total. \
-                         Full output: {path}]"
-                    ));
-                }
-
-                ToolResult {
-                    output: combined,
-                    is_error: !output_success,
-                }
+            } => format_bash_output(&stdout, &stderr, success, &timeout),
+            ExecOutcome::ExecErr(e) => ToolResult::err(format!("Failed to execute: {e}")),
+            ExecOutcome::Timeout => {
+                ToolResult::err(format!("Command timed out after {}s", timeout.as_secs()))
             }
-            ExecOutcome::ExecErr(e) => ToolResult {
-                output: format!("Failed to execute: {e}"),
-                is_error: true,
-            },
-            ExecOutcome::Timeout => ToolResult {
-                output: format!("Command timed out after {}s", timeout.as_secs()),
-                is_error: true,
-            },
         }
     }
 
@@ -407,10 +354,7 @@ impl Tool for BashTool {
         {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult {
-                    output: format!("Failed to spawn bash: {e}"),
-                    is_error: true,
-                };
+                return ToolResult::err(format!("Failed to spawn bash: {e}"));
             }
         };
 
@@ -489,10 +433,7 @@ impl Tool for BashTool {
                     let _ = child.kill().await;
                     stdout_task.abort();
                     stderr_task.abort();
-                    return ToolResult {
-                        output: format!("Command timed out after {}s", timeout_dur.as_secs()),
-                        is_error: true,
-                    };
+                    return ToolResult::err(format!("Command timed out after {}s", timeout_dur.as_secs()));
                 }
             }
         }
@@ -521,9 +462,10 @@ impl Tool for BashTool {
             ));
         }
 
-        ToolResult {
-            output: combined,
-            is_error: !success,
+        if success {
+            ToolResult::ok(combined)
+        } else {
+            ToolResult::err(combined)
         }
     }
 }
@@ -544,173 +486,8 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tool::Tool;
-
-    #[test]
-    fn classify_read_only_commands() {
-        assert_eq!(classify_bash("ls -la"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("cat file.txt"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("git status"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("git diff HEAD"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("rg pattern src/"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("pwd"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("cargo test --lib"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("head -20 file.rs"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("find . -name '*.rs'"), BashRisk::ReadOnly);
-    }
-
-    #[test]
-    fn classify_piped_read_only() {
-        assert_eq!(classify_bash("cat file.txt | grep foo"), BashRisk::ReadOnly);
-        assert_eq!(classify_bash("ls -la | wc -l"), BashRisk::ReadOnly);
-    }
-
-    #[test]
-    fn classify_write_commands() {
-        assert_eq!(classify_bash("echo x > file.txt"), BashRisk::Write);
-        assert_eq!(classify_bash("git commit -m 'msg'"), BashRisk::Write);
-        assert_eq!(classify_bash("cp a.txt b.txt"), BashRisk::Write);
-        assert_eq!(classify_bash("mkdir -p new_dir"), BashRisk::Write);
-        assert_eq!(classify_bash("npm install"), BashRisk::Write);
-    }
-
-    #[test]
-    fn classify_destructive_commands() {
-        assert_eq!(classify_bash("rm -rf /"), BashRisk::Destructive);
-        assert_eq!(classify_bash("rm -rf /*"), BashRisk::Destructive);
-        assert_eq!(classify_bash("mkfs.ext4 /dev/sda"), BashRisk::Destructive);
-        assert_eq!(
-            classify_bash("dd if=/dev/zero of=/dev/sda"),
-            BashRisk::Destructive
-        );
-    }
-
-    #[test]
-    fn classify_bash_permission_mapping() {
-        let tool = BashTool::new(30);
-        assert_eq!(
-            tool.effective_permission(&serde_json::json!({"command": "ls"}), Path::new("/")),
-            Permission::ReadOnly
-        );
-        assert_eq!(
-            tool.effective_permission(&serde_json::json!({"command": "rm -rf /"}), Path::new("/")),
-            Permission::Dangerous
-        );
-        assert_eq!(
-            tool.effective_permission(
-                &serde_json::json!({"command": "npm install"}),
-                Path::new("/")
-            ),
-            Permission::WorkspaceWrite
-        );
-    }
-
-    #[test]
-    fn spec_has_correct_name() {
-        let tool = BashTool::new(30);
-        assert_eq!(tool.spec().name, "bash");
-        assert_eq!(tool.spec().permission, Permission::Dangerous);
-    }
-
-    #[tokio::test]
-    async fn execute_echo() {
-        let tool = BashTool::new(10);
-        let result = tool
-            .execute(
-                serde_json::json!({"command": "echo hello"}),
-                Path::new("/tmp"),
-            )
-            .await;
-        assert!(!result.is_error);
-        assert_eq!(result.output.trim(), "hello");
-    }
-
-    #[tokio::test]
-    async fn execute_failing_command() {
-        let tool = BashTool::new(10);
-        let result = tool
-            .execute(serde_json::json!({"command": "false"}), Path::new("/tmp"))
-            .await;
-        assert!(result.is_error);
-    }
-
-    #[tokio::test]
-    async fn execute_captures_stderr() {
-        let tool = BashTool::new(10);
-        let result = tool
-            .execute(
-                serde_json::json!({"command": "echo err >&2"}),
-                Path::new("/tmp"),
-            )
-            .await;
-        assert!(result.output.contains("err"));
-    }
-
-    #[tokio::test]
-    async fn execute_timeout() {
-        let tool = BashTool::new(1);
-        let result = tool
-            .execute(
-                serde_json::json!({"command": "sleep 10", "timeout": 1}),
-                Path::new("/tmp"),
-            )
-            .await;
-        assert!(result.is_error);
-        assert!(result.output.contains("timed out"));
-    }
-
-    #[tokio::test]
-    async fn execute_invalid_input() {
-        let tool = BashTool::new(10);
-        let result = tool
-            .execute(serde_json::json!({"wrong_key": "ls"}), Path::new("/tmp"))
-            .await;
-        assert!(result.is_error);
-        assert!(result.output.contains("Invalid input"));
-    }
-
-    #[tokio::test]
-    async fn execute_respects_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let tool = BashTool::new(10);
-        let result = tool
-            .execute(serde_json::json!({"command": "pwd"}), dir.path())
-            .await;
-        assert!(!result.is_error);
-        assert!(result.output.trim().contains(dir.path().to_str().unwrap()));
-    }
-
-    #[test]
-    fn blocks_systemctl_restart() {
-        assert!(is_self_destructive(
-            "systemctl --user restart naked-tg.service"
-        ));
-        assert!(is_self_destructive("systemctl restart naked-tg"));
-        assert!(is_self_destructive(
-            "cargo build && systemctl --user restart naked-tg.service"
-        ));
-    }
-
-    #[test]
-    fn blocks_kill_commands() {
-        assert!(is_self_destructive("kill -9 12345"));
-        assert!(is_self_destructive("pkill naked-tg"));
-        assert!(is_self_destructive("killall naked"));
-    }
-
-    #[test]
-    fn allows_normal_commands() {
-        assert!(!is_self_destructive("ls -la"));
-        assert!(!is_self_destructive("cargo build --release"));
-        assert!(!is_self_destructive("cargo test"));
-        assert!(!is_self_destructive("systemctl status naked-tg"));
-        assert!(!is_self_destructive(
-            "cat /etc/systemd/system/naked-tg.service"
-        ));
-    }
-}
+#[path = "bash_tests.rs"]
+mod tests;
 
 #[tokio::test]
 async fn execute_large_output_saves_to_file() {
@@ -742,4 +519,55 @@ async fn execute_large_output_saves_to_file() {
     );
     // Clean up
     let _ = std::fs::remove_file(path);
+}
+
+/// Format bash execution output: combine stdout/stderr, truncate, save overflow.
+fn format_bash_output(
+    out_bytes: &[u8],
+    err_bytes: &[u8],
+    success: bool,
+    timeout: &std::time::Duration,
+) -> ToolResult {
+    const MAX_STREAM: usize = 16_384;
+    let raw_stdout = String::from_utf8_lossy(out_bytes);
+    let raw_stderr = String::from_utf8_lossy(err_bytes);
+    let total_bytes = raw_stdout.len() + raw_stderr.len();
+    let total_lines = raw_stdout.lines().count() + raw_stderr.lines().count();
+    let is_truncated = raw_stdout.len() > MAX_STREAM || raw_stderr.len() > MAX_STREAM;
+
+    let stdout = truncate_output(&raw_stdout, MAX_STREAM);
+    let stderr = truncate_output(&raw_stderr, MAX_STREAM);
+    let mut combined = if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n--- stderr ---\n{stderr}")
+    };
+
+    if is_truncated {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        combined.hash(&mut hasher);
+        let hash = format!("{:x}", hasher.finish());
+        let hash = &hash[..8];
+        let path = format!("/tmp/naked_bash_{hash}.log");
+        let full = if raw_stderr.is_empty() {
+            raw_stdout.to_string()
+        } else {
+            format!("{raw_stdout}\n--- stderr ---\n{raw_stderr}")
+        };
+        let _ = std::fs::write(&path, &full);
+        combined.push_str(&format!(
+            "\n\n[truncated: {total_lines} lines, {total_bytes} bytes total. \
+             Full output: {path}]"
+        ));
+    }
+
+    let _ = timeout; // used by caller for error message
+    if success {
+        ToolResult::ok(combined)
+    } else {
+        ToolResult::err(combined)
+    }
 }

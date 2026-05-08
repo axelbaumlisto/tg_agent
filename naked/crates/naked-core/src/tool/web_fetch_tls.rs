@@ -34,14 +34,12 @@
 //!   so the cascade in `web_fetch.rs` can attempt the next tier (Wayback).
 
 use std::path::Path;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 use crate::tool::Tool;
-use crate::tool::web_fetch::{DEFAULT_MAX_CHARS, html_to_text, truncate_chars};
+use crate::tool::fetch_common::{self, DEFAULT_MAX_CHARS};
 use crate::types::{Permission, ToolResult, ToolSpec};
 
 /// Per-invocation wall clock. curl_cffi adds session warmup (~1.2 s) on
@@ -101,10 +99,7 @@ impl Tool for WebFetchTlsTool {
         let url = match input.get("url").and_then(|v| v.as_str()) {
             Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
             _ => {
-                return ToolResult {
-                    output: "`url` is required and must be an absolute http(s) URL".into(),
-                    is_error: true,
-                };
+                return ToolResult::err("`url` is required and must be an absolute http(s) URL");
             }
         };
         let max_chars = input
@@ -125,109 +120,10 @@ impl Tool for WebFetchTlsTool {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        let script = script_path();
-        let mut cmd = Command::new("python3");
-        cmd.arg(&script).arg(&url);
-        if no_proxy {
-            cmd.arg("--no-proxy");
-        }
-        if let Some(imp) = impersonate.as_deref() {
-            cmd.arg("--impersonate").arg(imp);
-        }
-
-        tracing::info!(url = %url, script = %script, no_proxy, "web_fetch_tls: spawning");
-        let child = cmd
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        let child = match child {
-            Ok(c) => c,
-            Err(e) => {
-                return ToolResult {
-                    output: format!(
-                        "web_fetch_tls: failed to spawn `{script}` — {e}. \
-                         Ensure curl_cffi is installed: `pip install --user curl_cffi`."
-                    ),
-                    is_error: true,
-                };
-            }
-        };
-
-        let output = tokio::time::timeout(
-            Duration::from_secs(TLS_FETCH_TIMEOUT_SECS),
-            child.wait_with_output(),
-        )
-        .await;
-        let output = match output {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return ToolResult {
-                    output: format!("web_fetch_tls: process error: {e}"),
-                    is_error: true,
-                };
-            }
-            Err(_) => {
-                return ToolResult {
-                    output: format!(
-                        "web_fetch_tls: timed out after {TLS_FETCH_TIMEOUT_SECS}s (hard kill triggered)"
-                    ),
-                    is_error: true,
-                };
-            }
-        };
-
-        let stderr_tail = String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .rev()
-            .take(10)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if output.stdout.is_empty() {
-            return ToolResult {
-                output: format!(
-                    "web_fetch_tls: script produced no stdout (exit={}).\nstderr tail:\n{stderr_tail}",
-                    output
-                        .status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "?".into())
-                ),
-                is_error: true,
-            };
-        }
-
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = match serde_json::from_str(stdout_str.trim()) {
+        let parsed = match run_tls_script(&url, no_proxy, impersonate.as_deref()).await {
             Ok(v) => v,
-            Err(e) => {
-                return ToolResult {
-                    output: format!(
-                        "web_fetch_tls: script returned non-JSON stdout ({e}).\nraw stdout (first 500 chars):\n{}\nstderr tail:\n{stderr_tail}",
-                        &stdout_str.chars().take(500).collect::<String>()
-                    ),
-                    is_error: true,
-                };
-            }
+            Err(e) => return e,
         };
-
-        // Transport-level failure inside the script (DNS, connect refused,
-        // proxy reject…). The script populates `error` with the underlying
-        // exception; surface it so the agent / cascade knows to move on.
-        if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let err_msg = parsed
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return ToolResult {
-                output: format!("web_fetch_tls: transport failed — {err_msg}\n{stderr_tail}"),
-                is_error: true,
-            };
-        }
 
         let status = parsed.get("status").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
         let final_url = parsed
@@ -258,38 +154,118 @@ impl Tool for WebFetchTlsTool {
         // surface a structured failure — the cascade in `web_fetch.rs`
         // should then fall through to Wayback.
         if all_blocked {
-            return ToolResult {
-                output: format!(
-                    "BLOCKED via TLS impersonation: status={status}, url={final_url}\n\
-                     All impersonation profiles exhausted (chrome120, chrome124, firefox133, chrome131).\n\
-                     This site likely needs a cloud stealth service or archived snapshot.\n\
-                     Consider: web_fetch_wayback to retrieve the last working snapshot."
-                ),
-                is_error: true,
-            };
+            return ToolResult::err(format!(
+                "BLOCKED via TLS impersonation: status={status}, url={final_url}\n\
+                 All impersonation profiles exhausted (chrome120, chrome124, firefox133, chrome131).\n\
+                 This site likely needs a cloud stealth service or archived snapshot.\n\
+                 Consider: web_fetch_wayback to retrieve the last working snapshot."
+            ));
         }
 
-        let (text, links) = html_to_text(&body);
         let header = format!(
             "HTTP {status} — {final_url}\nContent-Type: {content_type}\nTLS-impersonate: {imp_used}\n\n"
         );
-        let remaining = max_chars.saturating_sub(header.chars().count());
-        let mut out = header;
-        out.push_str(&truncate_chars(&text, remaining));
-        if include_links && !links.is_empty() {
-            out.push_str("\n\n## Links\n");
-            for l in links.iter().take(40) {
-                out.push_str("- ");
-                out.push_str(l);
-                out.push('\n');
-            }
-        }
-
-        ToolResult {
-            output: out,
-            is_error: !(200..400).contains(&status),
-        }
+        fetch_common::format_fetch_output(
+            &body,
+            &header,
+            include_links,
+            max_chars,
+            (200..400).contains(&status),
+        )
     }
+}
+
+/// Spawn the TLS-impersonation Python script and parse its JSON output.
+async fn run_tls_script(
+    url: &str,
+    no_proxy: bool,
+    impersonate: Option<&str>,
+) -> Result<serde_json::Value, ToolResult> {
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    let script = script_path();
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script).arg(url);
+    if no_proxy {
+        cmd.arg("--no-proxy");
+    }
+    if let Some(imp) = impersonate {
+        cmd.arg("--impersonate").arg(imp);
+    }
+
+    tracing::info!(url = %url, script = %script, no_proxy, "web_fetch_tls: spawning");
+    let child = cmd
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ToolResult::err(format!(
+                "web_fetch_tls: failed to spawn `{script}` \u{2014} {e}. \
+             Ensure curl_cffi is installed: `pip install --user curl_cffi`."
+            ))
+        })?;
+
+    let output = match tokio::time::timeout(
+        Duration::from_secs(TLS_FETCH_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(ToolResult::err(format!(
+                "web_fetch_tls: process error: {e}"
+            )));
+        }
+        Err(_) => {
+            return Err(ToolResult::err(format!(
+                "web_fetch_tls: timed out after {TLS_FETCH_TIMEOUT_SECS}s"
+            )));
+        }
+    };
+
+    let stderr_tail: String = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if output.stdout.is_empty() {
+        return Err(ToolResult::err(format!(
+            "web_fetch_tls: script produced no stdout (exit={}).\nstderr tail:\n{stderr_tail}",
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into())
+        )));
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout_str.trim()).map_err(|e| {
+        ToolResult::err(format!(
+            "web_fetch_tls: non-JSON stdout ({e}).\nraw: {}\nstderr: {stderr_tail}",
+            &stdout_str.chars().take(500).collect::<String>()
+        ))
+    })?;
+
+    if !parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let err_msg = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(ToolResult::err(format!(
+            "web_fetch_tls: transport failed \u{2014} {err_msg}\n{stderr_tail}"
+        )));
+    }
+
+    Ok(parsed)
 }
 
 #[cfg(test)]

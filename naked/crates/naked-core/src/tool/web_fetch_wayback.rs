@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::tool::Tool;
-use crate::tool::web_fetch::{DEFAULT_MAX_CHARS, html_to_text, truncate_chars};
+use crate::tool::fetch_common::{self, DEFAULT_MAX_CHARS};
 use crate::types::{Permission, ToolResult, ToolSpec};
 
 const WAYBACK_AVAILABLE_ENDPOINT: &str = "https://archive.org/wayback/available";
@@ -99,10 +99,7 @@ impl Tool for WebFetchWaybackTool {
         let url = match input.get("url").and_then(|v| v.as_str()) {
             Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
             _ => {
-                return ToolResult {
-                    output: "`url` is required and must be an absolute http(s) URL".into(),
-                    is_error: true,
-                };
+                return ToolResult::err("`url` is required and must be an absolute http(s) URL");
             }
         };
         let ts_hint = input
@@ -119,169 +116,29 @@ impl Tool for WebFetchWaybackTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // --- Step 1: Wayback availability API ---------------------------
-        let avail_url = match ts_hint.as_deref() {
-            Some(ts) if !ts.is_empty() => {
-                format!("{WAYBACK_AVAILABLE_ENDPOINT}?url={url}&timestamp={ts}")
-            }
-            _ => format!("{WAYBACK_AVAILABLE_ENDPOINT}?url={url}"),
+        let snap = match self.resolve_and_fetch(&url, ts_hint.as_deref()).await {
+            Ok(s) => s,
+            Err(e) => return e,
         };
-        tracing::info!(url = %url, "web_fetch_wayback: querying availability");
-        let avail_resp = match self.client.get(&avail_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("web_fetch_wayback: availability request failed: {e}"),
-                    is_error: true,
-                };
-            }
-        };
-        let avail_status = avail_resp.status();
-        if !avail_status.is_success() {
-            return ToolResult {
-                output: format!("web_fetch_wayback: availability API returned HTTP {avail_status}"),
-                is_error: true,
-            };
-        }
-        let avail_json: serde_json::Value = match avail_resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("web_fetch_wayback: availability JSON parse failed: {e}"),
-                    is_error: true,
-                };
-            }
-        };
-
-        let closest = avail_json
-            .get("archived_snapshots")
-            .and_then(|v| v.get("closest"));
-        let (snapshot_url, timestamp, snapshot_status) = match closest {
-            Some(c)
-                if c.get("available")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false) =>
-            {
-                let u = c
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let ts = c
-                    .get("timestamp")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let st = c
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                (u, ts, st)
-            }
-            _ => {
-                return ToolResult {
-                    output: format!(
-                        "web_fetch_wayback: no archived snapshot available for {url}.\n\
-                         The Wayback Machine has never crawled this URL, or the closest \
-                         snapshot returned a non-success status."
-                    ),
-                    is_error: true,
-                };
-            }
-        };
-
-        if snapshot_url.is_empty() {
-            return ToolResult {
-                output: format!(
-                    "web_fetch_wayback: Wayback API returned empty snapshot URL for {url}"
-                ),
-                is_error: true,
-            };
-        }
-
-        // --- Step 2: Fetch the snapshot ---------------------------------
-        // Use `if_` URL form so Wayback serves the archived HTML *inline*
-        // without wrapping it in a JS-heavy frameset. Pattern:
-        //   http://web.archive.org/web/<TS>/<url>    -> with wrapper
-        //   http://web.archive.org/web/<TS>if_/<url> -> raw archived html
-        // The wrapper adds ~30 KB of Wayback toolbar we don't want.
-        let raw_snapshot_url =
-            rewrite_to_raw_snapshot(&snapshot_url).unwrap_or_else(|| snapshot_url.clone());
-
-        tracing::info!(
-            snapshot = %raw_snapshot_url,
-            timestamp = %timestamp,
-            "web_fetch_wayback: fetching snapshot"
-        );
-        let resp = match self.client.get(&raw_snapshot_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("web_fetch_wayback: snapshot fetch failed: {e}"),
-                    is_error: true,
-                };
-            }
-        };
-
-        let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if let Some(len_hint) = resp.content_length()
-            && len_hint > WAYBACK_MAX_BYTES
-        {
-            return ToolResult {
-                output: format!(
-                    "web_fetch_wayback: snapshot body too large ({len_hint} bytes, limit {WAYBACK_MAX_BYTES})"
-                ),
-                is_error: true,
-            };
-        }
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                return ToolResult {
-                    output: format!("web_fetch_wayback: snapshot body read failed: {e}"),
-                    is_error: true,
-                };
-            }
-        };
-        if bytes.len() as u64 > WAYBACK_MAX_BYTES {
-            return ToolResult {
-                output: format!(
-                    "web_fetch_wayback: snapshot body too large after read ({} bytes, limit {WAYBACK_MAX_BYTES})",
-                    bytes.len()
-                ),
-                is_error: true,
-            };
-        }
-        let body_text = String::from_utf8_lossy(&bytes).into_owned();
-        let (text, links) = html_to_text(&body_text);
-
+        let WaybackSnapshot {
+            body: body_text,
+            timestamp,
+            snapshot_url,
+            snapshot_status,
+            content_type,
+            status,
+        } = snap;
         let header = format!(
             "Wayback snapshot: HTTP {status} (origin HTTP {snapshot_status})\nTimestamp: {timestamp} ({})\nOriginal URL: {url}\nSnapshot URL: {snapshot_url}\nContent-Type: {content_type}\n\n",
             format_timestamp(&timestamp),
         );
-        let remaining = max_chars.saturating_sub(header.chars().count());
-        let mut out = header;
-        out.push_str(&truncate_chars(&text, remaining));
-        if include_links && !links.is_empty() {
-            out.push_str("\n\n## Links\n");
-            for l in links.iter().take(40) {
-                out.push_str("- ");
-                out.push_str(l);
-                out.push('\n');
-            }
-        }
-
-        ToolResult {
-            output: out,
-            is_error: !(200..400).contains(&status.as_u16()),
-        }
+        fetch_common::format_fetch_output(
+            &body_text,
+            &header,
+            include_links,
+            max_chars,
+            (200..400).contains(&status.as_u16()),
+        )
     }
 }
 
@@ -315,6 +172,128 @@ fn format_timestamp(ts: &str) -> String {
     let mm = ts.get(10..12).unwrap_or("00");
     let ss = ts.get(12..14).unwrap_or("00");
     format!("{y}-{m}-{d} {hh}:{mm}:{ss} UTC")
+}
+
+/// Resolved Wayback snapshot data.
+struct WaybackSnapshot {
+    body: String,
+    timestamp: String,
+    snapshot_url: String,
+    snapshot_status: String,
+    content_type: String,
+    status: reqwest::StatusCode,
+}
+
+impl WebFetchWaybackTool {
+    /// Resolve Wayback availability and fetch the snapshot body.
+    async fn resolve_and_fetch(
+        &self,
+        url: &str,
+        ts_hint: Option<&str>,
+    ) -> Result<WaybackSnapshot, ToolResult> {
+        let avail_url = match ts_hint {
+            Some(ts) if !ts.is_empty() => {
+                format!("{WAYBACK_AVAILABLE_ENDPOINT}?url={url}&timestamp={ts}")
+            }
+            _ => format!("{WAYBACK_AVAILABLE_ENDPOINT}?url={url}"),
+        };
+        tracing::info!(url = %url, "web_fetch_wayback: querying availability");
+        let avail_resp = self.client.get(&avail_url).send().await.map_err(|e| {
+            ToolResult::err(format!(
+                "web_fetch_wayback: availability request failed: {e}"
+            ))
+        })?;
+        if !avail_resp.status().is_success() {
+            return Err(ToolResult::err(format!(
+                "web_fetch_wayback: availability API returned HTTP {}",
+                avail_resp.status()
+            )));
+        }
+        let avail_json: serde_json::Value = avail_resp.json().await.map_err(|e| {
+            ToolResult::err(format!(
+                "web_fetch_wayback: availability JSON parse failed: {e}"
+            ))
+        })?;
+
+        let closest = avail_json
+            .get("archived_snapshots")
+            .and_then(|v| v.get("closest"));
+        let (snapshot_url, timestamp, snapshot_status) = match closest {
+            Some(c)
+                if c.get("available")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) =>
+            {
+                let u = c
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ts = c
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let st = c
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (u, ts, st)
+            }
+            _ => {
+                return Err(ToolResult::err(format!(
+                    "web_fetch_wayback: no archived snapshot available for {url}"
+                )));
+            }
+        };
+        if snapshot_url.is_empty() {
+            return Err(ToolResult::err(format!(
+                "web_fetch_wayback: empty snapshot URL for {url}"
+            )));
+        }
+
+        let raw_url =
+            rewrite_to_raw_snapshot(&snapshot_url).unwrap_or_else(|| snapshot_url.clone());
+        tracing::info!(snapshot = %raw_url, timestamp = %timestamp, "fetching snapshot");
+        let resp = self.client.get(&raw_url).send().await.map_err(|e| {
+            ToolResult::err(format!("web_fetch_wayback: snapshot fetch failed: {e}"))
+        })?;
+
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if let Some(len) = resp.content_length()
+            && len > WAYBACK_MAX_BYTES
+        {
+            return Err(ToolResult::err(format!(
+                "web_fetch_wayback: too large ({len} bytes, limit {WAYBACK_MAX_BYTES})"
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ToolResult::err(format!("web_fetch_wayback: body read failed: {e}")))?;
+        if bytes.len() as u64 > WAYBACK_MAX_BYTES {
+            return Err(ToolResult::err(format!(
+                "web_fetch_wayback: body too large ({} bytes)",
+                bytes.len()
+            )));
+        }
+
+        Ok(WaybackSnapshot {
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+            timestamp,
+            snapshot_url,
+            snapshot_status,
+            content_type,
+            status,
+        })
+    }
 }
 
 #[cfg(test)]

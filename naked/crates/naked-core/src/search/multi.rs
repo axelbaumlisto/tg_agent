@@ -45,7 +45,16 @@ impl MultiEngineSearch {
                         }
                     }
                 }
-                Err(e) => tracing::warn!(engine = %name, "search engine failed: {e}"),
+                Err(e) => {
+                    // 429 rate limits are routine when running multiple
+                    // engines in parallel — the query still succeeds via
+                    // other engines. Log at debug to reduce noise.
+                    if e.contains("429") {
+                        tracing::debug!(engine = %name, "search engine rate-limited: {e}");
+                    } else {
+                        tracing::warn!(engine = %name, "search engine failed: {e}");
+                    }
+                }
             }
         }
         out

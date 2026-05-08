@@ -133,13 +133,33 @@ impl Tool for MemoryTool {
             other => other.parse::<MemoryScope>(),
         };
 
+        self.dispatch_action(
+            action,
+            content,
+            &input,
+            &scope_str,
+            resolved_scope,
+            explicit_user,
+        )
+        .await
+    }
+}
+
+impl MemoryTool {
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_action(
+        &self,
+        action: &str,
+        content: &str,
+        input: &serde_json::Value,
+        scope_str: &str,
+        resolved_scope: Result<MemoryScope, String>,
+        explicit_user: Option<String>,
+    ) -> ToolResult {
         match action {
             "store" => {
                 if content.is_empty() {
-                    return ToolResult {
-                        output: "Error: content is required for store action".into(),
-                        is_error: true,
-                    };
+                    return ToolResult::err("Error: content is required for store action");
                 }
                 let type_str = input
                     .get("memory_type")
@@ -148,54 +168,35 @@ impl Tool for MemoryTool {
                 let memory_type: MemoryType = match type_str.parse() {
                     Ok(t) => t,
                     Err(e) => {
-                        return ToolResult {
-                            output: format!("Error: {e}"),
-                            is_error: true,
-                        };
+                        return ToolResult::err(format!("Error: {e}"));
                     }
                 };
                 let scope = match resolved_scope {
                     Ok(s) => s,
                     Err(e) => {
-                        return ToolResult {
-                            output: format!("Error: {e}"),
-                            is_error: true,
-                        };
+                        return ToolResult::err(format!("Error: {e}"));
                     }
                 };
                 let scope_label = scope.to_string();
 
                 match MemoryService::store(&self.workspace, scope, memory_type, content, "model") {
-                    Ok(true) => ToolResult {
-                        output: format!("Stored {scope_label} {memory_type} memory: {content}"),
-                        is_error: false,
-                    },
-                    Ok(false) => ToolResult {
-                        output: "Memory already exists (duplicate skipped)".into(),
-                        is_error: false,
-                    },
-                    Err(e) => ToolResult {
-                        output: format!("Error storing memory: {e}"),
-                        is_error: true,
-                    },
+                    Ok(true) => ToolResult::ok(format!(
+                        "Stored {scope_label} {memory_type} memory: {content}"
+                    )),
+                    Ok(false) => ToolResult::ok("Memory already exists (duplicate skipped)"),
+                    Err(e) => ToolResult::err(format!("Error storing memory: {e}")),
                 }
             }
 
             "search" => {
                 if content.is_empty() {
-                    return ToolResult {
-                        output: "Error: content (query) is required for search".into(),
-                        is_error: true,
-                    };
+                    return ToolResult::err("Error: content (query) is required for search");
                 }
                 let sender = explicit_user.clone().or_else(|| self.context.user_id());
                 let results =
                     MemoryService::search_for(&self.workspace, content, sender.as_deref());
                 if results.is_empty() {
-                    ToolResult {
-                        output: "No memories found matching query".into(),
-                        is_error: false,
-                    }
+                    ToolResult::ok("No memories found matching query")
                 } else {
                     // Bump the in-memory recall counter for every hit so the
                     // promotion gate sees evidence the model actively used
@@ -212,34 +213,29 @@ impl Tool for MemoryTool {
                             )
                         })
                         .collect();
-                    ToolResult {
-                        output: format!("Found {} memories:\n{}", results.len(), lines.join("\n")),
-                        is_error: false,
-                    }
+                    ToolResult::ok(format!(
+                        "Found {} memories:\n{}",
+                        results.len(),
+                        lines.join("\n")
+                    ))
                 }
             }
 
             "list" => {
-                let scope_filter = match scope_str.as_str() {
+                let scope_filter = match scope_str {
                     "global" => Some(MemoryScope::Global),
                     "project" => Some(MemoryScope::Project),
                     "user" => match resolved_scope {
                         Ok(s) => Some(s),
                         Err(e) => {
-                            return ToolResult {
-                                output: format!("Error: {e}"),
-                                is_error: true,
-                            };
+                            return ToolResult::err(format!("Error: {e}"));
                         }
                     },
                     _ => None,
                 };
                 let entries = MemoryService::list(&self.workspace, scope_filter);
                 if entries.is_empty() {
-                    ToolResult {
-                        output: "No memories stored".into(),
-                        is_error: false,
-                    }
+                    ToolResult::ok("No memories stored")
                 } else {
                     let lines: Vec<String> = entries
                         .iter()
@@ -250,48 +246,30 @@ impl Tool for MemoryTool {
                             )
                         })
                         .collect();
-                    ToolResult {
-                        output: format!("{} memories:\n{}", entries.len(), lines.join("\n")),
-                        is_error: false,
-                    }
+                    ToolResult::ok(format!("{} memories:\n{}", entries.len(), lines.join("\n")))
                 }
             }
 
             "delete" => {
                 let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 if id.is_empty() {
-                    return ToolResult {
-                        output: "Error: id is required for delete action".into(),
-                        is_error: true,
-                    };
+                    return ToolResult::err("Error: id is required for delete action");
                 }
                 let delete_result = if scope_str == "user" {
                     match resolved_scope {
                         Ok(MemoryScope::User(uid)) => MemoryService::delete_user(&uid, id),
                         Ok(_) => unreachable!(),
                         Err(e) => {
-                            return ToolResult {
-                                output: format!("Error: {e}"),
-                                is_error: true,
-                            };
+                            return ToolResult::err(format!("Error: {e}"));
                         }
                     }
                 } else {
                     MemoryService::delete(&self.workspace, id)
                 };
                 match delete_result {
-                    Ok(true) => ToolResult {
-                        output: format!("Deleted memory {id}"),
-                        is_error: false,
-                    },
-                    Ok(false) => ToolResult {
-                        output: format!("Memory {id} not found"),
-                        is_error: false,
-                    },
-                    Err(e) => ToolResult {
-                        output: format!("Error deleting memory: {e}"),
-                        is_error: true,
-                    },
+                    Ok(true) => ToolResult::ok(format!("Deleted memory {id}")),
+                    Ok(false) => ToolResult::ok(format!("Memory {id} not found")),
+                    Err(e) => ToolResult::err(format!("Error deleting memory: {e}")),
                 }
             }
 
@@ -299,21 +277,15 @@ impl Tool for MemoryTool {
                 let scope = match resolved_scope {
                     Ok(s) => s,
                     Err(e) => {
-                        return ToolResult {
-                            output: format!("Error: {e}"),
-                            is_error: true,
-                        };
+                        return ToolResult::err(format!("Error: {e}"));
                     }
                 };
                 let entries = dreams::read_dreams(&self.workspace, &scope);
                 if entries.is_empty() {
-                    return ToolResult {
-                        output: format!(
-                            "No dream entries for scope={scope} yet. The daily digest \
-                             writes here once per UTC day after evaluating drafts."
-                        ),
-                        is_error: false,
-                    };
+                    return ToolResult::ok(format!(
+                        "No dream entries for scope={scope} yet. The daily digest \
+                         writes here once per UTC day after evaluating drafts."
+                    ));
                 }
                 // Show only the last 7 entries — DREAMS.md can grow up to
                 // dreams_retention_days (default 90) and we don't want to
@@ -342,33 +314,24 @@ impl Tool for MemoryTool {
                         }
                     }
                 }
-                ToolResult {
-                    output: lines.join("\n"),
-                    is_error: false,
-                }
+                ToolResult::ok(lines.join("\n"))
             }
 
             "daily_drafts" => {
                 let scope = match resolved_scope {
                     Ok(s) => s,
                     Err(e) => {
-                        return ToolResult {
-                            output: format!("Error: {e}"),
-                            is_error: true,
-                        };
+                        return ToolResult::err(format!("Error: {e}"));
                     }
                 };
                 let today = chrono::Utc::now().date_naive();
                 let entries = MarkdownMemoryStore::read_daily(&self.workspace, &scope, today);
                 if entries.is_empty() {
-                    return ToolResult {
-                        output: format!(
-                            "No draft entries for {today} (scope={scope}). \
-                             Drafts come from session-close snapshots, pre-compaction \
-                             flushes, and auto-classified messages."
-                        ),
-                        is_error: false,
-                    };
+                    return ToolResult::ok(format!(
+                        "No draft entries for {today} (scope={scope}). \
+                         Drafts come from session-close snapshots, pre-compaction \
+                         flushes, and auto-classified messages."
+                    ));
                 }
                 let lines: Vec<String> = entries
                     .iter()
@@ -379,24 +342,18 @@ impl Tool for MemoryTool {
                         )
                     })
                     .collect();
-                ToolResult {
-                    output: format!(
-                        "Today's drafts ({} entries, scope={scope}):\n{}",
-                        entries.len(),
-                        lines.join("\n")
-                    ),
-                    is_error: false,
-                }
+                ToolResult::ok(format!(
+                    "Today's drafts ({} entries, scope={scope}):\n{}",
+                    entries.len(),
+                    lines.join("\n")
+                ))
             }
 
             "stats" => {
                 let scope = match resolved_scope {
                     Ok(s) => s,
                     Err(e) => {
-                        return ToolResult {
-                            output: format!("Error: {e}"),
-                            is_error: true,
-                        };
+                        return ToolResult::err(format!("Error: {e}"));
                     }
                 };
                 let durable = MemoryService::list(&self.workspace, Some(scope.clone())).len();
@@ -417,28 +374,109 @@ impl Tool for MemoryTool {
                     .max()
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "never".to_string());
-                ToolResult {
-                    output: format!(
-                        "Memory stats (scope={scope}):\n  \
-                         durable rules (MEMORY.md): {durable}\n  \
-                         drafts today ({today}): {drafts_today}\n  \
-                         dream entries (7d): {}\n  \
-                         promoted (7d): {promoted_7d}\n  \
-                         rejected (7d): {rejected_7d}\n  \
-                         last digest run: {last_run}",
-                        recent.len(),
-                    ),
-                    is_error: false,
-                }
+                ToolResult::ok(format!(
+                    "Memory stats (scope={scope}):\n  \
+                     durable rules (MEMORY.md): {durable}\n  \
+                     drafts today ({today}): {drafts_today}\n  \
+                     dream entries (7d): {}\n  \
+                     promoted (7d): {promoted_7d}\n  \
+                     rejected (7d): {rejected_7d}\n  \
+                     last digest run: {last_run}",
+                    recent.len(),
+                ))
             }
 
-            _ => ToolResult {
-                output: format!(
-                    "Unknown action: {action}. Use store, search, list, delete, \
-                     dreams, daily_drafts, or stats."
-                ),
-                is_error: true,
-            },
+            _ => ToolResult::err(format!(
+                "Unknown action: {action}. Use store, search, list, delete, \
+                 dreams, daily_drafts, or stats."
+            )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn make_tool(dir: &Path) -> MemoryTool {
+        MemoryTool::new(dir.to_path_buf())
+    }
+
+    #[tokio::test]
+    async fn store_and_search_round_trip() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "store", "content": "prefer dark theme", "memory_type": "preference"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!res.is_error, "store failed: {}", res.output);
+
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "search", "content": "dark"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!res.is_error);
+        assert!(
+            res.output.contains("dark theme"),
+            "search result: {}",
+            res.output
+        );
+    }
+
+    #[tokio::test]
+    async fn list_returns_stored_entries() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        tool.execute(
+            serde_json::json!({"action": "store", "content": "rule one", "memory_type": "correction"}),
+            tmp.path(),
+        )
+        .await;
+        let res = tool
+            .execute(serde_json::json!({"action": "list"}), tmp.path())
+            .await;
+        assert!(!res.is_error);
+        assert!(res.output.contains("rule one"), "list: {}", res.output);
+    }
+
+    #[tokio::test]
+    async fn unknown_action_returns_error() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let res = tool
+            .execute(serde_json::json!({"action": "explode"}), tmp.path())
+            .await;
+        assert!(res.is_error);
+        assert!(res.output.contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn store_without_content_errors() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let res = tool
+            .execute(serde_json::json!({"action": "store"}), tmp.path())
+            .await;
+        assert!(res.is_error, "should fail without content: {}", res.output);
+    }
+
+    #[tokio::test]
+    async fn search_empty_memory_returns_clean() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "search", "content": "anything"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!res.is_error);
     }
 }

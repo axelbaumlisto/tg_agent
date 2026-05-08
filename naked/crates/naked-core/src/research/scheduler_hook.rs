@@ -66,3 +66,99 @@ impl SchedulerHook for NoopSchedulerHook {
 pub fn noop_hook() -> Arc<dyn SchedulerHook> {
     Arc::new(NoopSchedulerHook)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn noop_notify_completes() {
+        let hook = NoopSchedulerHook;
+        let event = SchedulerEvent::SpecCreated {
+            spec_id: "test-spec".to_string(),
+        };
+
+        // This should not panic and should complete successfully
+        hook.notify(event).await;
+        // notify() returns (), so we just verify it doesn't panic
+    }
+
+    #[tokio::test]
+    async fn noop_notify_all_event_types() {
+        let hook = NoopSchedulerHook;
+
+        // Test all event types
+        hook.notify(SchedulerEvent::SpecCreated {
+            spec_id: "test-1".to_string(),
+        })
+        .await;
+
+        hook.notify(SchedulerEvent::SpecUpdated {
+            spec_id: "test-2".to_string(),
+        })
+        .await;
+
+        hook.notify(SchedulerEvent::SpecRemoved {
+            spec_id: "test-3".to_string(),
+        })
+        .await;
+
+        // All should complete without panic
+    }
+
+    #[tokio::test]
+    async fn noop_failure_snapshot_returns_none() {
+        let hook = NoopSchedulerHook;
+
+        let result = hook.failure_snapshot("some-spec-id").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn noop_reset_completes() {
+        let hook = NoopSchedulerHook;
+
+        // This should not panic
+        hook.reset_failures("test-spec-id").await;
+
+        // Call it multiple times to ensure it's idempotent
+        hook.reset_failures("test-spec-id").await;
+        hook.reset_failures("another-spec").await;
+    }
+
+    #[test]
+    fn noop_hook_constructor() {
+        let hook = noop_hook();
+
+        // Verify it's actually a SchedulerHook
+        let _: Arc<dyn SchedulerHook> = hook;
+    }
+
+    #[test]
+    fn scheduler_event_debug() {
+        // Test that SchedulerEvent implements Debug properly
+        let event = SchedulerEvent::SpecCreated {
+            spec_id: "debug-test".to_string(),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("SpecCreated"));
+        assert!(debug_str.contains("debug-test"));
+    }
+
+    #[test]
+    fn scheduler_event_clone() {
+        // Test that SchedulerEvent implements Clone properly
+        let event1 = SchedulerEvent::SpecUpdated {
+            spec_id: "clone-test".to_string(),
+        };
+        let event2 = event1.clone();
+
+        match (event1, event2) {
+            (
+                SchedulerEvent::SpecUpdated { spec_id: id1 },
+                SchedulerEvent::SpecUpdated { spec_id: id2 },
+            ) => assert_eq!(id1, id2),
+            _ => panic!("Events should be identical after clone"),
+        }
+    }
+}

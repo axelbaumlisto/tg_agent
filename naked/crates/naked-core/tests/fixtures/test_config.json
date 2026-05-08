@@ -1,0 +1,8 @@
+{
+  "providers": {},
+  "default_provider": "",
+  "default_model": "",
+  "workspace": "/tmp/naked-test",
+  "max_iterations": 5,
+  "skill_roots": ["./tests/fixtures/skills"]
+}

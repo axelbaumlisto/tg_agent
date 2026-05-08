@@ -4,6 +4,7 @@ mod media;
 mod metrics;
 
 use naked_tg::helpers::parse_interval;
+use naked_tg::markup::{self, MAX_TG_MSG as TG_MSG_LIMIT};
 use naked_tg::memory_scheduler;
 use naked_tg::research_html::{ReportMeta, render_report_html};
 use naked_tg::research_scheduler;
@@ -11,7 +12,6 @@ use naked_tg::research_ui::{
     HeartbeatProgress, PendingClarification, keyboard_after_complete,
     keyboard_paused_awaiting_clarification, keyboard_stop, render_waterfall,
 };
-use naked_tg::tg_markup::{self, MAX_TG_MSG as TG_MSG_LIMIT};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -218,6 +218,8 @@ async fn send_typing_raw(
 
 #[tokio::main]
 async fn main() {
+    naked_tg::guarded::install_panic_hook();
+
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let naked_dir = std::path::PathBuf::from(&home).join(".naked");
     let log_dir = naked_dir.join("logs");
@@ -506,6 +508,7 @@ async fn main() {
     let pending_perms: PendingPermissions = Arc::new(RwLock::new(HashMap::new()));
 
     let bot_token = config
+        .telegram
         .telegram_bot_token
         .clone()
         .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok())
@@ -599,8 +602,8 @@ async fn main() {
     tracing::info!("Webhook cleared, starting polling loop");
 
     // ── A7: Send MCP startup diagnostics to owner chat ────────────────
-    if !mcp_failures.is_empty() && !config.allowed_chat_ids.is_empty() {
-        let owner_chat = ChatId(config.allowed_chat_ids[0]);
+    if !mcp_failures.is_empty() && !config.telegram.allowed_chat_ids.is_empty() {
+        let owner_chat = ChatId(config.telegram.allowed_chat_ids[0]);
         let mut lines = vec!["🔌 <b>MCP startup report</b>".to_string()];
         // Show connected servers
         let connected = agent.list_mcp_servers().await;
@@ -612,8 +615,8 @@ async fn main() {
             let err_short: String = f.error.chars().take(120).collect();
             lines.push(format!(
                 "  ❌ <b>{}</b>: {}",
-                crate::tg_markup::escape_html(&f.name),
-                crate::tg_markup::escape_html(&err_short),
+                crate::markup::escape_html(&f.name),
+                crate::markup::escape_html(&err_short),
             ));
         }
         let text = lines.join("\n");
@@ -623,7 +626,7 @@ async fn main() {
             .await;
     }
 
-    if config.allowed_chat_ids.is_empty() {
+    if config.telegram.allowed_chat_ids.is_empty() {
         tracing::warn!(
             "allowed_chat_ids is empty — ALL messages will be rejected! Add your chat IDs to naked.json."
         );
@@ -724,7 +727,7 @@ async fn main() {
     // Runtime toggle for `tg_sender_attribution`. Seeded from config; the
     // `/attribution on|off` command flips this atomic without restarting.
     let attribution_flag: Arc<std::sync::atomic::AtomicBool> = Arc::new(
-        std::sync::atomic::AtomicBool::new(config.tg_sender_attribution),
+        std::sync::atomic::AtomicBool::new(config.telegram.tg_sender_attribution),
     );
     let mut offset: i64 = 0;
 
@@ -823,31 +826,39 @@ async fn main() {
                 let permit = task_tracker.clone();
                 let album = album_buffer.clone();
                 let task_tracker_for_flush = task_tracker.clone();
-                tokio::spawn(async move {
-                    // Album-coalescing wrapper: messages tagged with a
-                    // `media_group_id` are buffered and flushed once the
-                    // debounce window closes; everything else dispatches
-                    // immediately.
-                    let deps_for_flush = deps.clone();
-                    let outcome = album
-                        .submit(msg, move |mut msgs| async move {
-                            let _permit = task_tracker_for_flush.acquire().await;
-                            // Sort by message_id so the user's perceived order
-                            // matches the order of images in the agent prompt.
-                            msgs.sort_by_key(|m| m.id.0);
-                            let primary = msgs.remove(0);
-                            if let Err(e) = deps_for_flush.handle(primary, msgs).await {
-                                tracing::error!("handle_message (album) error: {e}");
+                let guard_chat = msg.chat.id;
+                let guard_thread = msg.thread_id;
+                naked_tg::guarded::spawn_guarded(
+                    bot.clone(),
+                    guard_chat,
+                    guard_thread,
+                    "message",
+                    async move {
+                        // Album-coalescing wrapper: messages tagged with a
+                        // `media_group_id` are buffered and flushed once the
+                        // debounce window closes; everything else dispatches
+                        // immediately.
+                        let deps_for_flush = deps.clone();
+                        let outcome = album
+                            .submit(msg, move |mut msgs| async move {
+                                let _permit = task_tracker_for_flush.acquire().await;
+                                // Sort by message_id so the user's perceived order
+                                // matches the order of images in the agent prompt.
+                                msgs.sort_by_key(|m| m.id.0);
+                                let primary = msgs.remove(0);
+                                if let Err(e) = deps_for_flush.handle(primary, msgs).await {
+                                    tracing::error!("handle_message (album) error: {e}");
+                                }
+                            })
+                            .await;
+                        if let album::Decision::Solo(msg) = outcome {
+                            let _permit = permit.acquire().await;
+                            if let Err(e) = deps.handle(*msg, Vec::new()).await {
+                                tracing::error!("handle_message error: {e}");
                             }
-                        })
-                        .await;
-                    if let album::Decision::Solo(msg) = outcome {
-                        let _permit = permit.acquire().await;
-                        if let Err(e) = deps.handle(*msg, Vec::new()).await {
-                            tracing::error!("handle_message error: {e}");
                         }
-                    }
-                });
+                    },
+                );
             }
             // edited_message → treat as a new message (simplest useful behavior).
             // If the original was already processed, the agent sees the edit as
@@ -909,12 +920,20 @@ async fn main() {
                         tg_attach_queue: tg_attach_queue.clone(),
                     };
                     let permit = task_tracker.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit.acquire().await;
-                        if let Err(e) = deps.handle(msg, Vec::new()).await {
-                            tracing::error!("handle edited_message error: {e}");
-                        }
-                    });
+                    let guard_chat = msg.chat.id;
+                    let guard_thread = msg.thread_id;
+                    naked_tg::guarded::spawn_guarded(
+                        bot.clone(),
+                        guard_chat,
+                        guard_thread,
+                        "edited_message",
+                        async move {
+                            let _permit = permit.acquire().await;
+                            if let Err(e) = deps.handle(msg, Vec::new()).await {
+                                tracing::error!("handle edited_message error: {e}");
+                            }
+                        },
+                    );
                 }
             }
             if let Some(cb_val) = upd.get("callback_query") {
@@ -932,14 +951,26 @@ async fn main() {
                 let channel_map = channel_map.clone();
                 let config = config.clone();
                 let permit = task_tracker.clone();
-                tokio::spawn(async move {
-                    let _permit = permit.acquire().await;
-                    if let Err(e) =
-                        handle_callback(bot, q, pending_perms, agent, channel_map, config).await
-                    {
-                        tracing::error!("handle_callback error: {e}");
-                    }
+                // Callback chat_id: from the message the button was on.
+                let cb_chat = q.message.as_ref().map(|m| m.chat().id).unwrap_or(ChatId(0));
+                let cb_thread = q.message.as_ref().and_then(|m| match m {
+                    teloxide::types::MaybeInaccessibleMessage::Regular(msg) => msg.thread_id,
+                    _ => None,
                 });
+                naked_tg::guarded::spawn_guarded(
+                    bot.clone(),
+                    cb_chat,
+                    cb_thread,
+                    "callback",
+                    async move {
+                        let _permit = permit.acquire().await;
+                        if let Err(e) =
+                            handle_callback(bot, q, pending_perms, agent, channel_map, config).await
+                        {
+                            tracing::error!("handle_callback error: {e}");
+                        }
+                    },
+                );
             }
             // message_reaction → 👎 removes/cancels queued message hint.
             // Since messages go directly into conversation history, we can't
@@ -1139,10 +1170,10 @@ use streaming::{send_long_text, stream_response};
 // ── Access control ──────────────────────────────────────────────────────────
 
 fn is_allowed(chat_id: i64, config: &Config) -> bool {
-    if config.allowed_chat_ids.is_empty() {
+    if config.telegram.allowed_chat_ids.is_empty() {
         return false;
     }
-    config.allowed_chat_ids.contains(&chat_id)
+    config.telegram.allowed_chat_ids.contains(&chat_id)
 }
 
 // ── Commands (extracted to commands.rs) ──────────────────────────────────────
@@ -1179,18 +1210,18 @@ use commands::{
 
 // ── Formatting helpers ──────────────────────────────────────────────────────
 
-// ── Telegram markup: delegate to tg_markup module (DRY) ─────────────────
+// ── Telegram markup: delegate to markup module (DRY) ──────────────────────
 
 pub(crate) fn escape_html(s: &str) -> String {
-    tg_markup::escape_html(s)
+    markup::escape_html(s)
 }
 
 fn md_to_tg_html(text: &str) -> String {
-    tg_markup::md_to_tg_html(text)
+    markup::md_to_tg_html(text)
 }
 
 fn split_html(text: &str, max_bytes: usize) -> Vec<String> {
-    tg_markup::split_html(text, max_bytes)
+    markup::split_html(text, max_bytes)
 }
 
 // ── Health check server ─────────────────────────────────────────────────────

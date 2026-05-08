@@ -14,16 +14,22 @@ use super::{SearchEngine, SearchHit};
 pub struct ExaEngine {
     pool: Arc<KeyPool>,
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl ExaEngine {
     pub fn new(pool: Arc<KeyPool>) -> Self {
+        Self::with_base_url(pool, "https://api.exa.ai".into())
+    }
+
+    pub fn with_base_url(pool: Arc<KeyPool>, base_url: String) -> Self {
         Self {
             pool,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
+            base_url,
         }
     }
 }
@@ -49,7 +55,7 @@ impl SearchEngine for ExaEngine {
 
         let resp = self
             .client
-            .post("https://api.exa.ai/search")
+            .post(format!("{}/search", self.base_url))
             .header("x-api-key", &key)
             .json(&body)
             .send()
@@ -101,4 +107,47 @@ fn truncate_at_char_boundary(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_pool() -> Arc<KeyPool> {
+        Arc::new(KeyPool::from_keys(vec!["test-key".into()]))
+    }
+
+    #[tokio::test]
+    async fn parses_successful_response() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    {"url": "https://example.com/a", "title": "Exa Result", "text": "Some text content here"},
+                ]
+            })))
+            .mount(&mock).await;
+
+        let engine = ExaEngine::with_base_url(test_pool(), mock.uri());
+        let hits = engine.search("test", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_engine, "exa");
+        assert!(hits[0].snippet.contains("Some text"));
+    }
+
+    #[tokio::test]
+    async fn forbidden_marks_key_dead() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock)
+            .await;
+
+        let engine = ExaEngine::with_base_url(test_pool(), mock.uri());
+        let err = engine.search("test", 5).await.unwrap_err();
+        assert!(err.contains("dead key"));
+    }
 }

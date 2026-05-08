@@ -90,8 +90,14 @@ impl Provider for ResilientProvider {
         self.providers.iter().flat_map(|p| p.models()).collect()
     }
 
-    fn as_resilient(&self) -> Option<&ResilientProvider> {
-        Some(self)
+    fn blacklisted_key_count(&self) -> usize {
+        let bl = self.blacklist.blocking_lock();
+        let now = Instant::now();
+        bl.values().filter(|&&exp| now < exp).count()
+    }
+
+    fn total_key_count(&self) -> usize {
+        self.providers.len()
     }
 
     async fn stream_chat(
@@ -191,7 +197,12 @@ impl Provider for ResilientProvider {
             }
         }
 
-        Err(last_err.expect("at least one provider must be configured"))
+        Err(last_err.unwrap_or_else(|| {
+            crate::error::AgentError::ProviderTyped(crate::provider::error::ProviderError::Other {
+                status: 0,
+                body: "all provider keys exhausted or blacklisted".into(),
+            })
+        }))
     }
 }
 
@@ -256,7 +267,12 @@ mod tests {
             &self,
             _request: ChatRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
-            Err(AgentError::Provider(format!("{} failed", self.name)))
+            Err(AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::Other {
+                    status: 0,
+                    body: format!("{} failed", self.name),
+                },
+            ))
         }
     }
 

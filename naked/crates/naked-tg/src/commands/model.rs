@@ -111,7 +111,7 @@ pub(crate) async fn cmd_model(
                 .map(|m| (prov.clone(), m))
                 .collect::<Vec<_>>()
         } else {
-            naked_tg::tg_markup::filter_models_by_scope(&all_models, scope)
+            naked_tg::model_glob::filter_models_by_scope(&all_models, scope)
                 .into_iter()
                 .cloned()
                 .collect()
@@ -183,6 +183,17 @@ pub(crate) async fn cmd_model(
                 )
             };
             reply_html_kb(bot, ctx, header, kb).await?;
+        }
+    } else if arg == "auto" {
+        let sid = get_or_create_session(*ctx, agent, channel_map, config).await;
+        // Set model to "auto" — select_model() will pick per-turn.
+        match agent.set_session_provider(&sid, None, Some("auto")).await {
+            Ok(()) => {
+                reply_text(bot, ctx, "\u{1f916} Auto mode: модель выбирается по задаче").await?;
+            }
+            Err(e) => {
+                reply_text(bot, ctx, format!("Error: {e}")).await?;
+            }
         }
     } else {
         let sid = get_or_create_session(*ctx, agent, channel_map, config).await;

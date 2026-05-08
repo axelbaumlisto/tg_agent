@@ -119,13 +119,20 @@ impl Provider for AnthropicProvider {
         }
 
         let response = req
-            .body(
-                serde_json::to_string(&body)
-                    .map_err(|e| AgentError::Provider(format!("serialize: {e}")))?,
-            )
+            .body(serde_json::to_string(&body).map_err(|e| {
+                AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+                    context: "anthropic request".into(),
+                    source: e.to_string(),
+                })
+            })?)
             .send()
             .await
-            .map_err(|e| AgentError::Provider(format!("HTTP error: {e}")))?;
+            .map_err(|e| {
+                AgentError::ProviderTyped(super::error::ProviderError::Other {
+                    status: 0,
+                    body: e.to_string(),
+                })
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -133,9 +140,13 @@ impl Provider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "no body".to_string());
-            return Err(AgentError::Provider(format!(
-                "Anthropic API {status}: {text}"
-            )));
+            return Err(AgentError::ProviderTyped(
+                super::error::ProviderError::from_llm_http(
+                    status.as_u16(),
+                    &text[..text.len().min(512)],
+                    &request.model,
+                ),
+            ));
         }
 
         let stream = sse_stream_from_response(response);
@@ -230,7 +241,7 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
                 }
                 "content_block_stop" if has_pending_tool => {
                         let input: serde_json::Value =
-                            serde_json::from_str(&pending_tool_json).unwrap_or(serde_json::json!({}));
+                            crate::tool::arg_repair::repair_json(&pending_tool_json);
                         yield StreamChunk::ToolUse {
                             id: std::mem::take(&mut pending_tool_id),
                             name: std::mem::take(&mut pending_tool_name),
@@ -275,5 +286,44 @@ fn parse_usage(usage: &serde_json::Value) -> TurnUsage {
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
         cache_write_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_usage_full() {
+        let u = serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 10
+        });
+        let tu = parse_usage(&u);
+        assert_eq!(tu.input_tokens, 100);
+        assert_eq!(tu.output_tokens, 50);
+        assert_eq!(tu.cache_read_tokens, 30);
+        assert_eq!(tu.cache_write_tokens, 10);
+    }
+
+    #[test]
+    fn parse_usage_missing_fields() {
+        let u = serde_json::json!({});
+        let tu = parse_usage(&u);
+        assert_eq!(tu.input_tokens, 0);
+        assert_eq!(tu.output_tokens, 0);
+    }
+
+    #[test]
+    fn provider_name_matches() {
+        let cfg = crate::config::ProviderConfig {
+            provider_type: "anthropic".into(),
+            api_key: "test".into(),
+            ..Default::default()
+        };
+        let p = AnthropicProvider::new("test-anthropic".into(), cfg);
+        assert_eq!(p.name(), "test-anthropic");
     }
 }

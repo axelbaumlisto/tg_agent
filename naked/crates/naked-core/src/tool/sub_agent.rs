@@ -131,10 +131,7 @@ impl Tool for SubAgentTool {
         let prompt = match input.get("prompt").and_then(|v| v.as_str()) {
             Some(p) if !p.trim().is_empty() => p.trim().to_string(),
             _ => {
-                return ToolResult {
-                    output: "Error: 'prompt' field is required and must be non-empty".into(),
-                    is_error: true,
-                };
+                return ToolResult::err("Error: 'prompt' field is required and must be non-empty");
             }
         };
 
@@ -179,9 +176,7 @@ impl Tool for SubAgentTool {
             model: self.model.clone(),
             max_tokens: 8192,
             temperature: Some(0.0),
-            reasoning: None,
-            provider: String::new(),
-            health: None,
+            ..Default::default()
         };
 
         let system = format!(
@@ -231,7 +226,7 @@ impl Tool for SubAgentTool {
                                 agent_id: fwd_agent_id.clone(),
                                 event: SubAgentEvent::ToolDone {
                                     name: name.clone(),
-                                    state: state.clone(),
+                                    state: *state,
                                 },
                             })
                             .await;
@@ -305,10 +300,7 @@ impl Tool for SubAgentTool {
                     usage.total_tokens(),
                 ));
 
-                ToolResult {
-                    output,
-                    is_error: false,
-                }
+                ToolResult::ok(output)
             }
             Err(e) => {
                 self.registry
@@ -320,10 +312,7 @@ impl Tool for SubAgentTool {
                         event: SubAgentEvent::Error(e.to_string()),
                     })
                     .await;
-                ToolResult {
-                    output: format!("Sub-agent error: {e}"),
-                    is_error: true,
-                }
+                ToolResult::err(format!("Sub-agent error: {e}"))
             }
         }
     }
@@ -346,5 +335,64 @@ impl Provider for ArcProvider {
         std::pin::Pin<Box<dyn tokio_stream::Stream<Item = crate::types::StreamChunk> + Send>>,
     > {
         self.0.stream_chat(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::NoopProvider;
+
+    fn make_tool() -> SubAgentTool {
+        SubAgentTool::new(Arc::new(NoopProvider), "mock".into(), 30, vec![])
+    }
+
+    #[test]
+    fn spec_has_required_fields() {
+        let tool = make_tool();
+        let spec = tool.spec();
+        assert_eq!(spec.name, "sub_agent");
+        assert!(!spec.description.is_empty());
+        assert!(spec.parameters.get("properties").is_some());
+    }
+
+    #[test]
+    fn build_tools_explore_includes_read_tools() {
+        let tool = make_tool();
+        let registry = tool.build_tools("explore");
+        assert!(registry.get("read_file").is_some());
+        assert!(registry.get("glob_search").is_some());
+        assert!(registry.get("grep_search").is_some());
+    }
+
+    #[test]
+    fn build_tools_code_includes_write_tools() {
+        let tool = make_tool();
+        let registry = tool.build_tools("code");
+        assert!(registry.get("write_file").is_some());
+        assert!(registry.get("edit_file").is_some());
+        assert!(registry.get("bash").is_some());
+    }
+
+    #[tokio::test]
+    async fn execute_missing_prompt_errors() {
+        let tool = make_tool();
+        let res = tool
+            .execute(serde_json::json!({}), std::path::Path::new("/tmp"))
+            .await;
+        assert!(res.is_error);
+        assert!(res.output.contains("prompt"));
+    }
+
+    #[tokio::test]
+    async fn execute_empty_prompt_errors() {
+        let tool = make_tool();
+        let res = tool
+            .execute(
+                serde_json::json!({"prompt": "   "}),
+                std::path::Path::new("/tmp"),
+            )
+            .await;
+        assert!(res.is_error);
     }
 }

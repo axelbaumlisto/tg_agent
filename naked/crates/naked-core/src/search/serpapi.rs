@@ -15,16 +15,22 @@ use super::{SearchEngine, SearchHit};
 pub struct SerpApiEngine {
     pool: Arc<KeyPool>,
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl SerpApiEngine {
     pub fn new(pool: Arc<KeyPool>) -> Self {
+        Self::with_base_url(pool, "https://serpapi.com".into())
+    }
+
+    pub fn with_base_url(pool: Arc<KeyPool>, base_url: String) -> Self {
         Self {
             pool,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
+            base_url,
         }
     }
 }
@@ -40,7 +46,7 @@ impl SearchEngine for SerpApiEngine {
 
         let resp = self
             .client
-            .get("https://serpapi.com/search")
+            .get(format!("{}/search", self.base_url))
             .query(&[
                 ("api_key", key.as_str()),
                 ("engine", "google"),
@@ -93,5 +99,51 @@ impl SearchEngine for SerpApiEngine {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_pool() -> Arc<KeyPool> {
+        Arc::new(KeyPool::from_keys(vec!["test-key".into()]))
+    }
+
+    #[tokio::test]
+    async fn parses_organic_results() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "organic_results": [
+                    {"link": "https://example.com/r1", "title": "Result", "snippet": "A snippet"},
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let engine = SerpApiEngine::with_base_url(test_pool(), mock.uri());
+        let hits = engine.search("query", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_engine, "serpapi");
+    }
+
+    #[tokio::test]
+    async fn api_error_field_returns_err() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "Invalid API key"
+            })))
+            .mount(&mock)
+            .await;
+
+        let engine = SerpApiEngine::with_base_url(test_pool(), mock.uri());
+        let err = engine.search("q", 5).await.unwrap_err();
+        assert!(err.contains("Invalid"));
     }
 }

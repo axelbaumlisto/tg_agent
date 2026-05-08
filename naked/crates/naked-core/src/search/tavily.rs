@@ -14,16 +14,23 @@ use super::{SearchEngine, SearchHit};
 pub struct TavilyEngine {
     pool: Arc<KeyPool>,
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl TavilyEngine {
     pub fn new(pool: Arc<KeyPool>) -> Self {
+        Self::with_base_url(pool, "https://api.tavily.com".into())
+    }
+
+    /// Constructor with custom base URL (for testing with wiremock).
+    pub fn with_base_url(pool: Arc<KeyPool>, base_url: String) -> Self {
         Self {
             pool,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),
+            base_url,
         }
     }
 }
@@ -48,7 +55,7 @@ impl SearchEngine for TavilyEngine {
 
         let resp = self
             .client
-            .post("https://api.tavily.com/search")
+            .post(format!("{}/search", self.base_url))
             .json(&body)
             .send()
             .await
@@ -86,5 +93,82 @@ impl SearchEngine for TavilyEngine {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_pool() -> Arc<KeyPool> {
+        Arc::new(KeyPool::from_keys(vec!["test-key".into()]))
+    }
+
+    #[tokio::test]
+    async fn parses_successful_response() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    {"url": "https://example.com/1", "title": "Result 1", "content": "Snippet 1"},
+                    {"url": "https://example.com/2", "title": "Result 2", "content": "Snippet 2"},
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let engine = TavilyEngine::with_base_url(test_pool(), mock.uri());
+        let hits = engine.search("test query", 5).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://example.com/1");
+        assert_eq!(hits[0].source_engine, "tavily");
+    }
+
+    #[tokio::test]
+    async fn empty_results() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": []
+            })))
+            .mount(&mock)
+            .await;
+
+        let engine = TavilyEngine::with_base_url(test_pool(), mock.uri());
+        let hits = engine.search("nothing", 5).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_marks_key_dead() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+
+        let pool = test_pool();
+        let engine = TavilyEngine::with_base_url(pool.clone(), mock.uri());
+        let err = engine.search("test", 5).await.unwrap_err();
+        assert!(err.contains("dead key"));
+    }
+
+    #[tokio::test]
+    async fn server_error_returns_err() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let engine = TavilyEngine::with_base_url(test_pool(), mock.uri());
+        let err = engine.search("test", 5).await.unwrap_err();
+        assert!(err.contains("500"));
     }
 }

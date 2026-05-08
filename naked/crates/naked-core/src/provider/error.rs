@@ -160,7 +160,11 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
@@ -296,5 +300,33 @@ mod tests {
         assert!(!err.is_key_dead());
         assert!(!err.is_model_dead());
         assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn truncate_ascii_within_limit() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_at_limit() {
+        assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn truncate_russian_on_char_boundary() {
+        // "Ошибка" = 6 chars, 12 bytes. Truncate at 5 bytes
+        // must not land inside a 2-byte char.
+        let s = "Ошибка сервера";
+        let result = truncate(s, 5);
+        // 5 bytes → 2 full Cyrillic chars (4 bytes) + ellipsis
+        assert_eq!(result, "Ош…");
+    }
+
+    #[test]
+    fn truncate_emdash_boundary() {
+        // em-dash — is 3 bytes. Truncate at 4 should give 3 bytes + ellipsis.
+        let s = "———"; // 9 bytes
+        let result = truncate(s, 4);
+        assert_eq!(result, "—…"); // 3 bytes + ellipsis
     }
 }

@@ -1,7 +1,7 @@
-//! `web_search` tool — thin wrapper around [`crate::search::multi::MultiEngineSearch`].
+//! `web_search` tool - thin wrapper around [`crate::search::multi::MultiEngineSearch`].
 //!
 //! Wires together every keyed engine that has at least one usable key in its
-//! pool, plus DDG as a no-key fallback. Output is unified — each result line
+//! pool, plus DDG as a no-key fallback. Output is unified - each result line
 //! carries `(via <engine>)` so the agent can see which backend won.
 
 use std::path::Path;
@@ -30,7 +30,7 @@ pub struct WebSearchTool {
 impl WebSearchTool {
     /// Build the tool from per-provider [`KeyPool`]s. Engines whose pool is
     /// empty are simply not wired up. DDG is always added as a last-resort
-    /// fallback — it costs nothing and works without keys.
+    /// fallback - it costs nothing and works without keys.
     pub fn new(
         exa_pool: Arc<KeyPool>,
         tavily_pool: Arc<KeyPool>,
@@ -131,10 +131,7 @@ impl Tool for WebSearchTool {
         let query = match input.get("query").and_then(|v| v.as_str()) {
             Some(q) if !q.trim().is_empty() => q.trim(),
             _ => {
-                return ToolResult {
-                    output: "Error: 'query' field is required and must be non-empty".into(),
-                    is_error: true,
-                };
+                return ToolResult::err("Error: 'query' field is required and must be non-empty");
             }
         };
         let num = input
@@ -145,13 +142,10 @@ impl Tool for WebSearchTool {
 
         let hits = self.multi.search(query, num).await;
         if hits.is_empty() {
-            return ToolResult {
-                output: format!(
-                    "[engines: {}] no results for: {query}",
-                    self.multi.engine_count()
-                ),
-                is_error: true,
-            };
+            return ToolResult::err(format!(
+                "[engines: {}] no results for: {query}",
+                self.multi.engine_count()
+            ));
         }
 
         let mut blocks = Vec::with_capacity(hits.len());
@@ -167,9 +161,9 @@ impl Tool for WebSearchTool {
             let extracted_line = match &extracted {
                 Some(f) => {
                     fast_path_count += 1;
-                    let phone = f.phone.as_deref().unwrap_or("—");
+                    let phone = f.phone.as_deref().unwrap_or("-");
                     format!(
-                        "\n  ⚡ extracted: price={} VND, area={} m², district={}, phone={}",
+                        "\n  ⚡ extracted: price={} VND, area={} m2, district={}, phone={}",
                         f.price_vnd_per_month, f.area_m2, f.district, phone
                     )
                 }
@@ -191,15 +185,12 @@ impl Tool for WebSearchTool {
             );
         }
 
-        ToolResult {
-            output: format!(
-                "[engines: {}] {} results:\n\n{}",
-                self.multi.engine_count(),
-                hits.len(),
-                blocks.join("\n\n")
-            ),
-            is_error: false,
-        }
+        ToolResult::ok(format!(
+            "[engines: {}] {} results:\n\n{}",
+            self.multi.engine_count(),
+            hits.len(),
+            blocks.join("\n\n")
+        ))
     }
 }
 
@@ -208,5 +199,210 @@ fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     let truncated: String = s.chars().take(max).collect();
-    format!("{truncated}…")
+    format!("{truncated}...")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::pool::KeyPool;
+    use crate::search::multi::MultiEngineSearch;
+    use crate::search::{SearchEngine, SearchHit};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    #[test]
+    fn web_search_tool_new_with_empty_pools() {
+        let empty_exa = Arc::new(KeyPool::empty("exa"));
+        let empty_tavily = Arc::new(KeyPool::empty("tavily"));
+        let empty_serpapi = Arc::new(KeyPool::empty("serpapi"));
+
+        // Should not panic even with empty key pools
+        let tool = WebSearchTool::new(empty_exa, empty_tavily, empty_serpapi);
+
+        // Verify the tool has a valid spec
+        let spec = tool.spec();
+        assert_eq!(spec.name, "web_search");
+        assert!(spec.description.contains("Search the web"));
+        assert!(spec.description.contains("ddg")); // Should always include DDG
+    }
+
+    #[test]
+    fn web_search_tool_legacy_constructor() {
+        // Test the legacy constructor with empty keys
+        let tool = WebSearchTool::from_legacy_exa(vec![]);
+
+        let spec = tool.spec();
+        assert_eq!(spec.name, "web_search");
+        assert!(spec.description.contains("ddg")); // Should have DDG fallback
+    }
+
+    #[test]
+    fn web_search_tool_legacy_constructor_with_keys() {
+        // Test with some dummy keys
+        let keys = vec!["test-key-1".to_string(), "test-key-2".to_string()];
+        let tool = WebSearchTool::from_legacy_exa(keys);
+
+        let spec = tool.spec();
+        assert_eq!(spec.name, "web_search");
+        assert!(spec.description.contains("exa")); // Should have exa when keys provided
+        assert!(spec.description.contains("ddg")); // Should still have DDG
+    }
+
+    #[tokio::test]
+    async fn web_search_tool_execute_missing_query() {
+        let tool = WebSearchTool::new(
+            Arc::new(KeyPool::empty("exa")),
+            Arc::new(KeyPool::empty("tavily")),
+            Arc::new(KeyPool::empty("serpapi")),
+        );
+
+        // Test with missing query
+        let input = serde_json::json!({});
+        let result = tool.execute(input, std::path::Path::new("/tmp")).await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("'query' field is required"));
+    }
+
+    #[tokio::test]
+    async fn web_search_tool_execute_empty_query() {
+        let tool = WebSearchTool::new(
+            Arc::new(KeyPool::empty("exa")),
+            Arc::new(KeyPool::empty("tavily")),
+            Arc::new(KeyPool::empty("serpapi")),
+        );
+
+        // Test with empty query
+        let input = serde_json::json!({
+            "query": ""
+        });
+        let result = tool.execute(input, std::path::Path::new("/tmp")).await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("must be non-empty"));
+    }
+
+    #[tokio::test]
+    async fn web_search_tool_execute_whitespace_query() {
+        let tool = WebSearchTool::new(
+            Arc::new(KeyPool::empty("exa")),
+            Arc::new(KeyPool::empty("tavily")),
+            Arc::new(KeyPool::empty("serpapi")),
+        );
+
+        // Test with whitespace-only query
+        let input = serde_json::json!({
+            "query": "   \n\t  "
+        });
+        let result = tool.execute(input, std::path::Path::new("/tmp")).await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("must be non-empty"));
+    }
+
+    #[test]
+    fn test_truncate() {
+        // Test the utility function
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly_ten", 11), "exactly_ten");
+        assert_eq!(truncate("exactly_ten", 10), "exactly_te...");
+        assert_eq!(truncate("this is longer than max", 10), "this is lo...");
+
+        // Test with Unicode characters
+        assert_eq!(truncate("café", 3), "caf..."); // "café" has 4 chars, so truncated
+        assert_eq!(truncate("café", 4), "café"); // Exactly 4 chars, no truncation
+        assert_eq!(truncate("café", 2), "ca..."); // Truncated to 2 chars
+    }
+
+    // Mock engine for testing search hit formatting
+    struct MockEngine {
+        name: &'static str,
+        hits: Vec<SearchHit>,
+    }
+
+    #[async_trait]
+    impl SearchEngine for MockEngine {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn search(&self, _query: &str, _num: usize) -> Result<Vec<SearchHit>, String> {
+            Ok(self.hits.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_hit_formatting() {
+        // Create a mock search hit to test the formatting logic
+        let hit = SearchHit {
+            url: "https://example.com/test".to_string(),
+            title: "Test Title".to_string(),
+            snippet: "This is a test snippet".to_string(),
+            source_engine: "test_engine",
+        };
+
+        // Create a tool with mock engine
+        let mock_engine = MockEngine {
+            name: "test_engine",
+            hits: vec![hit],
+        };
+
+        let multi = MultiEngineSearch::new(vec![Box::new(mock_engine)]);
+        let tool = WebSearchTool {
+            multi,
+            engine_summary: "test_engine".to_string(),
+            extractor: crate::search::snippet::SnippetExtractor::new(),
+        };
+
+        let input = serde_json::json!({
+            "query": "test query",
+            "num_results": 1
+        });
+
+        let result = tool.execute(input, std::path::Path::new("/tmp")).await;
+
+        assert!(!result.is_error);
+        let output = &result.output;
+        assert!(output.contains("Test Title"));
+        assert!(output.contains("via test_engine"));
+        assert!(output.contains("https://example.com/test"));
+        assert!(output.contains("This is a test snippet"));
+        assert!(output.contains("1 results"));
+    }
+
+    #[test]
+    fn tool_spec_structure() {
+        let tool = WebSearchTool::new(
+            Arc::new(KeyPool::empty("exa")),
+            Arc::new(KeyPool::empty("tavily")),
+            Arc::new(KeyPool::empty("serpapi")),
+        );
+
+        let spec = tool.spec();
+
+        // Verify required fields
+        assert_eq!(spec.name, "web_search");
+        assert!(!spec.description.is_empty());
+        assert_eq!(spec.permission, crate::types::Permission::ReadOnly);
+
+        // Verify parameter schema structure
+        let params = spec.parameters;
+        assert_eq!(params["type"].as_str(), Some("object"));
+
+        let properties = &params["properties"];
+        assert!(properties.is_object());
+        assert!(properties["query"].is_object());
+        assert!(properties["num_results"].is_object());
+
+        let required = &params["required"];
+        assert!(required.is_array());
+        let required_fields: Vec<&str> = required
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required_fields.contains(&"query"));
+    }
 }

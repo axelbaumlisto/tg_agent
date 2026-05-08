@@ -47,10 +47,12 @@ pub(crate) async fn handle_command(
         "/sessions" => session::cmd_sessions(bot, agent, channel_map, config, &ctx, text).await?,
         "/abort" | "/stop" => session::cmd_abort(bot, agent, channel_map, config, &ctx).await?,
         "/status" => session::cmd_status(bot, agent, channel_map, config, &ctx).await?,
+        "/usage" => session::cmd_usage(bot, agent, &ctx).await?,
         "/health" => info::cmd_health(bot, agent, channel_map, config, &ctx, text).await?,
         "/metrics" => info::cmd_metrics(bot, agent, channel_map, config, &ctx, text).await?,
         "/compact" => session::cmd_compact(bot, agent, channel_map, config, &ctx).await?,
         "/reload" => ops::cmd_reload(bot, agent, channel_map, config, &ctx).await?,
+        "/undo" => ops::cmd_undo(bot, agent, channel_map, config, &ctx).await?,
         "/provider" | "/providers" => {
             model::cmd_provider(bot, agent, channel_map, config, &ctx, text).await?
         }
@@ -67,8 +69,26 @@ pub(crate) async fn handle_command(
         "/allow" => {
             tools::cmd_allow(bot, agent, channel_map, config, &ctx, text, pending_perms).await?
         }
-        "/research" => {
-            research::handle_research_cmd(bot, agent, config, &ctx, text, cmd_word).await?;
+        "/research" | "/tasks" => {
+            // /tasks is an alias for /research ls
+            let effective_text = if cmd_word == "/tasks" {
+                "/research ls"
+            } else {
+                text
+            };
+            research::handle_research_cmd(
+                bot,
+                agent,
+                config,
+                &ctx,
+                effective_text,
+                if cmd_word == "/tasks" {
+                    "/research"
+                } else {
+                    cmd_word
+                },
+            )
+            .await?;
         }
         "/memory" => {
             memory::handle_memory_cmd(bot, agent, channel_map, &ctx, text, cmd_word).await?;

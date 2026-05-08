@@ -54,6 +54,18 @@ impl KeyPool {
         Self::new(Vec::new(), key_type, Duration::from_secs(3600))
     }
 
+    /// Create a pool pre-seeded with literal keys. For tests only.
+    /// Create a pool pre-seeded with literal keys. For tests only.
+    pub fn from_keys(keys: Vec<String>) -> Self {
+        let pool = Self::empty("test");
+        {
+            let mut g = pool.inner.write().expect("key_pool lock");
+            g.keys = keys;
+            g.refreshed_at = std::time::Instant::now();
+        }
+        pool
+    }
+
     fn refresh_if_stale(&self) {
         let stale = {
             let g = self.inner.read().expect("key_pool lock");

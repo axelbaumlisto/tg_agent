@@ -22,10 +22,12 @@ impl McpServer {
                 Arc::new(StdioTransport::spawn(config).await?)
             }
             _ => {
-                return Err(AgentError::Provider(format!(
-                    "MCP transport {:?} not yet supported",
-                    config.transport
-                )));
+                return Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Mcp {
+                        context: format!("transport {:?} not yet supported", config.transport),
+                        source: String::new(),
+                    },
+                ));
             }
         };
 

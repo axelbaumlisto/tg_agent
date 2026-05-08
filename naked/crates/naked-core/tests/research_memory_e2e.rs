@@ -10,17 +10,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
+use naked_core::PatchField;
 use naked_core::config::ResearchConfig;
 use naked_core::error::Result as NakedResult;
 use naked_core::memory::store::MarkdownMemoryStore;
 use naked_core::research::coordinator::{AgentRunner, CoordinatorConfig, ResearchCoordinator};
-use naked_core::research::ops_tool::{
-    ResearchHelpTool, ResearchListSpecsTool, ResearchMetricsTool, ResearchSetScheduleTool,
-};
+use naked_core::research::ops_tool::{ResearchListSpecsTool, ResearchMetricsTool};
+use naked_core::research::ops_tool_extra::{ResearchHelpTool, ResearchSetScheduleTool};
 use naked_core::research::spec::{Finding, ResearchSpec, RunRecord, dedup_hash};
 use naked_core::research::store::{
-    FsResearchStore, ReportStore, ResearchStore, RunStore, SpecStore, research_runlog_path,
+    ReportStore, ResearchStore, RunStore, SpecStore, research_runlog_path,
 };
+use naked_core::research::store_fs::FsResearchStore;
 use naked_core::tool::Tool;
 use naked_core::types::{AgentEvent, AgentHandle, PermissionResponse};
 use naked_core::{ResearchPatch, apply_research_patch, write_research_memory_link_for};
@@ -478,14 +479,14 @@ fn t_patch_interval_set_then_clear() {
     assert!(spec.interval_seconds.is_none());
 
     let patch = ResearchPatch {
-        interval_seconds: Some(Some(1800)),
+        interval_seconds: PatchField::Set(1800),
         ..Default::default()
     };
     apply_research_patch(&mut spec, patch);
     assert_eq!(spec.interval_seconds, Some(1800));
 
     let patch = ResearchPatch {
-        interval_seconds: Some(None),
+        interval_seconds: PatchField::Clear,
         ..Default::default()
     };
     apply_research_patch(&mut spec, patch);
@@ -521,8 +522,8 @@ fn t_patch_max_iterations_and_wall_seconds() {
     spec.max_wall_seconds = Some(60);
 
     let patch = ResearchPatch {
-        max_iterations: Some(Some(25)),
-        max_wall_seconds: Some(None),
+        max_iterations: PatchField::Set(25),
+        max_wall_seconds: PatchField::Clear,
         ..Default::default()
     };
     apply_research_patch(&mut spec, patch);
@@ -547,7 +548,7 @@ async fn t_research_update_spec_tool_payload_round_trip() {
     let patch = ResearchPatch {
         topic: Some("after".into()),
         sources_add: Some(vec!["https://added.example".into()]),
-        interval_seconds: Some(Some(7200)),
+        interval_seconds: PatchField::Set(7200),
         ..Default::default()
     };
 

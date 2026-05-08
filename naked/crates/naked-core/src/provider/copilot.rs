@@ -36,12 +36,16 @@ pub fn load_copilot_token() -> Option<String> {
 pub fn save_copilot_token(token: &str) -> Result<()> {
     let path = auth_file_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| AgentError::Provider(format!("cannot create ~/.naked: {e}")))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+                context: "create ~/.naked".into(),
+                source: e.to_string(),
+            })
+        })?;
     }
 
     let mut json = if let Ok(data) = std::fs::read_to_string(&path) {
-        serde_json::from_str::<serde_json::Value>(&data).unwrap_or(serde_json::json!({}))
+        crate::tool::arg_repair::repair_json(&data)
     } else {
         serde_json::json!({})
     };
@@ -51,10 +55,18 @@ pub fn save_copilot_token(token: &str) -> Result<()> {
         "created_at": chrono::Utc::now().timestamp(),
     });
 
-    let contents = serde_json::to_string_pretty(&json)
-        .map_err(|e| AgentError::Provider(format!("json serialize: {e}")))?;
-    std::fs::write(&path, contents)
-        .map_err(|e| AgentError::Provider(format!("write auth.json: {e}")))?;
+    let contents = serde_json::to_string_pretty(&json).map_err(|e| {
+        AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+            context: "json serialize".into(),
+            source: e.to_string(),
+        })
+    })?;
+    std::fs::write(&path, contents).map_err(|e| {
+        AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+            context: "write auth.json".into(),
+            source: e.to_string(),
+        })
+    })?;
 
     #[cfg(unix)]
     {
@@ -96,17 +108,29 @@ pub async fn copilot_device_login() -> Result<String> {
         }))
         .send()
         .await
-        .map_err(|e| AgentError::Provider(format!("device code request: {e}")))?;
+        .map_err(|e| {
+            AgentError::ProviderTyped(super::error::ProviderError::Other {
+                status: 0,
+                body: format!("device code request: {e}"),
+            })
+        })?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(AgentError::Provider(format!("device code failed: {text}")));
+        return Err(AgentError::ProviderTyped(
+            super::error::ProviderError::AuthFailed {
+                status: 0,
+                body: format!("device code: {text}"),
+            },
+        ));
     }
 
-    let device: DeviceCodeResponse = resp
-        .json()
-        .await
-        .map_err(|e| AgentError::Provider(format!("device code parse: {e}")))?;
+    let device: DeviceCodeResponse = resp.json().await.map_err(|e| {
+        AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+            context: "device code parse".into(),
+            source: e.to_string(),
+        })
+    })?;
 
     eprintln!();
     eprintln!("  ┌─────────────────────────────────────────┐");
@@ -138,16 +162,28 @@ pub async fn copilot_device_login() -> Result<String> {
             }))
             .send()
             .await
-            .map_err(|e| AgentError::Provider(format!("token poll: {e}")))?;
+            .map_err(|e| {
+                AgentError::ProviderTyped(super::error::ProviderError::Other {
+                    status: 0,
+                    body: format!("token poll: {e}"),
+                })
+            })?;
 
         if !resp.status().is_success() {
-            return Err(AgentError::Provider("token exchange failed".into()));
+            return Err(AgentError::ProviderTyped(
+                super::error::ProviderError::AuthFailed {
+                    status: 0,
+                    body: "token exchange failed".into(),
+                },
+            ));
         }
 
-        let token_resp: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| AgentError::Provider(format!("token parse: {e}")))?;
+        let token_resp: TokenResponse = resp.json().await.map_err(|e| {
+            AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+                context: "token parse".into(),
+                source: e.to_string(),
+            })
+        })?;
 
         if let Some(token) = token_resp.access_token {
             save_copilot_token(&token)?;
@@ -166,7 +202,12 @@ pub async fn copilot_device_login() -> Result<String> {
                 continue;
             }
             Some(err) => {
-                return Err(AgentError::Provider(format!("OAuth error: {err}")));
+                return Err(AgentError::ProviderTyped(
+                    super::error::ProviderError::AuthFailed {
+                        status: 0,
+                        body: format!("OAuth: {err}"),
+                    },
+                ));
             }
             None => continue,
         }
@@ -183,19 +224,28 @@ pub async fn fetch_copilot_models(token: &str) -> Result<Vec<String>> {
         .header("User-Agent", "naked-agent/0.1")
         .send()
         .await
-        .map_err(|e| AgentError::Provider(format!("models fetch: {e}")))?;
+        .map_err(|e| {
+            AgentError::ProviderTyped(super::error::ProviderError::Other {
+                status: 0,
+                body: format!("models fetch: {e}"),
+            })
+        })?;
 
     if !resp.status().is_success() {
-        return Err(AgentError::Provider(format!(
-            "models fetch HTTP {}",
-            resp.status()
-        )));
+        return Err(AgentError::ProviderTyped(
+            super::error::ProviderError::Other {
+                status: resp.status().as_u16(),
+                body: format!("models fetch HTTP {}", resp.status()),
+            },
+        ));
     }
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AgentError::Provider(format!("models parse: {e}")))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        AgentError::ProviderTyped(super::error::ProviderError::Serialize {
+            context: "models parse".into(),
+            source: e.to_string(),
+        })
+    })?;
 
     let models = body["data"]
         .as_array()

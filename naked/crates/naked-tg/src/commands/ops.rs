@@ -234,3 +234,23 @@ pub(crate) async fn cmd_remote(
     }
     Ok(())
 }
+
+pub(crate) async fn cmd_undo(
+    bot: &Bot,
+    agent: &std::sync::Arc<AgentCore>,
+    channel_map: &std::sync::Arc<ChannelSessionMap>,
+    config: &Config,
+    ctx: &ChatCtx,
+) -> Result<(), teloxide::RequestError> {
+    let sid = super::get_or_create_session(*ctx, agent, channel_map, config).await;
+    let workspace = agent.session_workspace(&sid).await.unwrap_or_default();
+    match naked_core::snapshot::undo_last(&workspace).await {
+        Ok(msg) => {
+            super::reply_text(bot, ctx, &format!("↩️ {msg}")).await?;
+        }
+        Err(e) => {
+            super::reply_text(bot, ctx, &format!("❌ {e}")).await?;
+        }
+    }
+    Ok(())
+}

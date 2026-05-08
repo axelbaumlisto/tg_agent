@@ -36,15 +36,24 @@ const SCRAPINGBEE_TIMEOUT_SECS: u64 = 60;
 pub struct ScrapingBeeEngine {
     client: Client,
     keys: Arc<KeyPool>,
+    base_url: String,
 }
 
 impl ScrapingBeeEngine {
     pub fn new(keys: Arc<KeyPool>) -> Self {
+        Self::with_base_url(keys, "https://app.scrapingbee.com".into())
+    }
+
+    pub fn with_base_url(keys: Arc<KeyPool>, base_url: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(SCRAPINGBEE_TIMEOUT_SECS))
             .build()
             .expect("scrapingbee: reqwest client init");
-        Self { client, keys }
+        Self {
+            client,
+            keys,
+            base_url,
+        }
     }
 
     pub fn key_count(&self) -> usize {
@@ -91,7 +100,7 @@ impl ScrapingBeeEngine {
     async fn scrape_once(&self, api_key: &str, url: &str) -> Result<ScrapeResult, String> {
         let req = self
             .client
-            .get("https://app.scrapingbee.com/api/v1/")
+            .get(format!("{}/api/v1/", self.base_url))
             .query(&[
                 ("api_key", api_key),
                 ("url", url),
@@ -139,5 +148,51 @@ impl ScrapingBeeEngine {
             body,
             provider: "scrapingbee",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_pool() -> Arc<KeyPool> {
+        Arc::new(KeyPool::from_keys(vec!["test-key".into()]))
+    }
+
+    #[tokio::test]
+    async fn successful_scrape() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>Hello</body></html>")
+                    .append_header("content-type", "text/html")
+                    .append_header("Spb-resolved-url", "https://example.com/page"),
+            )
+            .mount(&mock)
+            .await;
+
+        let engine = ScrapingBeeEngine::with_base_url(test_pool(), mock.uri());
+        let result = engine.scrape("https://example.com/page").await.unwrap();
+        assert_eq!(result.status, 200);
+        assert!(result.body.contains("Hello"));
+        assert_eq!(result.provider, "scrapingbee");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_marks_key_dead() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock)
+            .await;
+
+        let engine = ScrapingBeeEngine::with_base_url(test_pool(), mock.uri());
+        let err = engine.scrape("https://example.com").await.unwrap_err();
+        assert!(err.contains("dead") || err.contains("401"));
     }
 }

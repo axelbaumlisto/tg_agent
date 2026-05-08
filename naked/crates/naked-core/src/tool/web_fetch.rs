@@ -194,6 +194,210 @@ impl WebFetchTool {
             host_policy,
         }
     }
+    /// Fallback cascade: URL-prefix → TLS → cloud-scrape → Wayback.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_fallback_cascade(
+        &self,
+        primary: &mut FetchOutcome,
+        url: &str,
+        start_tier: Tier,
+        skip_fallback: bool,
+        max_chars: usize,
+        include_links: bool,
+        cascade_notes: &mut Vec<String>,
+    ) -> Option<super::ToolResult> {
+        // Tier-2 fallback: retry once via the CORS-prefix pool only if the
+        // primary path clearly failed (transport error, anti-bot wall, or
+        // non-success HTTP status). Successful 200-with-body is returned
+        // immediately — no point burning a second round-trip.
+        if primary.is_degraded()
+            && start_tier <= Tier::UrlPrefix
+            && let Some(prefix) = resolve_url_prefix()
+            && !is_already_prefixed(url, &prefix)
+        {
+            let wrapped = format!("{prefix}/{url}");
+            tracing::info!(
+                target = %url,
+                via = %prefix,
+                primary_status = primary.status,
+                primary_error = %primary.transport_error.as_deref().unwrap_or(""),
+                "web_fetch: primary degraded, retrying via URL-prefix proxy",
+            );
+            match self.fetch_once(&wrapped).await {
+                Ok(mut fallback) => {
+                    // The CORS proxy may itself return 5xx when the
+                    // upstream target is bad; in that case we still
+                    // prefer the primary result (it's at least
+                    // authoritative about what the origin said).
+                    if !fallback.is_degraded() {
+                        // Rewrite final_url back to the original
+                        // target so downstream dedup/memory doesn't
+                        // treat `ws-xxx.onrender.com/...` as a new
+                        // canonical URL for this content.
+                        fallback.final_url = url.to_string();
+                        *primary = fallback;
+                        self.host_policy
+                            .record(url, Tier::UrlPrefix, TierOutcome::Ok);
+                    } else {
+                        tracing::info!(
+                            fallback_status = fallback.status,
+                            fallback_error = %fallback.transport_error.as_deref().unwrap_or(""),
+                            "web_fetch: URL-prefix fallback also degraded; keeping primary result",
+                        );
+                        self.host_policy
+                            .record(url, Tier::UrlPrefix, TierOutcome::Blocked);
+                    }
+                }
+                Err(msg) => {
+                    tracing::warn!(error = %msg, "web_fetch: URL-prefix fallback failed");
+                    self.host_policy
+                        .record(url, Tier::UrlPrefix, TierOutcome::Blocked);
+                }
+            }
+        }
+
+        // --- Tier-3: TLS impersonation via curl_cffi subprocess ---------
+        // Reqwest+URL-prefix both reached dead ends. Before giving up,
+        // try the JA3-impersonation path — it's the only thing that
+        // empirically cracks batdongsan/chotot/alonhadat CF walls.
+        let is_blocked_primary = primary.transport_error.is_some()
+            || detect_block(primary.status, &primary.text).is_some()
+            || !(200..400).contains(&primary.status);
+        if is_blocked_primary && start_tier <= Tier::Reqwest {
+            cascade_notes.push(match primary.transport_error.as_deref() {
+                Some(e) => format!("reqwest: transport error ({e})"),
+                None => format!(
+                    "reqwest: HTTP {} {}",
+                    primary.status,
+                    detect_block(primary.status, &primary.text)
+                        .map(|k| format!("({:?})", k))
+                        .unwrap_or_default()
+                ),
+            });
+        }
+
+        if is_blocked_primary && !skip_fallback && start_tier <= Tier::Tls {
+            tracing::debug!(
+                url = %url,
+                "web_fetch: primary blocked/failed, escalating to TLS impersonation",
+            );
+            match fetch_via_tls_subprocess(url).await {
+                Ok(tls_body) => {
+                    if let Some(kind) = detect_block(tls_body.status, &tls_body.text) {
+                        cascade_notes.push(format!("tls: HTTP {} ({:?})", tls_body.status, kind));
+                        self.host_policy
+                            .record(url, Tier::Tls, TierOutcome::Blocked);
+                    } else if !(200..400).contains(&tls_body.status) {
+                        cascade_notes.push(format!("tls: HTTP {}", tls_body.status));
+                        self.host_policy
+                            .record(url, Tier::Tls, TierOutcome::Blocked);
+                    } else {
+                        *primary = tls_body;
+                        cascade_notes.push("tls: OK (used)".into());
+                        self.host_policy.record(url, Tier::Tls, TierOutcome::Ok);
+                    }
+                }
+                Err(msg) => {
+                    cascade_notes.push(format!("tls: {msg}"));
+                    self.host_policy
+                        .record(url, Tier::Tls, TierOutcome::Blocked);
+                }
+            }
+        }
+
+        // --- Tier-3.5: Cloud-scrape cascade (ScrapingBee / Firecrawl) ---
+        // Reqwest, URL-prefix, AND TLS impersonation all reached blocks.
+        // Burn a paid request through ScrapingBee/Firecrawl — they bring
+        // residential IPs + headless browsers and crack the remaining
+        // ~30% of CF-protected VN portals (chotot listing detail pages,
+        // batdongsan ads with phone-reveal walls, dotproperty SPA).
+        let mid_blocked = primary.transport_error.is_some()
+            || detect_block(primary.status, &primary.text).is_some()
+            || !(200..400).contains(&primary.status);
+        if mid_blocked
+            && !skip_fallback
+            && start_tier <= Tier::Cloud
+            && let Some(cloud) = self.cloud.as_ref()
+            && cloud.is_active()
+        {
+            tracing::debug!(
+                url = %url,
+                engines = %cloud.engine_summary(),
+                "web_fetch: escalating to cloud-scrape cascade",
+            );
+            match cloud.scrape(url).await {
+                Ok(cloud_body) => {
+                    if let Some(kind) = detect_block(cloud_body.status, &cloud_body.body) {
+                        cascade_notes.push(format!(
+                            "{}: HTTP {} ({:?})",
+                            cloud_body.provider, cloud_body.status, kind
+                        ));
+                        self.host_policy
+                            .record(url, Tier::Cloud, TierOutcome::Blocked);
+                    } else if !(200..400).contains(&cloud_body.status) {
+                        cascade_notes.push(format!(
+                            "{}: HTTP {}",
+                            cloud_body.provider, cloud_body.status
+                        ));
+                        self.host_policy
+                            .record(url, Tier::Cloud, TierOutcome::Blocked);
+                    } else {
+                        *primary = FetchOutcome {
+                            status: cloud_body.status,
+                            final_url: cloud_body.final_url,
+                            content_type: cloud_body.content_type,
+                            text: cloud_body.body,
+                            transport_error: None,
+                        };
+                        cascade_notes.push(format!("{}: OK (used)", cloud_body.provider));
+                        self.host_policy.record(url, Tier::Cloud, TierOutcome::Ok);
+                    }
+                }
+                Err(msg) => {
+                    cascade_notes.push(format!("cloud-scrape: {msg}"));
+                    self.host_policy
+                        .record(url, Tier::Cloud, TierOutcome::Blocked);
+                }
+            }
+        }
+
+        // --- Tier-4: Wayback snapshot -----------------------------------
+        // Last resort. Serves stale content but at least gives the agent
+        // *something* to reason about. Labelled clearly in the header so
+        // the agent knows to cite the archive timestamp.
+        let still_blocked = primary.transport_error.is_some()
+            || detect_block(primary.status, &primary.text).is_some()
+            || !(200..400).contains(&primary.status);
+        if still_blocked && !skip_fallback && start_tier <= Tier::Wayback {
+            tracing::info!(url = %url, "web_fetch: escalating to Wayback snapshot");
+            match fetch_wayback_snapshot(&self.client, url).await {
+                Ok((wb_body, wb_timestamp, wb_snapshot_url)) => {
+                    cascade_notes.push(format!("wayback: OK (ts={wb_timestamp}, used)"));
+                    self.host_policy.record(url, Tier::Wayback, TierOutcome::Ok);
+                    let cascade_summary = cascade_notes.join(" → ");
+                    let header = format!(
+                        "Wayback snapshot (timestamp {}): {}\nOriginal URL: {url}\nFallback cascade: {cascade_summary}\n\n",
+                        format_wayback_ts(&wb_timestamp),
+                        wb_snapshot_url,
+                    );
+                    return Some(super::fetch_common::format_fetch_output(
+                        &wb_body,
+                        &header,
+                        include_links,
+                        max_chars,
+                        true,
+                    ));
+                }
+                Err(msg) => {
+                    cascade_notes.push(format!("wayback: {msg}"));
+                    self.host_policy
+                        .record(url, Tier::Wayback, TierOutcome::Blocked);
+                }
+            }
+        }
+
+        None
+    }
 }
 
 /// Strip `user:pass@` from a proxy URL before logging. String-based so we
@@ -242,8 +446,16 @@ impl Tool for WebFetchTool {
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
         let url = match input.get("url").and_then(|v| v.as_str()) {
             Some(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_string(),
-            _ => return err("`url` is required and must be an absolute http(s) URL"),
+            _ => return ToolResult::err("`url` is required and must be an absolute http(s) URL"),
         };
+
+        // Network policy check:
+        if let Some(host) = crate::network_policy::host_from_url(&url) {
+            let policy = crate::network_policy::NetworkPolicy::default();
+            if policy.check(&host) == crate::network_policy::NetDecision::Deny {
+                return ToolResult::err(format!("Blocked by network policy: {host}"));
+            }
+        }
         let max_chars = input
             .get("max_chars")
             .and_then(|v| v.as_u64())
@@ -311,209 +523,23 @@ impl Tool for WebFetchTool {
             }
         };
 
-        // Tier-2 fallback: retry once via the CORS-prefix pool only if the
-        // primary path clearly failed (transport error, anti-bot wall, or
-        // non-success HTTP status). Successful 200-with-body is returned
-        // immediately — no point burning a second round-trip.
-        if primary.is_degraded()
-            && start_tier <= Tier::UrlPrefix
-            && let Some(prefix) = resolve_url_prefix()
-            && !is_already_prefixed(&url, &prefix)
+        if let Some(early) = self
+            .try_fallback_cascade(
+                &mut primary,
+                &url,
+                start_tier,
+                skip_fallback,
+                max_chars,
+                include_links,
+                &mut cascade_notes,
+            )
+            .await
         {
-            let wrapped = format!("{prefix}/{url}");
-            tracing::info!(
-                target = %url,
-                via = %prefix,
-                primary_status = primary.status,
-                primary_error = %primary.transport_error.as_deref().unwrap_or(""),
-                "web_fetch: primary degraded, retrying via URL-prefix proxy",
-            );
-            match self.fetch_once(&wrapped).await {
-                Ok(mut fallback) => {
-                    // The CORS proxy may itself return 5xx when the
-                    // upstream target is bad; in that case we still
-                    // prefer the primary result (it's at least
-                    // authoritative about what the origin said).
-                    if !fallback.is_degraded() {
-                        // Rewrite final_url back to the original
-                        // target so downstream dedup/memory doesn't
-                        // treat `ws-xxx.onrender.com/...` as a new
-                        // canonical URL for this content.
-                        fallback.final_url = url.clone();
-                        primary = fallback;
-                        self.host_policy
-                            .record(&url, Tier::UrlPrefix, TierOutcome::Ok);
-                    } else {
-                        tracing::info!(
-                            fallback_status = fallback.status,
-                            fallback_error = %fallback.transport_error.as_deref().unwrap_or(""),
-                            "web_fetch: URL-prefix fallback also degraded; keeping primary result",
-                        );
-                        self.host_policy
-                            .record(&url, Tier::UrlPrefix, TierOutcome::Blocked);
-                    }
-                }
-                Err(msg) => {
-                    tracing::warn!(error = %msg, "web_fetch: URL-prefix fallback failed");
-                    self.host_policy
-                        .record(&url, Tier::UrlPrefix, TierOutcome::Blocked);
-                }
-            }
+            return early;
         }
-
-        // --- Tier-3: TLS impersonation via curl_cffi subprocess ---------
-        // Reqwest+URL-prefix both reached dead ends. Before giving up,
-        // try the JA3-impersonation path — it's the only thing that
-        // empirically cracks batdongsan/chotot/alonhadat CF walls.
-        let is_blocked_primary = primary.transport_error.is_some()
-            || detect_block(primary.status, &primary.text).is_some()
-            || !(200..400).contains(&primary.status);
-        if is_blocked_primary && start_tier <= Tier::Reqwest {
-            cascade_notes.push(match primary.transport_error.as_deref() {
-                Some(e) => format!("reqwest: transport error ({e})"),
-                None => format!(
-                    "reqwest: HTTP {} {}",
-                    primary.status,
-                    detect_block(primary.status, &primary.text)
-                        .map(|k| format!("({:?})", k))
-                        .unwrap_or_default()
-                ),
-            });
-        }
-
-        if is_blocked_primary && !skip_fallback && start_tier <= Tier::Tls {
-            tracing::info!(
-                url = %url,
-                "web_fetch: primary blocked/failed, escalating to TLS impersonation",
-            );
-            match fetch_via_tls_subprocess(&url).await {
-                Ok(tls_body) => {
-                    if let Some(kind) = detect_block(tls_body.status, &tls_body.text) {
-                        cascade_notes.push(format!("tls: HTTP {} ({:?})", tls_body.status, kind));
-                        self.host_policy
-                            .record(&url, Tier::Tls, TierOutcome::Blocked);
-                    } else if !(200..400).contains(&tls_body.status) {
-                        cascade_notes.push(format!("tls: HTTP {}", tls_body.status));
-                        self.host_policy
-                            .record(&url, Tier::Tls, TierOutcome::Blocked);
-                    } else {
-                        primary = tls_body;
-                        cascade_notes.push("tls: OK (used)".into());
-                        self.host_policy.record(&url, Tier::Tls, TierOutcome::Ok);
-                    }
-                }
-                Err(msg) => {
-                    cascade_notes.push(format!("tls: {msg}"));
-                    self.host_policy
-                        .record(&url, Tier::Tls, TierOutcome::Blocked);
-                }
-            }
-        }
-
-        // --- Tier-3.5: Cloud-scrape cascade (ScrapingBee / Firecrawl) ---
-        // Reqwest, URL-prefix, AND TLS impersonation all reached blocks.
-        // Burn a paid request through ScrapingBee/Firecrawl — they bring
-        // residential IPs + headless browsers and crack the remaining
-        // ~30% of CF-protected VN portals (chotot listing detail pages,
-        // batdongsan ads with phone-reveal walls, dotproperty SPA).
-        let mid_blocked = primary.transport_error.is_some()
-            || detect_block(primary.status, &primary.text).is_some()
-            || !(200..400).contains(&primary.status);
-        if mid_blocked
-            && !skip_fallback
-            && start_tier <= Tier::Cloud
-            && let Some(cloud) = self.cloud.as_ref()
-            && cloud.is_active()
-        {
-            tracing::info!(
-                url = %url,
-                engines = %cloud.engine_summary(),
-                "web_fetch: escalating to cloud-scrape cascade",
-            );
-            match cloud.scrape(&url).await {
-                Ok(cloud_body) => {
-                    if let Some(kind) = detect_block(cloud_body.status, &cloud_body.body) {
-                        cascade_notes.push(format!(
-                            "{}: HTTP {} ({:?})",
-                            cloud_body.provider, cloud_body.status, kind
-                        ));
-                        self.host_policy
-                            .record(&url, Tier::Cloud, TierOutcome::Blocked);
-                    } else if !(200..400).contains(&cloud_body.status) {
-                        cascade_notes.push(format!(
-                            "{}: HTTP {}",
-                            cloud_body.provider, cloud_body.status
-                        ));
-                        self.host_policy
-                            .record(&url, Tier::Cloud, TierOutcome::Blocked);
-                    } else {
-                        primary = FetchOutcome {
-                            status: cloud_body.status,
-                            final_url: cloud_body.final_url,
-                            content_type: cloud_body.content_type,
-                            text: cloud_body.body,
-                            transport_error: None,
-                        };
-                        cascade_notes.push(format!("{}: OK (used)", cloud_body.provider));
-                        self.host_policy.record(&url, Tier::Cloud, TierOutcome::Ok);
-                    }
-                }
-                Err(msg) => {
-                    cascade_notes.push(format!("cloud-scrape: {msg}"));
-                    self.host_policy
-                        .record(&url, Tier::Cloud, TierOutcome::Blocked);
-                }
-            }
-        }
-
-        // --- Tier-4: Wayback snapshot -----------------------------------
-        // Last resort. Serves stale content but at least gives the agent
-        // *something* to reason about. Labelled clearly in the header so
-        // the agent knows to cite the archive timestamp.
-        let still_blocked = primary.transport_error.is_some()
-            || detect_block(primary.status, &primary.text).is_some()
-            || !(200..400).contains(&primary.status);
-        if still_blocked && !skip_fallback && start_tier <= Tier::Wayback {
-            tracing::info!(url = %url, "web_fetch: escalating to Wayback snapshot");
-            match fetch_wayback_snapshot(&self.client, &url).await {
-                Ok((wb_body, wb_timestamp, wb_snapshot_url)) => {
-                    cascade_notes.push(format!("wayback: OK (ts={wb_timestamp}, used)"));
-                    self.host_policy
-                        .record(&url, Tier::Wayback, TierOutcome::Ok);
-                    let (text, links) = html_to_text(&wb_body);
-                    let cascade_summary = cascade_notes.join(" → ");
-                    let header = format!(
-                        "Wayback snapshot (timestamp {}): {}\nOriginal URL: {url}\nFallback cascade: {cascade_summary}\n\n",
-                        format_wayback_ts(&wb_timestamp),
-                        wb_snapshot_url,
-                    );
-                    let remaining = max_chars.saturating_sub(header.chars().count());
-                    let mut out = header;
-                    out.push_str(&truncate_chars(&text, remaining));
-                    if include_links && !links.is_empty() {
-                        out.push_str("\n\n## Links\n");
-                        for l in links.iter().take(40) {
-                            out.push_str("- ");
-                            out.push_str(l);
-                            out.push('\n');
-                        }
-                    }
-                    return ToolResult {
-                        output: out,
-                        is_error: false,
-                    };
-                }
-                Err(msg) => {
-                    cascade_notes.push(format!("wayback: {msg}"));
-                    self.host_policy
-                        .record(&url, Tier::Wayback, TierOutcome::Blocked);
-                }
-            }
-        }
-
         // --- Report failure after the full cascade ---------------------
         if let Some(msg) = primary.transport_error {
-            return err(format!(
+            return ToolResult::err(format!(
                 "HTTP request failed: {msg}\nFallback cascade: {}",
                 cascade_notes.join(" → ")
             ));
@@ -542,33 +568,20 @@ impl Tool for WebFetchTool {
                 final_url = primary.final_url,
                 cascade_summary = cascade_summary,
             );
-            return ToolResult {
-                output: hint,
-                is_error: true,
-            };
+            return ToolResult::err(hint);
         }
 
-        let (body, links) = html_to_text(&primary.text);
-
-        let mut out = format!(
+        let header = format!(
             "HTTP {} — {}\nContent-Type: {}\n\n",
             primary.status, primary.final_url, primary.content_type
         );
-        let remaining = max_chars.saturating_sub(out.chars().count());
-        out.push_str(&truncate_chars(&body, remaining));
-        if include_links && !links.is_empty() {
-            out.push_str("\n\n## Links\n");
-            for l in links.iter().take(40) {
-                out.push_str("- ");
-                out.push_str(l);
-                out.push('\n');
-            }
-        }
-
-        ToolResult {
-            output: out,
-            is_error: !(200..400).contains(&primary.status),
-        }
+        super::fetch_common::format_fetch_output(
+            &primary.text,
+            &header,
+            include_links,
+            max_chars,
+            (200..400).contains(&primary.status),
+        )
     }
 }
 
@@ -807,28 +820,6 @@ impl WebFetchTool {
     }
 }
 
-fn err(msg: impl Into<String>) -> ToolResult {
-    ToolResult {
-        output: msg.into(),
-        is_error: true,
-    }
-}
-
-/// Truncate a string to `limit` chars, appending a "[truncated]" marker
-/// so the LLM knows the page continues past the context budget.
-/// Exposed `pub(crate)` for the sibling fetch tools (tls, wayback).
-pub(crate) fn truncate_chars(s: &str, limit: usize) -> String {
-    if limit == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= limit {
-        return s.to_string();
-    }
-    let mut out = s.chars().take(limit).collect::<String>();
-    out.push_str("\n\n… [truncated]");
-    out
-}
-
 /// Minimal HTML → plain-text stripper. Not a DOM parser — we explicitly
 /// don't rely on one because the output only needs to be "readable by an
 /// LLM", and a 300 KB page with nested `<script>` tags would otherwise
@@ -989,78 +980,5 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn drop_block_removes_scripts_and_styles() {
-        let html = "pre<script>alert('x')</script>mid<style>a{}</style>post";
-        let stripped = drop_block(html, "script");
-        let stripped = drop_block(&stripped, "style");
-        assert_eq!(stripped, "premidpost");
-    }
-
-    #[test]
-    fn drop_block_is_case_insensitive() {
-        let html = "<SCRIPT>bad</SCRIPT>good";
-        assert_eq!(drop_block(html, "script"), "good");
-    }
-
-    #[test]
-    fn html_to_text_extracts_body_and_links() {
-        let html = r#"
-            <html><head><title>X</title></head><body>
-              <h1>Hello</h1>
-              <p>World <a href="https://ex.com/1">one</a></p>
-              <p>See <a href="https://ex.com/2">two</a></p>
-              <script>window.ok=1;</script>
-            </body></html>
-        "#;
-        let (text, links) = html_to_text(html);
-        assert!(text.contains("Hello"));
-        assert!(text.contains("World"));
-        assert!(!text.contains("window.ok"), "script should be stripped");
-        assert_eq!(
-            links,
-            vec![
-                "https://ex.com/1".to_string(),
-                "https://ex.com/2".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn html_to_text_decodes_entities() {
-        let (text, _) = html_to_text("<p>a &amp; b &lt; c &gt; d</p>");
-        assert!(text.contains("a & b < c > d"));
-    }
-
-    #[test]
-    fn extract_hrefs_skips_fragment_and_js() {
-        let html = concat!(
-            r##"<a href="#top">t</a>"##,
-            r#"<a href="javascript:void(0)">x</a>"#,
-            r#"<a href="https://ex.com">ok</a>"#,
-        );
-        let hrefs = extract_hrefs(html);
-        assert_eq!(hrefs, vec!["https://ex.com".to_string()]);
-    }
-
-    #[test]
-    fn truncate_chars_respects_limit() {
-        let s = "a".repeat(1000);
-        let out = truncate_chars(&s, 100);
-        assert!(out.chars().count() > 100);
-        assert!(out.ends_with("[truncated]"));
-    }
-
-    #[tokio::test]
-    async fn web_fetch_rejects_bad_url() {
-        let tool = WebFetchTool::new();
-        let cwd = std::env::current_dir().unwrap();
-        let r = tool.execute(json!({"url":"not-a-url"}), &cwd).await;
-        assert!(r.is_error);
-        let r2 = tool.execute(json!({"url":"ftp://x"}), &cwd).await;
-        assert!(r2.is_error);
-    }
-}
+#[path = "web_fetch_tests.rs"]
+mod tests;

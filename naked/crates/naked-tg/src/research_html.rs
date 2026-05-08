@@ -352,9 +352,11 @@ fn linkify_md(s: &str) -> String {
             i = end;
             continue;
         }
-        let ch = bytes[i];
-        out.push(ch as char);
-        i += 1;
+        // Advance by full UTF-8 character, not by byte.
+        let ch = &s[i..];
+        let c = ch.chars().next().expect("non-empty slice");
+        out.push(c);
+        i += c.len_utf8();
     }
     out
 }
@@ -450,5 +452,67 @@ mod tests {
         assert!(html.contains("<pre><code>"));
         assert!(html.contains("let x = 1;"));
         assert!(html.contains("</code></pre>"));
+    }
+
+    // ── UTF-8 safety (regression for the silent panic) ─────────────
+
+    #[test]
+    fn linkify_md_russian_text_no_panic() {
+        // This exact string caused the production panic:
+        // "start byte index 1 is not a char boundary; it is inside 'с'"
+        let input = "слушай, мне надо собрать информацию о высоких зданиях";
+        let result = linkify_md(input);
+        assert_eq!(result, input); // no links → passthrough
+    }
+
+    #[test]
+    fn linkify_md_russian_with_url() {
+        let input = "Подробнее: https://example.com/path и далее";
+        let result = linkify_md(input);
+        assert!(result.contains("<a href=\"https://example.com/path\""));
+        assert!(result.contains("Подробнее:"));
+        assert!(result.contains("и далее"));
+    }
+
+    #[test]
+    fn linkify_md_vietnamese_text() {
+        let input = "Bất động sản Đà Nẵng giá từ 5 tỷ đồng";
+        let result = linkify_md(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn linkify_md_mixed_cyrillic_url_cyrillic() {
+        let input = "Цена — https://muaban.net/listing/123 — хорошая";
+        let result = linkify_md(input);
+        assert!(result.contains("<a href"));
+        assert!(result.contains("Цена —"));
+        assert!(result.contains("— хорошая"));
+    }
+
+    #[test]
+    fn linkify_md_markdown_link_in_russian() {
+        let input = "См. [ссылка](https://example.com) для деталей";
+        let result = linkify_md(input);
+        assert!(result.contains("<a href=\"https://example.com\">ссылка</a>"));
+        assert!(result.contains("для деталей"));
+    }
+
+    #[test]
+    fn render_report_html_russian_topic_no_panic() {
+        // The exact scenario: Russian topic + report_md
+        let meta = ReportMeta {
+            spec_id: "test-ru",
+            topic: "Facebook Marketplace Da Nang — коммерческая недвижимость",
+            run_id: Some("run-1"),
+            findings_total: 5,
+            new_findings: 2,
+            generated_at: Utc.with_ymd_and_hms(2026, 5, 4, 12, 0, 0).unwrap(),
+        };
+        let md = "## Результаты\n\n- Объект: [ссылка](https://example.com)\n- Цена: 5 000 000 VND";
+        let html = render_report_html(&meta, md);
+        let s = String::from_utf8(html).unwrap();
+        assert!(s.contains("коммерческая недвижимость"));
+        assert!(s.contains("Результаты"));
     }
 }

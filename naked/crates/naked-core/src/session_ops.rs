@@ -1,6 +1,45 @@
 //! Session lifecycle — create, send, queue, abort, compact, fork, restore, list, skills, MCP.
 
-use super::*;
+#[allow(unused_imports)]
+use crate::config::{EffectiveSessionConfig, SessionConfig};
+#[allow(unused_imports)]
+use crate::error::{AgentError, Result};
+#[allow(unused_imports)]
+use crate::history;
+#[allow(unused_imports)]
+use crate::loop_::AgentLoop;
+#[allow(unused_imports)]
+use crate::mcp::client::{McpRegistry, McpServer};
+#[allow(unused_imports)]
+use crate::memory;
+#[allow(unused_imports)]
+use crate::prompt;
+#[allow(unused_imports)]
+use crate::provider::{self, Provider};
+#[allow(unused_imports)]
+use crate::research;
+#[allow(unused_imports)]
+use crate::session::store::SessionStore;
+#[allow(unused_imports)]
+use crate::session::{Session, SessionMetadata, SessionState, SessionSummary};
+#[allow(unused_imports)]
+use crate::skill;
+#[allow(unused_imports)]
+use crate::skill::resolver::SkillResolver;
+#[allow(unused_imports)]
+use crate::tool::registry::ToolRegistry;
+#[allow(unused_imports)]
+use crate::types::{self, AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
+#[allow(unused_imports)]
+use crate::{AgentCore, UserPush};
+#[allow(unused_imports)]
+use std::path::Path;
+#[allow(unused_imports)]
+use std::sync::Arc;
+#[allow(unused_imports)]
+use tokio::sync::mpsc;
+#[allow(unused_imports)]
+use tokio_util::sync::CancellationToken;
 
 impl AgentCore {
     /// Record the current author for an upcoming turn. Used by the memory tool
@@ -23,7 +62,7 @@ impl AgentCore {
             return Vec::new();
         }
         {
-            let old = self.mcp_registry.read().await;
+            let old = self.catalog.mcp_registry.read().await;
             old.close_all().await;
         }
         let result = McpRegistry::connect_all_with_diagnostics(&servers).await;
@@ -32,7 +71,7 @@ impl AgentCore {
             result.registry.all_tools().len(),
             result.registry.servers().len()
         );
-        *self.mcp_registry.write().await = result.registry;
+        *self.catalog.mcp_registry.write().await = result.registry;
         result.failures
     }
 
@@ -63,7 +102,7 @@ impl AgentCore {
     }
 
     /// Structured compaction prompt (initial or iterative update).
-    fn compaction_prompt(previous_summary: Option<&str>) -> String {
+    pub(crate) fn compaction_prompt(previous_summary: Option<&str>) -> String {
         if let Some(prev) = previous_summary {
             format!(
                 "<previous-summary>\n{prev}\n</previous-summary>\n\n\
@@ -82,7 +121,7 @@ impl AgentCore {
         }
     }
 
-    const COMPACTION_FORMAT: &'static str = "\
+    pub(crate) const COMPACTION_FORMAT: &'static str = "\
 Use this EXACT format:\n\n\
 ## Goal\n\
 [What is the user trying to accomplish?]\n\n\
@@ -156,10 +195,12 @@ Keep each section concise. Preserve exact paths and identifiers.";
             reasoning: None,
         };
 
-        let mut stream = provider
-            .stream_chat(request)
-            .await
-            .map_err(|e| AgentError::Provider(format!("compaction LLM call failed: {e}")))?;
+        let mut stream = provider.stream_chat(request).await.map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Other {
+                status: 0,
+                body: format!("compaction LLM: {e}"),
+            })
+        })?;
 
         let mut text = String::new();
         while let Some(chunk) = stream.next().await {
@@ -167,16 +208,24 @@ Keep each section concise. Preserve exact paths and identifiers.";
                 types::StreamChunk::Text(t) => text.push_str(&t),
                 types::StreamChunk::Done => break,
                 types::StreamChunk::Error(e) => {
-                    return Err(AgentError::Provider(format!(
-                        "compaction stream error: {e}"
-                    )));
+                    return Err(AgentError::ProviderTyped(
+                        crate::provider::error::ProviderError::Other {
+                            status: 0,
+                            body: format!("compaction stream: {e}"),
+                        },
+                    ));
                 }
                 _ => {}
             }
         }
 
         if text.trim().is_empty() {
-            return Err(AgentError::Provider("compaction LLM returned empty".into()));
+            return Err(AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::Other {
+                    status: 0,
+                    body: "compaction LLM returned empty".into(),
+                },
+            ));
         }
 
         Ok(text)
@@ -212,7 +261,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             return Vec::new();
         }
 
-        if let Some(cached) = self.session_mcp.read().await.get(session_id) {
+        if let Some(cached) = self.catalog.session_mcp.read().await.get(session_id) {
             return cached.clone();
         }
 
@@ -232,7 +281,8 @@ Keep each section concise. Preserve exact paths and identifiers.";
             }
         }
 
-        self.session_mcp
+        self.catalog
+            .session_mcp
             .write()
             .await
             .insert(session_id.to_string(), servers.clone());
@@ -320,15 +370,14 @@ Keep each section concise. Preserve exact paths and identifiers.";
         .await
     }
 
-    async fn dispatch_turn(&self, session_id: &str, push: UserPush) -> Result<AgentHandle> {
-        let (tx, rx) = mpsc::channel(64);
-        let (perm_tx, perm_rx) = mpsc::channel::<PermissionResponse>(4);
-        let (steer_tx, steer_rx) = mpsc::channel::<crate::types::SteerMessage>(16);
-
-        // Load per-session config overlay (re-read each turn so edits take effect)
-        let sc = self.load_session_config_pub(session_id);
-        let effective = self.config().merge_session(&sc);
-
+    /// Phase 1: acquire session lock, resolve model/provider, push message,
+    /// gather compaction data, spawn background tasks. Drops lock before returning.
+    async fn setup_turn(
+        &self,
+        session_id: &str,
+        push: UserPush,
+        effective: &EffectiveSessionConfig,
+    ) -> Result<crate::turn::TurnSetup> {
         let mut sessions = self.ss.sessions.write().await;
         let session = sessions
             .get_mut(session_id)
@@ -336,14 +385,32 @@ Keep each section concise. Preserve exact paths and identifiers.";
         session.state = SessionState::Active;
         let _ = self.ss.store.mark_active(session_id).await;
 
-        // Update metadata to match effective config (model/provider may change between turns)
         session.metadata.provider = effective.provider.clone();
         session.metadata.model = effective.model.clone();
+        let mut model = session.metadata.model.clone();
+        let mut provider_name = session.metadata.provider.clone();
 
-        let model = session.metadata.model.clone();
-        let provider_name = session.metadata.provider.clone();
+        // Auto model selection
+        if model == "auto" {
+            let user_text = match &push {
+                UserPush::Text(t) => t.as_str(),
+                UserPush::Multimodal {
+                    classifier_text, ..
+                } => classifier_text.as_str(),
+            };
+            if let Some(choice) = crate::turn::resolve_auto_model(
+                user_text,
+                &self.config(),
+                session.history.estimated_tokens() as u64,
+            ) {
+                provider_name = choice.provider;
+                model = choice.model;
+                session.metadata.provider = provider_name.clone();
+                session.metadata.model = model.clone();
+            }
+        }
 
-        // Resolve context window: per-session > per-provider > model lookup > global > 128K
+        // Resolve context window
         let provider_ctx = self
             .config()
             .providers
@@ -376,119 +443,70 @@ Keep each section concise. Preserve exact paths and identifiers.";
         }
         session.updated_at = chrono::Utc::now();
 
-        // Background memory classification (non-blocking).
+        // Fire-and-forget: pre-turn snapshot + memory classification
+        let ws = session.workspace.clone();
+        let turn_seq = session.history.message_count() as u64;
+        tokio::spawn(async move {
+            if let Some(msg) = crate::snapshot::pre_turn_snapshot(&ws, turn_seq).await {
+                tracing::debug!(stash = %msg, "pre-turn snapshot");
+            }
+        });
         {
-            let provider_ref = self.provider_for(&provider_name).await;
-            let sender_id = self.session_sender(session_id).await;
+            let prov = self.provider_for(&provider_name).await;
+            let sender = self.session_sender(session_id).await;
             crate::turn::spawn_memory_classify(
-                provider_ref,
+                prov,
                 model.clone(),
                 classifier_text.clone(),
                 session.workspace.clone(),
-                sender_id,
+                sender,
                 self.config().memory.auto_classify_to_drafts,
             );
         }
 
         let ci = crate::turn::gather_compaction_data(session);
-
-        // Drop sessions lock before LLM call to avoid blocking other requests
         drop(sessions);
 
-        // LLM-based compaction with deterministic fallback
-        let llm_summary = if let Some(text_for_llm) = ci.compact_text {
-            tracing::info!(ci.before_msgs, "attempting LLM-based compaction");
-            let provider_arc = self.provider_for(&provider_name).await;
+        Ok(crate::turn::TurnSetup {
+            model,
+            provider_name,
+            compaction_input: ci,
+        })
+    }
 
-            if self.config().memory.daily_enabled && self.config().memory.pre_compaction_flush {
-                memory::digest::pre_compaction_flush(
-                    &*provider_arc,
-                    &model,
-                    &ci.workspace,
-                    &memory::types::MemoryScope::Project,
-                    &text_for_llm,
-                )
-                .await;
-            }
+    /// Phase 2: run LLM compaction, re-acquire lock, apply result, prepare
+    /// history + loop config. Drops lock before returning.
+    async fn compact_and_prepare(
+        &self,
+        session_id: &str,
+        setup: &crate::turn::TurnSetup,
+        effective: &EffectiveSessionConfig,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<crate::turn::TurnSpawnData> {
+        let llm_summary = self
+            .run_llm_compaction(&setup.compaction_input, &setup.provider_name, &setup.model)
+            .await;
 
-            match Self::llm_summarize(
-                &*provider_arc,
-                &model,
-                &text_for_llm,
-                ci.previous_summary.as_deref(),
-            )
-            .await
-            {
-                Ok(mut summary) => {
-                    crate::turn::append_file_tags(&mut summary, &ci.read_files, &ci.modified_files);
-                    tracing::info!("LLM compaction succeeded");
-                    Some(summary)
-                }
-                Err(e) => {
-                    tracing::warn!("LLM compaction failed, falling back to deterministic: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Re-acquire sessions lock to apply compaction
         let mut sessions = self.ss.sessions.write().await;
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
-
-        let compacted = if ci.needs_compact {
-            crate::turn::apply_compaction(session, llm_summary.as_deref(), ci.before_msgs)
-        } else {
-            None
-        };
-
-        if let Some((before, after)) = compacted {
-            let summary_hint = llm_summary
-                .as_ref()
-                .and_then(|s| crate::turn::extract_summary_hint(s));
-            let files_count = ci.read_files.len() + ci.modified_files.len();
-            tracing::info!("context compacted: {before} msgs -> {after} msgs");
-            let _ = tx
-                .send(AgentEvent::ContextCompacted {
-                    before_msgs: before,
-                    after_msgs: after,
-                    summary_hint,
-                    files_count,
-                })
-                .await;
-            // After compaction, older turns (and any image blocks they
-            // owned) are gone from history. Run a best-effort GC over the
-            // session's artifacts dir to reclaim disk for images that no
-            // JSONL line still references. Never block the user reply on
-            // GC failures — log and move on.
-            match self.ss.store.gc_orphan_image_artifacts(session_id).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!(
-                        removed = n,
-                        session = session_id,
-                        "post-compaction artifact GC reclaimed {n} orphan images"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        session = session_id,
-                        "post-compaction artifact GC failed: {e}"
-                    );
-                }
-            }
-        }
+        self.apply_compaction_and_gc(
+            session,
+            session_id,
+            &setup.compaction_input,
+            llm_summary.as_deref(),
+            tx,
+        )
+        .await;
 
         let session_root = self.ss.store.session_root(session_id);
-        let sender_for_rules = self.session_sender(session_id).await;
-        let (mut history, original_system_prompt) = crate::turn::prepare_history(
+        let sender = self.session_sender(session_id).await;
+        let (history, original_system_prompt) = crate::turn::prepare_history(
             session,
             &session_root,
-            &effective,
-            sender_for_rules.as_deref(),
+            effective,
+            sender.as_deref(),
             &self.config().memory,
         )
         .await;
@@ -497,28 +515,27 @@ Keep each section concise. Preserve exact paths and identifiers.";
         if let Err(e) = tokio::fs::create_dir_all(&artifacts).await {
             tracing::warn!("could not create artifacts dir: {e}");
         }
-
         let cwd = if session.workspace.as_os_str().is_empty() || !session.workspace.exists() {
             artifacts
         } else {
             session.workspace.clone()
         };
 
-        // Per-provider max_tokens / temperature.
         let (eff_max_tokens, eff_temperature) =
-            crate::turn::resolve_generation_params(&self.config(), &provider_name, &effective);
-
-        let loop_config = LoopConfig {
-            max_iterations: effective.max_iterations,
-            cwd,
-            model: model.clone(),
-            max_tokens: eff_max_tokens,
-            temperature: eff_temperature,
-            reasoning: effective.reasoning.clone(),
-            provider: provider_name.clone(),
-            health: Some(self.provider_svc.health()),
-        };
-
+            crate::turn::resolve_generation_params(&self.config(), &setup.provider_name, effective);
+        let loop_config = crate::turn::build_loop_config(
+            effective.max_iterations,
+            cwd.clone(),
+            setup.model.clone(),
+            eff_max_tokens,
+            eff_temperature,
+            effective.reasoning.clone(),
+            setup.provider_name.clone(),
+            self.provider_svc.health(),
+            self.token_tracker.clone(),
+            &self.config().session_dir,
+            session_id,
+        );
         let session_workspace = session.workspace.clone();
 
         let cancel = CancellationToken::new();
@@ -529,8 +546,34 @@ Keep each section concise. Preserve exact paths and identifiers.";
             .insert(session_id.to_string(), cancel.clone());
         drop(sessions);
 
-        // Validate model belongs to provider before making any API calls.
-        if let Some(err_msg) = crate::turn::validate_model(&self.config(), &provider_name, &model) {
+        Ok(crate::turn::TurnSpawnData {
+            history,
+            original_system_prompt,
+            session_workspace,
+            loop_config,
+        })
+    }
+
+    async fn dispatch_turn(&self, session_id: &str, push: UserPush) -> Result<AgentHandle> {
+        let (tx, rx) = mpsc::channel(64);
+        let (perm_tx, perm_rx) = mpsc::channel::<PermissionResponse>(4);
+        let (steer_tx, steer_rx) = mpsc::channel::<crate::types::SteerMessage>(16);
+
+        let sc = self.load_session_config_pub(session_id);
+        let effective = self.config().merge_session(&sc);
+
+        // Phase 1: setup session, push message, gather compaction data
+        let setup = self.setup_turn(session_id, push, &effective).await?;
+
+        // Phase 2: LLM compaction + prepare history & loop config
+        let mut spawn_data = self
+            .compact_and_prepare(session_id, &setup, &effective, &tx)
+            .await?;
+
+        // Validate model before making API calls
+        if let Some(err_msg) =
+            crate::turn::validate_model(&self.config(), &setup.provider_name, &setup.model)
+        {
             let _ = tx.send(AgentEvent::Error(err_msg)).await;
             let _ = tx.send(AgentEvent::Idle).await;
             if let Some(s) = self.ss.sessions.write().await.get_mut(session_id) {
@@ -543,38 +586,45 @@ Keep each section concise. Preserve exact paths and identifiers.";
             });
         }
 
-        // Per-session provider (falls back to global if unchanged)
-        let session_provider = self.provider_for(&provider_name).await;
-
-        // Build tool registry with per-session MCP + skills
+        // Phase 3: build tools, run hooks, spawn agent loop
+        let session_provider = self.provider_for(&setup.provider_name).await;
         let tools = self
             .build_tool_registry_for(
                 session_id,
                 &effective,
                 &session_provider,
-                &model,
-                &session_workspace,
+                &setup.model,
+                &spawn_data.session_workspace,
             )
             .await;
-        // B6: Run context hooks before the LLM call.
-        self.hooks.run_context_hooks(history.messages_mut()).await;
+        self.catalog
+            .hooks
+            .run_context_hooks(spawn_data.history.messages_mut())
+            .await;
 
-        let agent_loop = AgentLoop::new(provider_to_box(&session_provider), tools, loop_config);
+        let agent_loop = AgentLoop::new(
+            crate::provider::provider_to_box(&session_provider),
+            tools,
+            spawn_data.loop_config,
+        );
 
         let session_id_owned = session_id.to_string();
         let sessions_ref = self.ss.sessions.clone();
         let store_ref = self.ss.store.clone();
+        let cancel = self
+            .ss
+            .cancels
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(CancellationToken::new);
 
-        // Every turn gets a span with (session_id, provider, model). All
-        // events emitted from `agent_loop.run` — tool calls, usage, errors
-        // — inherit these attributes, so operators can grep one session's
-        // worth of logs by a single `session` field without hunting
-        // through chat/thread IDs.
         let turn_span = tracing::info_span!(
             "agent_turn",
             session = %session_id_owned,
-            provider = %provider_name,
-            model = %model,
+            provider = %setup.provider_name,
+            model = %setup.model,
         );
         use tracing::Instrument;
 
@@ -582,7 +632,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             async move {
                 let result = agent_loop
                     .run(
-                        &mut history,
+                        &mut spawn_data.history,
                         tx.clone(),
                         cancel,
                         Some(perm_rx),
@@ -591,8 +641,8 @@ Keep each section concise. Preserve exact paths and identifiers.";
                     .await;
                 crate::turn::persist_turn_result(
                     &session_id_owned,
-                    history,
-                    original_system_prompt,
+                    spawn_data.history,
+                    spawn_data.original_system_prompt,
                     &result,
                     &sessions_ref,
                     &*store_ref,
@@ -782,7 +832,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
     }
 
     pub async fn list_mcp_servers(&self) -> Vec<(String, usize)> {
-        let reg = self.mcp_registry.read().await;
+        let reg = self.catalog.mcp_registry.read().await;
         reg.servers()
             .iter()
             .map(|s| (s.name.clone(), s.tools().len()))
@@ -813,7 +863,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
         }
 
         // MCP servers & tools
-        let mcp_reg = self.mcp_registry.read().await;
+        let mcp_reg = self.catalog.mcp_registry.read().await;
         let servers = mcp_reg.servers();
         if !servers.is_empty() {
             let mut s = String::from("Connected MCP servers and their tools:\n");
@@ -849,11 +899,11 @@ Keep each section concise. Preserve exact paths and identifiers.";
         tracing::info!(
             "Refresh: {} skills, {} MCP servers",
             skills.len(),
-            self.mcp_registry.read().await.servers().len()
+            self.catalog.mcp_registry.read().await.servers().len()
         );
     }
 
-    async fn build_tool_registry_for(
+    pub(crate) async fn build_tool_registry_for(
         &self,
         session_id: &str,
         effective: &EffectiveSessionConfig,
@@ -865,13 +915,15 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         let mut tools = crate::tool::factory::core_tools(&crate::tool::factory::CoreToolCtx {
             config: &self.config(),
-            remote_ctx: &self.remote_ctx,
-            agent_registry: &self.agent_registry,
+            remote_ctx: &self.catalog.remote_ctx,
+            agent_registry: &self.catalog.agent_registry,
             search: &self.search,
             provider,
             model,
             workspace,
             sender_id,
+            todo_list: &self.shared_tools.todo_list,
+            plan_state: &self.shared_tools.plan_state,
         })
         .await;
 
@@ -884,9 +936,11 @@ Keep each section concise. Preserve exact paths and identifiers.";
         tools.extend(crate::tool::factory::skill_tools(&effective.skill_roots));
 
         let session_mcp = self.session_mcp_servers(session_id, effective).await;
-        tools.extend(crate::tool::factory::mcp_tools(&self.mcp_registry, &session_mcp).await);
+        tools.extend(
+            crate::tool::factory::mcp_tools(&self.catalog.mcp_registry, &session_mcp).await,
+        );
 
-        tools.extend(crate::tool::factory::extra_tools(&self.extra_tool_factories).await);
+        tools.extend(crate::tool::factory::extra_tools(&self.catalog.extra_tool_factories).await);
 
         ToolRegistry::new(tools)
     }
@@ -897,280 +951,85 @@ Keep each section concise. Preserve exact paths and identifiers.";
     // They hide the coordinator / store plumbing so callers don't need to
     // build it themselves; the trade-off is that AgentCore carries a research
     // store by construction, which is cheap (no network, one directory).
-}
 
-impl AgentCore {
-    pub async fn set_session_provider(
+    /// Run LLM-based compaction if needed, returning the summary.
+    async fn run_llm_compaction(
         &self,
-        session_id: &str,
-        provider: Option<&str>,
-        model: Option<&str>,
-    ) -> Result<()> {
-        if let Some(p) = provider
-            && !self.config().providers.contains_key(p)
-        {
-            return Err(AgentError::ProviderNotConfigured(p.to_string()));
+        ci: &crate::turn::CompactionInput,
+        provider_name: &str,
+        model: &str,
+    ) -> Option<String> {
+        let text_for_llm = ci.compact_text.as_deref()?;
+        tracing::info!(ci.before_msgs, "attempting LLM-based compaction");
+        let provider_arc = self.provider_for(provider_name).await;
+
+        if self.config().memory.daily_enabled && self.config().memory.pre_compaction_flush {
+            memory::digest::pre_compaction_flush(
+                &*provider_arc,
+                model,
+                &ci.workspace,
+                &memory::types::MemoryScope::Project,
+                text_for_llm,
+            )
+            .await;
         }
 
-        // Validate that the model belongs to the target provider.
-        // Resolve the effective provider (explicit or current session's).
-        if let Some(m) = model {
-            let target_provider = provider
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    let sessions = self.ss.sessions.try_read().ok()?;
-                    sessions
-                        .get(session_id)
-                        .map(|s| s.metadata.provider.clone())
+        match Self::llm_summarize(
+            &*provider_arc,
+            model,
+            text_for_llm,
+            ci.previous_summary.as_deref(),
+        )
+        .await
+        {
+            Ok(mut summary) => {
+                crate::turn::append_file_tags(&mut summary, &ci.read_files, &ci.modified_files);
+                tracing::info!("LLM compaction succeeded");
+                Some(summary)
+            }
+            Err(e) => {
+                tracing::warn!("LLM compaction failed, falling back to deterministic: {e}");
+                None
+            }
+        }
+    }
+
+    /// Apply compaction to session history and GC orphan image artifacts.
+    async fn apply_compaction_and_gc(
+        &self,
+        session: &mut crate::session::Session,
+        session_id: &str,
+        ci: &crate::turn::CompactionInput,
+        llm_summary: Option<&str>,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let compacted = if ci.needs_compact {
+            crate::turn::apply_compaction(session, llm_summary, ci.before_msgs)
+        } else {
+            None
+        };
+
+        if let Some((before, after)) = compacted {
+            let summary_hint = llm_summary.and_then(crate::turn::extract_summary_hint);
+            let files_count = ci.read_files.len() + ci.modified_files.len();
+            tracing::info!("context compacted: {before} msgs -> {after} msgs");
+            let _ = tx
+                .send(AgentEvent::ContextCompacted {
+                    before_msgs: before,
+                    after_msgs: after,
+                    summary_hint,
+                    files_count,
                 })
-                .unwrap_or_else(|| self.config().default_provider.clone());
-            if let Some(pc) = self.config().providers.get(&target_provider) {
-                let valid = pc.models.iter().any(|x| x == m)
-                    || pc.model_aliases.contains_key(m)
-                    || pc.model_aliases.values().any(|v| v == m);
-                if !valid {
-                    let available: Vec<_> = pc
-                        .models
-                        .iter()
-                        .chain(pc.model_aliases.keys())
-                        .take(8)
-                        .cloned()
-                        .collect();
-                    return Err(AgentError::Config(format!(
-                        "model '{m}' not found on provider '{target_provider}'. Available: {}",
-                        available.join(", ")
-                    )));
+                .await;
+            match self.ss.store.gc_orphan_image_artifacts(session_id).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(removed = n, session = session_id, "post-compaction GC");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(session = session_id, "post-compaction GC failed: {e}");
                 }
             }
-        }
-
-        let session_root = self.ss.store.session_root(session_id);
-        let config_path = session_root.join("config.json");
-
-        let mut sc = if config_path.exists() {
-            SessionConfig::from_file(&config_path).unwrap_or_default()
-        } else {
-            SessionConfig::default()
-        };
-
-        if let Some(p) = provider {
-            sc.default_provider = Some(p.to_string());
-        }
-        if let Some(m) = model {
-            sc.default_model = Some(m.to_string());
-        }
-
-        tokio::fs::create_dir_all(&session_root)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot create session dir: {e}")))?;
-        let json = serde_json::to_string_pretty(&sc)
-            .map_err(|e| AgentError::Config(format!("serialize: {e}")))?;
-        tokio::fs::write(&config_path, json)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot write config.json: {e}")))?;
-
-        // Update in-memory metadata immediately
-        let effective = self.config().merge_session(&sc);
-        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
-            session.metadata.provider = effective.provider;
-            session.metadata.model = effective.model;
-        }
-
-        // Invalidate cached provider so next turn rebuilds it (cache is keyed by provider name)
-        if let Some(p) = provider {
-            self.provider_svc.invalidate(p).await;
-        }
-
-        Ok(())
-    }
-
-    /// Set reasoning level for a session. Writes to config.json.
-    pub async fn set_session_reasoning(&self, session_id: &str, reasoning: &str) -> Result<()> {
-        let val = match reasoning {
-            "off" | "low" | "medium" | "high" => reasoning.to_string(),
-            _ => {
-                return Err(AgentError::Config(format!(
-                    "invalid reasoning level: {reasoning}"
-                )));
-            }
-        };
-
-        let session_root = self.ss.store.session_root(session_id);
-        let config_path = session_root.join("config.json");
-
-        let mut sc = if config_path.exists() {
-            SessionConfig::from_file(&config_path).unwrap_or_default()
-        } else {
-            SessionConfig::default()
-        };
-
-        sc.reasoning = if val == "off" { None } else { Some(val) };
-
-        tokio::fs::create_dir_all(&session_root)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot create session dir: {e}")))?;
-        let json = serde_json::to_string_pretty(&sc)
-            .map_err(|e| AgentError::Config(format!("serialize: {e}")))?;
-        tokio::fs::write(&config_path, json)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot write config.json: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Set yolo timestamp for a session. Writes to config.json.
-    /// Pass `Some(ts)` to enable with a specific unix timestamp, `None` to disable.
-    pub async fn set_session_yolo(&self, session_id: &str, enabled_at: Option<i64>) -> Result<()> {
-        let session_root = self.ss.store.session_root(session_id);
-        let config_path = session_root.join("config.json");
-
-        let mut sc = if config_path.exists() {
-            SessionConfig::from_file(&config_path).unwrap_or_default()
-        } else {
-            SessionConfig::default()
-        };
-
-        sc.yolo_enabled_at = enabled_at;
-
-        tokio::fs::create_dir_all(&session_root)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot create session dir: {e}")))?;
-        let json = serde_json::to_string_pretty(&sc)
-            .map_err(|e| AgentError::Config(format!("serialize: {e}")))?;
-        tokio::fs::write(&config_path, json)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot write config.json: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Set allow-list for a session. Writes to config.json.
-    pub async fn set_session_allow_list(&self, session_id: &str, tools: &[String]) -> Result<()> {
-        let session_root = self.ss.store.session_root(session_id);
-        let config_path = session_root.join("config.json");
-
-        let mut sc = if config_path.exists() {
-            SessionConfig::from_file(&config_path).unwrap_or_default()
-        } else {
-            SessionConfig::default()
-        };
-
-        sc.allow_list = if tools.is_empty() {
-            None
-        } else {
-            Some(tools.to_vec())
-        };
-
-        tokio::fs::create_dir_all(&session_root)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot create session dir: {e}")))?;
-        let json = serde_json::to_string_pretty(&sc)
-            .map_err(|e| AgentError::Config(format!("serialize: {e}")))?;
-        tokio::fs::write(&config_path, json)
-            .await
-            .map_err(|e| AgentError::Session(format!("cannot write config.json: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Get the current reasoning level for a session.
-    pub async fn session_reasoning(&self, session_id: &str) -> Option<String> {
-        let sc = self.load_session_config_pub(session_id);
-        sc.reasoning
-    }
-
-    /// Persist a channel-specific key so the channel→session mapping survives restarts.
-    /// For Telegram: `"tg:{chat_id}:{thread_id}"`.
-    pub async fn set_session_channel_id(&self, session_id: &str, channel_id: &str) {
-        self.ss.set_session_channel_id(session_id, channel_id).await
-    }
-
-    /// Return `(channel_id, session_id)` pairs for sessions that have a channel_id.
-    /// When multiple sessions share the same channel_id, only the most recently
-    /// updated one is returned.
-    pub async fn channel_session_mappings(&self) -> Vec<(String, String)> {
-        self.ss.channel_session_mappings().await
-    }
-
-    /// Get the currently active provider and model for a session.
-    /// Sum of token usage across all assistant turns in a session.
-    pub async fn session_total_usage(&self, session_id: &str) -> types::TurnUsage {
-        self.ss.session_total_usage(session_id).await
-    }
-
-    /// B3: Get file tracking stats for a session (read-only, modified).
-    pub async fn session_file_stats(&self, session_id: &str) -> (Vec<String>, Vec<String>) {
-        self.ss.session_file_stats(session_id).await
-    }
-
-    /// Returns (estimated_tokens, context_window_tokens) for a session.
-    pub async fn session_context_usage(&self, session_id: &str) -> Option<(usize, u32)> {
-        let sessions = self.ss.sessions.read().await;
-        sessions.get(session_id).map(|s| {
-            (
-                s.history.estimated_tokens(),
-                s.history.context_window_tokens(),
-            )
-        })
-    }
-
-    pub async fn session_provider_model(&self, session_id: &str) -> (String, String) {
-        let sc = self.load_session_config_pub(session_id);
-        let effective = self.config().merge_session(&sc);
-        (effective.provider, effective.model)
-    }
-}
-#[async_trait::async_trait]
-impl crate::services::ToolBuilder for AgentCore {
-    async fn build_registry(
-        &self,
-        session_id: &str,
-        effective: &crate::EffectiveSessionConfig,
-        provider: &std::sync::Arc<dyn crate::provider::Provider>,
-        model: &str,
-        workspace: &std::path::Path,
-    ) -> crate::tool::registry::ToolRegistry {
-        self.build_tool_registry_for(session_id, effective, provider, model, workspace)
-            .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compaction_prompt_fresh_has_format_instructions() {
-        let prompt = AgentCore::compaction_prompt(None);
-        assert!(prompt.contains("## Goal"), "missing Goal section");
-        assert!(prompt.contains("## Progress"), "missing Progress section");
-        assert!(
-            prompt.contains("Summarize"),
-            "missing Summarize instruction"
-        );
-        assert!(!prompt.contains("<previous-summary>"));
-    }
-
-    #[test]
-    fn compaction_prompt_with_previous_includes_it() {
-        let prompt = AgentCore::compaction_prompt(Some("old summary here"));
-        assert!(prompt.contains("<previous-summary>"));
-        assert!(prompt.contains("old summary here"));
-        assert!(prompt.contains("Update the existing summary"));
-        assert!(prompt.contains("## Goal"));
-    }
-
-    #[test]
-    fn compaction_format_has_all_sections() {
-        let fmt = AgentCore::COMPACTION_FORMAT;
-        for section in [
-            "## Goal",
-            "## Progress",
-            "### Done",
-            "### In Progress",
-            "## Next Steps",
-        ] {
-            assert!(fmt.contains(section), "missing {section}");
         }
     }
 }

@@ -367,3 +367,40 @@ impl Default for ResearchConfig {
 fn default_max_concurrent_runs() -> usize {
     5
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_research_config_sane() {
+        let cfg = ResearchConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.max_iterations > 0);
+        assert!(cfg.max_wall_seconds > 0);
+        assert!(cfg.max_concurrent_runs >= 1);
+    }
+
+    #[test]
+    fn deserialize_minimal_json() {
+        let json = r#"{"enabled": false}"#;
+        let cfg: ResearchConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+        // All other fields should use defaults
+        assert_eq!(cfg.max_iterations, 30);
+    }
+
+    #[test]
+    fn deserialize_full_override() {
+        let json = r#"{
+            "enabled": true,
+            "max_iterations": 50,
+            "max_wall_seconds": 600,
+            "max_concurrent_runs": 3
+        }"#;
+        let cfg: ResearchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_iterations, 50);
+        assert_eq!(cfg.max_wall_seconds, 600);
+        assert_eq!(cfg.max_concurrent_runs, 3);
+    }
+}

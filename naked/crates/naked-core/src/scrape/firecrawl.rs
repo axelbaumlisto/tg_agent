@@ -34,15 +34,24 @@ const FIRECRAWL_TIMEOUT_SECS: u64 = 90;
 pub struct FirecrawlEngine {
     client: Client,
     keys: Arc<KeyPool>,
+    base_url: String,
 }
 
 impl FirecrawlEngine {
     pub fn new(keys: Arc<KeyPool>) -> Self {
+        Self::with_base_url(keys, "https://api.firecrawl.dev".into())
+    }
+
+    pub fn with_base_url(keys: Arc<KeyPool>, base_url: String) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(FIRECRAWL_TIMEOUT_SECS))
             .build()
             .expect("firecrawl: reqwest client init");
-        Self { client, keys }
+        Self {
+            client,
+            keys,
+            base_url,
+        }
     }
 
     pub fn key_count(&self) -> usize {
@@ -85,7 +94,7 @@ impl FirecrawlEngine {
     async fn scrape_once(&self, api_key: &str, url: &str) -> Result<ScrapeResult, String> {
         let resp = self
             .client
-            .post("https://api.firecrawl.dev/v1/scrape")
+            .post(format!("{}/v1/scrape", self.base_url))
             .bearer_auth(api_key)
             .json(&json!({
                 "url": url,
@@ -148,5 +157,57 @@ impl FirecrawlEngine {
             body,
             provider: "firecrawl",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_pool() -> Arc<KeyPool> {
+        Arc::new(KeyPool::from_keys(vec!["test-key".into()]))
+    }
+
+    #[tokio::test]
+    async fn successful_scrape() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/scrape"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "html": "<html><body>Page content</body></html>",
+                    "metadata": {
+                        "statusCode": 200,
+                        "sourceURL": "https://example.com"
+                    }
+                }
+            })))
+            .mount(&mock)
+            .await;
+
+        let engine = FirecrawlEngine::with_base_url(test_pool(), mock.uri());
+        let result = engine.scrape("https://example.com").await.unwrap();
+        assert!(result.body.contains("Page content"));
+        assert_eq!(result.provider, "firecrawl");
+    }
+
+    #[tokio::test]
+    async fn api_failure_returns_err() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/scrape"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "error": "Rate limit exceeded"
+            })))
+            .mount(&mock)
+            .await;
+
+        let engine = FirecrawlEngine::with_base_url(test_pool(), mock.uri());
+        let err = engine.scrape("https://example.com").await.unwrap_err();
+        assert!(err.contains("Rate limit") || err.contains("fail"));
     }
 }

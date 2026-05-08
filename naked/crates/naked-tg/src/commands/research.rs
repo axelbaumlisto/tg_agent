@@ -4,6 +4,7 @@
 
 use super::super::fmt_utils::{escape_html_min, format_age, format_interval, safe_slug};
 use super::super::*;
+use naked_tg::guarded::spawn_guarded;
 
 pub(crate) async fn launch_research_run_with_ui(
     bot: Bot,
@@ -85,71 +86,77 @@ pub(crate) async fn launch_research_run_with_ui(
     let bot_for_hb = bot.clone();
     let spec_for_hb = spec_id.clone();
     let topic_for_hb = spec_topic.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(20));
-        // Skip the immediate tick — the placeholder already reflects the
-        // initial state.
-        tick.tick().await;
-        let mut done_rx = done_rx;
-        let outcome: ResearchOutcome = loop {
-            tokio::select! {
-                res = &mut done_rx => {
-                    break res.unwrap_or(ResearchOutcome::Error(
-                        "internal: research task dropped".to_string(),
-                    ));
-                }
-                _ = tick.tick() => {
-                    let events = agent_for_hb
-                        .research_run_events_snapshot(&spec_for_hb, 16)
-                        .await;
-                    let total = agent_for_hb
-                        .research_store()
-                        .count_findings(&spec_for_hb)
-                        .await
-                        .unwrap_or(findings_baseline);
-                    let progress = HeartbeatProgress {
-                        topic: topic_for_hb.clone(),
-                        started_at,
-                        findings_total: total,
-                        findings_baseline,
-                        iteration_estimate: None,
-                        iteration_cap,
-                    };
-                    let body = render_waterfall(
-                        &spec_for_hb,
-                        &progress,
-                        &events,
-                        chrono::Utc::now(),
-                    );
-                    let edit = bot_for_hb
-                        .edit_message_text(chat_id, msg_id, body)
-                        .reply_markup(keyboard_stop(&spec_for_hb))
-                        .await;
-                    if let Err(e) = edit {
-                        // Don't bail — a transient 400 "message is not
-                        // modified" or rate-limit is routine. We keep
-                        // ticking; the next edit will succeed or the
-                        // completion path will replace the message anyway.
-                        tracing::debug!(spec_id = %spec_for_hb, ?e, "heartbeat edit failed");
+    spawn_guarded(
+        bot_for_hb.clone(),
+        chat_id,
+        thread_id,
+        "research-ui",
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            // Skip the immediate tick — the placeholder already reflects the
+            // initial state.
+            tick.tick().await;
+            let mut done_rx = done_rx;
+            let outcome: ResearchOutcome = loop {
+                tokio::select! {
+                    res = &mut done_rx => {
+                        break res.unwrap_or(ResearchOutcome::Error(
+                            "internal: research task dropped".to_string(),
+                        ));
+                    }
+                    _ = tick.tick() => {
+                        let events = agent_for_hb
+                            .research_run_events_snapshot(&spec_for_hb, 16)
+                            .await;
+                        let total = agent_for_hb
+                            .research_store()
+                            .count_findings(&spec_for_hb)
+                            .await
+                            .unwrap_or(findings_baseline);
+                        let progress = HeartbeatProgress {
+                            topic: topic_for_hb.clone(),
+                            started_at,
+                            findings_total: total,
+                            findings_baseline,
+                            iteration_estimate: None,
+                            iteration_cap,
+                        };
+                        let body = render_waterfall(
+                            &spec_for_hb,
+                            &progress,
+                            &events,
+                            chrono::Utc::now(),
+                        );
+                        let edit = bot_for_hb
+                            .edit_message_text(chat_id, msg_id, body)
+                            .reply_markup(keyboard_stop(&spec_for_hb))
+                            .await;
+                        if let Err(e) = edit {
+                            // Don't bail — a transient 400 "message is not
+                            // modified" or rate-limit is routine. We keep
+                            // ticking; the next edit will succeed or the
+                            // completion path will replace the message anyway.
+                            tracing::debug!(spec_id = %spec_for_hb, ?e, "heartbeat edit failed");
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        finalize_research_ui(
-            &bot_for_hb,
-            chat_id,
-            thread_id,
-            msg_id,
-            &agent_for_hb,
-            &spec_for_hb,
-            &topic_for_hb,
-            findings_baseline,
-            started_at,
-            outcome,
-        )
-        .await;
-    });
+            finalize_research_ui(
+                &bot_for_hb,
+                chat_id,
+                thread_id,
+                msg_id,
+                &agent_for_hb,
+                &spec_for_hb,
+                &topic_for_hb,
+                findings_baseline,
+                started_at,
+                outcome,
+            )
+            .await;
+        },
+    );
 
     String::new()
 }
@@ -540,7 +547,7 @@ research-skill через LLM."
                 match action {
                     "off" | "disable" => {
                         let patch = naked_core::ResearchPatch {
-                            interval_seconds: Some(None),
+                            interval_seconds: naked_core::PatchField::Clear,
                             ..Default::default()
                         };
                         match agent.update_research(id, patch).await {
@@ -661,7 +668,7 @@ async fn schedule_research_on(
         return format!("bad interval `{arg}` — try `3600`, `30m`, `1h`, `1d`");
     };
     let patch = naked_core::ResearchPatch {
-        interval_seconds: Some(Some(s)),
+        interval_seconds: naked_core::PatchField::Set(s),
         ..Default::default()
     };
     match agent.update_research(id, patch).await {

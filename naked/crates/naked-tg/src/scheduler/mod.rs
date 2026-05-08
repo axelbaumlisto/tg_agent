@@ -40,10 +40,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use naked_core::AgentCore;
-use naked_core::ResearchPatch;
 use naked_core::research::{
     Inflight, ResearchSpec, ResearchStore, RunState, SchedulerEvent, SchedulerHook, StopReason,
 };
+use naked_core::{PatchField, ResearchPatch};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 

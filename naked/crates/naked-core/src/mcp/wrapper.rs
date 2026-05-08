@@ -40,11 +40,15 @@ impl Tool for McpToolWrapper {
         ToolSpec {
             name: self.tool_info.name.clone(),
             description: self.tool_info.description.clone().unwrap_or_default(),
-            parameters: self
-                .tool_info
-                .input_schema
-                .clone()
-                .unwrap_or(serde_json::json!({"type": "object"})),
+            parameters: {
+                let mut schema = self
+                    .tool_info
+                    .input_schema
+                    .clone()
+                    .unwrap_or(serde_json::json!({"type": "object"}));
+                crate::tool::schema_sanitize::sanitize(&mut schema);
+                schema
+            },
             permission: Permission::Dangerous,
         }
     }
@@ -71,15 +75,13 @@ impl Tool for McpToolWrapper {
                     let cut = output.len() - end;
                     format!("{}\n\n[output truncated — {cut} bytes cut]", &output[..end])
                 };
-                ToolResult {
-                    output,
-                    is_error: result.is_error,
+                if result.is_error {
+                    ToolResult::err(output)
+                } else {
+                    ToolResult::ok(output)
                 }
             }
-            Err(e) => ToolResult {
-                output: format!("MCP call failed: {e}"),
-                is_error: true,
-            },
+            Err(e) => ToolResult::err(format!("MCP call failed: {e}")),
         }
     }
 }

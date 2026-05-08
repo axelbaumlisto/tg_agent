@@ -1,6 +1,21 @@
 //! Session configuration.
 
-use super::*;
+#[allow(unused_imports)]
+use super::AgentError;
+#[allow(unused_imports)]
+use super::Config;
+#[allow(unused_imports)]
+use super::McpServerConfig;
+#[allow(unused_imports)]
+use super::dirs_home;
+#[allow(unused_imports)]
+use crate::error::Result;
+#[allow(unused_imports)]
+use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use std::collections::HashMap;
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
 
 /// Per-session config override. All fields are optional — missing fields
 /// fall back to the global `Config`. Placed in `sessions/{id}/config.json`.
@@ -136,5 +151,51 @@ pub fn expand_tilde(p: &Path) -> PathBuf {
         dirs_home().join(rest)
     } else {
         p.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_home() {
+        let home = super::super::dirs_home();
+        assert_eq!(expand_tilde(Path::new("~")), home);
+        assert_eq!(expand_tilde(Path::new("~/foo")), home.join("foo"));
+    }
+
+    #[test]
+    fn expand_tilde_absolute_unchanged() {
+        assert_eq!(
+            expand_tilde(Path::new("/abs/path")),
+            PathBuf::from("/abs/path")
+        );
+    }
+
+    #[test]
+    fn expand_env_plain_string() {
+        assert_eq!(expand_env("plain-key").unwrap(), "plain-key");
+    }
+
+    #[test]
+    fn expand_env_dollar_home() {
+        // $HOME is always set in UNIX environments
+        let result = expand_env("$HOME");
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn expand_env_missing_is_error() {
+        assert!(expand_env("$DEFINITELY_NOT_SET_XYZ_12345").is_err());
+    }
+
+    #[test]
+    fn session_config_default() {
+        let sc = SessionConfig::default();
+        assert!(sc.default_provider.is_none());
+        assert!(sc.default_model.is_none());
+        assert!(sc.reasoning.is_none());
     }
 }

@@ -1,49 +1,170 @@
-pub mod active_turns;
+// ── Core engine ─────────────────────────────────────────────────────────────
+pub mod config;
+pub mod error;
+pub mod error_taxonomy;
+#[path = "history_mod/mod.rs"]
+pub mod history;
+pub mod hooks;
+pub mod loop_;
+pub mod loop_guard;
+pub mod prompt;
+pub mod services;
+pub mod session;
+mod session_config_ops;
+mod session_ops;
+pub mod turn;
+
+// ── Agent identity & orchestration ──────────────────────────────────────────
 pub mod agent_registry;
 pub mod agent_role;
 pub mod agent_run;
 pub mod agent_store;
 pub mod agent_validator;
-pub mod config;
-pub mod error;
-#[path = "history_mod/mod.rs"]
-pub mod history;
-pub mod hooks;
-pub mod keys;
-pub mod loop_;
-pub mod mcp;
-pub mod memory;
-pub mod model_catalog;
-pub mod prompt;
-pub mod provider;
-mod provider_ops;
-pub mod research;
-mod research_ops;
-pub mod scrape;
-pub mod search;
-pub mod services;
-pub mod session;
-mod session_ops;
+
+// ── Tools & skills ──────────────────────────────────────────────────────────
 pub mod skill;
 pub mod tool;
-pub mod turn;
+
+// ── Providers & models ──────────────────────────────────────────────────────
+pub mod model_catalog;
+pub mod model_selector;
+pub mod provider;
+mod provider_ops;
+
+// ── Memory & persistence ────────────────────────────────────────────────────
+pub mod memory;
+pub mod snapshot;
+pub mod working_set;
+
+// ── Research ────────────────────────────────────────────────────────────────
+pub mod research;
+mod research_ops;
+
+// ── External integrations ───────────────────────────────────────────────────
+pub mod keys;
+pub mod mcp;
+pub mod scrape;
+pub mod search;
+
+// ── Infrastructure & utilities ──────────────────────────────────────────────
+pub mod active_turns;
+pub mod audit;
+pub mod auto_reasoning;
+pub mod capacity;
+pub mod coherence;
+pub mod command_arity;
+pub mod mentions;
+pub mod network_policy;
+pub mod retry;
+pub mod schema_migration;
+pub mod stream_filter;
+pub mod token_tracker;
 pub mod types;
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+
+    #[test]
+    fn lock_or_recover_normal() {
+        let m = std::sync::Mutex::new(42);
+        let g = lock_or_recover(&m);
+        assert_eq!(*g, 42);
+    }
+
+    #[test]
+    fn write_or_recover_normal() {
+        let rw = std::sync::RwLock::new("hello");
+        let g = write_or_recover(&rw);
+        assert_eq!(*g, "hello");
+    }
+
+    #[test]
+    fn read_or_recover_normal() {
+        let rw = std::sync::RwLock::new(99);
+        let g = read_or_recover(&rw);
+        assert_eq!(*g, 99);
+    }
+
+    #[test]
+    fn provider_factory_anthropic_registered() {
+        assert!(
+            PROVIDER_FACTORIES
+                .iter()
+                .any(|(name, _)| *name == "anthropic")
+        );
+    }
+
+    #[test]
+    fn provider_factory_copilot_registered() {
+        assert!(
+            PROVIDER_FACTORIES
+                .iter()
+                .any(|(name, _)| *name == "copilot")
+        );
+    }
+
+    #[test]
+    fn create_single_provider_anthropic() {
+        let cfg = config::ProviderConfig {
+            provider_type: "anthropic".into(),
+            api_key: "test-key".into(),
+            ..Default::default()
+        };
+        let p = create_single_provider("test", cfg);
+        assert!(p.name().contains("test"));
+    }
+
+    #[test]
+    fn create_single_provider_unknown_falls_back_to_openai() {
+        let cfg = config::ProviderConfig {
+            provider_type: "unknown_provider".into(),
+            api_key: "test-key".into(),
+            ..Default::default()
+        };
+        let p = create_single_provider("test", cfg);
+        // OpenAiCompatProvider is the fallback
+        assert!(p.name().contains("test"));
+    }
+
+    #[test]
+    fn shared_tool_state_new() {
+        let s = SharedToolState::new();
+        // TodoList and PlanState are private but we can verify construction doesn't panic
+        let _ = s;
+    }
+}
 
 #[cfg(test)]
 pub mod test_support;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Weak};
 
-use tokio::sync::{RwLock, mpsc};
-use tokio_util::sync::CancellationToken;
+/// Lock a `std::sync::Mutex`, recovering from poison (panicked holder).
+///
+/// Replaces the verbose `.lock().unwrap_or_else(|e| e.into_inner())`
+/// pattern used throughout the codebase.
+pub fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write-lock a `std::sync::RwLock`, recovering from poison.
+pub fn write_or_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read-lock a `std::sync::RwLock`, recovering from poison.
+pub fn read_or_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+use tokio::sync::RwLock;
 
 use agent_registry::AgentRegistry;
 use config::{Config, EffectiveSessionConfig, ResolvedProvider, SessionConfig};
 use error::{AgentError, Result};
-use keys::pool::KeyPool;
-use loop_::{AgentLoop, LoopConfig};
 use mcp::client::{McpRegistry, McpServer};
 use provider::Provider;
 use provider::anthropic::AnthropicProvider;
@@ -51,16 +172,12 @@ use provider::copilot::CopilotProvider;
 use provider::openai_compat::OpenAiCompatProvider;
 use provider::resilient::ResilientProvider;
 use research::{
-    CoordinatorConfig, FsResearchStore, ResearchContext, ResearchCoordinator, ResearchSpec,
-    ResearchStore, RunRecord, RunReport, VerifiedRunReport, new_research_id,
-    parse_provider_model_pair,
+    CoordinatorConfig, FsResearchStore, ResearchContext, ResearchSpec, ResearchStore,
+    new_research_id, parse_provider_model_pair,
 };
 use session::jsonl_store::JsonlSessionStore;
-use session::store::SessionStore;
-use session::{Session, SessionMetadata, SessionState, SessionSummary};
-use skill::resolver::SkillResolver;
-use tool::registry::ToolRegistry;
-use types::{AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
+
+use types::{AgentHandle, ContentBlock};
 
 /// What to push to history at the start of a turn. Internal — public callers
 /// pick the variant via `send_prompt` (text-only) or `send_prompt_multimodal`
@@ -73,13 +190,30 @@ enum UserPush {
     },
 }
 
+/// Registry of provider factories — add new provider types here.
+///
+/// Open/Closed: adding a new provider type = one line in this array,
+/// no changes to `create_single_provider`.
+type ProviderFactory = fn(String, config::ProviderConfig) -> Box<dyn Provider>;
+static PROVIDER_FACTORIES: &[(&str, ProviderFactory)] = &[
+    ("anthropic", |name, cfg| {
+        Box::new(AnthropicProvider::new(name, cfg))
+    }),
+    ("copilot", |name, cfg| {
+        Box::new(CopilotProvider::new(name, cfg))
+    }),
+];
+
 /// Create a single Provider instance for one key.
+/// Looks up `cfg.provider_type` in [`PROVIDER_FACTORIES`]; falls back
+/// to OpenAI-compatible if no match (covers openai, deepseek, kimi, etc.).
 fn create_single_provider(name: &str, cfg: config::ProviderConfig) -> Box<dyn Provider> {
-    match cfg.provider_type.as_str() {
-        "anthropic" => Box::new(AnthropicProvider::new(name.to_string(), cfg)),
-        "copilot" => Box::new(CopilotProvider::new(name.to_string(), cfg)),
-        _ => Box::new(OpenAiCompatProvider::new(name.to_string(), cfg)),
+    for &(type_name, factory) in PROVIDER_FACTORIES {
+        if cfg.provider_type == type_name {
+            return factory(name.to_string(), cfg);
+        }
     }
+    Box::new(OpenAiCompatProvider::new(name.to_string(), cfg))
 }
 
 /// Create a Provider from a resolved config.
@@ -152,10 +286,12 @@ pub async fn acquire_research_permit(
     if sem.available_permits() == 0 {
         tracing::debug!(spec = %label, "research run waiting for permit");
     }
-    sem.clone()
-        .acquire_owned()
-        .await
-        .map_err(|e| AgentError::Provider(format!("research semaphore closed: {e}")))
+    sem.clone().acquire_owned().await.map_err(|e| {
+        AgentError::ProviderTyped(crate::provider::error::ProviderError::Other {
+            status: 0,
+            body: format!("semaphore closed: {e}"),
+        })
+    })
 }
 
 /// Build a provider (possibly resilient with fallbacks) from config.
@@ -194,59 +330,60 @@ pub struct ProviderInfo {
 type ExtraToolFactories = Vec<Arc<dyn Fn() -> Box<dyn tool::Tool> + Send + Sync>>;
 
 /// Grouped research subsystem state.
-pub(crate) struct ResearchState {
-    pub store: Arc<dyn ResearchStore>,
-    pub context: ResearchContext,
-    pub run_semaphore: Arc<tokio::sync::Semaphore>,
-    pub run_events: research::RunEventRegistry,
-    pub cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    pub scheduler_hook: std::sync::RwLock<Arc<dyn research::SchedulerHook>>,
-}
+/// Re-export from services.
+pub(crate) use services::research::ResearchState;
 
 /// Grouped search/scrape key pools.
-pub(crate) struct SearchState {
-    pub exa_key_pool: Arc<KeyPool>,
-    pub tavily_key_pool: Arc<KeyPool>,
-    pub serpapi_key_pool: Arc<KeyPool>,
-    pub cloud_scraper: Option<Arc<crate::scrape::multi::MultiCloudScraper>>,
-    pub host_policy: Arc<crate::scrape::host_policy::HostPolicy>,
+/// Re-export from services.
+pub(crate) use services::search::SearchState;
+
+/// Grouped catalog/extension state: MCP, agents, skills, tools.
+pub(crate) struct CatalogState {
+    pub mcp_registry: Arc<RwLock<McpRegistry>>,
+    pub session_mcp: RwLock<HashMap<String, Vec<Arc<McpServer>>>>,
+    pub agent_registry: AgentRegistry,
+    pub agent_store: Arc<agent_store::AgentStore>,
+    pub extra_tool_factories: RwLock<ExtraToolFactories>,
+    pub remote_ctx: tool::remote::RemoteContext,
+    pub hooks: hooks::HookRegistry,
+}
+
+/// Grouped state for tools that persist across sessions (todo list, plans).
+/// Keeps `AgentCore` from leaking tool-specific types as public fields.
+pub struct SharedToolState {
+    pub(crate) todo_list: tool::todo_tool::TodoList,
+    pub(crate) plan_state: tool::plan_tool::PlanState,
+}
+
+impl SharedToolState {
+    fn new() -> Self {
+        Self {
+            todo_list: tool::todo_tool::TodoList::new(),
+            plan_state: tool::plan_tool::PlanState::new(),
+        }
+    }
 }
 
 pub struct AgentCore {
     config: arc_swap::ArcSwap<Config>,
-    mcp_registry: Arc<RwLock<McpRegistry>>,
-
-    /// Per-session MCP servers (connected lazily from session config.json).
-    session_mcp: RwLock<HashMap<String, Vec<Arc<McpServer>>>>,
-    agent_registry: AgentRegistry,
+    /// Catalog & extensions: MCP, agents, skills, remote, hooks.
+    pub(crate) catalog: CatalogState,
 
     research: ResearchState,
-    /// Weak self-reference so orchestration tools (e.g. `research_launch`) can
-    /// upgrade to `Arc<Self>` and call methods like `run_research`. Set once via
-    /// `init_self_ref()` after Arc construction.
     self_ref: std::sync::RwLock<Option<Weak<AgentCore>>>,
-    /// Catalog of agent roles loaded from `Config::agent_dirs` at
-    /// startup. Cheap to clone (`Arc` inside) so callers can hand it
-    /// to coordinators / CLI subcommands without lock contention.
-    /// Empty when no `agent_dirs` exist on disk — that's a valid
-    /// config for hosts that build roles programmatically.
-    agent_store: Arc<agent_store::AgentStore>,
 
     search: SearchState,
-    /// Extra tools injected by the embedding binary (e.g. naked-tg).
-    /// Appended to every session's tool registry after the built-in
-    /// tools. Factory closures produce fresh instances per session.
-    extra_tool_factories: RwLock<ExtraToolFactories>,
-    /// B7: Remote execution context (local by default, switchable to SSH).
-    remote_ctx: tool::remote::RemoteContext,
-    /// B6: Hook registry for context and tool call interception.
-    hooks: hooks::HookRegistry,
     /// Step 4: Provider service (owns provider, cache, health).
     /// Gradually replacing direct access to `provider`, `provider_cache`, `model_health`.
     pub(crate) provider_svc: Arc<services::ProviderService>,
     /// Session state (owns sessions, cancels, store, senders).
     /// Methods on SessionState replace direct field access.
     pub(crate) ss: Arc<services::session_state::SessionState>,
+    /// Per-agent token tracker — shared across all sessions.
+    pub token_tracker: token_tracker::TokenTracker,
+    /// Shared todo list — persists across turns.
+    /// Shared tool state — persists across all sessions and turns.
+    pub shared_tools: SharedToolState,
 }
 
 impl AgentCore {
@@ -296,10 +433,7 @@ impl AgentCore {
         let research_context = ResearchContext::new();
         research_context.set_run_events(Some(research_run_events.clone()));
 
-        let (exa_key_pool, tavily_key_pool, serpapi_key_pool) =
-            build_search_key_pools(&config.exa_api_keys);
-        let cloud_scraper = build_cloud_scraper();
-        let host_policy = Arc::new(crate::scrape::host_policy::HostPolicy::new());
+        let search_state = crate::services::search::SearchState::from_config(&config.exa_api_keys);
 
         // Clone for ProviderService before moving into Self.
         let provider_arc: Arc<dyn Provider> = Arc::from(provider);
@@ -307,42 +441,32 @@ impl AgentCore {
 
         Self {
             config: arc_swap::ArcSwap::from_pointee(config),
-            mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
-
-            session_mcp: RwLock::new(HashMap::new()),
-            agent_registry: AgentRegistry::new(),
+            catalog: CatalogState {
+                mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
+                session_mcp: RwLock::new(HashMap::new()),
+                agent_registry: AgentRegistry::new(),
+                agent_store,
+                extra_tool_factories: RwLock::new(Vec::new()),
+                remote_ctx: tool::remote::RemoteContext::new(),
+                hooks: hooks::HookRegistry::new(),
+            },
             self_ref: std::sync::RwLock::new(None),
-            agent_store,
-            research: ResearchState {
-                store: research_store,
-                context: ResearchContext::new(),
-                scheduler_hook: std::sync::RwLock::new(research::noop_hook()),
-                run_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-                run_events: research::RunEventRegistry::new(),
-                cancels: Arc::new(RwLock::new(HashMap::new())),
-            },
-            search: SearchState {
-                exa_key_pool,
-                tavily_key_pool,
-                serpapi_key_pool,
-                cloud_scraper,
-                host_policy,
-            },
-            extra_tool_factories: RwLock::new(Vec::new()),
-            remote_ctx: tool::remote::RemoteContext::new(),
-            hooks: hooks::HookRegistry::new(),
+            research: ResearchState::new(research_store, max_concurrent),
+            search: search_state,
             provider_svc: Arc::new(services::ProviderService::new(
                 provider_arc,
                 model_health,
                 config_arc,
             )),
             ss: Arc::new(services::session_state::SessionState::new(store)),
+            token_tracker: token_tracker::TokenTracker::new(),
+            shared_tools: SharedToolState::new(),
         }
     }
 
     /// B7: Get the remote execution context.
     pub fn remote_context(&self) -> &tool::remote::RemoteContext {
-        &self.remote_ctx
+        &self.catalog.remote_ctx
     }
 
     /// Load session IDs that were mid-turn when the process crashed.
@@ -380,7 +504,7 @@ impl AgentCore {
 
     /// B6: Get the hook registry.
     pub fn hooks(&self) -> &hooks::HookRegistry {
-        &self.hooks
+        &self.catalog.hooks
     }
 
     /// Shared runtime health tracker. Exposed so telemetry surfaces
@@ -394,21 +518,7 @@ impl AgentCore {
     /// `naked_core::agent_store::resolve_role(name, &core.agent_store(),
     /// &config.agent_roles)` to pick a role with overrides applied.
     pub fn agent_store(&self) -> Arc<agent_store::AgentStore> {
-        self.agent_store.clone()
-    }
-
-    /// Expose the process-wide research-run semaphore. Schedulers and other
-    /// internal callers may need to inspect it (e.g. `available_permits()` for
-    /// dispatch planning) without going through `run_research*`.
-    pub fn research_run_permits(&self) -> Arc<tokio::sync::Semaphore> {
-        self.research.run_semaphore.clone()
-    }
-
-    /// Install an in-process scheduler hook. The TG bot calls this once at
-    /// startup so spec mutations (`research_create`, `research_update_spec`,
-    /// pause/resume) trigger immediate rescheduling.
-    pub fn set_scheduler_hook(&self, hook: Arc<dyn research::SchedulerHook>) {
-        *self.research.scheduler_hook.write().unwrap() = hook;
+        self.catalog.agent_store.clone()
     }
 
     /// Register an extra tool factory. Each factory is called once per
@@ -419,62 +529,17 @@ impl AgentCore {
     where
         F: Fn() -> Box<dyn tool::Tool> + Send + Sync + 'static,
     {
-        self.extra_tool_factories
+        self.catalog
+            .extra_tool_factories
             .write()
             .await
             .push(Arc::new(factory));
     }
 
-    fn scheduler_hook(&self) -> Arc<dyn research::SchedulerHook> {
-        self.research.scheduler_hook.read().unwrap().clone()
-    }
-
-    /// Snapshot the scheduler's in-memory failure tracker for `spec_id`.
-    /// Returns `None` when no scheduler is wired (CLI / tests) or when
-    /// the spec has never failed under the current process. Surfaces
-    /// the data needed by `/research state <id>` without leaking any
-    /// scheduler internals to the bot crate.
-    pub async fn scheduler_failure_snapshot(&self, spec_id: &str) -> Option<(u32, bool)> {
-        self.scheduler_hook().failure_snapshot(spec_id).await
-    }
-
-    /// Manually rearm a research spec after operator intervention.
-    ///
-    /// Wipes the in-memory failure streak / alert flag, clears
-    /// `pause_reason`, and resumes the spec on disk in one atomic
-    /// move. Idempotent — calling it on a healthy spec is a no-op.
-    /// Powers the `/research reset <id>` command so an operator can
-    /// undo an auto-pause without grepping for the right knobs to
-    /// twist.
-    pub async fn reset_research_failures(&self, id: &str) -> Result<()> {
-        self.scheduler_hook().reset_failures(id).await;
-        let mut spec = self.research.store.load_spec(id).await?;
-        let needs_save = spec.paused || spec.pause_reason.is_some();
-        spec.paused = false;
-        spec.pause_reason = None;
-        if needs_save {
-            self.research.store.save_spec(&spec).await?;
-        }
-        self.scheduler_hook()
-            .notify(research::SchedulerEvent::SpecUpdated {
-                spec_id: id.to_string(),
-            })
-            .await;
-        Ok(())
-    }
-
     /// Must be called once after wrapping in `Arc` so orchestration tools can
     /// obtain a reference back to the core (e.g. `research_launch`).
     pub fn init_self_ref(self: &Arc<Self>) {
-        *self.self_ref.write().unwrap() = Some(Arc::downgrade(self));
-    }
-
-    /// Expose the research store so CLI / TG handlers can read & write without
-    /// going through the full research coordinator. The store is always live;
-    /// callers still need to check `config.research.enabled` before offering
-    /// `/research *` surfaces to the user.
-    pub fn research_store(&self) -> Arc<dyn ResearchStore> {
-        self.research.store.clone()
+        *write_or_recover(&self.self_ref) = Some(Arc::downgrade(self));
     }
 
     /// Expose the underlying provider so out-of-loop consumers (e.g. the
@@ -502,7 +567,7 @@ impl services::ProviderResolver for AgentCore {
 }
 
 #[async_trait::async_trait]
-impl services::SessionManager for AgentCore {
+impl services::SessionLifecycle for AgentCore {
     async fn create_session(&self, workspace: &Path) -> String {
         self.create_session(workspace).await
     }
@@ -512,12 +577,20 @@ impl services::SessionManager for AgentCore {
     async fn is_session_active(&self, session_id: &str) -> bool {
         self.is_session_active(session_id).await
     }
+}
+
+#[async_trait::async_trait]
+impl services::SessionControl for AgentCore {
     async fn abort(&self, session_id: &str) {
         self.abort(session_id).await
     }
     async fn list_sessions(&self) -> Vec<session::SessionSummary> {
         self.list_sessions().await
     }
+}
+
+#[async_trait::async_trait]
+impl services::SessionDiagnostics for AgentCore {
     async fn session_total_usage(&self, session_id: &str) -> types::TurnUsage {
         self.session_total_usage(session_id).await
     }
@@ -526,45 +599,7 @@ impl services::SessionManager for AgentCore {
     }
 }
 
-/// RAII guard that owns the lifecycle of a research run's
-/// `(cancel_token, events)` registration. Inserts the entry on
-/// `install`, removes it on drop — so every exit path of
-/// `run_research_*` (Ok, Err, panic) cleans up without boilerplate.
-struct ResearchCancelGuard {
-    cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    events: research::RunEventRegistry,
-    spec_id: String,
-}
-
-impl ResearchCancelGuard {
-    async fn install(
-        cancels: Arc<RwLock<HashMap<String, CancellationToken>>>,
-        events: research::RunEventRegistry,
-        spec_id: &str,
-        token: CancellationToken,
-    ) -> Self {
-        cancels.write().await.insert(spec_id.to_string(), token);
-        Self {
-            cancels,
-            events,
-            spec_id: spec_id.to_string(),
-        }
-    }
-}
-
-impl Drop for ResearchCancelGuard {
-    fn drop(&mut self) {
-        // Take ownership of the necessary fields so the spawned future
-        // doesn't outlive the guard. All state is cheaply clone-able.
-        let cancels = self.cancels.clone();
-        let events = self.events.clone();
-        let spec_id = std::mem::take(&mut self.spec_id);
-        tokio::spawn(async move {
-            cancels.write().await.remove(&spec_id);
-            events.drop_run(&spec_id).await;
-        });
-    }
-}
+impl services::SessionManager for AgentCore {}
 
 /// Adapter so the research coordinator can drive `AgentCore` without AgentCore
 /// having a direct dep on the coordinator's `AgentRunner` trait bounds (keeps
@@ -713,327 +748,6 @@ impl research::AgentRunner for AgentCoreResearchRunner {
     }
 }
 
-fn provider_to_box(provider: &Arc<dyn Provider>) -> Box<dyn Provider> {
-    Box::new(ArcProvider(provider.clone()))
-}
-
-/// Partial mutation applied to a [`ResearchSpec`] by [`AgentCore::update_research`].
-///
-/// Every field is optional. The double-`Option` on `interval_seconds`
-/// distinguishes "do not touch" (`None`) from "clear the schedule"
-/// (`Some(None)`); same for `provider`, `model`, `max_iterations`, and
-/// `max_wall_seconds` (where an empty string / explicit `null` clears).
-#[derive(Debug, Default, Clone)]
-pub struct ResearchPatch {
-    pub topic: Option<String>,
-    /// Replace the entire sources list (after dedup, empty entries dropped).
-    pub sources_replace: Option<Vec<String>>,
-    /// Append to the sources list (skipping duplicates).
-    pub sources_add: Option<Vec<String>>,
-    pub interval_seconds: Option<Option<u64>>,
-    /// One-shot at-time trigger. `Some(Some(t))` = set to `t`,
-    /// `Some(None)` = clear, `None` = leave unchanged.
-    pub run_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
-    /// Recurring cron expression. Same triple-state semantics.
-    pub cron: Option<Option<String>>,
-    /// Per-spec scheduler-task timeout override (seconds).
-    pub task_timeout_seconds: Option<Option<u64>>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub max_iterations: Option<Option<u32>>,
-    pub max_wall_seconds: Option<Option<u64>>,
-}
-
-/// Apply a [`ResearchPatch`] to an in-memory [`ResearchSpec`] following the
-/// same semantics used by [`AgentCore::update_research`]. Exposed so tests can
-/// assert patch behavior without spinning up an [`AgentCore`].
-pub fn apply_research_patch(spec: &mut ResearchSpec, patch: ResearchPatch) {
-    if let Some(topic) = patch.topic {
-        let trimmed = topic.trim();
-        if !trimmed.is_empty() {
-            spec.topic = trimmed.to_string();
-        }
-    }
-    if let Some(sources) = patch.sources_replace {
-        let mut seen = std::collections::HashSet::new();
-        spec.sources = sources
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .filter(|s| seen.insert(s.clone()))
-            .collect();
-    }
-    if let Some(extra) = patch.sources_add {
-        for s in extra {
-            let s = s.trim().to_string();
-            if !s.is_empty() && !spec.sources.contains(&s) {
-                spec.sources.push(s);
-            }
-        }
-    }
-    if let Some(interval) = patch.interval_seconds {
-        spec.interval_seconds = interval;
-    }
-    if let Some(at) = patch.run_at {
-        spec.run_at = at;
-    }
-    if let Some(cron) = patch.cron {
-        spec.cron = cron;
-    }
-    if let Some(timeout) = patch.task_timeout_seconds {
-        spec.task_timeout_seconds = timeout;
-    }
-    if let Some(provider) = patch.provider {
-        spec.provider = if provider.trim().is_empty() {
-            None
-        } else {
-            Some(provider)
-        };
-    }
-    if let Some(model) = patch.model {
-        spec.model = if model.trim().is_empty() {
-            None
-        } else {
-            Some(model)
-        };
-    }
-    if let Some(iters) = patch.max_iterations {
-        spec.max_iterations = iters;
-    }
-    if let Some(secs) = patch.max_wall_seconds {
-        spec.max_wall_seconds = secs;
-    }
-}
-
-/// Implementation behind [`AgentCore::write_research_memory_link`].
-/// Extracted into a free function so it can be exercised by tests without
-/// having to spin up a full `AgentCore`.
-///
-/// Run-completion lines are appended to the **research run-log**
-/// (`research::store::research_runlog_path()` by default), *not* to any
-/// `MEMORY.md`. The durable memory files are reserved for promoted rules
-/// from the daily-digest pipeline; flooding them with one entry per
-/// research run pollutes the system prompt and trips the per-file cap.
-///
-/// If `memory_path_override` is `Some`, the line is appended to that
-/// exact file (used by tests). The parameter name is kept for API
-/// stability — callers in `naked-core` already pass `None`.
-pub async fn write_research_memory_link_for(
-    store: &dyn ResearchStore,
-    _workspace: &Path,
-    spec_id: &str,
-    run_id: &str,
-    verified: Option<&VerifiedRunReport>,
-    memory_path_override: Option<&Path>,
-) -> Result<()> {
-    let spec = store.load_spec(spec_id).await?;
-    let runs = store.list_runs(spec_id, Some(50)).await.unwrap_or_default();
-    let record: Option<RunRecord> = runs.into_iter().find(|r| r.run_id == run_id);
-    let total_after = record.as_ref().map(|r| r.total_findings_after).unwrap_or(0);
-    let new_findings = record.as_ref().map(|r| r.new_findings).unwrap_or(0);
-    let elapsed_secs = record.as_ref().and_then(|r| r.elapsed_secs).unwrap_or(0);
-
-    let report_path = store
-        .report_path(spec_id)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unavailable>".to_string());
-
-    let topic = spec.topic.replace('"', "'");
-    let mut body = format!(
-        "research:{spec_id} | topic=\"{topic}\" | run={run_id} | new={new_findings} total={total_after}",
-    );
-    if let Some(vr) = verified {
-        body.push_str(&format!(
-            " | verified={r} rounds, removed={d}, replaced={p}, remaining={rem}",
-            r = vr.verification_rounds,
-            d = vr.dead_removed,
-            p = vr.replacements_found,
-            rem = vr.remaining_issues.len(),
-        ));
-    }
-    body.push_str(&format!(
-        " | elapsed={elapsed_secs}s | report={report_path}"
-    ));
-
-    // UTF-8 safe truncation: `MAX_ENTRY_CHARS` is named in chars, not bytes,
-    // and a plain byte slice (`&body[..max - 3]`) panics inside multi-byte
-    // codepoints — e.g. the Cyrillic 'й' (2 bytes) in a Russian research
-    // topic split exactly at byte 497. Walk char boundaries instead and
-    // never split inside a codepoint.
-    let max = memory::store::MAX_ENTRY_CHARS;
-    let body = if body.chars().count() > max {
-        let mut truncated: String = body.chars().take(max.saturating_sub(3)).collect();
-        truncated.push_str("...");
-        truncated
-    } else {
-        body
-    };
-
-    let path: PathBuf = match memory_path_override {
-        Some(p) => p.to_path_buf(),
-        None => research::store::research_runlog_path(),
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| AgentError::Provider(format!("research runlog dir: {e}")))?;
-    }
-    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    let line = format!("- {stamp} {body}\n");
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| AgentError::Provider(format!("research runlog open: {e}")))?;
-    f.write_all(line.as_bytes())
-        .map_err(|e| AgentError::Provider(format!("research runlog write: {e}")))?;
-    Ok(())
-}
-
-/// Build the per-provider [`KeyPool`]s used by [`WebSearchTool`].
-///
-/// Sources, in order:
-/// 1. [`keys::fs::FilesystemKeyProvider`] reading the standalone JSON pool
-///    at `~/.naked/secrets/search_pool.alive.json` — the **primary** source
-///    populated by `naked/scripts/import_search_keys.py`.
-/// 2. [`keys::env::EnvKeyProvider`] (CSV env-vars like `EXA_API_KEYS`) —
-///    legacy fallback for hosts that don't ship the pool file.
-/// 3. For Exa specifically, the legacy `Config::exa_api_keys` slice is
-///    folded in too so existing `.env` setups keep working until everyone
-///    migrates.
-///
-/// TTL: 6 hours, matching the recommended refresh cadence in
-/// `naked/scripts/README-search-pool.md`.
-fn build_search_key_pools(
-    legacy_exa_keys: &[String],
-) -> (Arc<KeyPool>, Arc<KeyPool>, Arc<KeyPool>) {
-    use keys::KeyProvider;
-    use keys::env::EnvKeyProvider;
-    use keys::fs::FilesystemKeyProvider;
-    use std::time::Duration;
-
-    let fs_path = FilesystemKeyProvider::default_path();
-    let fs_provider: Arc<dyn KeyProvider> = Arc::new(FilesystemKeyProvider::new(fs_path.clone()));
-    let env_provider: Arc<dyn KeyProvider> = Arc::new(EnvKeyProvider::defaults());
-
-    // Bridge legacy `Config::exa_api_keys` (set from `.env` at startup) into
-    // the Exa pool so a host without the JSON file still gets its keys.
-    struct StaticProvider {
-        keys: Vec<String>,
-    }
-    impl KeyProvider for StaticProvider {
-        fn fetch(&self, _: &str) -> std::result::Result<Vec<String>, String> {
-            Ok(self.keys.clone())
-        }
-    }
-    let legacy_exa: Arc<dyn KeyProvider> = Arc::new(StaticProvider {
-        keys: legacy_exa_keys.to_vec(),
-    });
-
-    let ttl = Duration::from_secs(6 * 3600);
-
-    let exa = Arc::new(KeyPool::new(
-        vec![fs_provider.clone(), env_provider.clone(), legacy_exa],
-        "exa",
-        ttl,
-    ));
-    let tavily = Arc::new(KeyPool::new(
-        vec![fs_provider.clone(), env_provider.clone()],
-        "tavily",
-        ttl,
-    ));
-    let serpapi = Arc::new(KeyPool::new(
-        vec![fs_provider.clone(), env_provider.clone()],
-        "serpapi",
-        ttl,
-    ));
-
-    tracing::info!(
-        pool_path = %fs_path.display(),
-        exa = exa.size(),
-        tavily = tavily.size(),
-        serpapi = serpapi.size(),
-        "search key pools initialized"
-    );
-    (exa, tavily, serpapi)
-}
-
-/// Build the optional cloud-scrape cascade for [`WebFetchTool`] Tier 3.5.
-///
-/// Reads ScrapingBee + Firecrawl keys from the same `~/.naked/secrets/
-/// search_pool.alive.json` source as the search engines, with the
-/// `SCRAPINGBEE_API_KEYS` / `FIRECRAWL_API_KEYS` CSV env-vars as
-/// fallback. Returns `None` when no keys are available so the cascade
-/// silently skips the tier — the existing 4-tier path still works on
-/// hosts that haven't provisioned cloud-scrape credentials.
-fn build_cloud_scraper() -> Option<Arc<crate::scrape::multi::MultiCloudScraper>> {
-    use crate::scrape::CloudScraper;
-    use crate::scrape::firecrawl::FirecrawlEngine;
-    use crate::scrape::multi::MultiCloudScraper;
-    use crate::scrape::scrapingbee::ScrapingBeeEngine;
-    use keys::KeyProvider;
-    use keys::env::EnvKeyProvider;
-    use keys::fs::FilesystemKeyProvider;
-    use std::time::Duration;
-
-    let fs_provider: Arc<dyn KeyProvider> = Arc::new(FilesystemKeyProvider::new(
-        FilesystemKeyProvider::default_path(),
-    ));
-    let env_provider: Arc<dyn KeyProvider> = Arc::new(EnvKeyProvider::defaults());
-    let ttl = Duration::from_secs(6 * 3600);
-
-    let scrapingbee_pool = Arc::new(KeyPool::new(
-        vec![fs_provider.clone(), env_provider.clone()],
-        "scrapingbee",
-        ttl,
-    ));
-    let firecrawl_pool = Arc::new(KeyPool::new(
-        vec![fs_provider, env_provider],
-        "firecrawl",
-        ttl,
-    ));
-
-    let mut engines: Vec<Arc<dyn CloudScraper>> = Vec::new();
-    if scrapingbee_pool.size() > 0 {
-        engines.push(Arc::new(ScrapingBeeEngine::new(scrapingbee_pool.clone())));
-    }
-    if firecrawl_pool.size() > 0 {
-        engines.push(Arc::new(FirecrawlEngine::new(firecrawl_pool.clone())));
-    }
-
-    if engines.is_empty() {
-        tracing::info!("cloud-scrape: no keys available, Tier 3.5 disabled");
-        return None;
-    }
-
-    let summary = engines
-        .iter()
-        .map(|e| e.name().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    tracing::info!(
-        engines = %summary,
-        scrapingbee_keys = scrapingbee_pool.size(),
-        firecrawl_keys = firecrawl_pool.size(),
-        "cloud-scrape: cascade initialized",
-    );
-    Some(Arc::new(MultiCloudScraper::new(engines)))
-}
-
-struct ArcProvider(Arc<dyn Provider>);
-
-#[async_trait::async_trait]
-impl Provider for ArcProvider {
-    fn name(&self) -> &str {
-        self.0.name()
-    }
-    fn models(&self) -> Vec<types::ModelInfo> {
-        self.0.models()
-    }
-    async fn stream_chat(
-        &self,
-        request: provider::ChatRequest,
-    ) -> Result<std::pin::Pin<Box<dyn tokio_stream::Stream<Item = types::StreamChunk> + Send>>>
-    {
-        self.0.stream_chat(request).await
-    }
-}
+// Re-export from research submodules for backward compatibility.
+pub use research::patch::{PatchField, ResearchPatch, apply_research_patch};
+pub use research::runlog::write_research_memory_link_for;

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use naked_core::AgentCore;
+use naked_core::PatchField;
 use naked_core::ResearchPatch;
 use naked_core::config::{Config, ResearchConfig};
 use naked_core::provider::{ChatRequest, Provider};
@@ -170,7 +171,7 @@ async fn t_reschedule_replaces_interval() {
         .expect("create_research");
     let id = spec.id.clone();
     let patch = ResearchPatch {
-        interval_seconds: Some(Some(86_400)),
+        interval_seconds: PatchField::Set(86_400),
         ..Default::default()
     };
     core.update_research(&id, patch)
@@ -192,7 +193,7 @@ async fn t_reschedule_replaces_interval() {
 
     // User shortens the interval to 30s via the LLM-facing patch surface.
     let patch = ResearchPatch {
-        interval_seconds: Some(Some(30)),
+        interval_seconds: PatchField::Set(30),
         ..Default::default()
     };
     core.update_research(&id, patch)
@@ -214,7 +215,7 @@ async fn t_reschedule_replaces_interval() {
     // And clearing the schedule entirely (interval_seconds=null) makes it
     // never due again, even with no prior run.
     let patch = ResearchPatch {
-        interval_seconds: Some(None),
+        interval_seconds: PatchField::Clear,
         ..Default::default()
     };
     core.update_research(&id, patch)

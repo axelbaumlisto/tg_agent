@@ -39,10 +39,7 @@ impl ToolRegistry {
     pub async fn execute(&self, name: &str, input: serde_json::Value, cwd: &Path) -> ToolResult {
         match self.tools.get(name) {
             Some(tool) => tool.execute(input, cwd).await,
-            None => ToolResult {
-                output: format!("Unknown tool: {name}"),
-                is_error: true,
-            },
+            None => ToolResult::err(format!("Unknown tool: {name}")),
         }
     }
 
@@ -53,12 +50,49 @@ impl ToolRegistry {
         cwd: &Path,
         progress: mpsc::Sender<AgentEvent>,
     ) -> ToolResult {
-        match self.tools.get(name) {
-            Some(tool) => tool.execute_with_progress(input, cwd, progress).await,
-            None => ToolResult {
-                output: format!("Unknown tool: {name}"),
-                is_error: true,
-            },
+        let mut result = match self.tools.get(name) {
+            Some(tool) => {
+                tool.execute_with_progress(input.clone(), cwd, progress)
+                    .await
+            }
+            None => {
+                return ToolResult::err(format!("Unknown tool: {name}"));
+            }
+        };
+
+        // Large output routing: truncate oversized tool results.
+        result.output = super::large_output::route_large_output(
+            &result.output,
+            super::large_output::DEFAULT_THRESHOLD_CHARS,
+        );
+
+        // Post-edit validation: if a file-modifying tool succeeded,
+        // run a language-specific check and append diagnostics.
+        if !result.is_error
+            && let Some(path) = Self::edited_file_path(name, &input)
+        {
+            let full = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(&path)
+            };
+            if let Some(validation) = super::validator::run_post_edit_check(&full, cwd).await {
+                result.output.push_str(&validation.to_tool_suffix());
+            }
+        }
+
+        result
+    }
+
+    /// Extract the file path from a file-modifying tool's input.
+    fn edited_file_path(tool_name: &str, input: &serde_json::Value) -> Option<std::path::PathBuf> {
+        match tool_name {
+            "write_file" | "edit_file" | "apply_patch" => input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from),
+            _ => None,
         }
     }
 
@@ -94,10 +128,7 @@ mod tests {
         }
 
         async fn execute(&self, _input: serde_json::Value, _cwd: &Path) -> ToolResult {
-            ToolResult {
-                output: self.output.clone(),
-                is_error: false,
-            }
+            ToolResult::ok(self.output.clone())
         }
     }
 

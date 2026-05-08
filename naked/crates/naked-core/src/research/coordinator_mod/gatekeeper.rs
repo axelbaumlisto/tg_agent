@@ -1,7 +1,20 @@
 //! Gatekeeper / verification logic for research findings.
 
-use super::*;
+#[allow(unused_imports)]
+use super::DeadFinding;
+#[allow(unused_imports)]
+use super::FuzzyFingerprint;
+#[allow(unused_imports)]
+use super::GatekeeperVerdict;
+#[allow(unused_imports)]
+use super::ResearchCoordinator;
+#[allow(unused_imports)]
+use crate::error::Result;
 use crate::research::tool::parse_listing_date;
+#[allow(unused_imports)]
+use chrono::Utc;
+#[allow(unused_imports)]
+use std::time::Duration;
 
 impl ResearchCoordinator {
     /// Check every finding against the rules defined in `GatekeeperConfig`.
@@ -50,7 +63,6 @@ impl ResearchCoordinator {
                 verdict.dead_details.push(DeadFinding {
                     url: f.url.clone(),
                     title: f.title.clone().unwrap_or_default(),
-                    hash: f.dedup_hash.clone(),
                 });
             }
 
@@ -156,7 +168,6 @@ impl ResearchCoordinator {
                     verdict.dead_details.push(DeadFinding {
                         url: f.url.clone(),
                         title: f.title.clone().unwrap_or_default(),
-                        hash: f.dedup_hash.clone(),
                     });
                     verdict.issues.push(format!(
                         "{}: semantic duplicate of {} (same title+price)",
@@ -177,7 +188,6 @@ impl ResearchCoordinator {
                         verdict.dead_details.push(DeadFinding {
                             url: f.url.clone(),
                             title: f.title.clone().unwrap_or_default(),
-                            hash: f.dedup_hash.clone(),
                         });
                         verdict.issues.push(format!(
                             "{}: fuzzy semantic duplicate of {} (overlapping title tokens + same price)",
@@ -342,5 +352,49 @@ impl ResearchCoordinator {
             .replace("{min_source}", &gk.min_source_content_chars.to_string());
 
         Ok(prompt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::FuzzyFingerprint;
+
+    #[test]
+    fn fuzzy_detects_duplicates_same_price() {
+        let a = FuzzyFingerprint::new(
+            Some("apartment two bedroom vinhomes grand park district nine"),
+            Some("350000"),
+        )
+        .unwrap();
+        let b = FuzzyFingerprint::new(
+            Some("apartment two bedroom vinhomes grand park district nine sale"),
+            Some("350000"),
+        )
+        .unwrap();
+        assert!(
+            a.is_duplicate_of(&b),
+            "overlapping titles + same price = dupe"
+        );
+    }
+
+    #[test]
+    fn fuzzy_different_prices_not_duplicate() {
+        let a =
+            FuzzyFingerprint::new(Some("Nice apartment downtown area"), Some("500 USD")).unwrap();
+        let b =
+            FuzzyFingerprint::new(Some("Nice apartment downtown area"), Some("600 USD")).unwrap();
+        assert!(!a.is_duplicate_of(&b));
+    }
+
+    #[test]
+    fn fuzzy_short_title_returns_none() {
+        assert!(FuzzyFingerprint::new(Some("Hi"), Some("100")).is_none());
+    }
+
+    #[test]
+    fn fuzzy_no_price_not_duplicate() {
+        let a = FuzzyFingerprint::new(Some("Large villa with pool in Bali Ubud"), None).unwrap();
+        let b = FuzzyFingerprint::new(Some("Large villa with pool in Bali Ubud"), None).unwrap();
+        assert!(!a.is_duplicate_of(&b), "missing price should not be dupe");
     }
 }

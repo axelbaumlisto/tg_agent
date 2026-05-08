@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use naked_core::AgentCore;
+use naked_core::PatchField;
 use naked_core::ResearchPatch;
 use naked_core::config::Config;
 use naked_core::provider::{ChatRequest, Provider};
@@ -110,7 +111,7 @@ async fn scheduler_hook_fires_on_create_update_pause_delete() {
 
     let patch = ResearchPatch {
         sources_add: Some(vec!["https://added.example".into()]),
-        interval_seconds: Some(Some(3_600)),
+        interval_seconds: PatchField::Set(3_600),
         ..Default::default()
     };
     agent.update_research(&id, patch).await.expect("update");

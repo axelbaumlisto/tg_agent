@@ -1,6 +1,11 @@
 //! Provider/model listing. Pure provider queries, no session access.
 
-use super::*;
+#[allow(unused_imports)]
+use super::AgentCore;
+#[allow(unused_imports)]
+use super::ProviderInfo;
+#[allow(unused_imports)]
+use super::types;
 
 impl AgentCore {
     /// Delegates to ProviderService.

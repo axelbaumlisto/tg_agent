@@ -183,7 +183,7 @@ fn default_recent_shift_max_chars() -> usize {
     1500
 }
 fn default_recent_shift_days() -> u32 {
-    2
+    7
 }
 fn default_daily_retention_days() -> u32 {
     30
@@ -221,4 +221,30 @@ fn default_compact_recall_half_life_days() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_memory_config_sane() {
+        let cfg = MemoryConfig::default();
+        assert!(cfg.daily_enabled);
+        assert!(cfg.digest_max_chars > 0);
+    }
+
+    #[test]
+    fn deserialize_empty_json() {
+        let cfg: MemoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.daily_enabled);
+    }
+
+    #[test]
+    fn deserialize_override() {
+        let cfg: MemoryConfig =
+            serde_json::from_str(r#"{"daily_enabled": false, "digest_max_chars": 10}"#).unwrap();
+        assert!(!cfg.daily_enabled);
+        assert_eq!(cfg.digest_max_chars, 10);
+    }
 }

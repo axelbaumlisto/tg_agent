@@ -43,15 +43,31 @@ pub trait ProviderResolver: Send + Sync {
 ///
 /// Provider code uses this for usage queries instead of touching `sessions` HashMap.
 #[async_trait]
-pub trait SessionManager: Send + Sync {
+/// Core session lifecycle: create, send, query.
+#[async_trait]
+pub trait SessionLifecycle: Send + Sync {
     async fn create_session(&self, workspace: &Path) -> String;
     async fn send_prompt(&self, session_id: &str, text: &str) -> Result<AgentHandle>;
     async fn is_session_active(&self, session_id: &str) -> bool;
+}
+
+/// Session control: abort, list.
+#[async_trait]
+pub trait SessionControl: Send + Sync {
     async fn abort(&self, session_id: &str);
     async fn list_sessions(&self) -> Vec<SessionSummary>;
+}
+
+/// Session diagnostics: usage, provider info.
+#[async_trait]
+pub trait SessionDiagnostics: Send + Sync {
     async fn session_total_usage(&self, session_id: &str) -> TurnUsage;
     async fn session_provider_model(&self, session_id: &str) -> (String, String);
 }
+
+/// Combined session manager — all session operations.
+/// Implementors get this automatically when they implement all three sub-traits.
+pub trait SessionManager: SessionLifecycle + SessionControl + SessionDiagnostics {}
 
 // ---------------------------------------------------------------------------
 // EventSink — receiving agent events (tool results, text, errors)
@@ -109,7 +125,10 @@ pub trait ToolBuilder: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::services::*;
+    use crate::test_support::TestCore;
+    use crate::types::AgentEvent;
+    use tokio::sync::mpsc;
 
     /// Verify ChannelEventSink delivers events.
     #[tokio::test]
@@ -136,4 +155,58 @@ mod tests {
         fn _assert<T: super::ToolBuilder>() {}
         _assert::<crate::AgentCore>();
     }
+
+    #[tokio::test]
+    async fn provider_resolver_returns_default_for_empty_name() {
+        let tc = TestCore::build();
+        let p = <crate::AgentCore as ProviderResolver>::resolve_provider(&tc.core, "").await;
+        assert_eq!(p.name(), "noop");
+    }
+
+    #[tokio::test]
+    async fn provider_resolver_returns_default_model() {
+        let tc = TestCore::build();
+        let (prov, model) =
+            <crate::AgentCore as ProviderResolver>::default_provider_model(&tc.core);
+        assert!(!prov.is_empty() || !model.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_create_and_query() {
+        let tc = TestCore::build();
+        let ws = tc.workspace();
+        let sid = <crate::AgentCore as SessionLifecycle>::create_session(&tc.core, &ws).await;
+        assert!(!sid.is_empty());
+        let active =
+            <crate::AgentCore as SessionLifecycle>::is_session_active(&tc.core, &sid).await;
+        assert!(!active, "new session should be idle");
+    }
+
+    #[tokio::test]
+    async fn session_control_list_includes_created() {
+        let tc = TestCore::build();
+        let ws = tc.workspace();
+        let sid = tc.core.create_session(&ws).await;
+        let sessions = <crate::AgentCore as SessionControl>::list_sessions(&tc.core).await;
+        assert!(
+            sessions.iter().any(|s| s.id == sid),
+            "created session should appear in list"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_diagnostics_usage_starts_zero() {
+        let tc = TestCore::build();
+        let ws = tc.workspace();
+        let sid = tc.core.create_session(&ws).await;
+        let usage =
+            <crate::AgentCore as SessionDiagnostics>::session_total_usage(&tc.core, &sid).await;
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+    }
 }
+pub mod research;
+pub mod search;
+
+#[cfg(test)]
+mod boundary_tests;
