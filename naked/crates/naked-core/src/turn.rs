@@ -743,6 +743,9 @@ pub(crate) fn build_loop_config(
         data_dir: Some(session_dir.to_path_buf()),
         working_set: None,
         observer: std::sync::Arc::new(crate::loop_observer::TracingObserver),
+        cycle_archiver: std::sync::Arc::new(crate::cycle_archiver::FsCycleArchiver {
+            data_dir: session_dir.to_path_buf(),
+        }),
     }
 }
 

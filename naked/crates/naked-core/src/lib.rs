@@ -1,5 +1,6 @@
 // ── Core engine ─────────────────────────────────────────────────────────────
 pub mod config;
+pub mod cycle_archiver;
 pub mod error;
 pub mod error_taxonomy;
 #[path = "history_mod/mod.rs"]

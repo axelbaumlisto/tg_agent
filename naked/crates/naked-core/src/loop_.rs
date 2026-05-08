@@ -100,6 +100,8 @@ pub struct LoopConfig {
     pub working_set: Option<std::sync::Arc<std::sync::Mutex<crate::working_set::WorkingSet>>>,
     /// Observer for business events (DIP). Defaults to [`TracingObserver`].
     pub observer: std::sync::Arc<dyn LoopObserver>,
+    /// Archiver for completed cycle messages (DIP). Defaults to [`NoopCycleArchiver`].
+    pub cycle_archiver: std::sync::Arc<dyn crate::cycle_archiver::CycleArchiver>,
 }
 
 impl Default for LoopConfig {
@@ -120,6 +122,7 @@ impl Default for LoopConfig {
             data_dir: None,
             working_set: None,
             observer: std::sync::Arc::new(TracingObserver),
+            cycle_archiver: std::sync::Arc::new(crate::cycle_archiver::NoopCycleArchiver),
         }
     }
 }
@@ -920,10 +923,6 @@ impl AgentLoop {
         if !crate::session::cycle::should_advance_cycle(est, cycle_cfg) {
             return Ok(false);
         }
-        let data_dir = match self.config.data_dir.as_ref() {
-            Some(d) => d,
-            None => return Ok(false),
-        };
         let session_id = self.config.session_id.as_deref().unwrap_or("unknown");
         let cycle_num = history.cycle_count();
         let checkpoint = crate::session::cycle::build_checkpoint(
@@ -933,12 +932,11 @@ impl AgentLoop {
             None, // TODO: pass working_set when available
             cycle_cfg,
         );
-        if let Ok(archive_path) = crate::session::cycle::write_archive(
-            data_dir,
-            session_id,
-            cycle_num,
-            history.messages(),
-        ) {
+        if let Ok(archive_path) =
+            self.config
+                .cycle_archiver
+                .archive(session_id, cycle_num, history.messages())
+        {
             let restart_prompt =
                 crate::session::cycle::build_restart_prompt(&checkpoint, history.system_prompt());
             let archived_count = history.message_count();
