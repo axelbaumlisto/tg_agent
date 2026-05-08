@@ -100,6 +100,18 @@ impl LoopConfig {
     }
 }
 
+/// Outcome of a single provider turn returned by [`AgentLoop::stream_one_turn`].
+/// The outer loop in [`AgentLoop::run`] decides what to do with empty turns
+/// and dispatches tool calls.
+struct TurnStreamOutcome {
+    blocks: Vec<ContentBlock>,
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+    turn_usage: Option<TurnUsage>,
+    /// True when the stream produced no content at all (no text, no tools, no thinking).
+    /// The outer loop decides whether to retry via the empty-content-attempts budget.
+    empty: bool,
+}
+
 pub struct AgentLoop {
     provider: Box<dyn Provider>,
     tools: ToolRegistry,
@@ -246,218 +258,16 @@ impl AgentLoop {
 
             let request = self.build_chat_request(history);
 
-            let mut text_acc = String::new();
-            let mut thinking_acc = String::new();
-            let mut in_fake_tool = false;
-            let mut blocks: Vec<ContentBlock> = Vec::new();
-            let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
-            let mut turn_usage: Option<TurnUsage> = None;
-            let mut stream_ok = false;
-
-            for retry in 0..=MAX_STREAM_RETRIES {
-                let connect_result = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        return Err(AgentError::Cancelled);
-                    }
-                    r = self.provider.stream_chat(request.clone()) => r,
-                };
-                let mut stream = match connect_result {
-                    Ok(s) => s,
-                    Err(e) => {
-                        if matches!(
-                            &e,
-                            AgentError::ProviderTyped(
-                                crate::provider::error::ProviderError::ContextWindowExceeded { .. }
-                            )
-                        ) {
-                            let before = history.message_count();
-                            if before <= 3 {
-                                return Err(e);
-                            }
-                            for round in 0..5 {
-                                let keep = (history.message_count() / 3).clamp(2, 6);
-                                tracing::warn!(
-                                    round,
-                                    keep,
-                                    msgs = history.message_count(),
-                                    est_tokens = history.estimated_tokens(),
-                                    "emergency compaction round"
-                                );
-                                history.compact(keep);
-                                if history.estimated_tokens()
-                                    < history.context_window_tokens() as usize * 4 / 5
-                                {
-                                    break;
-                                }
-                            }
-                            let after = history.message_count();
-                            tracing::warn!("emergency compaction done: {before} -> {after} msgs");
-                            let _ = tx
-                                .send(AgentEvent::ContextCompacted {
-                                    before_msgs: before,
-                                    after_msgs: after,
-                                    summary_hint: None,
-                                    files_count: 0,
-                                })
-                                .await;
-                            continue 'outer;
-                        }
-                        if retry < MAX_STREAM_RETRIES {
-                            let delay = Backoff {
-                                base_ms: BASE_RETRY_DELAY_MS,
-                                max_attempts: MAX_STREAM_RETRIES + 1,
-                            }
-                            .delay(retry);
-                            tracing::warn!(
-                                "stream_chat connect error (retry {}/{}, backoff {}ms): {e}",
-                                retry + 1,
-                                MAX_STREAM_RETRIES,
-                                delay.as_millis()
-                            );
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        }
-                        self.config.record_health(
-                            crate::model_catalog::HealthEventKind::Error,
-                            None,
-                            Some(e.to_string()),
-                        );
-                        return Err(e);
-                    }
-                };
-
-                text_acc.clear();
-                thinking_acc.clear();
-                blocks.clear();
-                tool_calls.clear();
-                turn_usage = None;
-                let mut mid_stream_error = None;
-
-                loop {
-                    let chunk = tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Err(AgentError::Cancelled);
-                        }
-                        next = stream.next() => match next {
-                            Some(c) => c,
-                            None => break,
-                        },
-                    };
-
-                    match chunk {
-                        StreamChunk::Text(t) => {
-                            let cleaned =
-                                crate::stream_filter::filter_fake_tool_delta(&t, &mut in_fake_tool);
-                            if !cleaned.is_empty() {
-                                let _ = tx.send(AgentEvent::TextDelta(cleaned.clone())).await;
-                                text_acc.push_str(&cleaned);
-                            } else if !t.is_empty() {
-                                tracing::debug!("stream_filter: scrubbed fake tool wrapper");
-                            }
-                        }
-                        StreamChunk::Thinking(t) => {
-                            let _ = tx.send(AgentEvent::ThinkingDelta(t.clone())).await;
-                            thinking_acc.push_str(&t);
-                        }
-                        StreamChunk::ToolUse { id, name, input } => {
-                            if !thinking_acc.is_empty() {
-                                blocks.push(ContentBlock::Thinking {
-                                    text: std::mem::take(&mut thinking_acc),
-                                });
-                            }
-                            if !text_acc.is_empty() {
-                                blocks.push(ContentBlock::Text {
-                                    text: std::mem::take(&mut text_acc),
-                                });
-                            }
-                            let _ = tx
-                                .send(AgentEvent::ToolStart {
-                                    call_id: id.clone(),
-                                    name: name.clone(),
-                                    input: input.clone(),
-                                })
-                                .await;
-                            blocks.push(ContentBlock::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            });
-                            tool_calls.push((id, name, input));
-                        }
-                        StreamChunk::Usage(u) => {
-                            cumulative_usage.input_tokens += u.input_tokens;
-                            cumulative_usage.output_tokens += u.output_tokens;
-                            cumulative_usage.cache_read_tokens += u.cache_read_tokens;
-                            cumulative_usage.cache_write_tokens += u.cache_write_tokens;
-                            if let Some(ref tracker) = self.config.token_tracker {
-                                tracker.record(&self.config.model, u.input_tokens, u.output_tokens);
-                            }
-                            turn_usage = Some(u.clone());
-                            let _ = tx.send(AgentEvent::UsageUpdate(u)).await;
-                        }
-                        StreamChunk::Done => break,
-                        StreamChunk::Error(e) => {
-                            mid_stream_error = Some(e);
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(e) = mid_stream_error {
-                    if tool_calls.is_empty() && retry < MAX_STREAM_RETRIES {
-                        let delay = Backoff {
-                            base_ms: BASE_RETRY_DELAY_MS,
-                            max_attempts: MAX_STREAM_RETRIES + 1,
-                        }
-                        .delay(retry);
-                        tracing::warn!(
-                            "mid-stream error (retry {}/{}, backoff {}ms): {e}",
-                            retry + 1,
-                            MAX_STREAM_RETRIES,
-                            delay.as_millis()
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    let _ = tx.send(AgentEvent::Error(e.clone())).await;
-                    self.config.record_health(
-                        crate::model_catalog::HealthEventKind::Error,
-                        None,
-                        Some(e.clone()),
-                    );
-                    return Err(AgentError::ProviderTyped(
-                        crate::provider::error::ProviderError::Other { status: 0, body: e },
-                    ));
-                }
-
-                stream_ok = true;
-                break;
-            }
-
-            if !stream_ok {
-                let _ = tx
-                    .send(AgentEvent::Error("stream retries exhausted".into()))
-                    .await;
-                self.config.record_health(
-                    crate::model_catalog::HealthEventKind::Error,
-                    None,
-                    Some("stream retries exhausted".into()),
-                );
-                return Err(AgentError::ProviderTyped(
-                    crate::provider::error::ProviderError::Other {
-                        status: 0,
-                        body: "stream retries exhausted".into(),
-                    },
-                ));
-            }
-
-            if !thinking_acc.is_empty() {
-                blocks.push(ContentBlock::Thinking { text: thinking_acc });
-            }
-            if !text_acc.is_empty() {
-                blocks.push(ContentBlock::Text { text: text_acc });
-            }
-
+            let outcome = match self
+                .stream_one_turn(&request, history, &mut cumulative_usage, &cancel, &tx)
+                .await
+            {
+                Ok(o) => o,
+                Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::ContextWindowExceeded { .. },
+                )) => continue 'outer,
+                Err(e) => return Err(e),
+            };
             // Guard against "provider returned nothing" turns.
             //
             // Some providers (notably `glm-cn`/`glm-5-turbo`) can close a
@@ -468,7 +278,7 @@ impl AgentLoop {
             // Only when retries are exhausted do we surface an Error and
             // return without polluting history (which would cause the
             // "dirty-session 0-tok refusal" loop on subsequent turns).
-            if blocks.is_empty() && tool_calls.is_empty() {
+            if outcome.empty {
                 if empty_content_attempts < MAX_EMPTY_CONTENT_RETRIES {
                     empty_content_attempts += 1;
                     crate::types::EMPTY_CONTENT_RETRY_COUNT
@@ -510,7 +320,12 @@ impl AgentLoop {
             // This means a transient hiccup at iteration N doesn't starve
             // retries at iteration N+5.
             empty_content_attempts = 0;
-
+            let TurnStreamOutcome {
+                blocks,
+                tool_calls,
+                turn_usage,
+                ..
+            } = outcome;
             history.push_assistant(blocks, turn_usage);
 
             if tool_calls.is_empty() {
@@ -855,6 +670,240 @@ impl AgentLoop {
         for (mime, b64) in crate::tool::image_result::drain_images() {
             history.push_image(&mime, &b64);
         }
+    }
+
+    /// Run one provider turn end-to-end (connect → stream → drain).
+    /// Handles connect retries and mid-stream retries, but **not**
+    /// empty-content retries (caller decides) or outer loop continuation
+    /// after context-window compaction (caller sees `Err(CWE)` and
+    /// does `continue 'outer`).
+    async fn stream_one_turn(
+        &self,
+        request: &ChatRequest,
+        history: &mut ConversationHistory,
+        cumulative_usage: &mut TurnUsage,
+        cancel: &CancellationToken,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<TurnStreamOutcome> {
+        let mut text_acc = String::new();
+        let mut thinking_acc = String::new();
+        let mut in_fake_tool = false;
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut turn_usage: Option<TurnUsage> = None;
+        let mut stream_ok = false;
+
+        for retry in 0..=MAX_STREAM_RETRIES {
+            let connect_result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(AgentError::Cancelled);
+                }
+                r = self.provider.stream_chat(request.clone()) => r,
+            };
+            let mut stream = match connect_result {
+                Ok(s) => s,
+                Err(e) => {
+                    if matches!(
+                        &e,
+                        AgentError::ProviderTyped(
+                            crate::provider::error::ProviderError::ContextWindowExceeded { .. }
+                        )
+                    ) {
+                        let before = history.message_count();
+                        if before <= 3 {
+                            return Err(e);
+                        }
+                        for round in 0..5 {
+                            let keep = (history.message_count() / 3).clamp(2, 6);
+                            tracing::warn!(
+                                round,
+                                keep,
+                                msgs = history.message_count(),
+                                est_tokens = history.estimated_tokens(),
+                                "emergency compaction round"
+                            );
+                            history.compact(keep);
+                            if history.estimated_tokens()
+                                < history.context_window_tokens() as usize * 4 / 5
+                            {
+                                break;
+                            }
+                        }
+                        let after = history.message_count();
+                        tracing::warn!("emergency compaction done: {before} -> {after} msgs");
+                        let _ = tx
+                            .send(AgentEvent::ContextCompacted {
+                                before_msgs: before,
+                                after_msgs: after,
+                                summary_hint: None,
+                                files_count: 0,
+                            })
+                            .await;
+                        return Err(e);
+                    }
+                    if retry < MAX_STREAM_RETRIES {
+                        let delay = Backoff {
+                            base_ms: BASE_RETRY_DELAY_MS,
+                            max_attempts: MAX_STREAM_RETRIES + 1,
+                        }
+                        .delay(retry);
+                        tracing::warn!(
+                            "stream_chat connect error (retry {}/{}, backoff {}ms): {e}",
+                            retry + 1,
+                            MAX_STREAM_RETRIES,
+                            delay.as_millis()
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    self.config.record_health(
+                        crate::model_catalog::HealthEventKind::Error,
+                        None,
+                        Some(e.to_string()),
+                    );
+                    return Err(e);
+                }
+            };
+
+            text_acc.clear();
+            thinking_acc.clear();
+            blocks.clear();
+            tool_calls.clear();
+            turn_usage = None;
+            let mut mid_stream_error = None;
+
+            loop {
+                let chunk = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Err(AgentError::Cancelled);
+                    }
+                    next = stream.next() => match next {
+                        Some(c) => c,
+                        None => break,
+                    },
+                };
+
+                match chunk {
+                    StreamChunk::Text(t) => {
+                        let cleaned =
+                            crate::stream_filter::filter_fake_tool_delta(&t, &mut in_fake_tool);
+                        if !cleaned.is_empty() {
+                            let _ = tx.send(AgentEvent::TextDelta(cleaned.clone())).await;
+                            text_acc.push_str(&cleaned);
+                        } else if !t.is_empty() {
+                            tracing::debug!("stream_filter: scrubbed fake tool wrapper");
+                        }
+                    }
+                    StreamChunk::Thinking(t) => {
+                        let _ = tx.send(AgentEvent::ThinkingDelta(t.clone())).await;
+                        thinking_acc.push_str(&t);
+                    }
+                    StreamChunk::ToolUse { id, name, input } => {
+                        if !thinking_acc.is_empty() {
+                            blocks.push(ContentBlock::Thinking {
+                                text: std::mem::take(&mut thinking_acc),
+                            });
+                        }
+                        if !text_acc.is_empty() {
+                            blocks.push(ContentBlock::Text {
+                                text: std::mem::take(&mut text_acc),
+                            });
+                        }
+                        let _ = tx
+                            .send(AgentEvent::ToolStart {
+                                call_id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            })
+                            .await;
+                        blocks.push(ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                        tool_calls.push((id, name, input));
+                    }
+                    StreamChunk::Usage(u) => {
+                        cumulative_usage.input_tokens += u.input_tokens;
+                        cumulative_usage.output_tokens += u.output_tokens;
+                        cumulative_usage.cache_read_tokens += u.cache_read_tokens;
+                        cumulative_usage.cache_write_tokens += u.cache_write_tokens;
+                        if let Some(ref tracker) = self.config.token_tracker {
+                            tracker.record(&self.config.model, u.input_tokens, u.output_tokens);
+                        }
+                        turn_usage = Some(u.clone());
+                        let _ = tx.send(AgentEvent::UsageUpdate(u)).await;
+                    }
+                    StreamChunk::Done => break,
+                    StreamChunk::Error(e) => {
+                        mid_stream_error = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(e) = mid_stream_error {
+                if tool_calls.is_empty() && retry < MAX_STREAM_RETRIES {
+                    let delay = Backoff {
+                        base_ms: BASE_RETRY_DELAY_MS,
+                        max_attempts: MAX_STREAM_RETRIES + 1,
+                    }
+                    .delay(retry);
+                    tracing::warn!(
+                        "mid-stream error (retry {}/{}, backoff {}ms): {e}",
+                        retry + 1,
+                        MAX_STREAM_RETRIES,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                let _ = tx.send(AgentEvent::Error(e.clone())).await;
+                self.config.record_health(
+                    crate::model_catalog::HealthEventKind::Error,
+                    None,
+                    Some(e.clone()),
+                );
+                return Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Other { status: 0, body: e },
+                ));
+            }
+
+            stream_ok = true;
+            break;
+        }
+
+        if !stream_ok {
+            let _ = tx
+                .send(AgentEvent::Error("stream retries exhausted".into()))
+                .await;
+            self.config.record_health(
+                crate::model_catalog::HealthEventKind::Error,
+                None,
+                Some("stream retries exhausted".into()),
+            );
+            return Err(AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::Other {
+                    status: 0,
+                    body: "stream retries exhausted".into(),
+                },
+            ));
+        }
+
+        if !thinking_acc.is_empty() {
+            blocks.push(ContentBlock::Thinking { text: thinking_acc });
+        }
+        if !text_acc.is_empty() {
+            blocks.push(ContentBlock::Text { text: text_acc });
+        }
+
+        let empty = blocks.is_empty() && tool_calls.is_empty();
+        Ok(TurnStreamOutcome {
+            blocks,
+            tool_calls,
+            turn_usage,
+            empty,
+        })
     }
 
     async fn drain_steers(
