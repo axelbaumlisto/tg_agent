@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 // ── Core engine ─────────────────────────────────────────────────────────────
 pub mod config;
 pub mod cycle_archiver;

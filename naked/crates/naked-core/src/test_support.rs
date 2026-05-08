@@ -1,6 +1,7 @@
 //! Test harness: minimal AgentCore for unit tests.
 //!
 //! `TestCore::build()` creates an AgentCore with:
+#![allow(clippy::unwrap_used)] // test-utility module: panics on misuse are intentional
 //! - In-memory config (no disk)
 //! - NoopProvider (returns empty stream)  
 //! - Temp directory for sessions + research
