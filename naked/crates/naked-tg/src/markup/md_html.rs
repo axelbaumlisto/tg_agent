@@ -543,3 +543,151 @@ mod tests {
         assert_eq!(sanitize_code_lang("a<b>c"), "abc");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based tests for `escape_html` (T13 of
+    //! PLAN_CORE_HARDENING_v2). Telegram HTML parse mode is strict:
+    //! any unescaped `<`/`>`/`&`/`"` in the output silently breaks
+    //! rendering. Properties pin those invariants.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    fn has_raw_html_special(s: &str) -> bool {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '<' | '>' | '"' => return true,
+                '&' => {
+                    let rest: String = chars.clone().take(5).collect();
+                    let ok = rest.starts_with("lt;")
+                        || rest.starts_with("gt;")
+                        || rest.starts_with("amp;")
+                        || rest.starts_with("quot;");
+                    if !ok {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 200,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn output_has_no_raw_specials(input in "\\PC{0,200}") {
+            let escaped = escape_html(&input);
+            prop_assert!(
+                !has_raw_html_special(&escaped),
+                "escape_html left raw HTML specials in output: {escaped:?}"
+            );
+        }
+
+        #[test]
+        fn double_escape_still_safe(input in "\\PC{0,200}") {
+            let once = escape_html(&input);
+            let twice = escape_html(&once);
+            prop_assert!(
+                !has_raw_html_special(&twice),
+                "double escape produced raw specials: {twice:?}"
+            );
+            if once.contains("&lt;") || once.contains("&amp;") {
+                prop_assert!(twice.contains("&amp;"));
+            }
+        }
+
+        #[test]
+        fn safe_alnum_passes_through(input in "[a-zA-Z0-9 ]{0,80}") {
+            prop_assert_eq!(escape_html(&input), input);
+        }
+
+        #[test]
+        fn no_tag_injection(
+            tag in "[a-z]{1,8}",
+            payload in "[a-zA-Z0-9 ]{0,40}",
+        ) {
+            let injected = format!("<{tag}>{payload}</{tag}>");
+            let escaped = escape_html(&injected);
+            prop_assert!(
+                !escaped.contains('<'),
+                "raw '<' survived in: {escaped:?}"
+            );
+            prop_assert!(
+                !escaped.contains('>'),
+                "raw '>' survived in: {escaped:?}"
+            );
+            if !payload.is_empty() {
+                prop_assert!(
+                    escaped.contains(&payload),
+                    "payload {payload:?} lost in escape: {escaped:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! Insta snapshot tests for md_to_tg_html (T12 of
+    //! PLAN_CORE_HARDENING_v2). Pinning the rendering shape so any
+    //! future tweak to the converter trips a visible diff.
+
+    use super::*;
+
+    #[test]
+    fn snapshot_plain_paragraphs() {
+        let md = "First paragraph.\n\nSecond paragraph with *emphasis*.";
+        insta::assert_snapshot!("plain_paragraphs", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_fenced_code_block() {
+        let md =
+            "Here's some code:\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nDone.";
+        insta::assert_snapshot!("fenced_code_block", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_unordered_list_with_emphasis() {
+        let md = "Tasks:\n- buy *milk*\n- read **book**\n- write `code`";
+        insta::assert_snapshot!("unordered_list_with_emphasis", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_link_and_inline_code() {
+        let md = "See [the docs](https://example.com/path?x=1) and run `cargo test`.";
+        insta::assert_snapshot!("link_and_inline_code", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_html_special_chars_escaped() {
+        // `<script>` should be escaped, never survive raw.
+        let md = "Beware: <script>alert(1)</script> & friends \"quoted\".";
+        insta::assert_snapshot!("html_special_chars_escaped", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_blockquote_then_heading() {
+        let md = "> a quoted line\n> another quoted line\n\n## Heading\n\nbody text.";
+        insta::assert_snapshot!("blockquote_then_heading", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_mixed_russian_and_english() {
+        let md = "Привет! Это **тест** с `кодом`.\n\nAlso English: *italic* word.";
+        insta::assert_snapshot!("mixed_russian_and_english", md_to_tg_html(md));
+    }
+
+    #[test]
+    fn snapshot_escape_html_direct() {
+        let s = "5 < 10 && \"quote\" with > sign";
+        insta::assert_snapshot!("escape_html_direct", escape_html(s));
+    }
+}

@@ -1,0 +1,10 @@
+---
+source: crates/naked-tg/src/markup/md_html.rs
+expression: md_to_tg_html(md)
+---
+<blockquote>a quoted line
+another quoted line</blockquote>
+
+<b>Heading</b>
+
+body text.

@@ -129,7 +129,7 @@ impl HostPolicy {
         if host.is_empty() {
             return;
         }
-        let mut inner = self.inner.write().expect("host_policy lock");
+        let mut inner = crate::write_or_recover(&self.inner);
         let state = inner.entry(host).or_default();
         match outcome {
             Outcome::Ok => {
@@ -161,7 +161,7 @@ impl HostPolicy {
     /// Defaults to `Tier::Reqwest` for unknown hosts (current behaviour).
     pub fn recommended_start_tier(&self, url: &str) -> Tier {
         let host = Self::host_of(url);
-        let inner = self.inner.read().expect("host_policy lock");
+        let inner = crate::read_or_recover(&self.inner);
         let Some(state) = inner.get(&host) else {
             return Tier::Reqwest;
         };
@@ -185,7 +185,7 @@ impl HostPolicy {
     /// Snapshot of `(host, tier, ok, fail)` rows for telemetry / debugging.
     /// Cheap clone — operators occasionally want to dump this from the CLI.
     pub fn snapshot(&self) -> Vec<(String, Tier, u32, u32)> {
-        let inner = self.inner.read().expect("host_policy lock");
+        let inner = crate::read_or_recover(&self.inner);
         let mut out = Vec::new();
         for (host, state) in inner.iter() {
             for (tier, stats) in state.tiers.iter() {

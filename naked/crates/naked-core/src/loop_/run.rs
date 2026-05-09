@@ -214,40 +214,18 @@ impl super::AgentLoop {
                     .map(|t| t.effective_permission(&input, &self.config.cwd))
                     .unwrap_or(Permission::Dangerous);
 
-                // Check approval cache before prompting user:
                 let fp = crate::tool::approval_cache::fingerprint(&name, &input);
-                let cached = self.approval_cache.is_approved(&fp);
-
-                let allowed = if cached {
-                    // Previously approved fingerprint — auto-approve.
-                    let _ = tx
-                        .send(AgentEvent::ToolOutput {
-                            call_id: id.clone(),
-                            chunk: format!("\u{2705} auto-approved (cached: {fp})"),
-                        })
-                        .await;
-                    true
-                } else if let Some(ref mut prx) = permission_rx {
-                    let _ = tx
-                        .send(AgentEvent::PermissionRequest {
-                            call_id: id.clone(),
-                            tool_name: name.clone(),
-                            input: input.clone(),
-                            permission: perm,
-                        })
-                        .await;
-                    match prx.recv().await {
-                        Some(resp) if resp.call_id == id => {
-                            if resp.allowed {
-                                self.approval_cache.approve(&fp);
-                            }
-                            resp.allowed
-                        }
-                        _ => false,
-                    }
-                } else {
-                    true
-                };
+                let allowed = super::permission::request_or_cached_approval(
+                    &self.approval_cache,
+                    &fp,
+                    &mut permission_rx,
+                    &id,
+                    &name,
+                    &input,
+                    perm,
+                    &tx,
+                )
+                .await;
 
                 if !allowed {
                     let _ = tx

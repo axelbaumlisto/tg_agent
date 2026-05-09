@@ -1,0 +1,11 @@
+---
+source: crates/naked-tg/src/markup/md_html.rs
+expression: md_to_tg_html(md)
+---
+Here's some code:
+
+<pre><code class="language-rust">fn main() {
+    println!(&quot;hi&quot;);
+}</code></pre>
+
+Done.

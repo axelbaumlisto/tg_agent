@@ -1,0 +1,5 @@
+---
+source: crates/naked-tg/src/markup/md_html.rs
+expression: escape_html(s)
+---
+5 &lt; 10 &amp;&amp; &quot;quote&quot; with &gt; sign

@@ -61,3 +61,83 @@ mod tests {
         assert_eq!(next.format("%H:%M").to_string(), "04:00");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based tests for `next_cron_after` (T13 of
+    //! PLAN_CORE_HARDENING_v2).
+    //!
+    //! Properties:
+    //!   1. **Strict monotonicity**: returned time is always strictly
+    //!      greater than the `after` argument (no fire at the boundary).
+    //!   2. **Stability**: feeding the same `(expr, after)` twice yields
+    //!      identical results.
+    //!   3. **Hourly-cron upper bound**: a `0 * * * *` schedule never
+    //!      returns a time more than 1h+1min into the future, regardless
+    //!      of what `after` falls on.
+    //!   4. **Garbage-in → None**: random non-cron strings return None,
+    //!      not panic.
+
+    use super::*;
+    use chrono::{Duration as ChronoDuration, TimeZone};
+    use proptest::prelude::*;
+
+    /// Generate a UTC time in [2026-01-01, 2030-12-31].
+    fn arb_after() -> impl Strategy<Value = DateTime<Utc>> {
+        // 5 years × ~31.5M seconds ≈ 1.6 × 10^8
+        (0u64..157_680_000u64).prop_map(|secs| {
+            let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            base + ChronoDuration::seconds(secs as i64)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 200,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn strict_monotone_for_any_minute(after in arb_after()) {
+            // "every minute" cron must always fire strictly after `after`.
+            let next = next_cron_after("* * * * *", after).expect("parses");
+            prop_assert!(
+                next > after,
+                "non-monotone: next={next} not > after={after}"
+            );
+        }
+
+        #[test]
+        fn stable_across_calls(after in arb_after()) {
+            let a = next_cron_after("0 4 * * *", after);
+            let b = next_cron_after("0 4 * * *", after);
+            prop_assert_eq!(a, b, "next_cron_after is not pure");
+        }
+
+        #[test]
+        fn hourly_within_1h_1m(after in arb_after()) {
+            let next = next_cron_after("0 * * * *", after).expect("parses");
+            let delta = next - after;
+            prop_assert!(
+                delta <= ChronoDuration::minutes(61),
+                "hourly cron returned {delta:?} into the future (after={after})"
+            );
+            prop_assert!(delta > ChronoDuration::zero());
+        }
+
+        #[test]
+        fn garbage_returns_none_not_panic(garbage in "[a-z!@#$%^&*]{1,30}") {
+            // Anything that is NOT a valid cron must return None
+            // without panicking. The whitespace test below catches
+            // the case where random bytes happen to look like a cron.
+            // We pre-filter obvious cron-like inputs.
+            if garbage.split_whitespace().count() == 5
+                || garbage.split_whitespace().count() == 6
+            {
+                return Ok(());
+            }
+            let after = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+            prop_assert!(next_cron_after(&garbage, after).is_none());
+        }
+    }
+}

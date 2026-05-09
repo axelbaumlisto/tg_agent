@@ -1,0 +1,7 @@
+---
+source: crates/naked-tg/src/markup/md_html.rs
+expression: md_to_tg_html(md)
+---
+Привет! Это <b>тест</b> с <code>кодом</code>.
+
+Also English: <i>italic</i> word.

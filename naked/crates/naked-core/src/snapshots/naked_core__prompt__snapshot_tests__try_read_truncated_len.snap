@@ -1,0 +1,5 @@
+---
+source: crates/naked-core/src/prompt.rs
+expression: "format!(\"{}\", result.len())"
+---
+16000

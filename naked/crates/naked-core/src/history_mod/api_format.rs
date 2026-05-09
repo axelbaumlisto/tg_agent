@@ -1,10 +1,7 @@
 //! Convert conversation history to provider API message format.
 
-#[allow(unused_imports)]
 use super::ContentBlock;
-#[allow(unused_imports)]
 use super::ConversationHistory;
-#[allow(unused_imports)]
 use super::Role;
 
 impl ConversationHistory {

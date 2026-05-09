@@ -1,45 +1,17 @@
 //! Session lifecycle — create, send, queue, fork, restore, close, MCP init.
 
-#[allow(unused_imports)]
-use crate::config::{EffectiveSessionConfig, SessionConfig};
-#[allow(unused_imports)]
+use crate::config::SessionConfig;
 use crate::error::{AgentError, Result};
-#[allow(unused_imports)]
-use crate::history;
-#[allow(unused_imports)]
-use crate::loop_::AgentLoop;
-#[allow(unused_imports)]
-use crate::mcp::client::{McpRegistry, McpServer};
-#[allow(unused_imports)]
+use crate::mcp::client::McpRegistry;
 use crate::memory;
-#[allow(unused_imports)]
 use crate::prompt;
-#[allow(unused_imports)]
-use crate::provider::{self, Provider};
-#[allow(unused_imports)]
 use crate::research;
-#[allow(unused_imports)]
-use crate::session::store::SessionStore;
-#[allow(unused_imports)]
-use crate::session::{Session, SessionMetadata, SessionState, SessionSummary};
-#[allow(unused_imports)]
+use crate::session::{Session, SessionMetadata};
 use crate::skill;
-#[allow(unused_imports)]
 use crate::skill::resolver::SkillResolver;
-#[allow(unused_imports)]
-use crate::tool::registry::ToolRegistry;
-#[allow(unused_imports)]
-use crate::types::{self, AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
-#[allow(unused_imports)]
+use crate::types::{AgentHandle, ContentBlock};
 use crate::{AgentCore, UserPush};
-#[allow(unused_imports)]
 use std::path::Path;
-#[allow(unused_imports)]
-use std::sync::Arc;
-#[allow(unused_imports)]
-use tokio::sync::mpsc;
-#[allow(unused_imports)]
-use tokio_util::sync::CancellationToken;
 
 impl AgentCore {
     /// Record the current author for an upcoming turn. Used by the memory tool

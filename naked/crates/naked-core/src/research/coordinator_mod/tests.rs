@@ -3,6 +3,7 @@ use crate::research::spec::{Finding, ResearchSpec, dedup_hash};
 use crate::research::store_fs::FsResearchStore;
 use crate::types::{AgentEvent, PermissionResponse};
 use async_trait::async_trait;
+use chrono::Utc;
 use tempfile::tempdir;
 use tokio::sync::{Mutex, mpsc};
 

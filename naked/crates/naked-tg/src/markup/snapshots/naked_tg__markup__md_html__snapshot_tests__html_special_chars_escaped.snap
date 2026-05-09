@@ -1,0 +1,5 @@
+---
+source: crates/naked-tg/src/markup/md_html.rs
+expression: md_to_tg_html(md)
+---
+Beware: &lt;script&gt;alert(1)&lt;/script&gt; &amp; friends &quot;quoted&quot;.

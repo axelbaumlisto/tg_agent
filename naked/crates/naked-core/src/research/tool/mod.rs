@@ -26,13 +26,10 @@ use super::store::ResearchStore;
 // suppress the "unused import" lint that fires because mod.rs itself never
 // names them directly.
 #[cfg(test)]
-#[allow(unused_imports)]
 use crate::tool::Tool;
 #[cfg(test)]
-#[allow(unused_imports)]
 use chrono::Utc;
 #[cfg(test)]
-#[allow(unused_imports)]
 use serde_json::json;
 
 mod handlers;

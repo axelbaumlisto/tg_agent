@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::{ChatRequest, Provider};
 use crate::tool::Tool;
-use crate::types::{Permission, Role, ToolSpec};
+use crate::types::{ContentBlock, Permission, Role, SteerMessage, ToolSpec, ToolState};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

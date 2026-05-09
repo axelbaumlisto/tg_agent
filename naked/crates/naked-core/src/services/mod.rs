@@ -7,6 +7,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub mod provider_svc;
+pub mod research_adapter;
+pub mod session_config;
 pub mod session_state;
 
 use async_trait::async_trait;
@@ -18,6 +20,7 @@ use crate::session::SessionSummary;
 use crate::types::{AgentEvent, AgentHandle, TurnUsage};
 
 pub use provider_svc::ProviderService;
+pub use session_config::SessionConfigService;
 
 // ---------------------------------------------------------------------------
 // ProviderResolver — resolving a provider by name

@@ -1,0 +1,8 @@
+---
+source: crates/naked-core/src/prompt.rs
+expression: cleaned
+---
+# AGENTS.md
+# Project Rules
+- always read before editing
+- run cargo fmt

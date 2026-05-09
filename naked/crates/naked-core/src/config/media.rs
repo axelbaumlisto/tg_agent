@@ -1,14 +1,9 @@
 //! Telegram media configuration.
 
-#[allow(unused_imports)]
 use super::ProviderConfig;
-#[allow(unused_imports)]
 use super::expand_env;
-#[allow(unused_imports)]
 use crate::error::Result;
-#[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)]
 use std::collections::HashMap;
 
 /// Runtime settings for Telegram media processing. All sub-sections are

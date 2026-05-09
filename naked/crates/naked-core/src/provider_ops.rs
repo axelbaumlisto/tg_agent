@@ -1,10 +1,7 @@
 //! Provider/model listing. Pure provider queries, no session access.
 
-#[allow(unused_imports)]
 use super::AgentCore;
-#[allow(unused_imports)]
 use super::ProviderInfo;
-#[allow(unused_imports)]
 use super::types;
 
 impl AgentCore {

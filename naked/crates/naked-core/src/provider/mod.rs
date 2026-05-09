@@ -1,8 +1,11 @@
 pub mod anthropic;
 pub mod copilot;
 pub mod error;
+pub mod factory;
 pub mod openai_compat;
 pub mod resilient;
+
+pub use factory::{build_provider_from_config, create_provider};
 
 use std::pin::Pin;
 

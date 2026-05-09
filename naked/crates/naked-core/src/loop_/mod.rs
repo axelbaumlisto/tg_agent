@@ -6,27 +6,20 @@ use crate::tool::registry::ToolRegistry;
 // These are referenced from `loop__tests.rs` and must be in this module's
 // namespace; they are only consumed in test builds.
 #[cfg(test)]
-#[allow(unused_imports)]
 use crate::error::AgentError;
 #[cfg(test)]
-#[allow(unused_imports)]
 use crate::history::ConversationHistory;
 #[cfg(test)]
-#[allow(unused_imports)]
-use crate::types::{
-    AgentEvent, ContentBlock, Permission, PermissionResponse, SteerMessage, StreamChunk, ToolState,
-    TurnUsage,
-};
+use crate::types::{AgentEvent, StreamChunk, TurnUsage};
 #[cfg(test)]
-#[allow(unused_imports)]
 use tokio::sync::mpsc;
 #[cfg(test)]
-#[allow(unused_imports)]
 use tokio_util::sync::CancellationToken;
 
 // Sub-modules (private impls of AgentLoop are split across files)
 mod budget;
 mod cycle;
+mod permission;
 mod run;
 mod steers;
 mod stream_turn;

@@ -1,0 +1,5 @@
+---
+source: crates/naked-tg/src/markup/md_html.rs
+expression: md_to_tg_html(md)
+---
+See <a href="https://example.com/path?x=1">the docs</a> and run <code>cargo test</code>.

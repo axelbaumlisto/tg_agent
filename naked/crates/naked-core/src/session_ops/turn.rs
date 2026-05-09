@@ -1,44 +1,18 @@
 //! Turn dispatch — setup_turn, dispatch_turn, session_mcp_servers, build_tool_registry_for.
 
-#[allow(unused_imports)]
-use crate::config::{EffectiveSessionConfig, SessionConfig};
-#[allow(unused_imports)]
+use crate::config::EffectiveSessionConfig;
 use crate::error::{AgentError, Result};
-#[allow(unused_imports)]
 use crate::history;
-#[allow(unused_imports)]
 use crate::loop_::AgentLoop;
-#[allow(unused_imports)]
-use crate::mcp::client::{McpRegistry, McpServer};
-#[allow(unused_imports)]
-use crate::memory;
-#[allow(unused_imports)]
-use crate::prompt;
-#[allow(unused_imports)]
-use crate::provider::{self, Provider};
-#[allow(unused_imports)]
-use crate::research;
-#[allow(unused_imports)]
-use crate::session::store::SessionStore;
-#[allow(unused_imports)]
-use crate::session::{Session, SessionMetadata, SessionState, SessionSummary};
-#[allow(unused_imports)]
-use crate::skill;
-#[allow(unused_imports)]
-use crate::skill::resolver::SkillResolver;
-#[allow(unused_imports)]
+use crate::mcp::client::McpServer;
+use crate::provider::Provider;
+use crate::session::SessionState;
 use crate::tool::registry::ToolRegistry;
-#[allow(unused_imports)]
-use crate::types::{self, AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
-#[allow(unused_imports)]
+use crate::types::{AgentEvent, AgentHandle, PermissionResponse};
 use crate::{AgentCore, UserPush};
-#[allow(unused_imports)]
 use std::path::Path;
-#[allow(unused_imports)]
 use std::sync::Arc;
-#[allow(unused_imports)]
 use tokio::sync::mpsc;
-#[allow(unused_imports)]
 use tokio_util::sync::CancellationToken;
 
 impl AgentCore {
@@ -341,5 +315,20 @@ impl AgentCore {
         tools.extend(crate::tool::factory::extra_tools(&self.catalog.extra_tool_factories).await);
 
         ToolRegistry::new(tools)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::services::ToolBuilder for AgentCore {
+    async fn build_registry(
+        &self,
+        session_id: &str,
+        effective: &crate::EffectiveSessionConfig,
+        provider: &Arc<dyn crate::provider::Provider>,
+        model: &str,
+        workspace: &Path,
+    ) -> crate::tool::registry::ToolRegistry {
+        self.build_tool_registry_for(session_id, effective, provider, model, workspace)
+            .await
     }
 }

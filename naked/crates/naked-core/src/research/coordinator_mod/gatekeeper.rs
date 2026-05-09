@@ -1,19 +1,12 @@
 //! Gatekeeper / verification logic for research findings.
 
-#[allow(unused_imports)]
 use super::DeadFinding;
-#[allow(unused_imports)]
 use super::FuzzyFingerprint;
-#[allow(unused_imports)]
 use super::GatekeeperVerdict;
-#[allow(unused_imports)]
 use super::ResearchCoordinator;
-#[allow(unused_imports)]
 use crate::error::Result;
 use crate::research::tool::parse_listing_date;
-#[allow(unused_imports)]
 use chrono::Utc;
-#[allow(unused_imports)]
 use std::time::Duration;
 
 impl ResearchCoordinator {

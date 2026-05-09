@@ -190,3 +190,128 @@ mod tests {
         assert!(!is_readonly("rm"));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based tests for `canonical_prefix` (T13 of
+    //! PLAN_CORE_HARDENING_v2). The function must be:
+    //!   1. **Pure**: same input → same output across runs.
+    //!   2. **Lower-cased**: result is always lowercase ASCII.
+    //!   3. **Subset of input**: the result tokens, joined by
+    //!      whitespace, appear (case-insensitively) at the start of
+    //!      the input's positional argv.
+    //!   4. **Flag-stable**: prefixing or suffixing GNU-style `--flag`
+    //!      tokens never changes the output.
+    //!   5. **Idempotent**: feeding the result back yields the result.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Generate a positional command word: lower/upper alpha-ish,
+    /// no spaces, no leading dash. 1–8 chars.
+    fn arb_word() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                Just('a'..='z')
+                    .prop_flat_map(|r| { proptest::sample::select(r.collect::<Vec<_>>()) }),
+                Just('A'..='Z')
+                    .prop_flat_map(|r| { proptest::sample::select(r.collect::<Vec<_>>()) }),
+                Just('0'..='9')
+                    .prop_flat_map(|r| { proptest::sample::select(r.collect::<Vec<_>>()) }),
+            ],
+            1..8usize,
+        )
+        .prop_map(|chars| chars.into_iter().collect::<String>())
+    }
+
+    /// Generate a `--flag` or `-x` style argument.
+    fn arb_flag() -> impl Strategy<Value = String> {
+        prop_oneof![
+            arb_word().prop_map(|w| format!("--{w}")),
+            "[a-z]".prop_map(|c| format!("-{c}")),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 200,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn pure_idempotent(words in proptest::collection::vec(arb_word(), 1..6)) {
+            let cmd = words.join(" ");
+            let p1 = canonical_prefix(&cmd);
+            let p2 = canonical_prefix(&cmd);
+            prop_assert_eq!(&p1, &p2, "canonical_prefix not pure");
+            // Feeding the prefix back yields itself.
+            if !p1.is_empty() {
+                let p3 = canonical_prefix(&p1);
+                prop_assert_eq!(p1, p3, "canonical_prefix not idempotent");
+            }
+        }
+
+        #[test]
+        fn output_is_lowercase(words in proptest::collection::vec(arb_word(), 1..6)) {
+            let cmd = words.join(" ");
+            let p = canonical_prefix(&cmd);
+            prop_assert_eq!(
+                &p,
+                &p.to_lowercase(),
+                "canonical_prefix produced non-lowercase output"
+            );
+        }
+
+        #[test]
+        fn flags_dont_change_prefix(
+            words in proptest::collection::vec(arb_word(), 1..6),
+            flags in proptest::collection::vec(arb_flag(), 0..6),
+        ) {
+            let plain = words.join(" ");
+            let with_flags = {
+                let mut tokens: Vec<String> = Vec::new();
+                tokens.extend(words.iter().cloned());
+                // Sprinkle flags in the middle (after the first word so
+                // we don't try to test what happens when the very first
+                // token is itself a flag — that's a separate case).
+                if tokens.is_empty() {
+                    tokens.extend(flags);
+                } else {
+                    let head = tokens.remove(0);
+                    tokens.splice(0..0, flags.iter().cloned());
+                    tokens.insert(0, head);
+                }
+                tokens.join(" ")
+            };
+            prop_assert_eq!(
+                canonical_prefix(&plain),
+                canonical_prefix(&with_flags),
+                "flags changed canonical_prefix"
+            );
+        }
+
+        #[test]
+        fn output_is_prefix_of_input(
+            words in proptest::collection::vec(arb_word(), 1..6),
+        ) {
+            let cmd = words.join(" ");
+            let p = canonical_prefix(&cmd);
+            if p.is_empty() { return Ok(()); }
+            let lower_cmd = cmd.to_lowercase();
+            // The prefix tokens should match the leading positional tokens
+            // of the input (case-insensitively).
+            let prefix_token_count = p.split_whitespace().count();
+            let head: String = lower_cmd
+                .split_whitespace()
+                .filter(|t| !t.starts_with('-'))
+                .take(prefix_token_count)
+                .collect::<Vec<_>>()
+                .join(" ");
+            prop_assert_eq!(
+                &p,
+                &head,
+                "prefix is not a leading-positional slice of the input"
+            );
+        }
+    }
+}

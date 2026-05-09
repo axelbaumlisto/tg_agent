@@ -1,20 +1,12 @@
 //! Session configuration.
 
-#[allow(unused_imports)]
 use super::AgentError;
-#[allow(unused_imports)]
 use super::Config;
-#[allow(unused_imports)]
 use super::McpServerConfig;
-#[allow(unused_imports)]
 use super::dirs_home;
-#[allow(unused_imports)]
 use crate::error::Result;
-#[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)]
 use std::collections::HashMap;
-#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 
 /// Per-session config override. All fields are optional — missing fields

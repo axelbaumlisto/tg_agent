@@ -1,26 +1,10 @@
 //! Session diagnostics — store, provider_for, list, inspect.
 
-#[allow(unused_imports)]
 use crate::AgentCore;
-#[allow(unused_imports)]
-use crate::config::{EffectiveSessionConfig, SessionConfig};
-#[allow(unused_imports)]
-use crate::error::{AgentError, Result};
-#[allow(unused_imports)]
-use crate::provider::{self, Provider};
-#[allow(unused_imports)]
+use crate::provider::Provider;
+use crate::session::SessionSummary;
 use crate::session::store::SessionStore;
-#[allow(unused_imports)]
-use crate::session::{Session, SessionMetadata, SessionState, SessionSummary};
-#[allow(unused_imports)]
-use crate::skill;
-#[allow(unused_imports)]
 use crate::skill::resolver::SkillResolver;
-#[allow(unused_imports)]
-use crate::types::{self, AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
-#[allow(unused_imports)]
-use std::path::Path;
-#[allow(unused_imports)]
 use std::sync::Arc;
 
 impl AgentCore {

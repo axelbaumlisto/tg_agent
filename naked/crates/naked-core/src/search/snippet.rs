@@ -8,7 +8,7 @@
 //! `homedy.com`, `chotot.com`, and Facebook listings — the dominant
 //! formats observed in the Da Nang corpus.
 
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -46,9 +46,24 @@ const KNOWN_DISTRICTS: &[&str] = &[
 #[derive(Debug, Default, Clone)]
 pub struct SnippetExtractor;
 
-static RE_PRICE: OnceLock<Regex> = OnceLock::new();
-static RE_AREA: OnceLock<Regex> = OnceLock::new();
-static RE_PHONE: OnceLock<Regex> = OnceLock::new();
+// Static regex literals — compile once on first use. Using `LazyLock`
+// instead of `OnceLock + .expect("static regex")` removes panic
+// branches: a malformed literal would now fail at first call rather than
+// being unwrap-deferred, but since the literals are integration-tested
+// below the practical effect is identical and the prod code is
+// `.expect`-free (DRY: T8 of PLAN_CORE_HARDENING_v2).
+static RE_PRICE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(\d+(?:[.,]\d+)?)\s*(triệu|tr|tỷ|ty|million|billion|usd|\$|vnd|vnđ|đ)\b")
+        .expect("RE_PRICE static regex literal")
+});
+static RE_AREA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(\d{2,5})\s*m\s*(?:²|2|\bvuông\b|\bvuong\b)")
+        .expect("RE_AREA static regex literal")
+});
+static RE_PHONE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:\+?84[\s.-]?|0)((?:3|5|7|8|9)\d(?:[\s.-]?\d){7,8})")
+        .expect("RE_PHONE static regex literal")
+});
 
 impl SnippetExtractor {
     pub fn new() -> Self {
@@ -78,13 +93,7 @@ impl SnippetExtractor {
     /// - `usd` / `$`                 → ×24_500 (USD/VND ≈ 2026 spot)
     /// - `vnd` / `đ` / `vnđ`         → ×1
     pub fn extract_price(&self, s: &str) -> Option<u64> {
-        let re = RE_PRICE.get_or_init(|| {
-            Regex::new(
-                r"(?i)(\d+(?:[.,]\d+)?)\s*(triệu|tr|tỷ|ty|million|billion|usd|\$|vnd|vnđ|đ)\b",
-            )
-            .expect("static regex")
-        });
-        let cap = re.captures(s)?;
+        let cap = RE_PRICE.captures(s)?;
         let n: f64 = cap[1].replace(',', ".").parse().ok()?;
         let unit = cap[2].to_lowercase();
         let mult: u64 = match unit.as_str() {
@@ -99,10 +108,7 @@ impl SnippetExtractor {
 
     /// Parse area in m² (m2 / m vuông / mét vuông variants).
     pub fn extract_area(&self, s: &str) -> Option<u32> {
-        let re = RE_AREA.get_or_init(|| {
-            Regex::new(r"(?i)(\d{2,5})\s*m\s*(?:²|2|\bvuông\b|\bvuong\b)").expect("static regex")
-        });
-        re.captures(s).and_then(|c| c[1].parse().ok())
+        RE_AREA.captures(s).and_then(|c| c[1].parse().ok())
     }
 
     pub fn extract_district(&self, s: &str) -> Option<String> {
@@ -119,11 +125,7 @@ impl SnippetExtractor {
     /// - 09xxxxxxxx, 03xxxxxxxx, 07xxxxxxxx, 08xxxxxxxx, 05xxxxxxxx
     /// - +84 prefix, with optional space/dot separators.
     pub fn extract_phone(&self, s: &str) -> Option<String> {
-        let re = RE_PHONE.get_or_init(|| {
-            Regex::new(r"(?:\+?84[\s.-]?|0)((?:3|5|7|8|9)\d(?:[\s.-]?\d){7,8})")
-                .expect("static regex")
-        });
-        let cap = re.captures(s)?;
+        let cap = RE_PHONE.captures(s)?;
         let digits: String = cap[1].chars().filter(|c| c.is_ascii_digit()).collect();
         Some(format!("0{}", digits))
     }

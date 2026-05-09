@@ -1,12 +1,8 @@
 //! Event drain loop + per-run statistics for research coordinator.
 
-#[allow(unused_imports)]
 use super::AgentEvent;
-#[allow(unused_imports)]
 use super::AgentHandle;
-#[allow(unused_imports)]
 use super::CancellationToken;
-#[allow(unused_imports)]
 use super::StopReason;
 
 #[derive(Default)]

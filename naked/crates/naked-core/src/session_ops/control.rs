@@ -1,44 +1,13 @@
 //! Session control — abort, compact_session, compaction pipeline.
 
-#[allow(unused_imports)]
-use crate::config::{EffectiveSessionConfig, SessionConfig};
-#[allow(unused_imports)]
+use crate::AgentCore;
+use crate::config::EffectiveSessionConfig;
 use crate::error::{AgentError, Result};
-#[allow(unused_imports)]
-use crate::history;
-#[allow(unused_imports)]
-use crate::loop_::AgentLoop;
-#[allow(unused_imports)]
-use crate::mcp::client::{McpRegistry, McpServer};
-#[allow(unused_imports)]
 use crate::memory;
-#[allow(unused_imports)]
-use crate::prompt;
-#[allow(unused_imports)]
 use crate::provider::{self, Provider};
-#[allow(unused_imports)]
-use crate::research;
-#[allow(unused_imports)]
-use crate::session::store::SessionStore;
-#[allow(unused_imports)]
-use crate::session::{Session, SessionMetadata, SessionState, SessionSummary};
-#[allow(unused_imports)]
-use crate::skill;
-#[allow(unused_imports)]
-use crate::skill::resolver::SkillResolver;
-#[allow(unused_imports)]
-use crate::tool::registry::ToolRegistry;
-#[allow(unused_imports)]
-use crate::types::{self, AgentEvent, AgentHandle, ContentBlock, PermissionResponse};
-#[allow(unused_imports)]
-use crate::{AgentCore, UserPush};
-#[allow(unused_imports)]
-use std::path::Path;
-#[allow(unused_imports)]
-use std::sync::Arc;
-#[allow(unused_imports)]
+use crate::session::SessionState;
+use crate::types::{self, AgentEvent};
 use tokio::sync::mpsc;
-#[allow(unused_imports)]
 use tokio_util::sync::CancellationToken;
 
 impl AgentCore {
@@ -350,6 +319,46 @@ Keep each section concise. Preserve exact paths and identifiers.";
                     tracing::warn!(session = session_id, "post-compaction GC failed: {e}");
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentCore;
+
+    #[test]
+    fn compaction_prompt_fresh_has_format_instructions() {
+        let prompt = AgentCore::compaction_prompt(None);
+        assert!(prompt.contains("## Goal"), "missing Goal section");
+        assert!(prompt.contains("## Progress"), "missing Progress section");
+        assert!(
+            prompt.contains("Summarize"),
+            "missing Summarize instruction"
+        );
+        assert!(!prompt.contains("<previous-summary>"));
+    }
+
+    #[test]
+    fn compaction_prompt_with_previous_includes_it() {
+        let prompt = AgentCore::compaction_prompt(Some("old summary here"));
+        assert!(prompt.contains("<previous-summary>"));
+        assert!(prompt.contains("old summary here"));
+        assert!(prompt.contains("Update the existing summary"));
+        assert!(prompt.contains("## Goal"));
+    }
+
+    #[test]
+    fn compaction_format_has_all_sections() {
+        let fmt = AgentCore::COMPACTION_FORMAT;
+        for section in [
+            "## Goal",
+            "## Progress",
+            "### Done",
+            "### In Progress",
+            "## Next Steps",
+        ] {
+            assert!(fmt.contains(section), "missing {section}");
         }
     }
 }
