@@ -1,6 +1,12 @@
 //! CLI research subcommands.
 
-use super::*;
+use std::sync::Arc;
+
+use anyhow::Result;
+use naked_core::AgentCore;
+use naked_core::config::Config;
+
+use crate::commands::arg_values;
 
 pub(crate) async fn research_cmd(args: &[String]) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("help");

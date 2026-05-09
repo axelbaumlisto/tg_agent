@@ -3,6 +3,8 @@ name = "naked-cli"
 version.workspace = true
 edition.workspace = true
 
+default-run = "naked"
+
 [[bin]]
 name = "naked"
 path = "src/main.rs"
