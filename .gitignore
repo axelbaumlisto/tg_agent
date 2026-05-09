@@ -19,3 +19,4 @@
 /naked/data/research_runs/
 /naked/results/autopilot/_logs/
 *.runlog
+STATUS.txt
