@@ -698,8 +698,13 @@ async fn t62_emergency_compaction_then_continue_working() {
             self.captured_requests.lock().unwrap().push(request);
             match n {
                 0 => {
-                    Err(naked_core::error::AgentError::Provider(
-                        "OpenAI API 400 Bad Request: {\"error\":{\"message\":\"The prompt is too long: 1039163, model maximum context length: 202751\"}}".into()
+                    // After T3 (typed ProviderError::ContextWindowExceeded), loop_ matches
+                    // on the typed variant rather than substring-sniffing the error string.
+                    // Emit the typed CWE directly so emergency compaction triggers.
+                    Err(naked_core::error::AgentError::ProviderTyped(
+                        naked_core::provider::error::ProviderError::ContextWindowExceeded {
+                            message: "The prompt is too long: 1039163, model maximum context length: 202751".into()
+                        }
                     ))
                 }
                 1 => {
