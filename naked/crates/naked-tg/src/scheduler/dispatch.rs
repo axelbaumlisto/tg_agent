@@ -89,7 +89,7 @@ pub(crate) async fn scan_and_dispatch(
 ) -> anyhow::Result<()> {
     let store = core.research_store();
     let specs = store.list_specs().await?;
-    let now = Utc::now();
+    let now = config.clock.now();
 
     // ── Sweep phase: free slots from completed / timed-out runs ────────────
     sweep_running(state, notifier, &specs, config, &store, Some(core)).await;

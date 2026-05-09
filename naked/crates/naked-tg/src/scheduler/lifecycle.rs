@@ -124,7 +124,7 @@ pub(crate) async fn purge_terminal_inflight_now(
         }
     };
     match store
-        .purge_terminal_inflight(chrono::Utc::now(), retention)
+        .purge_terminal_inflight(config.clock.now(), retention)
         .await
     {
         Ok(0) => {}

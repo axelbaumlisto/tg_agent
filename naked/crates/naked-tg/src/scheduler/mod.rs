@@ -51,11 +51,13 @@ use crate::cron_util::next_cron_after;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
+mod clock;
 mod dispatch;
 mod lifecycle;
 mod tasks;
 
 // Public re-exports for external tests and other crates
+pub use clock::{Clock, RealClock};
 pub use dispatch::{is_due, plan_dispatches};
 
 /// Configuration knobs for [`ResearchScheduler`]. Defaults match the prod TG
@@ -133,6 +135,9 @@ pub struct SchedulerConfig {
     /// `Duration::ZERO` (or `inflight_terminal_retention == ZERO`)
     /// disables the periodic purge entirely.
     pub inflight_purge_interval: Duration,
+    /// Time source used by the scheduler. Defaults to [`RealClock`] (wall
+    /// clock). Override with a `MockClock` in tests for deterministic time.
+    pub clock: std::sync::Arc<dyn Clock>,
 }
 
 impl Default for SchedulerConfig {
@@ -152,6 +157,7 @@ impl Default for SchedulerConfig {
             cancel_grace_period: Duration::from_secs(30),
             inflight_terminal_retention: Duration::from_secs(14 * 24 * 60 * 60),
             inflight_purge_interval: Duration::from_secs(60 * 60),
+            clock: std::sync::Arc::new(RealClock),
         }
     }
 }

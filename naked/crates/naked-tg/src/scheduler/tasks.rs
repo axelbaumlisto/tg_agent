@@ -280,7 +280,7 @@ pub(crate) async fn sweep_running(
     // way past budget but the in-memory `running` map doesn't know
     // about them (e.g. previous process died and the boot
     // resurrection somehow missed it). Finalise as Failed.
-    let now = Utc::now();
+    let now = config.clock.now();
     let budget = chrono::Duration::from_std(config.heartbeat_budget)
         .unwrap_or_else(|_| chrono::Duration::seconds(120));
     let running_ids: HashSet<String> = state.lock().await.running.keys().cloned().collect();
@@ -358,7 +358,7 @@ pub(crate) async fn apply_outcome(
             let mut s = state.lock().await;
             s.failures.remove(&spec.id);
             s.alerted.remove(&spec.id);
-            s.last_runs.insert(spec.id.clone(), Utc::now());
+            s.last_runs.insert(spec.id.clone(), cfg.clock.now());
             (FailurePolicy::Quiet, String::new())
         }
         RunOutcome::Failure(msg) => {

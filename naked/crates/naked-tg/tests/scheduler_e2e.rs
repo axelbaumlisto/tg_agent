@@ -35,7 +35,7 @@ use naked_core::config::{Config, ResearchConfig};
 use naked_core::provider::{ChatRequest, Provider};
 use naked_core::research::{FsResearchStore, ResearchSpec, ResearchStore};
 use naked_core::types::{ModelInfo, StreamChunk};
-use naked_tg::research_scheduler::{is_due, plan_dispatches};
+use naked_tg::research_scheduler::{Clock, is_due, plan_dispatches};
 use tempfile::TempDir;
 use tokio_stream::Stream;
 
@@ -89,6 +89,29 @@ impl Provider for DummyProvider {
     }
 }
 
+/// Deterministic clock for use in integration tests.
+///
+/// Starts at a fixed moment in time; never advances on its own.
+/// Tests that need time to pass call [`MockClock::advance`] explicitly.
+#[derive(Debug)]
+struct MockClock {
+    fixed: std::sync::Mutex<chrono::DateTime<chrono::Utc>>,
+}
+
+impl MockClock {
+    fn new(t: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            fixed: std::sync::Mutex::new(t),
+        }
+    }
+}
+
+impl Clock for MockClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.fixed.lock().unwrap()
+    }
+}
+
 fn make_core(tmp: &TempDir) -> Arc<AgentCore> {
     let cfg = Config {
         workspace: tmp.path().to_path_buf(),
@@ -96,6 +119,12 @@ fn make_core(tmp: &TempDir) -> Arc<AgentCore> {
         research: ResearchConfig {
             enabled: true,
             storage_dir: Some(tmp.path().join("research")),
+            // Disable auto_first_run so create_research does NOT set run_at.
+            // If run_at is set to the creation instant, the is_due run_at
+            // trigger fires in plan_dispatches because last_run (= now-60s)
+            // pre-dates run_at (= creation time ≈ now-epsilon), causing
+            // t_reschedule_replaces_interval to fail non-deterministically.
+            auto_first_run: false,
             ..Default::default()
         },
         ..Default::default()
@@ -164,7 +193,22 @@ async fn t_reschedule_replaces_interval() {
     let tmp = TempDir::new().expect("tempdir");
     let core = make_core(&tmp);
 
+    // Use a fixed, deterministic "now" so the test never races against
+    // the real wall clock.  MockClock is defined locally in this file;
+    // the scheduler's Clock trait is public via research_scheduler.
+    let clock = MockClock::new(
+        chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+    );
+    let now = clock.now();
+
     // Start: long interval, recent run → not due.
+    // make_core sets auto_first_run=false so create_research leaves run_at=None;
+    // without that, the run_at one-shot trigger would fire here and cause a
+    // spurious "spec is due" result (the is_due run_at check fires when
+    // last_run < run_at, which is always true when last_run = now-60s and
+    // run_at = creation-time ≈ now-epsilon).
     let spec = core
         .create_research("rolling daily refresh", vec![], None, None, None)
         .await
@@ -178,7 +222,6 @@ async fn t_reschedule_replaces_interval() {
         .await
         .expect("set initial interval");
 
-    let now = Utc::now();
     let mut last_runs = HashMap::new();
     last_runs.insert(id.clone(), now - ChronoDuration::seconds(60));
 
