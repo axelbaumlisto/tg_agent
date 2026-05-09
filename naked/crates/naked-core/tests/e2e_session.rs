@@ -745,17 +745,15 @@ async fn t62_emergency_compaction_then_continue_working() {
                         StreamChunk::Done,
                     ])))
                 }
-                _ => {
-                    Ok(Box::pin(tokio_stream::iter(vec![
-                        StreamChunk::Text("Done! File created and verified after compaction.".into()),
-                        StreamChunk::Usage(naked_core::types::TurnUsage {
-                            input_tokens: 700,
-                            output_tokens: 20,
-                            ..Default::default()
-                        }),
-                        StreamChunk::Done,
-                    ])))
-                }
+                _ => Ok(Box::pin(tokio_stream::iter(vec![
+                    StreamChunk::Text("Done! File created and verified after compaction.".into()),
+                    StreamChunk::Usage(naked_core::types::TurnUsage {
+                        input_tokens: 700,
+                        output_tokens: 20,
+                        ..Default::default()
+                    }),
+                    StreamChunk::Done,
+                ]))),
             }
         }
     }

@@ -47,7 +47,19 @@ impl SearchEngine for DdgEngine {
         let resp = self
             .client
             .get(&url)
-            .header("User-Agent", "Mozilla/5.0 (compatible; NakedBot/1.0)")
+            // Realistic browser UA: DuckDuckGo's anti-bot defaults serve a
+            // CAPTCHA wall ("Select all squares containing a duck") to any
+            // bot-shaped User-Agent. Pose as a current Firefox on Linux so
+            // the html endpoint returns actual `result__a` markup.
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            )
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.5")
             .send()
             .await
             .map_err(|e| format!("ddg: request error: {e}"))?;
