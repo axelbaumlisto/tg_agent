@@ -187,9 +187,10 @@ impl McpTransport for MockTransport {
         self.sent.lock().await.push(req.clone());
         let mut responses = self.responses.lock().await;
         if responses.is_empty() {
-            Err(AgentError::Provider(
-                "MockTransport: no more responses".into(),
-            ))
+            Err(AgentError::ProviderTyped(ProviderError::Other {
+                status: 0,
+                body: "MockTransport: no more responses".into(),
+            }))
         } else {
             Ok(responses.remove(0))
         }

@@ -436,8 +436,11 @@ mod tests {
             &self,
             _request: ChatRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
-            Err(AgentError::Provider(
-                "OpenAI API 402 Payment Required: {\"error\":{\"message\":\"membership not active\"}}".to_string()
+            Err(AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::PaymentRequired {
+                    status: 402,
+                    body: "OpenAI API 402 Payment Required: {\"error\":{\"message\":\"membership not active\"}}".into(),
+                },
             ))
         }
     }
@@ -514,8 +517,11 @@ mod tests {
             &self,
             _request: ChatRequest,
         ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
-            Err(AgentError::Provider(
-                "OpenAI API 404 Not Found: model_not_found".into(),
+            Err(AgentError::ProviderTyped(
+                crate::provider::error::ProviderError::ModelNotFound {
+                    model: "test".into(),
+                    body: "OpenAI API 404 Not Found: model_not_found".into(),
+                },
             ))
         }
     }
