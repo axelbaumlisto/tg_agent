@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 //! Library surface of `naked-tg`.
 //!
 //! The Telegram bot itself lives in `main.rs`; this lib only re-exports the
