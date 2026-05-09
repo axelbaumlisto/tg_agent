@@ -57,13 +57,26 @@ tg_agent/
 ```bash
 cd naked
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p naked-core --lib                # ~40s, must be green
+cargo test -p naked-tg --lib                  # ~1s, must be green
+cargo test -p naked-core --test loop_golden   # 8 golden tests, must be green
 cargo build --release           # produces target/release/{naked,naked-tg}
 ```
 
-Pre-commit must pass `cargo fmt + clippy -D warnings + cargo test`
-for the Rust workspace.
+Pre-commit must pass `cargo fmt + clippy --workspace -D warnings` and the
+three targeted test commands above.
+
+**Avoid `cargo test --workspace` in pre-commit.** It includes ~30 minutes
+of live-LLM/live-DDG e2e tests (`t89_deep_research_full_cycle`,
+`live_todo_tool` in `plan_v9_live_e2e`, etc.) that are stochastic and
+depend on external services. Run them deliberately when needed:
+
+```bash
+cargo test -p naked-core --test e2e_provider   # live LLM, ~15min
+cargo test -p naked-core --test plan_v9_live_e2e -- --test-threads=1
+cargo test -p naked-core --test e2e_core       # includes DDG fallback
+```
 
 ## Push targets
 
@@ -81,6 +94,10 @@ naked/scripts/export_github_sanitized.sh
   absolute paths in `naked/ops/{systemd,cron}/`, the installed user
   service, and the active crontab. Keep those in sync with your local
   install path.
+- **Never run `naked-tg` binary while the systemd service is active.**
+  The pid-lock will kill the running daemon. Always
+  `systemctl --user stop naked-tg.service` first if you need to invoke
+  the binary directly (including `--help`).
 - **Don't hand-edit between `# BEGIN naked/research_tick` markers** in
   the user crontab — regenerate via
   `make -C naked/ops/cron install-cron`.
@@ -102,3 +119,41 @@ naked/scripts/export_github_sanitized.sh
 `OPERATIONS.md` lists the optional sibling services used by a typical
 deployment. They are referenced via URLs / docs / comments only; do not
 commit host-local filesystem dependencies, secrets, or chat IDs.
+
+## Multi-agent workflow (proven 2026-05-08–2026-05-09)
+
+Large architectural batches (T1-T26 across two waves, score 8.7 → 9.6)
+were executed by parallel pi-subagents on `claude-sonnet-4-6`. Patterns
+that worked, encoded for future batches:
+
+- **Compact prompts (1-2 KB).** Reference the plan file from the
+  worktree (`naked/docs/PLAN_*.md`) for templates and anti-footgun
+  lists rather than re-pasting them. Long prompts (3-5 KB) cause
+  workers to die after 1 commit due to context-budget exhaustion.
+- **Worktrees + named-paths only.** Each task gets its own
+  `git worktree add /tmp/agents/<slug>` from current `main`. **Never**
+  `git add -A` from worktree root — it pulls in `target/` (one v1
+  worker accidentally committed 2456 build artifacts).
+- **Targeted test commands.** Workers use `cargo test -p <crate> --test
+  <name>` and `-p <crate> --lib`, never `--workspace` (see Commands
+  section).
+- **Pre-flight scout-surveys.** Read-only `scout` agents with
+  `subagent({async: true})` produce inventories (line numbers, risk
+  registers) before workers touch code. Saved hours on T2/T3/T4/T11/T12.
+- **`#[allow(clippy::...)]` only at module scope** of test-utility
+  files (rationale required) or `#[cfg_attr(test, allow(...))]` on
+  test functions. Function-level prod allows are instant reject.
+- **Continuation pattern when worker dies mid-task.** Compact
+  follow-up prompt referencing the killed worker's last commit:
+  "Step 1 already in commit `<sha>`. Your job is just X." Saved T2,
+  T3, T4 from manual recovery.
+- **`needsAttentionAfterMs` override.** Set 600s (or 900s for heavy
+  cargo cycles) on `subagent({control: {needsAttentionAfterMs: ...}})`
+  to suppress 60-second false alarms during compilation.
+
+Full lessons in [`naked/docs/postmortems/`](naked/docs/postmortems/);
+plan templates in [`naked/docs/done/`](naked/docs/done/) for shape
+reference. The plan-as-contract structure (`§ 0` pre-flight, `§ 3`
+shared SPLIT TEMPLATE, `§ 4` per-task with acceptance one-liners,
+`§ 6` instant-reject anti-patterns) is the recommended template for
+future batches.
