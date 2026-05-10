@@ -43,8 +43,21 @@ impl SnapshotRepo {
         let git_dir = super::paths::snapshot_git_dir(workspace)
             .ok_or_else(|| "cannot resolve snapshot dir (no $HOME?)".to_string())?;
         if !git_dir.exists() {
-            std::fs::create_dir_all(&git_dir).map_err(|e| format!("create snapshot dir: {e}"))?;
-            Self::run_git(&git_dir, workspace, &["init", "--bare", "--quiet"])?;
+            if let Some(parent) = git_dir.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create snapshot parent dir: {e}"))?;
+            }
+            // `git init` doesn't accept `--git-dir` / `--work-tree`
+            // — pass target as positional. Subsequent commands use
+            // the standard `--git-dir + --work-tree` pair.
+            let init = Command::new("git")
+                .args(["init", "--bare", "--quiet"])
+                .arg(&git_dir)
+                .status()
+                .map_err(|e| format!("git init: {e}"))?;
+            if !init.success() {
+                return Err(format!("git init exited {init}"));
+            }
             Self::run_git(&git_dir, workspace, &["config", "gc.auto", "0"])?;
             Self::run_git(
                 &git_dir,
@@ -140,13 +153,16 @@ impl SnapshotRepo {
 
     /// Internal: run `git` with `--git-dir` + `--work-tree`.
     fn run_git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> Result<(), String> {
-        let status = Command::new("git")
-            .args([
-                "--git-dir",
-                &git_dir.to_string_lossy(),
-                "--work-tree",
-                &work_tree.to_string_lossy(),
-            ])
+        // `config` doesn't need `--work-tree`. Other commands do (we
+        // use a bare repo + external work-tree, which only works when
+        // both are set).
+        let needs_work_tree = !matches!(args.first().copied(), Some("config"));
+        let mut cmd = Command::new("git");
+        cmd.args(["--git-dir", &git_dir.to_string_lossy()]);
+        if needs_work_tree {
+            cmd.args(["--work-tree", &work_tree.to_string_lossy()]);
+        }
+        let status = cmd
             .args(args)
             .status()
             .map_err(|e| format!("git {args:?}: {e}"))?;

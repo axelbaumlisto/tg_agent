@@ -33,6 +33,36 @@ impl SkillResolver {
         Self { roots }
     }
 
+    /// T9 of PLAN_QUALITY_v1 — build a resolver that augments the
+    /// user-configured roots with ecosystem-shared paths (Claude
+    /// Code, Agents SDK). Walks parent dirs from `cwd` up to root
+    /// looking for `.claude/skills/` and `.agents/skills/`, then
+    /// appends global `~/.claude/skills/` and `~/.agents/skills/`.
+    /// User roots take precedence (declared first); a duplicate
+    /// skill name resolves to the user-owned copy.
+    #[must_use]
+    pub fn with_ecosystem_paths(mut user_roots: Vec<PathBuf>, cwd: &std::path::Path) -> Self {
+        let mut walker = Some(cwd.to_path_buf());
+        while let Some(d) = walker {
+            for sub in [".claude/skills", ".agents/skills"] {
+                let candidate = d.join(sub);
+                if candidate.is_dir() {
+                    user_roots.push(candidate);
+                }
+            }
+            walker = d.parent().map(|p| p.to_path_buf());
+        }
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            for sub in [".claude/skills", ".agents/skills"] {
+                let candidate = home.join(sub);
+                if candidate.is_dir() {
+                    user_roots.push(candidate);
+                }
+            }
+        }
+        Self { roots: user_roots }
+    }
+
     /// Resolve a skill name to its disk path. Searches roots in
     /// declaration order; within each root tries exact then
     /// case-insensitive directory match. Inside the matched directory
