@@ -746,6 +746,13 @@ pub(crate) fn build_loop_config(
         cycle_archiver: std::sync::Arc::new(crate::cycle_archiver::FsCycleArchiver {
             data_dir: session_dir.to_path_buf(),
         }),
+        // T2/T5/T6 wiring (PLAN_QUALITY_v1): None by default. The
+        // builder caller (AgentCore::compact_and_prepare and friends)
+        // overrides these from the agent config when the operator
+        // opts in.
+        lsp: None,
+        lifecycle_hooks: None,
+        permissions: None,
     }
 }
 

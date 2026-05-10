@@ -76,6 +76,22 @@ pub struct LoopConfig {
     pub observer: std::sync::Arc<dyn LoopObserver>,
     /// Archiver for completed cycle messages (DIP). Defaults to [`NoopCycleArchiver`].
     pub cycle_archiver: std::sync::Arc<dyn crate::cycle_archiver::CycleArchiver>,
+    /// Optional LSP manager. When attached, the loop calls
+    /// `diagnostics_for(workspace, path)` after every successful
+    /// edit_file/apply_patch/write_file and pushes the rendered
+    /// block as a synthetic system message before the next request.
+    /// `None` disables the post-edit hook (zero overhead). Wiring
+    /// for T2 of `PLAN_QUALITY_v1.md`.
+    pub lsp: Option<std::sync::Arc<crate::lsp::LspManager>>,
+    /// Optional lifecycle hook runner. When attached, the loop
+    /// fires PreToolUse/PostToolUse/PermissionRequest events to
+    /// any user-configured shell-out hooks. T6 of
+    /// `PLAN_QUALITY_v1.md`.
+    pub lifecycle_hooks: Option<std::sync::Arc<crate::lifecycle_hooks::LifecycleHookRunner>>,
+    /// Optional permission ruleset. When attached, the loop's
+    /// approval flow consults `Ruleset::evaluate(tool, target)`
+    /// before surfacing a UI prompt. T5 of `PLAN_QUALITY_v1.md`.
+    pub permissions: Option<std::sync::Arc<tokio::sync::RwLock<crate::permissions::Ruleset>>>,
 }
 
 impl Default for LoopConfig {
@@ -97,6 +113,9 @@ impl Default for LoopConfig {
             working_set: None,
             observer: std::sync::Arc::new(TracingObserver),
             cycle_archiver: std::sync::Arc::new(crate::cycle_archiver::NoopCycleArchiver),
+            lsp: None,
+            lifecycle_hooks: None,
+            permissions: None,
         }
     }
 }

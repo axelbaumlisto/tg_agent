@@ -39,6 +39,7 @@ pub(super) async fn request_or_cached_approval(
     input: &serde_json::Value,
     perm: Permission,
     tx: &mpsc::Sender<AgentEvent>,
+    permissions: Option<&std::sync::Arc<tokio::sync::RwLock<crate::permissions::Ruleset>>>,
 ) -> bool {
     if cache.is_approved(fingerprint) {
         let _ = tx
@@ -48,6 +49,40 @@ pub(super) async fn request_or_cached_approval(
             })
             .await;
         return true;
+    }
+
+    // T5 of PLAN_QUALITY_v1: pattern-rule check before UI prompt.
+    // Allow → bypass + cache. Deny → reject without prompting.
+    // Ask → fall through to existing flow.
+    if let Some(rs_lock) = permissions {
+        let target = input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| input.get("command").and_then(serde_json::Value::as_str))
+            .unwrap_or("");
+        let action = rs_lock.read().await.evaluate(tool_name, target);
+        match action {
+            crate::permissions::Action::Allow => {
+                cache.approve(fingerprint);
+                let _ = tx
+                    .send(AgentEvent::ToolOutput {
+                        call_id: call_id.to_string(),
+                        chunk: format!("\u{2705} auto-approved by rule for `{tool_name}`"),
+                    })
+                    .await;
+                return true;
+            }
+            crate::permissions::Action::Deny => {
+                let _ = tx
+                    .send(AgentEvent::ToolOutput {
+                        call_id: call_id.to_string(),
+                        chunk: format!("\u{274c} denied by rule for `{tool_name}` on `{target}`"),
+                    })
+                    .await;
+                return false;
+            }
+            crate::permissions::Action::Ask => {}
+        }
     }
 
     let Some(prx) = permission_rx.as_mut() else {
@@ -108,6 +143,7 @@ mod tests {
             &json!({"cmd":"ls"}),
             Permission::Dangerous,
             &tx,
+            None,
         )
         .await;
         assert!(allowed);
@@ -134,6 +170,7 @@ mod tests {
             &json!({}),
             Permission::Dangerous,
             &tx,
+            None,
         )
         .await;
         assert!(allowed);
@@ -170,6 +207,7 @@ mod tests {
             &json!({"file":"a.rs"}),
             Permission::Dangerous,
             &tx,
+            None,
         )
         .await;
         approver.await.unwrap();
@@ -207,6 +245,7 @@ mod tests {
             &json!({}),
             Permission::Dangerous,
             &tx,
+            None,
         )
         .await;
         denier.await.unwrap();
@@ -246,6 +285,7 @@ mod tests {
             &json!({}),
             Permission::Dangerous,
             &tx,
+            None,
         )
         .await;
         prankster.await.unwrap();

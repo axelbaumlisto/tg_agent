@@ -85,7 +85,10 @@ impl Tool for SubAgentTool {
             name: "sub_agent".into(),
             description: "Delegate a task to a child agent that can use tools independently. \
                           Use for exploration, analysis, or isolated subtasks. \
-                          The child agent runs with its own context and returns a text result."
+                          The child agent runs with its own context and returns a text result. \
+                          Mode picks the role posture: explore (read-only mapping), \
+                          plan (strategy, no edits), review (read+grade), implementer \
+                          (focused edit), verifier (test runner), general (default)."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -96,8 +99,7 @@ impl Tool for SubAgentTool {
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["explore", "general"],
-                        "description": "explore = read-only tools only (safe); general = full tool set (default: explore)"
+                        "description": "Sub-agent role posture. Accepted: general/explore/plan/review/implementer/verifier/custom (case-insensitive aliases supported: worker, explorer, planning, code-review, builder, tester). Default: explore."
                     }
                 },
                 "required": ["prompt"]
@@ -111,8 +113,14 @@ impl Tool for SubAgentTool {
             .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or("explore");
-        match mode {
-            "general" => Permission::WorkspaceWrite,
+        // T10 of PLAN_QUALITY_v1: route through canonical role
+        // taxonomy. Roles that write files get WorkspaceWrite;
+        // read-only postures stay ReadOnly. Unknown role names
+        // fall back to ReadOnly (safe default).
+        match crate::agent_role::canonicalize_role(mode) {
+            Some(crate::agent_role::CanonicalRole::General)
+            | Some(crate::agent_role::CanonicalRole::Implementer)
+            | Some(crate::agent_role::CanonicalRole::Custom) => Permission::WorkspaceWrite,
             _ => Permission::ReadOnly,
         }
     }

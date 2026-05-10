@@ -262,6 +262,34 @@ impl super::AgentLoop {
                 // Drain steer messages between sequential tool calls.
                 steer.drain(&mut steer_rx, history, &tx).await;
 
+                // T6 of PLAN_QUALITY_v1: PreToolUse hook. If a hook
+                // is configured to abort on this (tool, input) pair,
+                // skip the call and emit a synthetic ToolEnd with
+                // an error so the model sees what happened.
+                if let Some(hooks) = &self.config.lifecycle_hooks {
+                    let key = format!("{name}:{input}");
+                    let path_var = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let outcome = hooks
+                        .run(
+                            crate::lifecycle_hooks::HookEvent::PreToolUse,
+                            &key,
+                            &[("tool", &name), ("path", path_var)],
+                        )
+                        .await;
+                    if outcome == crate::lifecycle_hooks::HookOutcome::FailedAbort {
+                        let _ = tx
+                            .send(AgentEvent::ToolEnd {
+                                call_id: id.clone(),
+                                name: name.clone(),
+                                state: ToolState::Error,
+                                output: "PreToolUse hook aborted this call".into(),
+                            })
+                            .await;
+                        history.push_tool_result(&id, "PreToolUse hook aborted this call", true);
+                        continue;
+                    }
+                }
+
                 let perm = self
                     .tools
                     .get(&name)
@@ -278,6 +306,7 @@ impl super::AgentLoop {
                     &input,
                     perm,
                     &tx,
+                    self.config.permissions.as_ref(),
                 )
                 .await;
 
@@ -297,7 +326,7 @@ impl super::AgentLoop {
                 let result = self
                     .execute_tool_with_heartbeat(
                         &name,
-                        input,
+                        input.clone(),
                         &id,
                         &cancel,
                         &tx,
@@ -305,6 +334,42 @@ impl super::AgentLoop {
                         &mut steer,
                     )
                     .await?;
+
+                // T2 of PLAN_QUALITY_v1: post-edit LSP hook. Compute
+                // the edited paths and ask the LSP manager for
+                // diagnostics. The rendered block (if any) is
+                // pushed to history as a synthetic system message
+                // so the model sees compile errors before its next
+                // reasoning step. No-op when lsp == None or the
+                // tool isn't an edit.
+                if !result.is_error
+                    && let Some(mgr) = self.config.lsp.as_ref()
+                {
+                    let paths = super::lsp_hooks::edited_paths_for_tool(&name, &input);
+                    for p in &paths {
+                        let diags = mgr.diagnostics_for(&self.config.cwd, p).await;
+                        if !diags.is_empty() {
+                            let body = crate::lsp::render_for_model(p, &diags);
+                            history.push_user(&body);
+                        }
+                    }
+                }
+
+                // T6 of PLAN_QUALITY_v1: PostToolUse hook. Fired
+                // for every gated-tool exec regardless of
+                // success/error so operator hooks (e.g. cargo fmt
+                // after .rs writes) always run.
+                if let Some(hooks) = &self.config.lifecycle_hooks {
+                    let key = format!("{name}:{input}");
+                    let path_var = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let _ = hooks
+                        .run(
+                            crate::lifecycle_hooks::HookEvent::PostToolUse,
+                            &key,
+                            &[("tool", &name), ("path", path_var)],
+                        )
+                        .await;
+                }
 
                 let state = if result.is_error {
                     ToolState::Error
