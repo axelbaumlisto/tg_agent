@@ -49,6 +49,34 @@ pub(crate) async fn build() -> WiredBot {
     let agent = Arc::new(AgentCore::new(config.clone(), provider));
     agent.init_self_ref();
 
+    // PLAN_QUALITY_v1 wiring (T2/T5/T6): install pluggable managers.
+    // Each is opt-in via config / disk presence; missing = silent
+    // off-path (zero overhead).
+    {
+        // T2 LSP manager. enabled=false by default in LspConfig;
+        // operator opts in via [lsp] in naked.json (TODO: thread
+        // through a real config-driven LspConfig once the section
+        // exists; for now defaults give zero-overhead off-path).
+        let lsp = std::sync::Arc::new(naked_core::lsp::LspManager::new(
+            naked_core::lsp::LspConfig::default(),
+        ));
+        agent.set_lsp(lsp);
+
+        // T6 lifecycle hooks: load ~/.naked/hooks.json if present.
+        // Empty file / missing path = no hooks installed (silent).
+        let hooks = std::sync::Arc::new(naked_core::lifecycle_hooks::LifecycleHookRunner::new());
+        hooks.load_default().await;
+        agent.set_lifecycle_hooks(hooks);
+
+        // T5 permission ruleset: load ~/.naked/permissions.json if
+        // present. Empty file / missing path = empty ruleset = every
+        // tool falls through to the existing UI prompt (Ask).
+        let ruleset = naked_core::permissions::Store::load();
+        let permissions = std::sync::Arc::new(tokio::sync::RwLock::new(ruleset));
+        agent.set_permissions(permissions);
+        tracing::info!("PLAN_QUALITY_v1 wiring installed: lsp + hooks + permissions");
+    }
+
     // Register telegram_attach tool — lets the agent send files to chat.
     // The attachment queue is per-turn (created in stream_response), but
     // the tool factory captures a global queue that stream_response swaps.

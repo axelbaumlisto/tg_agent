@@ -191,7 +191,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         let (eff_max_tokens, eff_temperature) =
             crate::turn::resolve_generation_params(&self.config(), &setup.provider_name, effective);
-        let loop_config = crate::turn::build_loop_config(
+        let mut loop_config = crate::turn::build_loop_config(
             effective.max_iterations,
             cwd.clone(),
             setup.model.clone(),
@@ -204,6 +204,18 @@ Keep each section concise. Preserve exact paths and identifiers.";
             &self.config().session_dir,
             session_id,
         );
+        // PLAN_QUALITY_v1 wiring: copy installed managers from
+        // AgentCore (Some(...) when the bot has called set_lsp /
+        // set_lifecycle_hooks / set_permissions; None otherwise).
+        if let Ok(g) = self.lsp.read() {
+            loop_config.lsp = g.clone();
+        }
+        if let Ok(g) = self.lifecycle_hooks.read() {
+            loop_config.lifecycle_hooks = g.clone();
+        }
+        if let Ok(g) = self.permissions.read() {
+            loop_config.permissions = g.clone();
+        }
         let session_workspace = session.workspace.clone();
 
         let cancel = CancellationToken::new();

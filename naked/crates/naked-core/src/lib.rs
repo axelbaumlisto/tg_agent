@@ -251,6 +251,21 @@ pub struct AgentCore {
     /// Shared todo list — persists across turns.
     /// Shared tool state — persists across all sessions and turns.
     pub shared_tools: SharedToolState,
+    /// PLAN_QUALITY_v1 wiring: optional LSP manager. naked-tg's
+    /// wiring.rs constructs an `LspManager` from `[lsp]` config and
+    /// installs it via [`AgentCore::set_lsp`]. Default `None` →
+    /// zero overhead.
+    pub(crate) lsp: std::sync::RwLock<Option<Arc<crate::lsp::LspManager>>>,
+    /// PLAN_QUALITY_v1 wiring: optional lifecycle hook runner. The
+    /// bot loads `~/.naked/hooks.json` once at boot and installs
+    /// the runner via [`AgentCore::set_lifecycle_hooks`].
+    pub(crate) lifecycle_hooks:
+        std::sync::RwLock<Option<Arc<crate::lifecycle_hooks::LifecycleHookRunner>>>,
+    /// PLAN_QUALITY_v1 wiring: optional permission ruleset. Loaded
+    /// from `~/.naked/permissions.json` and shared across the
+    /// process.
+    pub(crate) permissions:
+        std::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::permissions::Ruleset>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +373,30 @@ impl AgentCore {
             ss: session_state,
             token_tracker: token_tracker::TokenTracker::new(),
             shared_tools: SharedToolState::new(),
+            lsp: std::sync::RwLock::new(None),
+            lifecycle_hooks: std::sync::RwLock::new(None),
+            permissions: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// PLAN_QUALITY_v1 setter — install LSP manager.
+    pub fn set_lsp(&self, lsp: Arc<crate::lsp::LspManager>) {
+        if let Ok(mut g) = self.lsp.write() {
+            *g = Some(lsp);
+        }
+    }
+
+    /// PLAN_QUALITY_v1 setter — install lifecycle hook runner.
+    pub fn set_lifecycle_hooks(&self, runner: Arc<crate::lifecycle_hooks::LifecycleHookRunner>) {
+        if let Ok(mut g) = self.lifecycle_hooks.write() {
+            *g = Some(runner);
+        }
+    }
+
+    /// PLAN_QUALITY_v1 setter — install permission ruleset.
+    pub fn set_permissions(&self, ruleset: Arc<tokio::sync::RwLock<crate::permissions::Ruleset>>) {
+        if let Ok(mut g) = self.permissions.write() {
+            *g = Some(ruleset);
         }
     }
 
