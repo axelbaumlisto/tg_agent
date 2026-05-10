@@ -31,6 +31,12 @@ pub(crate) struct WiredBot {
     // Kept alive for the lifetime of the process:
     pub(crate) _scheduler_lock: Option<naked_tg::scheduler_lock::SchedulerLock>,
     pub(crate) _memory_scheduler: naked_tg::memory_scheduler::MemoryScheduler,
+    /// Shared liveness registry. The polling loop and the research
+    /// scheduler both `beat` into this; the watchdog arbiter
+    /// (`spawn_watchdog_with_liveness` in runtime) reads it.
+    /// Created in `build()` so every long-running task can be wired
+    /// to the same instance — single source of truth (DRY).
+    pub(crate) liveness: Arc<naked_core::liveness::LivenessRegistry>,
 }
 
 /// Build the complete DI graph and return a ready-to-run [`WiredBot`].
@@ -98,6 +104,13 @@ pub(crate) async fn build() -> WiredBot {
         None
     };
 
+    // F2 of PLAN_NEXT_SESSION: shared liveness registry — the
+    // polling loop and the scheduler both beat into it, the watchdog
+    // arbiter (in runtime.rs) reads it.
+    let liveness = Arc::new(naked_core::liveness::LivenessRegistry::new());
+    liveness.register("tg_polling.tick");
+    liveness.register("scheduler.tick");
+
     if config.research.enabled && _scheduler_lock.is_some() {
         let scheduler_cfg = research_scheduler::SchedulerConfig {
             verify_by_default: config.research.verify_by_default,
@@ -105,6 +118,7 @@ pub(crate) async fn build() -> WiredBot {
             max_concurrent_runs: config.research.max_concurrent_runs.max(1),
             task_timeout: std::time::Duration::from_secs(config.research.task_timeout_seconds),
             max_retries_before_alert: config.research.max_retries_before_alert,
+            liveness: Some(liveness.clone()),
             ..Default::default()
         };
         let (_scheduler, hook) =
@@ -365,6 +379,7 @@ pub(crate) async fn build() -> WiredBot {
         rate_limiter,
         _scheduler_lock,
         _memory_scheduler,
+        liveness,
     }
 }
 

@@ -138,6 +138,12 @@ pub struct SchedulerConfig {
     /// Time source used by the scheduler. Defaults to [`RealClock`] (wall
     /// clock). Override with a `MockClock` in tests for deterministic time.
     pub clock: std::sync::Arc<dyn Clock>,
+    /// Optional liveness registry. When set, the scheduler beats
+    /// `"scheduler.tick"` at the start of every tick so the watchdog
+    /// arbiter (`spawn_watchdog_with_liveness`) can detect a frozen
+    /// scheduler with the same mechanism it uses for the polling
+    /// loop. F2 of `PLAN_NEXT_SESSION.md`.
+    pub liveness: Option<std::sync::Arc<naked_core::liveness::LivenessRegistry>>,
 }
 
 impl Default for SchedulerConfig {
@@ -158,6 +164,7 @@ impl Default for SchedulerConfig {
             inflight_terminal_retention: Duration::from_secs(14 * 24 * 60 * 60),
             inflight_purge_interval: Duration::from_secs(60 * 60),
             clock: std::sync::Arc::new(RealClock),
+            liveness: None,
         }
     }
 }

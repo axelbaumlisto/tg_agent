@@ -35,6 +35,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
         rate_limiter,
         _scheduler_lock,
         _memory_scheduler,
+        liveness,
     } = wb;
 
     // Permissions are per-process state, not part of the DI graph.
@@ -146,19 +147,32 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
             None => Arc::new(naked_tg::watchdog::NoopWatchdog),
         };
     watchdog_notifier.notify_ready().await;
-    let liveness = Arc::new(naked_core::liveness::LivenessRegistry::new());
-    liveness.register("tg_polling.tick");
+    // F2: liveness registry comes from wiring (single source of truth
+    // shared with the scheduler). The polling-loop tick source is
+    // already pre-registered by build().
+    let _ = &liveness; // bind name for clarity
     let watchdog_shutdown = Arc::new(tokio::sync::Notify::new());
     let watchdog_handle = naked_tg::watchdog::spawn_watchdog_with_liveness(
         watchdog_notifier.clone(),
         liveness.clone(),
-        vec![naked_tg::watchdog::LivenessRequirement {
-            source: "tg_polling.tick",
-            // Long-poll is ~30s + reasonable network slack. If we don't
-            // see a tick in 90s, the loop is wedged and systemd should
-            // recycle us.
-            max_silence: Duration::from_secs(90),
-        }],
+        vec![
+            naked_tg::watchdog::LivenessRequirement {
+                source: "tg_polling.tick",
+                // Long-poll is ~30s + reasonable network slack. If we don't
+                // see a tick in 90s, the loop is wedged and systemd should
+                // recycle us.
+                max_silence: Duration::from_secs(90),
+            },
+            // F2 of PLAN_NEXT_SESSION: scheduler.tick is a 30s cadence
+            // by default; allow up to 3x that before declaring it
+            // wedged. The arbiter only ever stops sd_notify when ALL
+            // required sources are stale, so a polling-only failure
+            // still trips the watchdog within polling's 90s budget.
+            naked_tg::watchdog::LivenessRequirement {
+                source: "scheduler.tick",
+                max_silence: Duration::from_secs(120),
+            },
+        ],
         // Grace covers boot wiring + first long-poll round trip.
         Duration::from_secs(60),
         watchdog_shutdown.clone(),

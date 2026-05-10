@@ -42,6 +42,14 @@ pub(crate) async fn run_loop(
 
     let mut last_inflight_purge = Instant::now();
     loop {
+        // F2 of PLAN_NEXT_SESSION: heartbeat the liveness registry so
+        // the watchdog arbiter can detect 'scheduler frozen, polling
+        // alive' — the symmetric failure mode of incident
+        // 2026-05-10 12:47.
+        if let Some(l) = &config.liveness {
+            l.beat("scheduler.tick");
+        }
+
         let woke_for_shutdown = tokio::select! {
             _ = sleep_until_next(config.tick_interval) => false,
             _ = notify.notified() => false,
