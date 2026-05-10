@@ -13,6 +13,7 @@ pub mod liveness;
 pub mod loop_;
 pub mod loop_guard;
 pub mod loop_observer;
+pub mod lsp;
 pub mod prompt;
 pub mod services;
 pub mod session;

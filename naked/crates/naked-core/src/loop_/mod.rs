@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 // Sub-modules (private impls of AgentLoop are split across files)
 mod budget;
 mod cycle;
+pub(crate) mod lsp_hooks;
 mod permission;
 mod run;
 mod steers;

@@ -556,3 +556,155 @@ pub fn apply_role_override(mut role: AgentRole, ov: &AgentRoleOverride) -> Agent
 #[cfg(test)]
 #[path = "agent_role_tests.rs"]
 mod tests;
+
+// ── T10 of PLAN_QUALITY_v1: canonical role taxonomy ──────────────
+//
+// Six well-known roles + `custom`. Each has a tuned system-prompt
+// prefix; the parent picks the right kind of helper for the work
+// instead of dispatching ad-hoc roles. Aliases (case-insensitive)
+// match DeepSeek TUI's table so users coming from there don't have
+// to relearn the spelling.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CanonicalRole {
+    General,
+    Explore,
+    Plan,
+    Review,
+    Implementer,
+    Verifier,
+    Custom,
+}
+
+impl CanonicalRole {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Explore => "explore",
+            Self::Plan => "plan",
+            Self::Review => "review",
+            Self::Implementer => "implementer",
+            Self::Verifier => "verifier",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// Map any case-insensitive alias to a [`CanonicalRole`]. Unknown
+/// inputs return `None` so the caller can decide whether to surface
+/// an error.
+#[must_use]
+pub fn canonicalize_role(s: &str) -> Option<CanonicalRole> {
+    let lower = s.trim().to_ascii_lowercase();
+    Some(match lower.as_str() {
+        "general" | "worker" | "default" | "general-purpose" => CanonicalRole::General,
+        "explore" | "explorer" | "exploration" => CanonicalRole::Explore,
+        "plan" | "planning" | "awaiter" => CanonicalRole::Plan,
+        "review" | "reviewer" | "code-review" => CanonicalRole::Review,
+        "implementer" | "implement" | "implementation" | "builder" => CanonicalRole::Implementer,
+        "verifier" | "verify" | "verification" | "validator" | "tester" => CanonicalRole::Verifier,
+        "custom" => CanonicalRole::Custom,
+        _ => return None,
+    })
+}
+
+/// Build a freshly-configured [`AgentRole`] for a canonical role.
+/// Tool-filter enforcement still flows through the loop's permission
+/// gate; the role's intent is set here so the model receives a
+/// posture-appropriate system prompt prefix.
+#[must_use]
+pub fn role_for_canonical(role: CanonicalRole) -> AgentRole {
+    let (name, system) = match role {
+        CanonicalRole::General => (
+            "general",
+            "You are a focused sub-agent. Carry out the parent's task end-to-end. \
+             Prefer minimum-edit solutions. Hand back a brief structured summary.",
+        ),
+        CanonicalRole::Explore => (
+            "explore",
+            "You are a READ-ONLY explorer. Map the requested code/topic FAST. \
+             You may run shell to grep / list / read; you MUST NOT write to disk \
+             or apply patches. Hand back a structured map with file paths + line ranges.",
+        ),
+        CanonicalRole::Plan => (
+            "plan",
+            "You are a planner. Produce an executable strategy: numbered steps, \
+             explicit dependencies, acceptance criteria. You may write plan files \
+             but MUST NOT apply code edits. Don't carry out the plan; the parent \
+             dispatches an implementer for that.",
+        ),
+        CanonicalRole::Review => (
+            "review",
+            "You are a reviewer. Read + grade the change. Severity scores: \
+             critical / high / medium / low / nit. NEVER write or patch. \
+             Describe each fix as a finding; the parent decides whether to dispatch \
+             an implementer.",
+        ),
+        CanonicalRole::Implementer => (
+            "implementer",
+            "You are an implementer. Land the specified change with the minimum \
+             edit. No drive-by refactors. Run a quick verification (cargo check / \
+             pytest etc) and hand back a structured outcome.",
+        ),
+        CanonicalRole::Verifier => (
+            "verifier",
+            "You are a verifier. Run the requested test/validation suite, report \
+             pass/fail with the failing assertion + stack. Do NOT fix failures; \
+             record fix candidates under RISKS in the output.",
+        ),
+        CanonicalRole::Custom => (
+            "custom",
+            "You are a custom-scope sub-agent. The parent has supplied an explicit \
+             `allowed_tools` list; you may only use those. Stay within the requested \
+             narrow scope.",
+        ),
+    };
+    AgentRole::new(name, system)
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    #[test]
+    fn aliases_resolve() {
+        assert_eq!(canonicalize_role("explorer"), Some(CanonicalRole::Explore));
+        assert_eq!(canonicalize_role("WORKER"), Some(CanonicalRole::General));
+        assert_eq!(
+            canonicalize_role("Code-Review"),
+            Some(CanonicalRole::Review)
+        );
+        assert_eq!(canonicalize_role("tester"), Some(CanonicalRole::Verifier));
+        assert_eq!(canonicalize_role("nope"), None);
+    }
+
+    #[test]
+    fn build_returns_role_with_expected_name() {
+        let r = role_for_canonical(CanonicalRole::Explore);
+        assert_eq!(r.name, "explore");
+    }
+
+    #[test]
+    fn every_role_has_distinct_label() {
+        let labels: Vec<&str> = [
+            CanonicalRole::General,
+            CanonicalRole::Explore,
+            CanonicalRole::Plan,
+            CanonicalRole::Review,
+            CanonicalRole::Implementer,
+            CanonicalRole::Verifier,
+            CanonicalRole::Custom,
+        ]
+        .iter()
+        .map(|&r| r.label())
+        .collect();
+        assert_eq!(
+            labels
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            7
+        );
+    }
+}
