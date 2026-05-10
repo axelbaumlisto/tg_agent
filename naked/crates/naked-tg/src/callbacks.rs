@@ -417,49 +417,112 @@ pub(crate) async fn handle_callback(
                 bot.answer_callback_query(q.id.clone()).await?;
             }
         }
-        // ── A3: Error action callbacks ────────────────────────────
-        // Streaming control card buttons. PLAN_NEXT_SESSION auto-fire
-        // UX. Both buttons abort the active turn; the difference is
-        // only the toast text. The run.rs drain-on-exit fix
-        // guarantees pending steers / queued input land in history
-        // before the cancel error propagates, so the next message
-        // (or button-driven re-send) sees the full context.
+        // ── A3: Streaming control card buttons ───────────────
+        //
+        // Two semantically distinct actions:
+        //
+        //   * stream:abort  — hard stop. Cancels the active turn's
+        //     CancellationToken. The run-loop's drain-on-error path
+        //     preserves pending steers / queued input for the next
+        //     turn (via the SteerPipeline rescue). Use when the user
+        //     wants to throw away current work entirely.
+        //
+        //   * stream:sendnow — soft nudge via the steer pipeline.
+        //     Injects a synthetic SteerMessage into the running turn
+        //     telling the model to stop tool-calling and reply with
+        //     what it has. The S2/S3 mid-stream interrupt then
+        //     re-issues the iteration with the nudge in history;
+        //     the model produces its best-available answer
+        //     immediately. NO abort — the session keeps streaming.
+        //     Falls back to abort if the steer channel is somehow
+        //     unavailable (turn ended in the millisecond the user
+        //     tapped).
         "stream" if parts.len() >= 2 => {
             let action = parts[1];
             // F3: bump per-action click counter for /metrics. Done
-            // before the abort path so the counter advances even if
-            // there's no active session (we still want to know users
-            // are clicking).
+            // before the action so the counter advances even if
+            // there's no active session.
             crate::metrics::record_stream_button_click(action);
             let cb_ctx = ChatCtx::from_callback(&q);
             let cid = cb_ctx.chat_id.0;
             let tid = cb_ctx.raw_thread_id();
 
-            // Abort the active session, if any.
-            let aborted = if let Some(sid) = channel_map.get(cid, tid).await {
-                agent.abort(&sid).await;
-                true
-            } else {
-                false
-            };
-
-            // Best-effort: delete our own control card. The streaming
-            // pipeline's end-of-turn cleanup will also try (idempotent).
-            if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
-                .write()
-                .await
-                .remove(&(cid, tid))
-            {
-                let _ = bot.delete_message(chat, mid).await;
-            }
-
-            let toast = match (action, aborted) {
-                ("abort", true) => "⏹ Остановлено",
-                ("abort", false) => "⏹ Нет активной сессии",
-                ("sendnow", true) => {
-                    "⏩ Остановлено — отправь след. сообщение, весь контекст сохранён"
+            let toast: &str = match action {
+                "abort" => {
+                    let aborted = if let Some(sid) = channel_map.get(cid, tid).await {
+                        agent.abort(&sid).await;
+                        true
+                    } else {
+                        false
+                    };
+                    if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
+                        .write()
+                        .await
+                        .remove(&(cid, tid))
+                    {
+                        let _ = bot.delete_message(chat, mid).await;
+                    }
+                    if aborted {
+                        "⏹ Остановлено"
+                    } else {
+                        "⏹ Нет активной сессии"
+                    }
                 }
-                ("sendnow", false) => "⏩ Нет активной сессии",
+                "sendnow" => {
+                    // Try to inject the synthetic steer first. If the
+                    // steer channel exists, leave the session running
+                    // (the model will pick up the nudge via S2/S3 and
+                    // wrap up). The control card stays — the next
+                    // assistant message-end will tear it down through
+                    // the streaming pipeline's end-of-turn cleanup.
+                    let key = (cid, tid);
+                    let nudge_text = "[⏩ Send now] Пользователь просит ответить немедленно с тем, что уже собрано. Не вызывай больше инструменты, резюмируй и выдавай финальный ответ.";
+                    let nudged = {
+                        let map = crate::shared::STEER_SENDERS.read().await;
+                        if let Some(steer_tx) = map.get(&key) {
+                            steer_tx
+                                .try_send(naked_core::types::SteerMessage {
+                                    // Synthetic — no Telegram message
+                                    // is associated, so use a sentinel
+                                    // negative id to avoid colliding
+                                    // with any real msg_id (Telegram
+                                    // ids are positive).
+                                    msg_id: -1,
+                                    text: nudge_text.into(),
+                                    is_edit: false,
+                                })
+                                .is_ok()
+                        } else {
+                            false
+                        }
+                    };
+                    if nudged {
+                        "⏩ Нудж отправлен — модель завершит с тем, что есть"
+                    } else {
+                        // Fallback: no live steer channel → do an
+                        // abort instead so the user gets some
+                        // observable effect rather than silent
+                        // no-op.
+                        let aborted = if let Some(sid) = channel_map.get(cid, tid).await {
+                            agent.abort(&sid).await;
+                            true
+                        } else {
+                            false
+                        };
+                        if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
+                            .write()
+                            .await
+                            .remove(&(cid, tid))
+                        {
+                            let _ = bot.delete_message(chat, mid).await;
+                        }
+                        if aborted {
+                            "⏩ Нудж не прошёл — остановил. Отправь сообщение, весь контекст сохранён"
+                        } else {
+                            "⏩ Нет активной сессии"
+                        }
+                    }
+                }
                 _ => "…",
             };
             bot.answer_callback_query(q.id.clone()).text(toast).await?;

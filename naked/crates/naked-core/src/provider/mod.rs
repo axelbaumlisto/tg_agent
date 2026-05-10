@@ -51,6 +51,31 @@ pub trait Provider: Send + Sync {
     }
 }
 
+/// Pass-through impl so `Box<dyn Provider>` can stand in wherever
+/// `P: Provider` is required (notably as the inner of
+/// [`timeout::TimeoutProvider`]). R3 of `PLAN_NEXT_SESSION.md`.
+#[async_trait]
+impl Provider for Box<dyn Provider> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        (**self).models()
+    }
+    fn blacklisted_key_count(&self) -> usize {
+        (**self).blacklisted_key_count()
+    }
+    fn total_key_count(&self) -> usize {
+        (**self).total_key_count()
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        (**self).stream_chat(request).await
+    }
+}
+
 pub fn tool_spec_to_anthropic_json(spec: &ToolSpec) -> serde_json::Value {
     serde_json::json!({
         "name": spec.name,
