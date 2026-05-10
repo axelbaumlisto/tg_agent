@@ -62,6 +62,9 @@ impl super::AgentLoop {
         pending.clear();
 
         history.push_user(&combined);
+        // F3: bump observability counter so operators can graph
+        // "steers actually delivered to the model".
+        crate::types::STEER_DELIVERED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = tx
             .send(AgentEvent::SteerReceived {
                 text: combined,

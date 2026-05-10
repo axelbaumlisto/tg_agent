@@ -30,6 +30,30 @@ static DESCRIBER_FALLBACK: AtomicU64 = AtomicU64::new(0);
 /// Useful for spotting spam bursts or runaway retry loops in production.
 static RATE_LIMIT_DELAYED: AtomicU64 = AtomicU64::new(0);
 
+// ── F3 of PLAN_NEXT_SESSION (2026-05-10) ──────────────────
+// Streaming-control-card button clicks. Two counters, one per
+// callback action. A high `STREAM_BUTTON_CLICK_ABORT` rate (relative
+// to active turns) signals UX friction; a high `_SENDNOW` rate
+// means users frequently want to cut tool execution short.
+static STREAM_BUTTON_CLICK_ABORT: AtomicU64 = AtomicU64::new(0);
+static STREAM_BUTTON_CLICK_SENDNOW: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped by [`crate::callbacks::handle_callback`] for every
+/// `stream:abort` / `stream:sendnow` button press. The two-bucket
+/// split (rather than one labelled counter) keeps the renderer
+/// dead-simple — same convention as the rest of this module.
+pub fn record_stream_button_click(action: &str) {
+    match action {
+        "abort" => {
+            STREAM_BUTTON_CLICK_ABORT.fetch_add(1, Ordering::Relaxed);
+        }
+        "sendnow" => {
+            STREAM_BUTTON_CLICK_SENDNOW.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 /// Public bump for the rate-limiter. Kept in this module so all counters
 /// stay in one place and the Prometheus renderer can see it directly.
 #[allow(dead_code)] // used by tests + may be re-wired to adaptive limiter
@@ -63,6 +87,8 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         native_route_downgraded_oversize: NATIVE_ROUTE_DOWNGRADED_OVERSIZE.load(Ordering::Relaxed),
         describer_fallback: DESCRIBER_FALLBACK.load(Ordering::Relaxed),
         rate_limit_delayed: RATE_LIMIT_DELAYED.load(Ordering::Relaxed),
+        stream_button_click_abort: STREAM_BUTTON_CLICK_ABORT.load(Ordering::Relaxed),
+        stream_button_click_sendnow: STREAM_BUTTON_CLICK_SENDNOW.load(Ordering::Relaxed),
     }
 }
 
@@ -72,6 +98,8 @@ pub struct MediaRoutingSnapshot {
     pub native_route_downgraded_oversize: u64,
     pub describer_fallback: u64,
     pub rate_limit_delayed: u64,
+    pub stream_button_click_abort: u64,
+    pub stream_button_click_sendnow: u64,
 }
 
 impl MediaRoutingSnapshot {
@@ -99,6 +127,18 @@ impl MediaRoutingSnapshot {
         let empty_retries = naked_core::types::EMPTY_CONTENT_RETRY_COUNT.load(Ordering::Relaxed);
         let turn_ok = naked_core::types::TURN_COMPLETED_COUNT.load(Ordering::Relaxed);
         let turn_err = naked_core::types::TURN_ERROR_COUNT.load(Ordering::Relaxed);
+        // F3: steer-pipeline + supervisor counters. Pin the recent
+        // steer/abort UX work so a regression on either drain path
+        // or the supervisor primitive shows up as a flat-zero series.
+        let steer_delivered = naked_core::types::STEER_DELIVERED_COUNT.load(Ordering::Relaxed);
+        let steer_soft_interrupted =
+            naked_core::types::STEER_SOFT_INTERRUPTED_COUNT.load(Ordering::Relaxed);
+        let steer_drained_on_abort =
+            naked_core::types::STEER_DRAINED_ON_ABORT_COUNT.load(Ordering::Relaxed);
+        // Note: `supervised` is in the lib crate (`naked_tg::`),
+        // not the bin crate's `crate::*` namespace.
+        let supervisor_restart =
+            naked_tg::supervised::SUPERVISOR_PANIC_RESTART_COUNT.load(Ordering::Relaxed);
         // Pollution sentinel from `naked-housekeep.timer`: 0 unless the
         // daily sweep found `research:*` lines in global MEMORY.md. Non-zero
         // means the research-leak fix regressed and operator should
@@ -151,6 +191,24 @@ impl MediaRoutingSnapshot {
              # HELP naked_core_turn_error_total Agent turns that ended with an error.\n\
              # TYPE naked_core_turn_error_total counter\n\
              naked_core_turn_error_total {turn_err}\n\
+             # HELP naked_core_steer_delivered_total Steer messages successfully merged into history.\n\
+             # TYPE naked_core_steer_delivered_total counter\n\
+             naked_core_steer_delivered_total {steer_delivered}\n\
+             # HELP naked_core_steer_soft_interrupted_total Times the LLM stream was soft-interrupted by a mid-stream steer (S2/S3 path).\n\
+             # TYPE naked_core_steer_soft_interrupted_total counter\n\
+             naked_core_steer_soft_interrupted_total {steer_soft_interrupted}\n\
+             # HELP naked_core_steer_drained_on_abort_total Times the run-loop's drain-on-error rescued in-flight steers from a dying turn.\n\
+             # TYPE naked_core_steer_drained_on_abort_total counter\n\
+             naked_core_steer_drained_on_abort_total {steer_drained_on_abort}\n\
+             # HELP naked_tg_supervisor_panic_restart_total Panic-triggered restarts inside spawn_supervised_with_opts.\n\
+             # TYPE naked_tg_supervisor_panic_restart_total counter\n\
+             naked_tg_supervisor_panic_restart_total {supervisor_restart}\n\
+             # HELP naked_tg_stream_button_click_abort_total Clicks of the [⏹ Стоп] inline button on the streaming control card.\n\
+             # TYPE naked_tg_stream_button_click_abort_total counter\n\
+             naked_tg_stream_button_click_abort_total {btn_abort}\n\
+             # HELP naked_tg_stream_button_click_sendnow_total Clicks of the [⏩ Send now] inline button on the streaming control card.\n\
+             # TYPE naked_tg_stream_button_click_sendnow_total counter\n\
+             naked_tg_stream_button_click_sendnow_total {btn_sendnow}\n\
              # HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n\
              # TYPE naked_memory_pollution_count gauge\n\
              naked_memory_pollution_count {memory_pollution}\n\
@@ -163,6 +221,12 @@ impl MediaRoutingSnapshot {
             empty_retries = empty_retries,
             turn_ok = turn_ok,
             turn_err = turn_err,
+            steer_delivered = steer_delivered,
+            steer_soft_interrupted = steer_soft_interrupted,
+            steer_drained_on_abort = steer_drained_on_abort,
+            supervisor_restart = supervisor_restart,
+            btn_abort = self.stream_button_click_abort,
+            btn_sendnow = self.stream_button_click_sendnow,
             memory_pollution = memory_pollution,
             model_health_body = model_health_body,
         )
@@ -264,6 +328,7 @@ mod tests {
             native_route_downgraded_oversize: 2,
             describer_fallback: 3,
             rate_limit_delayed: 0,
+            ..MediaRoutingSnapshot::default()
         };
         let t = s.render_text();
         assert!(t.contains("1"));
@@ -289,6 +354,7 @@ mod tests {
             native_route_downgraded_oversize: 2,
             describer_fallback: 1,
             rate_limit_delayed: 5,
+            ..MediaRoutingSnapshot::default()
         };
         let p = s.render_prometheus();
         assert!(p.contains("# HELP naked_tg_native_route_chosen_total"));
@@ -297,6 +363,56 @@ mod tests {
         assert!(p.contains("naked_tg_native_route_downgraded_oversize_total 2"));
         assert!(p.contains("naked_tg_describer_fallback_total 1"));
         assert!(p.contains("naked_core_sentinel_leak_stripped_total"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_steer_pipeline_counters_f3() {
+        // F3: pin every metric introduced by the steer / abort /
+        // button work so a removal in render_prometheus is loud.
+        let p = snapshot().render_prometheus();
+        for metric in [
+            "naked_core_steer_delivered_total",
+            "naked_core_steer_soft_interrupted_total",
+            "naked_core_steer_drained_on_abort_total",
+            "naked_tg_supervisor_panic_restart_total",
+            "naked_tg_stream_button_click_abort_total",
+            "naked_tg_stream_button_click_sendnow_total",
+        ] {
+            assert!(
+                p.contains(metric),
+                "render_prometheus must expose `{metric}`; full body:\n{p}",
+            );
+            // Each must declare its own HELP + TYPE pair (Prometheus
+            // text format insists on it).
+            assert!(
+                p.contains(&format!("# HELP {metric}")),
+                "missing HELP for {metric}",
+            );
+            assert!(
+                p.contains(&format!("# TYPE {metric} counter")),
+                "missing TYPE for {metric}",
+            );
+        }
+    }
+
+    #[test]
+    fn stream_button_click_counter_splits_by_action() {
+        let snap_before = snapshot();
+        record_stream_button_click("abort");
+        record_stream_button_click("abort");
+        record_stream_button_click("sendnow");
+        record_stream_button_click("unknown"); // ignored
+        let snap_after = snapshot();
+        assert_eq!(
+            snap_after.stream_button_click_abort,
+            snap_before.stream_button_click_abort + 2,
+        );
+        assert_eq!(
+            snap_after.stream_button_click_sendnow,
+            snap_before.stream_button_click_sendnow + 1,
+        );
+        // Unknown action must be a silent no-op (no panic, no
+        // sneaking into either bucket).
     }
 
     #[test]

@@ -49,6 +49,40 @@ pub static TURN_COMPLETED_COUNT: std::sync::atomic::AtomicU64 =
 /// unlabelled to keep the renderer dead-simple).
 pub static TURN_ERROR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ── Steer-pipeline counters (PLAN_NEXT_SESSION 2026-05-10) ─────────
+//
+// Three counters that pin the new steer behaviour. Operators can
+// graph these to detect:
+//   * `STEER_DELIVERED_COUNT` shrinking vs. `SteerMessage` channel
+//     send rate → the bot is dropping user input.
+//   * `STEER_SOFT_INTERRUPTED_COUNT` vs. delivered — fraction of
+//     steers that hit during an in-flight LLM stream (S2/S3 path).
+//   * `STEER_DRAINED_ON_ABORT_COUNT` rising = users frequently
+//     abort with pending input, suggesting UX friction.
+//
+// All three are unlabelled `AtomicU64` for the same dead-simple
+// renderer convention as the existing counters above.
+
+/// Bumped once per successful drain in `loop_/steers.rs::drain_steers`
+/// when at least one steer was merged into history.
+pub static STEER_DELIVERED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped when the third arm of `stream_one_turn`'s select! fires
+/// — a steer arrived mid-LLM-stream and triggered the soft-interrupt
+/// path (S2/S3). Each burst-drain (multiple steers in one tick)
+/// counts as one event.
+pub static STEER_SOFT_INTERRUPTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped when the run-loop's drain-on-error path (cancel / provider
+/// error / empty-content giveup) actually found pending steers or
+/// channel-buffered messages and rescued them into history. Zero
+/// would mean the drain is a pure no-op safety net; non-zero means
+/// it's actively saving user input.
+pub static STEER_DRAINED_ON_ABORT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Strip every embedded `@@NAKED_IMG_REF@@…` segment (sentinel + the
 /// optional `/<hash>` or `{...json}` tail that follows it on the same line)
 /// from `text`. Returns the cleaned string and bumps `SENTINEL_LEAK_COUNT`

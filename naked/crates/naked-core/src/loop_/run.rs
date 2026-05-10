@@ -50,6 +50,7 @@ impl super::AgentLoop {
                 // the user typed a steer 50ms before /abort — it
                 // would otherwise be silently dropped with the
                 // dying channel).
+                let before = history.message_count();
                 Self::drain_steers(
                     &mut steer_rx,
                     &mut pending_steers,
@@ -58,6 +59,10 @@ impl super::AgentLoop {
                     &tx,
                 )
                 .await;
+                if history.message_count() > before {
+                    crate::types::STEER_DRAINED_ON_ABORT_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Err(AgentError::Cancelled);
             }
 
@@ -103,6 +108,7 @@ impl super::AgentLoop {
                     // is a non-blocking try_recv loop) and applies
                     // uniformly to provider errors so the user
                     // doesn't lose typed input on a transient failure.
+                    let before = history.message_count();
                     Self::drain_steers(
                         &mut steer_rx,
                         &mut pending_steers,
@@ -111,6 +117,10 @@ impl super::AgentLoop {
                         &tx,
                     )
                     .await;
+                    if history.message_count() > before {
+                        crate::types::STEER_DRAINED_ON_ABORT_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     return Err(e);
                 }
             };
@@ -169,6 +179,7 @@ impl super::AgentLoop {
                     None,
                     Some(msg.clone()),
                 );
+                let before = history.message_count();
                 Self::drain_steers(
                     &mut steer_rx,
                     &mut pending_steers,
@@ -177,6 +188,10 @@ impl super::AgentLoop {
                     &tx,
                 )
                 .await;
+                if history.message_count() > before {
+                    crate::types::STEER_DRAINED_ON_ABORT_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Err(AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::Other {
                         status: 0,

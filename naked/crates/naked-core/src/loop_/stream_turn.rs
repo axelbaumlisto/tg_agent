@@ -243,6 +243,11 @@ impl super::AgentLoop {
             // "complete enough" — no retry, no error — and let the
             // outer loop re-issue.
             if mid_stream_steer_flag {
+                // F3: pin the soft-interrupt event for /metrics. Bump
+                // here (after the inner break) so we don't double-count
+                // a retry-and-re-trigger sequence.
+                crate::types::STEER_SOFT_INTERRUPTED_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 stream_ok = true;
                 break;
             }

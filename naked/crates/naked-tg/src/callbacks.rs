@@ -426,6 +426,11 @@ pub(crate) async fn handle_callback(
         // (or button-driven re-send) sees the full context.
         "stream" if parts.len() >= 2 => {
             let action = parts[1];
+            // F3: bump per-action click counter for /metrics. Done
+            // before the abort path so the counter advances even if
+            // there's no active session (we still want to know users
+            // are clicking).
+            crate::metrics::record_stream_button_click(action);
             let cb_ctx = ChatCtx::from_callback(&q);
             let cid = cb_ctx.chat_id.0;
             let tid = cb_ctx.raw_thread_id();

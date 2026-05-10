@@ -22,11 +22,19 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+/// F3: process-wide counter — every panic-triggered restart inside
+/// `spawn_supervised_with_opts` bumps this. Surfaces over Prometheus
+/// as `naked_tg_supervisor_panic_restart_total` so operators can
+/// graph supervisor flapping (a steady non-zero rate means a task is
+/// in a panic-loop the cap-arm is masking).
+pub static SUPERVISOR_PANIC_RESTART_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Optional panic-observation hook for [`spawn_supervised_with_opts`].
 ///
@@ -187,6 +195,7 @@ where
                 }
                 Err(join_err) if join_err.is_panic() => {
                     panic_attempts = panic_attempts.saturating_add(1);
+                    SUPERVISOR_PANIC_RESTART_COUNT.fetch_add(1, Ordering::Relaxed);
                     let msg = panic_payload(join_err.into_panic());
                     let details = format!(
                         "task '{name}' panicked (attempt {panic_attempts}/{cap}): {msg}",
