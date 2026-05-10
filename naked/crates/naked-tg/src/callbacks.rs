@@ -418,6 +418,47 @@ pub(crate) async fn handle_callback(
             }
         }
         // ── A3: Error action callbacks ────────────────────────────
+        // Streaming control card buttons. PLAN_NEXT_SESSION auto-fire
+        // UX. Both buttons abort the active turn; the difference is
+        // only the toast text. The run.rs drain-on-exit fix
+        // guarantees pending steers / queued input land in history
+        // before the cancel error propagates, so the next message
+        // (or button-driven re-send) sees the full context.
+        "stream" if parts.len() >= 2 => {
+            let action = parts[1];
+            let cb_ctx = ChatCtx::from_callback(&q);
+            let cid = cb_ctx.chat_id.0;
+            let tid = cb_ctx.raw_thread_id();
+
+            // Abort the active session, if any.
+            let aborted = if let Some(sid) = channel_map.get(cid, tid).await {
+                agent.abort(&sid).await;
+                true
+            } else {
+                false
+            };
+
+            // Best-effort: delete our own control card. The streaming
+            // pipeline's end-of-turn cleanup will also try (idempotent).
+            if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
+                .write()
+                .await
+                .remove(&(cid, tid))
+            {
+                let _ = bot.delete_message(chat, mid).await;
+            }
+
+            let toast = match (action, aborted) {
+                ("abort", true) => "⏹ Остановлено",
+                ("abort", false) => "⏹ Нет активной сессии",
+                ("sendnow", true) => {
+                    "⏩ Остановлено — отправь след. сообщение, весь контекст сохранён"
+                }
+                ("sendnow", false) => "⏩ Нет активной сессии",
+                _ => "…",
+            };
+            bot.answer_callback_query(q.id.clone()).text(toast).await?;
+        }
         "err" if parts.len() >= 2 => {
             let action = parts[1];
             match action {

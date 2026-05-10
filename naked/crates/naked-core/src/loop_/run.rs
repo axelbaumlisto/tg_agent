@@ -44,6 +44,20 @@ impl super::AgentLoop {
 
         'outer: for _iteration in 0..limit {
             if cancel.is_cancelled() {
+                // PLAN_NEXT_SESSION §A.2 S6 follow-up: preserve any
+                // in-flight user input across an abort. Without this
+                // the next turn starts with an incomplete view (e.g.
+                // the user typed a steer 50ms before /abort — it
+                // would otherwise be silently dropped with the
+                // dying channel).
+                Self::drain_steers(
+                    &mut steer_rx,
+                    &mut pending_steers,
+                    &mut delivered_msg_ids,
+                    history,
+                    &tx,
+                )
+                .await;
                 return Err(AgentError::Cancelled);
             }
 
@@ -83,7 +97,22 @@ impl super::AgentLoop {
                 Err(AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::ContextWindowExceeded { .. },
                 )) => continue 'outer,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Same context-preservation guarantee as the
+                    // pre-iteration cancel check above. Cheap (drain
+                    // is a non-blocking try_recv loop) and applies
+                    // uniformly to provider errors so the user
+                    // doesn't lose typed input on a transient failure.
+                    Self::drain_steers(
+                        &mut steer_rx,
+                        &mut pending_steers,
+                        &mut delivered_msg_ids,
+                        history,
+                        &tx,
+                    )
+                    .await;
+                    return Err(e);
+                }
             };
 
             // S2/S3 of PLAN_NEXT_SESSION: stream was interrupted by a
@@ -140,6 +169,14 @@ impl super::AgentLoop {
                     None,
                     Some(msg.clone()),
                 );
+                Self::drain_steers(
+                    &mut steer_rx,
+                    &mut pending_steers,
+                    &mut delivered_msg_ids,
+                    history,
+                    &tx,
+                )
+                .await;
                 return Err(AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::Other {
                         status: 0,

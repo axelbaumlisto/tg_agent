@@ -278,6 +278,20 @@ pub(crate) type SteerAckMap =
 pub(crate) static STEER_ACK_IDS: LazyLock<tokio::sync::RwLock<SteerAckMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
+/// PLAN_NEXT_SESSION §A.2 (auto-fire UX) — in-stream control cards
+/// (⏹ Стоп / ⏩ Send now buttons). Keyed by `(chat_id,
+/// thread_id)`. Inserted by `streaming_mod::pipeline::stream_response`
+/// right after the placeholder is sent; removed and the message
+/// deleted on Idle / Error / model-switch / abort.
+///
+/// One control card per active streaming turn — we never want to
+/// stack two (would let user click an orphan button and confuse the
+/// callback router).
+pub(crate) type ControlCardMap =
+    HashMap<(i64, Option<i32>), (teloxide::types::ChatId, teloxide::types::MessageId)>;
+pub(crate) static CONTROL_CARDS: LazyLock<tokio::sync::RwLock<ControlCardMap>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+
 /// Global rate limiter instance — accessible from commands.rs for /metrics.
 pub(crate) static RATE_LIMITER: LazyLock<naked_tg::rate_limit::RateLimiter> =
     LazyLock::new(naked_tg::rate_limit::RateLimiter::new);

@@ -51,6 +51,27 @@ pub(crate) async fn stream_response(
         }
     };
 
+    // PLAN_NEXT_SESSION auto-fire UX: send a thin control card with
+    // [⏹ Стоп] [⏩ Send now] inline buttons under the placeholder.
+    // Stop = abort. Send now = abort + hint that pending input is
+    // preserved in history (the run.rs drain-on-exit fix). Card is
+    // deleted at end-of-turn so it never lingers.
+    let control_kb = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+        teloxide::types::InlineKeyboardButton::callback("⏹ Стоп", "stream:abort"),
+        teloxide::types::InlineKeyboardButton::callback("⏩ Send now", "stream:sendnow"),
+    ]]);
+    if let Ok(card) = bot
+        .send_message(ctx.chat_id, "⏯️")
+        .maybe_thread(ctx.thread_id)
+        .reply_markup(control_kb)
+        .await
+    {
+        crate::shared::CONTROL_CARDS
+            .write()
+            .await
+            .insert((chat_id_raw, tid), (ctx.chat_id, card.id));
+    }
+
     let typing_client = http_client.clone();
     let typing_base = base_url.to_string();
     let typing_cancel = tokio_util::sync::CancellationToken::new();
@@ -358,6 +379,19 @@ pub(crate) async fn stream_response(
     MODEL_SWITCHES.write().await.remove(&chat_key);
     QUEUE_COUNTS.write().await.remove(&chat_key);
     STEER_SENDERS.write().await.remove(&chat_key_for_steer);
+    // Auto-fire UX: remove the [⏹ Стоп] [⏩ Send now] card.
+    if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
+        .write()
+        .await
+        .remove(&(chat_id_raw, tid))
+        && let Err(e) = bot.delete_message(chat, mid).await
+    {
+        tracing::debug!(
+            chat = chat.0,
+            msg = mid.0,
+            "control card delete failed (likely already gone): {e}"
+        );
+    }
     // S6 cleanup: any ack ids still parked for this chat/thread are
     // unreachable now (turn ended without an Idle-time SteerReceived
     // for them). Best-effort delete — prevents the temp
