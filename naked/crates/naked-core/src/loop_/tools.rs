@@ -18,7 +18,7 @@ impl super::AgentLoop {
         cancel: &CancellationToken,
         tx: &mpsc::Sender<AgentEvent>,
         steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
-        pending_steers: &mut Vec<SteerMessage>,
+        steer: &mut super::steers::SteerPipeline,
     ) -> Result<Vec<(String, String, crate::types::ToolResult)>> {
         let futs: Vec<_> = batch
             .iter()
@@ -50,7 +50,12 @@ impl super::AgentLoop {
                     }
                 } => {
                     if let Some(msg) = msg {
-                        pending_steers.push(msg);
+                        // R1: pipeline owns the pending vec. Use
+                        // record_winner_and_burst so any messages that
+                        // piled up in the same tick are also stashed
+                        // (matches the semantics of the stream-side
+                        // arm in stream_one_turn).
+                        steer.record_winner_and_burst(msg, steer_rx);
                     }
                 }
             }
@@ -176,7 +181,7 @@ impl super::AgentLoop {
         cancel: &CancellationToken,
         tx: &mpsc::Sender<AgentEvent>,
         steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
-        pending_steers: &mut Vec<SteerMessage>,
+        steer: &mut super::steers::SteerPipeline,
     ) -> Result<crate::types::ToolResult> {
         let heartbeat_tx = tx.clone();
         let heartbeat_cancel = CancellationToken::new();
@@ -219,7 +224,8 @@ impl super::AgentLoop {
                                 call_id: call_id.to_string(),
                                 chunk: format!("\u{21a9}\u{fe0f} Steer queued: {}", &msg.text[..msg.text.len().min(60)]),
                             }).await;
-                            pending_steers.push(msg);
+                            // R1: pipeline-owned, with burst.
+                            steer.record_winner_and_burst(msg, steer_rx);
                         }
                     }
                 }

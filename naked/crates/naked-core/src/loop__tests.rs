@@ -909,17 +909,18 @@ async fn steer_edit_replaces_in_pending_queue() {
 
 #[tokio::test]
 async fn steer_edit_after_drain_adds_correction() {
-    // Test drain_steers directly: drain once (delivers msg_id=20),
-    // then edit msg_id=20 arrives → must appear as [correction].
+    // R1: this used to poke AgentLoop::drain_steers directly. The
+    // unified `SteerPipeline` makes that signature private, so the
+    // tightest equivalent is a pipeline-level test that mirrors the
+    // exact scenario (drain → edit-of-delivered → second drain).
+    use crate::loop_::steers::SteerPipeline;
     let (steer_tx, steer_rx) = mpsc::channel(16);
     let mut opt_rx = Some(steer_rx);
-    let mut pending: Vec<SteerMessage> = Vec::new();
-    let mut delivered = std::collections::HashSet::new();
+    let mut pipeline = SteerPipeline::new();
     let mut history = ConversationHistory::new("sys".into());
     history.push_user("go");
     let (tx, _rx) = mpsc::channel(64);
 
-    // Send original.
     steer_tx
         .send(SteerMessage {
             msg_id: 20,
@@ -930,8 +931,8 @@ async fn steer_edit_after_drain_adds_correction() {
         .unwrap();
 
     // Drain 1: delivers msg_id=20.
-    AgentLoop::drain_steers(&mut opt_rx, &mut pending, &mut delivered, &mut history, &tx).await;
-
+    let r1 = pipeline.drain(&mut opt_rx, &mut history, &tx).await;
+    assert!(r1, "first drain must report rescue");
     let user_msgs: Vec<_> = history
         .messages()
         .iter()
@@ -942,12 +943,8 @@ async fn steer_edit_after_drain_adds_correction() {
         user_msgs.iter().any(|t| t.contains("original direction")),
         "original must be delivered"
     );
-    assert!(
-        delivered.contains(&20),
-        "msg_id=20 must be in delivered set"
-    );
 
-    // Now send an edit of msg_id=20.
+    // Edit of an already-delivered msg_id=20.
     steer_tx
         .send(SteerMessage {
             msg_id: 20,
@@ -956,9 +953,8 @@ async fn steer_edit_after_drain_adds_correction() {
         })
         .await
         .unwrap();
-
-    // Drain 2: edit of already-delivered msg_id=20.
-    AgentLoop::drain_steers(&mut opt_rx, &mut pending, &mut delivered, &mut history, &tx).await;
+    let r2 = pipeline.drain(&mut opt_rx, &mut history, &tx).await;
+    assert!(r2, "second drain must also report rescue");
 
     let all_text: String = history
         .messages()

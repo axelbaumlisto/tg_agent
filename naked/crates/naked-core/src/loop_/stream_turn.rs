@@ -40,7 +40,7 @@ impl super::AgentLoop {
         cancel: &CancellationToken,
         tx: &mpsc::Sender<AgentEvent>,
         steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
-        pending_steers: &mut Vec<SteerMessage>,
+        steer: &mut super::steers::SteerPipeline,
     ) -> Result<TurnStreamOutcome> {
         let mut text_acc = String::new();
         let mut thinking_acc = String::new();
@@ -157,20 +157,16 @@ impl super::AgentLoop {
                     } => {
                         if let Some(msg) = maybe_msg {
                             // S3 — soft-interrupt policy: stash the
-                            // winning steer in pending_steers, then
-                            // BURST-drain the channel so any messages
-                            // that arrived in the same scheduler tick
-                            // are merged into one re-issue. Without
-                            // this, two close-spaced steers would
-                            // each trigger their own iteration with a
-                            // single user message — not the merge
-                            // semantics drain_steers expects.
-                            pending_steers.push(msg);
-                            if let Some(rx) = steer_rx.as_mut() {
-                                while let Ok(more) = rx.try_recv() {
-                                    pending_steers.push(more);
-                                }
-                            }
+                            // winning steer in the pipeline, which
+                            // also burst-drains the channel so any
+                            // messages that arrived in the same
+                            // scheduler tick are merged into one
+                            // re-issue. Without this, two close-spaced
+                            // steers would each trigger their own
+                            // iteration with a single user message —
+                            // not the merge semantics SteerPipeline::drain
+                            // expects.
+                            steer.record_winner_and_burst(msg, steer_rx);
                             mid_stream_steer_flag = true;
                             break;
                         }

@@ -11,7 +11,21 @@ use tokio_util::sync::CancellationToken;
 
 use super::MAX_EMPTY_CONTENT_RETRIES;
 use super::budget::EmptyContentBudget;
+use super::steers::SteerPipeline;
 use super::stream_turn::TurnStreamOutcome;
+
+/// R1 of PLAN_NEXT_SESSION: every drain-on-error site bumps this
+/// counter via `bump_drained_on_abort_if_rescued`. Lifted to a free
+/// helper so the three Err-paths in `run()` keep their bodies
+/// compact (and never accidentally fall out of sync about whether a
+/// drain that produced output should be observable as a rescue).
+#[inline]
+fn bump_drained_on_abort_if_rescued(rescued: bool) {
+    if rescued {
+        crate::types::STEER_DRAINED_ON_ABORT_COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 impl super::AgentLoop {
     pub async fn run(
@@ -35,12 +49,8 @@ impl super::AgentLoop {
         // of empty responses (the actual `glm-5-turbo` failure mode) are
         // capped.
         let mut empty_budget = EmptyContentBudget::new();
-        // Pending steer messages not yet flushed to history.
-        // Kept as a vec so edits can replace by msg_id before drain.
-        let mut pending_steers: Vec<SteerMessage> = Vec::new();
-        // msg_ids already flushed to history (for edit-after-drain detection).
-        let mut delivered_msg_ids: std::collections::HashSet<i32> =
-            std::collections::HashSet::new();
+        // R1: SteerPipeline owns pending vec + delivered set.
+        let mut steer = SteerPipeline::new();
 
         'outer: for _iteration in 0..limit {
             if cancel.is_cancelled() {
@@ -50,19 +60,8 @@ impl super::AgentLoop {
                 // the user typed a steer 50ms before /abort — it
                 // would otherwise be silently dropped with the
                 // dying channel).
-                let before = history.message_count();
-                Self::drain_steers(
-                    &mut steer_rx,
-                    &mut pending_steers,
-                    &mut delivered_msg_ids,
-                    history,
-                    &tx,
-                )
-                .await;
-                if history.message_count() > before {
-                    crate::types::STEER_DRAINED_ON_ABORT_COUNT
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                let rescued = steer.drain(&mut steer_rx, history, &tx).await;
+                bump_drained_on_abort_if_rescued(rescued);
                 return Err(AgentError::Cancelled);
             }
 
@@ -71,14 +70,7 @@ impl super::AgentLoop {
             let mut loop_guard = crate::loop_guard::LoopGuard::default();
 
             // Drain steer messages between iterations.
-            Self::drain_steers(
-                &mut steer_rx,
-                &mut pending_steers,
-                &mut delivered_msg_ids,
-                history,
-                &tx,
-            )
-            .await;
+            steer.drain(&mut steer_rx, history, &tx).await;
 
             // Checkpoint-restart cycle: if token usage exceeds threshold,
             // archive old messages and restart with fresh context.
@@ -94,7 +86,7 @@ impl super::AgentLoop {
                     &cancel,
                     &tx,
                     &mut steer_rx,
-                    &mut pending_steers,
+                    &mut steer,
                 )
                 .await
             {
@@ -108,39 +100,21 @@ impl super::AgentLoop {
                     // is a non-blocking try_recv loop) and applies
                     // uniformly to provider errors so the user
                     // doesn't lose typed input on a transient failure.
-                    let before = history.message_count();
-                    Self::drain_steers(
-                        &mut steer_rx,
-                        &mut pending_steers,
-                        &mut delivered_msg_ids,
-                        history,
-                        &tx,
-                    )
-                    .await;
-                    if history.message_count() > before {
-                        crate::types::STEER_DRAINED_ON_ABORT_COUNT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    let rescued = steer.drain(&mut steer_rx, history, &tx).await;
+                    bump_drained_on_abort_if_rescued(rescued);
                     return Err(e);
                 }
             };
 
             // S2/S3 of PLAN_NEXT_SESSION: stream was interrupted by a
-            // mid-stream steer. Drain steers (the one in pending_steers
-            // plus any that may have piled up since), do NOT push the
+            // mid-stream steer. Drain steers (the one in the
+            // pipeline plus any that may have piled up since), do NOT push the
             // partial assistant message to history (the user already
             // saw it via TextDelta), and re-issue the iteration so the
             // model sees the augmented context.
             if outcome.mid_stream_steer {
                 empty_budget.reset();
-                Self::drain_steers(
-                    &mut steer_rx,
-                    &mut pending_steers,
-                    &mut delivered_msg_ids,
-                    history,
-                    &tx,
-                )
-                .await;
+                steer.drain(&mut steer_rx, history, &tx).await;
                 continue 'outer;
             }
             // Guard against "provider returned nothing" turns.
@@ -179,19 +153,8 @@ impl super::AgentLoop {
                     None,
                     Some(msg.clone()),
                 );
-                let before = history.message_count();
-                Self::drain_steers(
-                    &mut steer_rx,
-                    &mut pending_steers,
-                    &mut delivered_msg_ids,
-                    history,
-                    &tx,
-                )
-                .await;
-                if history.message_count() > before {
-                    crate::types::STEER_DRAINED_ON_ABORT_COUNT
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                let rescued = steer.drain(&mut steer_rx, history, &tx).await;
+                bump_drained_on_abort_if_rescued(rescued);
                 return Err(AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::Other {
                         status: 0,
@@ -218,16 +181,7 @@ impl super::AgentLoop {
                 // user's clarification would otherwise be silently lost
                 // (steer_rx is dropped when run() returns) — the exact
                 // failure mode reproduced in incident img_20260510_f1d4.
-                let msgs_before_drain = history.message_count();
-                Self::drain_steers(
-                    &mut steer_rx,
-                    &mut pending_steers,
-                    &mut delivered_msg_ids,
-                    history,
-                    &tx,
-                )
-                .await;
-                if history.message_count() > msgs_before_drain {
+                if steer.drain(&mut steer_rx, history, &tx).await {
                     // The drain just appended a fresh user message;
                     // continue the iteration loop instead of returning
                     // Idle so the model gets a chance to react.
@@ -274,7 +228,7 @@ impl super::AgentLoop {
                     &cancel,
                     &tx,
                     &mut steer_rx,
-                    &mut pending_steers,
+                    &mut steer,
                 )
                 .await?;
                 for (id, name, result) in results {
@@ -306,14 +260,7 @@ impl super::AgentLoop {
             // Execute gated tools sequentially (require permission).
             for (id, name, input) in gated_calls {
                 // Drain steer messages between sequential tool calls.
-                Self::drain_steers(
-                    &mut steer_rx,
-                    &mut pending_steers,
-                    &mut delivered_msg_ids,
-                    history,
-                    &tx,
-                )
-                .await;
+                steer.drain(&mut steer_rx, history, &tx).await;
 
                 let perm = self
                     .tools
@@ -355,7 +302,7 @@ impl super::AgentLoop {
                         &cancel,
                         &tx,
                         &mut steer_rx,
-                        &mut pending_steers,
+                        &mut steer,
                     )
                     .await?;
 
