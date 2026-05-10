@@ -53,13 +53,19 @@ pub(crate) async fn build() -> WiredBot {
     // Each is opt-in via config / disk presence; missing = silent
     // off-path (zero overhead).
     {
-        // T2 LSP manager. enabled=false by default in LspConfig;
-        // operator opts in via [lsp] in naked.json (TODO: thread
-        // through a real config-driven LspConfig once the section
-        // exists; for now defaults give zero-overhead off-path).
-        let lsp = std::sync::Arc::new(naked_core::lsp::LspManager::new(
-            naked_core::lsp::LspConfig::default(),
-        ));
+        // T2 LSP manager. ENABLED by default (post-edit compiler
+        // feedback is the biggest quality multiplier in
+        // PLAN_QUALITY_v1). Lazy: LSP servers spawn on first edit
+        // per language. Operators who want to disable can set
+        // NAKED_LSP_DISABLED=1.
+        let lsp_cfg = naked_core::lsp::LspConfig::default();
+        tracing::info!(
+            lsp_enabled = lsp_cfg.enabled,
+            lsp_warn_included = lsp_cfg.include_warnings,
+            lsp_max_diagnostics = lsp_cfg.max_diagnostics_per_file,
+            "PLAN_QUALITY_v1 LSP manager configured"
+        );
+        let lsp = std::sync::Arc::new(naked_core::lsp::LspManager::new(lsp_cfg));
         agent.set_lsp(lsp);
 
         // T6 lifecycle hooks: load ~/.naked/hooks.json if present.

@@ -36,9 +36,17 @@ pub use registry::{Language, server_for_extension};
 
 /// Knobs read from `[lsp]` in `naked.json`. All defaults match the
 /// plan acceptance row in PLAN_QUALITY_v1 §Q.2.
+///
+/// **Default is enabled** so the model gets post-edit compiler
+/// feedback out of the box — the biggest quality-multiplier in
+/// PLAN_QUALITY_v1. Spawning is lazy (server starts on first edit
+/// per language only); failure-mode is silent (`tracing::debug!`,
+/// no-op). Operators who explicitly want to disable it can set
+/// `NAKED_LSP_DISABLED=1` in the environment, or build an
+/// `LspConfig { enabled: false, ..Default::default() }` programmatically.
 #[derive(Debug, Clone)]
 pub struct LspConfig {
-    /// Globally enabled? Default `false` (zero-overhead off-path).
+    /// Globally enabled? Default `true`.
     pub enabled: bool,
     /// How long after `didChange` to wait for diagnostics. Default 5s.
     pub poll_after_edit: Duration,
@@ -50,8 +58,20 @@ pub struct LspConfig {
 
 impl Default for LspConfig {
     fn default() -> Self {
+        // Honour `NAKED_LSP_DISABLED` env opt-out. Any value that
+        // parses as truthy turns LSP off; missing or empty leaves
+        // it on. We use the same truthy set as `DEEPSEEK_MEMORY`
+        // / GitHub Actions so it feels familiar.
+        let disabled = matches!(
+            std::env::var("NAKED_LSP_DISABLED")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
         Self {
-            enabled: false,
+            enabled: !disabled,
             poll_after_edit: Duration::from_millis(5000),
             max_diagnostics_per_file: 20,
             include_warnings: false,
@@ -142,10 +162,37 @@ mod tests {
     #[test]
     fn disabled_returns_empty() {
         // Smoke: with enabled=false, diagnostics_for is a no-op.
-        let mgr = LspManager::new(LspConfig::default());
+        // Default is now enabled=true (PLAN_QUALITY_v1 follow-up),
+        // so we explicitly disable for this test.
+        let mgr = LspManager::new(LspConfig {
+            enabled: false,
+            ..Default::default()
+        });
         let rt = tokio::runtime::Runtime::new().unwrap();
         let diags = rt.block_on(mgr.diagnostics_for(Path::new("/tmp"), Path::new("foo.rs")));
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn default_is_enabled_unless_env_disables() {
+        // Without env override, default is on.
+        // (We can't safely mutate $NAKED_LSP_DISABLED in this test
+        // because of the workspace's deny-unsafe-code lint, but if
+        // it happens to be set in the CI environment the env-opt-out
+        // code path is exercised.)
+        let cfg = LspConfig::default();
+        let env_disabled = std::env::var("NAKED_LSP_DISABLED")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        assert_eq!(
+            cfg.enabled, !env_disabled,
+            "default enabled state must reflect env opt-out"
+        );
     }
 
     #[test]
