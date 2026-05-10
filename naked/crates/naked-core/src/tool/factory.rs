@@ -104,6 +104,7 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         Box::new(super::git_tools::GitDiffTool),
         Box::new(super::apply_patch::ApplyPatchTool),
         Box::new(super::diagnostics::DiagnosticsTool),
+        Box::new(super::revert_turn::RevertTurnTool),
         Box::new(super::validate_data::ValidateDataTool),
         Box::new(super::todo_tool::TodoTool::new(ctx.todo_list.clone())),
         Box::new(super::plan_tool::PlanTool::new(ctx.plan_state.clone())),

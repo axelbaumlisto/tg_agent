@@ -8,6 +8,7 @@ pub mod error_taxonomy;
 #[path = "history_mod/mod.rs"]
 pub mod history;
 pub mod hooks;
+pub mod lifecycle_hooks;
 pub mod liveness;
 pub mod loop_;
 pub mod loop_guard;
@@ -59,6 +60,7 @@ pub mod coherence;
 pub mod command_arity;
 pub mod mentions;
 pub mod network_policy;
+pub mod permissions;
 pub mod retry;
 pub mod schema_migration;
 pub mod stream_filter;

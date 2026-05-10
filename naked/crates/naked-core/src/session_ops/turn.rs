@@ -134,12 +134,30 @@ impl AgentCore {
         }
         session.updated_at = chrono::Utc::now();
 
-        // Fire-and-forget: pre-turn snapshot + memory classification
+        // Fire-and-forget: pre-turn snapshot + memory classification.
+        // T1 of PLAN_QUALITY_v1: in addition to the legacy git-stash
+        // snapshot we also capture into the side-git SnapshotRepo
+        // (`~/.naked/snapshots/<hash>/.git`). This is what the
+        // model-callable `revert_turn` tool + the `/restore` slash
+        // command read from. Both paths are non-fatal: a missing
+        // git binary or read-only fs degrades to a debug log; the
+        // turn proceeds.
         let ws = session.workspace.clone();
         let turn_seq = session.history.message_count() as u64;
         tokio::spawn(async move {
             if let Some(msg) = crate::snapshot::pre_turn_snapshot(&ws, turn_seq).await {
-                tracing::debug!(stash = %msg, "pre-turn snapshot");
+                tracing::debug!(stash = %msg, "pre-turn legacy stash snapshot");
+            }
+        });
+        let ws_side = session.workspace.clone();
+        tokio::task::spawn_blocking(move || {
+            match crate::snapshot::SnapshotRepo::open_or_init(&ws_side) {
+                Ok(repo) => {
+                    if let Err(e) = repo.capture(&format!("pre-turn:{turn_seq}")) {
+                        tracing::debug!("pre-turn side snapshot skipped: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!("pre-turn side snapshot init skipped: {e}"),
             }
         });
         {

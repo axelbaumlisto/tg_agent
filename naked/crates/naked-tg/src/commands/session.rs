@@ -153,7 +153,7 @@ pub(crate) async fn cmd_status(
         ));
         // Coherence state:
         let ratio = est as f32 / cw.max(1) as f32;
-        let coh = naked_core::coherence::from_capacity(ratio);
+        let coh = naked_core::coherence::from_capacity(ratio as f64);
         lines.push(format!(
             "<b>Health:</b> {} {}",
             coh.emoji(),

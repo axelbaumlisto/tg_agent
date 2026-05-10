@@ -110,13 +110,49 @@ pub(crate) async fn cmd_health(
         snap.stream_button_click_abort, snap.stream_button_click_sendnow, supervisor_restart,
     ));
 
-    // ── 4) Uptime ──────────────────────────────────
+    // ── 4) Coherence ladder (T7 of PLAN_QUALITY_v1) ─────────
+    // Pure derivation from existing process-wide counters — no
+    // separate state, no I/O. Healthy is the default; we degrade
+    // when empty-retries climb and recover after a successful
+    // compaction or steer rescue.
+    let coh = derive_coherence_state();
+    lines.push(String::new());
+    lines.push(format!(
+        "{} <b>Coherence</b>: {} — <i>{}</i>",
+        coh.icon(),
+        coh.label(),
+        coh.description(),
+    ));
+
+    // ── 5) Uptime ──────────────────────────────────
     let up = crate::shared::PROCESS_STARTED_AT.elapsed();
     lines.push(String::new());
     lines.push(format!("⏱ <b>Uptime</b>: {}", fmt_age(up)));
 
     reply_html(bot, ctx, lines.join("\n")).await?;
     Ok(())
+}
+
+/// Derive coherence state from the current snapshot of process-wide
+/// counters. Cheap (a few atomic loads); no caching needed.
+fn derive_coherence_state() -> naked_core::coherence::CoherenceState {
+    use naked_core::coherence::{CoherenceSignal, CoherenceState, next_coherence_state};
+    use std::sync::atomic::Ordering;
+    let mut state = CoherenceState::Healthy;
+    let empty = naked_core::types::EMPTY_CONTENT_RETRY_COUNT.load(Ordering::Relaxed);
+    let drained = naked_core::types::STEER_DRAINED_ON_ABORT_COUNT.load(Ordering::Relaxed);
+    // Heuristic: any nonzero recent retries imply context pressure.
+    // We don't have rate-windows here; the counters are monotonic,
+    // so we just treat "observed empties at all" as the warm signal.
+    // Operators get the precise counts in the panel above; the
+    // ladder is a one-glance overview.
+    if empty > 0 {
+        state = next_coherence_state(state, CoherenceSignal::EmptyContentRetriesRising);
+    }
+    if drained > 0 {
+        state = next_coherence_state(state, CoherenceSignal::SteerRescued);
+    }
+    state
 }
 
 /// Format a [`Duration`] as a compact `Hh Mm Ss` / `Mm Ss` / `Ss`
