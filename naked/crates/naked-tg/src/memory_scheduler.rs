@@ -23,7 +23,10 @@ use naked_core::memory::types::MemoryScope;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::cron_util::next_cron_after;
+use crate::supervised::{Backoff, spawn_supervised};
 
 /// Public handle returned by [`spawn`]. Keep it alive for as long as
 /// the scheduler should run; dropping the handle drops the background
@@ -44,12 +47,42 @@ impl MemoryScheduler {
 /// Spawn the daily-memory scheduler. Returns immediately. The
 /// scheduler is a no-op when `cfg.daily_enabled = false` (it stays
 /// alive but never fires).
+///
+/// T5 of PLAN_LIVENESS_v1: wrapped in [`spawn_supervised`] so a
+/// panic in `run_daily` (e.g. provider OOMs while building the
+/// digest prompt) doesn't silently kill the scheduler. Without
+/// the wrapper a panic detached the spawn task and no further
+/// digests would fire until the next process restart — same
+/// failure-mode class as the polling-loop incident, just rarer.
 pub fn spawn(agent: Arc<AgentCore>, workspace: PathBuf, cfg: MemoryConfig) -> MemoryScheduler {
     let notify = Arc::new(Notify::new());
     let notify_inner = notify.clone();
-    let handle = tokio::spawn(async move {
-        run_loop(agent, workspace, cfg, notify_inner).await;
-    });
+    // The supervisor uses a CancellationToken; the existing run_loop
+    // listens on `Notify`. Both are wired so caller-side `poke()`
+    // and supervisor-side shutdown work independently.
+    let supervisor_token = CancellationToken::new();
+    let agent_clone = agent;
+    let workspace_clone = workspace;
+    let cfg_clone = cfg;
+    let handle = spawn_supervised(
+        "memory_scheduler",
+        Backoff {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(60),
+            multiplier: 2,
+        },
+        supervisor_token.clone(),
+        move |_inner_tok| {
+            let agent = agent_clone.clone();
+            let workspace = workspace_clone.clone();
+            let cfg = cfg_clone.clone();
+            let notify = notify_inner.clone();
+            async move {
+                run_loop(agent, workspace, cfg, notify).await;
+                Ok(())
+            }
+        },
+    );
     MemoryScheduler {
         _handle: handle,
         notify,
