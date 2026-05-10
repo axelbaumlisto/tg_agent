@@ -68,7 +68,15 @@ impl super::AgentLoop {
             let request = self.build_chat_request(history);
 
             let outcome = match self
-                .stream_one_turn(&request, history, &mut cumulative_usage, &cancel, &tx)
+                .stream_one_turn(
+                    &request,
+                    history,
+                    &mut cumulative_usage,
+                    &cancel,
+                    &tx,
+                    &mut steer_rx,
+                    &mut pending_steers,
+                )
                 .await
             {
                 Ok(o) => o,
@@ -77,6 +85,25 @@ impl super::AgentLoop {
                 )) => continue 'outer,
                 Err(e) => return Err(e),
             };
+
+            // S2/S3 of PLAN_NEXT_SESSION: stream was interrupted by a
+            // mid-stream steer. Drain steers (the one in pending_steers
+            // plus any that may have piled up since), do NOT push the
+            // partial assistant message to history (the user already
+            // saw it via TextDelta), and re-issue the iteration so the
+            // model sees the augmented context.
+            if outcome.mid_stream_steer {
+                empty_budget.reset();
+                Self::drain_steers(
+                    &mut steer_rx,
+                    &mut pending_steers,
+                    &mut delivered_msg_ids,
+                    history,
+                    &tx,
+                )
+                .await;
+                continue 'outer;
+            }
             // Guard against "provider returned nothing" turns.
             //
             // Some providers (notably `glm-cn`/`glm-5-turbo`) can close a
@@ -133,6 +160,34 @@ impl super::AgentLoop {
             history.push_assistant(blocks, turn_usage);
 
             if tool_calls.is_empty() {
+                // S1 of PLAN_NEXT_SESSION: before signalling Idle and
+                // returning, drain any steer messages that arrived while
+                // the model was streaming. If a steer is pending, the
+                // user's clarification would otherwise be silently lost
+                // (steer_rx is dropped when run() returns) — the exact
+                // failure mode reproduced in incident img_20260510_f1d4.
+                let msgs_before_drain = history.message_count();
+                Self::drain_steers(
+                    &mut steer_rx,
+                    &mut pending_steers,
+                    &mut delivered_msg_ids,
+                    history,
+                    &tx,
+                )
+                .await;
+                if history.message_count() > msgs_before_drain {
+                    // The drain just appended a fresh user message;
+                    // continue the iteration loop instead of returning
+                    // Idle so the model gets a chance to react.
+                    self.config.observer.on_retry(
+                        RetryKind::EmptyContent,
+                        0,
+                        0,
+                        0,
+                        "steer-drained-on-idle-exit",
+                    );
+                    continue 'outer;
+                }
                 let _ = tx.send(AgentEvent::Idle).await;
                 self.config.record_health(
                     crate::model_catalog::HealthEventKind::Success,

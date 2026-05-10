@@ -5,7 +5,7 @@ use crate::history::ConversationHistory;
 use crate::loop_observer::RetryKind;
 use crate::provider::ChatRequest;
 use crate::retry::Backoff;
-use crate::types::{AgentEvent, ContentBlock, StreamChunk, TurnUsage};
+use crate::types::{AgentEvent, ContentBlock, SteerMessage, StreamChunk, TurnUsage};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -22,9 +22,16 @@ pub(super) struct TurnStreamOutcome {
     /// True when the stream produced no content at all (no text, no tools, no thinking).
     /// The outer loop decides whether to retry via the empty-content-attempts budget.
     pub(super) empty: bool,
+    /// S2/S3 of PLAN_NEXT_SESSION: true when the stream was broken
+    /// out of mid-flight because a steer message arrived. The outer
+    /// loop must drain steers and re-issue the iteration WITHOUT
+    /// pushing the partial assistant message to history (the user
+    /// already saw the partial via TextDelta events).
+    pub(super) mid_stream_steer: bool,
 }
 
 impl super::AgentLoop {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn stream_one_turn(
         &self,
         request: &ChatRequest,
@@ -32,6 +39,8 @@ impl super::AgentLoop {
         cumulative_usage: &mut TurnUsage,
         cancel: &CancellationToken,
         tx: &mpsc::Sender<AgentEvent>,
+        steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
+        pending_steers: &mut Vec<SteerMessage>,
     ) -> Result<TurnStreamOutcome> {
         let mut text_acc = String::new();
         let mut thinking_acc = String::new();
@@ -40,6 +49,9 @@ impl super::AgentLoop {
         let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
         let mut turn_usage: Option<TurnUsage> = None;
         let mut stream_ok = false;
+        // Hoisted out of the retry loop so the post-loop tail can
+        // surface it on the TurnStreamOutcome.
+        let mut mid_stream_steer_flag = false;
 
         for retry in 0..=MAX_STREAM_RETRIES {
             let connect_result = tokio::select! {
@@ -121,6 +133,12 @@ impl super::AgentLoop {
             let mut mid_stream_error = None;
 
             loop {
+                // S2 of PLAN_NEXT_SESSION: 3-arm select! — cancel,
+                // next chunk, OR a steer message landing while we
+                // stream. The steer arm makes the polling task
+                // observable to user input within ~one tokio yield,
+                // matching pi-coding-agent's REPL feel and removing
+                // the "Принято — доставлю между шагами" hang.
                 let chunk = tokio::select! {
                     _ = cancel.cancelled() => {
                         return Err(AgentError::Cancelled);
@@ -129,6 +147,37 @@ impl super::AgentLoop {
                         Some(c) => c,
                         None => break,
                     },
+                    maybe_msg = async {
+                        match steer_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            // No steer channel: park forever so this
+                            // arm never wins.
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(msg) = maybe_msg {
+                            // S3 — soft-interrupt policy: stash the
+                            // winning steer in pending_steers, then
+                            // BURST-drain the channel so any messages
+                            // that arrived in the same scheduler tick
+                            // are merged into one re-issue. Without
+                            // this, two close-spaced steers would
+                            // each trigger their own iteration with a
+                            // single user message — not the merge
+                            // semantics drain_steers expects.
+                            pending_steers.push(msg);
+                            if let Some(rx) = steer_rx.as_mut() {
+                                while let Ok(more) = rx.try_recv() {
+                                    pending_steers.push(more);
+                                }
+                            }
+                            mid_stream_steer_flag = true;
+                            break;
+                        }
+                        // Channel closed (sender dropped) — fall
+                        // through and keep streaming.
+                        continue;
+                    }
                 };
 
                 match chunk {
@@ -188,6 +237,14 @@ impl super::AgentLoop {
                         break;
                     }
                 }
+            }
+
+            // S3: when steer interrupted, treat the iteration as
+            // "complete enough" — no retry, no error — and let the
+            // outer loop re-issue.
+            if mid_stream_steer_flag {
+                stream_ok = true;
+                break;
             }
 
             if let Some(e) = mid_stream_error {
@@ -252,6 +309,7 @@ impl super::AgentLoop {
             tool_calls,
             turn_usage,
             empty,
+            mid_stream_steer: mid_stream_steer_flag,
         })
     }
 }

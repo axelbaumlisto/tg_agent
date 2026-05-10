@@ -1153,3 +1153,138 @@ async fn steer_during_readonly_parallel_tools_is_buffered() {
         .any(|m| m.role == Role::User && m.text_content().contains("parallel steer"));
     assert!(found, "steer during parallel tools must appear in history");
 }
+
+/// MockProvider variant whose FIRST response yields chunks slowly so
+/// the test can inject a steer between iteration-top drain and
+/// pre-Idle drain. Subsequent responses are instant.
+struct SlowFirstMockProvider {
+    responses: Vec<Vec<StreamChunk>>,
+    call_count: AtomicUsize,
+    first_chunk_delay: std::time::Duration,
+}
+
+impl SlowFirstMockProvider {
+    fn new(responses: Vec<Vec<StreamChunk>>, delay: std::time::Duration) -> Self {
+        Self {
+            responses,
+            call_count: AtomicUsize::new(0),
+            first_chunk_delay: delay,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for SlowFirstMockProvider {
+    fn name(&self) -> &str {
+        "slow-first-mock"
+    }
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        vec![]
+    }
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>> {
+        use tokio_stream::StreamExt;
+        let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+        let chunks = if idx < self.responses.len() {
+            self.responses[idx].clone()
+        } else {
+            vec![StreamChunk::Text("fallback".into()), StreamChunk::Done]
+        };
+        if idx == 0 {
+            // Delay each chunk so a steer can land between
+            // iteration-top drain and pre-Idle drain.
+            let delay = self.first_chunk_delay;
+            let stream = tokio_stream::iter(chunks).then(move |c| async move {
+                tokio::time::sleep(delay).await;
+                c
+            });
+            Ok(Box::pin(stream))
+        } else {
+            Ok(Box::pin(tokio_stream::iter(chunks)))
+        }
+    }
+}
+
+#[tokio::test]
+async fn steer_after_idle_does_not_get_lost() {
+    // S1 of PLAN_NEXT_SESSION: pinned regression for the user-visible
+    // "Принято — доставлю между шагами" hang.
+    //
+    // Scenario: model produces a text-only response (no tool calls)
+    // → pre-S1 the loop returned Idle BEFORE any drain_steers call,
+    // so a steer arriving during the stream was silently dropped
+    // (steer_rx is destroyed when run() returns).
+    //
+    // We use SlowFirstMockProvider so iteration 1's stream yields a
+    // chunk every 80ms; we send the steer at t+50ms, after
+    // iteration-top drain has already run (empty) but well before
+    // the pre-Idle drain. With S1 the pre-Idle drain catches it and
+    // continues to a second iteration.
+    let provider = SlowFirstMockProvider::new(
+        vec![
+            // Iteration 1: text-only response, slow chunks
+            vec![StreamChunk::Text("ok, doing X".into()), StreamChunk::Done],
+            // Iteration 2: instant response to the steer (only reached
+            // when S1 works)
+            vec![
+                StreamChunk::Text("acknowledged steer".into()),
+                StreamChunk::Done,
+            ],
+        ],
+        std::time::Duration::from_millis(80),
+    );
+
+    let agent_loop = AgentLoop::new(
+        Box::new(provider),
+        crate::tool::registry::ToolRegistry::new(vec![]),
+        LoopConfig::default(),
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("do something");
+
+    let (tx, _rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let (steer_tx, steer_rx) = mpsc::channel(16);
+
+    let handle = tokio::spawn(async move {
+        agent_loop
+            .run(&mut history, tx, cancel, None, Some(steer_rx))
+            .await
+            .map(|_| history)
+    });
+
+    // Wait long enough that iteration-top drain has run with an empty
+    // channel, but iteration 1 hasn't finished streaming.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    steer_tx
+        .send(SteerMessage {
+            msg_id: 7,
+            text: "нет не надо".into(),
+            is_edit: false,
+        })
+        .await
+        .unwrap();
+
+    let history = handle.await.unwrap().unwrap();
+    // Steer must appear in history (drained on Idle exit).
+    let steer_in_history = history
+        .messages()
+        .iter()
+        .any(|m| m.role == Role::User && m.text_content().contains("нет не надо"));
+    assert!(
+        steer_in_history,
+        "S1: steer arriving on text-only-response turn must reach history (was lost pre-S1)"
+    );
+    // The model's answer to the steer must appear too — proves the
+    // loop did NOT return Idle before re-issuing.
+    let steer_answered = history
+        .messages()
+        .iter()
+        .any(|m| m.role == Role::Assistant && m.text_content().contains("acknowledged steer"));
+    assert!(
+        steer_answered,
+        "S1: model must respond to the drained steer, not exit at Idle"
+    );
+}
