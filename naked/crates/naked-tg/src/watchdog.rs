@@ -49,6 +49,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::{Instant, sleep};
 
+use naked_core::liveness::LivenessRegistry;
+
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 
@@ -126,6 +128,75 @@ pub fn spawn_watchdog_ticks(
 
 async fn sleep_until(deadline: Instant) {
     sleep(deadline.saturating_duration_since(Instant::now())).await;
+}
+
+// ---------------------------------------------------------------------------
+// Liveness-gated watchdog (T2 of PLAN_LIVENESS_v1)
+// ---------------------------------------------------------------------------
+
+/// One required liveness source for the watchdog arbiter.
+#[derive(Debug, Clone, Copy)]
+pub struct LivenessRequirement {
+    pub source: &'static str,
+    pub max_silence: Duration,
+}
+
+/// Liveness-gated watchdog ticker. Forwards `notify_alive()` to
+/// the underlying notifier only when every required source has
+/// beaten within `max_silence`.
+///
+/// During `grace_period` after spawn, pings are sent unconditionally
+/// so the bot can finish wiring its sources without tripping.
+///
+/// Returns `None` when `notifier.interval()` is `None` (no-op env).
+pub fn spawn_watchdog_with_liveness(
+    notifier: Arc<dyn WatchdogNotifier>,
+    liveness: Arc<LivenessRegistry>,
+    requirements: Vec<LivenessRequirement>,
+    grace_period: Duration,
+    shutdown: Arc<Notify>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let interval = notifier.interval()?;
+    if interval == Duration::ZERO {
+        return None;
+    }
+    let tick = (interval / 2).max(Duration::from_millis(50));
+
+    Some(tokio::spawn(async move {
+        let started = Instant::now();
+        loop {
+            let next = Instant::now() + tick;
+            tokio::select! {
+                _ = shutdown.notified() => return,
+                _ = sleep_until(next) => {}
+            }
+            let in_grace = started.elapsed() < grace_period;
+            let stale = collect_stale(&liveness, &requirements);
+            if in_grace || stale.is_empty() {
+                notifier.notify_alive().await;
+            } else {
+                tracing::warn!(
+                    stale = ?stale,
+                    "watchdog: SKIPPING sd_notify — liveness sources stale"
+                );
+            }
+        }
+    }))
+}
+
+fn collect_stale(
+    liveness: &LivenessRegistry,
+    requirements: &[LivenessRequirement],
+) -> Vec<(&'static str, Duration)> {
+    let mut out = Vec::new();
+    for req in requirements {
+        match liveness.last_beat(req.source) {
+            None => out.push((req.source, Duration::from_secs(u64::MAX / 2))),
+            Some(age) if age > req.max_silence => out.push((req.source, age)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// systemd-compatible watchdog. Talks the `sd_notify(3)` protocol
@@ -513,6 +584,214 @@ mod tests {
         assert!(
             wd.interval().is_none(),
             "no WatchdogSec → no periodic ticks, but READY/STOPPING still send"
+        );
+    }
+
+    // ── spawn_watchdog_with_liveness (T2 of PLAN_LIVENESS_v1) ───────────────
+
+    fn rec_notifier(interval_ms: u64) -> Arc<RecordingNotifier> {
+        Arc::new(RecordingNotifier {
+            events: Default::default(),
+            interval: Some(Duration::from_millis(interval_ms)),
+        })
+    }
+
+    #[tokio::test]
+    async fn liveness_arbiter_returns_none_for_noop_notifier() {
+        let liveness = Arc::new(LivenessRegistry::new());
+        let shutdown = Arc::new(Notify::new());
+        let h = spawn_watchdog_with_liveness(
+            Arc::new(NoopWatchdog),
+            liveness,
+            vec![],
+            Duration::from_secs(0),
+            shutdown,
+        );
+        assert!(h.is_none());
+    }
+
+    #[tokio::test]
+    async fn liveness_arbiter_in_grace_pings_unconditionally() {
+        let liveness = Arc::new(LivenessRegistry::new());
+        let n = rec_notifier(200);
+        let shutdown = Arc::new(Notify::new());
+        let h = spawn_watchdog_with_liveness(
+            n.clone(),
+            liveness,
+            vec![LivenessRequirement {
+                source: "polling",
+                max_silence: Duration::from_millis(50),
+            }],
+            Duration::from_secs(2),
+            shutdown.clone(),
+        )
+        .expect("ticker spawned");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        shutdown.notify_one();
+        let _ = h.await;
+        let alive = n
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == "alive")
+            .count();
+        assert!(alive >= 2, "grace ping count: {alive}");
+    }
+
+    #[tokio::test]
+    async fn liveness_arbiter_skips_ping_when_source_stale() {
+        let liveness = Arc::new(LivenessRegistry::new());
+        liveness.register("polling");
+        let n = rec_notifier(200);
+        let shutdown = Arc::new(Notify::new());
+        let h = spawn_watchdog_with_liveness(
+            n.clone(),
+            liveness,
+            vec![LivenessRequirement {
+                source: "polling",
+                max_silence: Duration::from_millis(50),
+            }],
+            Duration::from_millis(50),
+            shutdown.clone(),
+        )
+        .expect("ticker spawned");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown.notify_one();
+        let _ = h.await;
+        let alive = n
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == "alive")
+            .count();
+        assert_eq!(alive, 0, "stale source must suppress pings, got {alive}");
+    }
+
+    #[tokio::test]
+    async fn liveness_arbiter_pings_when_source_fresh() {
+        let liveness = Arc::new(LivenessRegistry::new());
+        let live_clone = liveness.clone();
+        let n = rec_notifier(200);
+        let shutdown = Arc::new(Notify::new());
+        // SEPARATE Notify for beater — Notify::notify_one() wakes only
+        // one waiter, so sharing one with the watchdog would leave the
+        // beater alive and hang the test (lesson learned).
+        let beater_shutdown = Arc::new(Notify::new());
+        let beater_token = beater_shutdown.clone();
+        let beater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = beater_token.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(30)) => {
+                        live_clone.beat("polling");
+                    }
+                }
+            }
+        });
+        let h = spawn_watchdog_with_liveness(
+            n.clone(),
+            liveness,
+            vec![LivenessRequirement {
+                source: "polling",
+                max_silence: Duration::from_millis(100),
+            }],
+            Duration::from_millis(50),
+            shutdown.clone(),
+        )
+        .expect("ticker spawned");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown.notify_one();
+        beater_shutdown.notify_one();
+        let _ = h.await;
+        let _ = beater.await;
+        let alive = n
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == "alive")
+            .count();
+        assert!(alive >= 2, "fresh source ping count: {alive}");
+    }
+
+    #[tokio::test]
+    async fn liveness_arbiter_any_one_stale_suppresses_all() {
+        let liveness = Arc::new(LivenessRegistry::new());
+        liveness.register("polling");
+        liveness.register("scheduler");
+        let live_clone = liveness.clone();
+        let beater_shutdown = Arc::new(Notify::new());
+        let beater_clone = beater_shutdown.clone();
+        let beater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = beater_clone.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                        live_clone.beat("polling");
+                    }
+                }
+            }
+        });
+        let n = rec_notifier(200);
+        let shutdown = Arc::new(Notify::new());
+        let h = spawn_watchdog_with_liveness(
+            n.clone(),
+            liveness,
+            vec![
+                LivenessRequirement {
+                    source: "polling",
+                    max_silence: Duration::from_millis(100),
+                },
+                LivenessRequirement {
+                    source: "scheduler",
+                    max_silence: Duration::from_millis(100),
+                },
+            ],
+            Duration::from_millis(50),
+            shutdown.clone(),
+        )
+        .expect("ticker spawned");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        shutdown.notify_one();
+        beater_shutdown.notify_one();
+        let _ = h.await;
+        let _ = beater.await;
+        let alive = n
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == "alive")
+            .count();
+        assert_eq!(
+            alive, 0,
+            "any-one-stale must suppress all pings, got {alive}"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_arbiter_shuts_down_promptly() {
+        let liveness = Arc::new(LivenessRegistry::new());
+        let n = rec_notifier(2000);
+        let shutdown = Arc::new(Notify::new());
+        let h = spawn_watchdog_with_liveness(
+            n,
+            liveness,
+            vec![],
+            Duration::from_secs(0),
+            shutdown.clone(),
+        )
+        .expect("ticker spawned");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let start = std::time::Instant::now();
+        shutdown.notify_one();
+        let _ = h.await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "shutdown took {:?}",
+            start.elapsed()
         );
     }
 }

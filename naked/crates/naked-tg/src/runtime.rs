@@ -128,11 +128,13 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
     });
 
     // ── systemd watchdog (no-op outside `Type=notify`) ─────────────────
-    // Wired after the bot is fully constructed (provider, scheduler,
-    // Telegram client) but before we enter the polling loop, so the
-    // `READY=1` notification is sent only when the bot is actually
-    // ready to handle work. Drops the handle on shutdown via the
-    // `Notify` we wake from the `ctrl_c` task — see below.
+    // Wired after the bot is fully constructed but before the polling
+    // loop starts, so READY=1 is sent only when the bot is actually
+    // ready to handle work. Liveness arbiter (T2 of
+    // PLAN_LIVENESS_v1) gates sd_notify on real polling progress —
+    // not just process aliveness. If polling silently dies (incident
+    // 2026-05-10 12:47), the arbiter stops pinging and systemd
+    // restarts us within WatchdogSec.
     use naked_tg::watchdog::WatchdogNotifier as _;
     let watchdog_notifier: Arc<dyn naked_tg::watchdog::WatchdogNotifier> =
         match naked_tg::watchdog::SystemdWatchdog::detect_from_env() {
@@ -144,9 +146,21 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
             None => Arc::new(naked_tg::watchdog::NoopWatchdog),
         };
     watchdog_notifier.notify_ready().await;
+    let liveness = Arc::new(naked_core::liveness::LivenessRegistry::new());
+    liveness.register("tg_polling.tick");
     let watchdog_shutdown = Arc::new(tokio::sync::Notify::new());
-    let watchdog_handle = naked_tg::watchdog::spawn_watchdog_ticks(
+    let watchdog_handle = naked_tg::watchdog::spawn_watchdog_with_liveness(
         watchdog_notifier.clone(),
+        liveness.clone(),
+        vec![naked_tg::watchdog::LivenessRequirement {
+            source: "tg_polling.tick",
+            // Long-poll is ~30s + reasonable network slack. If we don't
+            // see a tick in 90s, the loop is wedged and systemd should
+            // recycle us.
+            max_silence: Duration::from_secs(90),
+        }],
+        // Grace covers boot wiring + first long-poll round trip.
+        Duration::from_secs(60),
         watchdog_shutdown.clone(),
     );
     {
@@ -174,7 +188,20 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
     let base: &str = &base_url;
     let client: &reqwest::Client = &http_client;
 
+    // T4 of PLAN_LIVENESS_v1: getUpdates round trip is wrapped in one
+    // tokio::time::timeout. Without this, a half-broken TCP stream
+    // could hang resp.json().await forever (incident 2026-05-10).
+    // Long-poll is 30s on the server side; we add 30s of network
+    // slack and another 15s for body decode — total 75s.
+    const POLL_TIMEOUT: Duration = Duration::from_secs(75);
+
     while !shutdown.is_cancelled() {
+        // Heartbeat the liveness registry every iteration. The
+        // arbiter forwards sd_notify only while this stays fresh
+        // (max_silence = 90s, set above). One missed iteration is
+        // tolerated; two (~150s of silence) trips the watchdog.
+        liveness.beat("tg_polling.tick");
+
         let body = serde_json::json!({
             "offset": offset,
             "timeout": 30,
@@ -182,26 +209,26 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
         });
         tracing::debug!(offset, "polling getUpdates");
 
-        let resp = tokio::select! {
+        let payload: serde_json::Value = tokio::select! {
             _ = shutdown.cancelled() => break,
-            r = client.post(format!("{base}/getUpdates")).json(&body).send() => {
-                match r {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("getUpdates network error: {e}");
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        continue;
-                    }
+            outcome = tokio::time::timeout(
+                POLL_TIMEOUT,
+                fetch_updates(client, base, &body),
+            ) => match outcome {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    tracing::error!("getUpdates error: {e}");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
                 }
-            }
-        };
-
-        let payload: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("getUpdates parse error: {e}");
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                continue;
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = POLL_TIMEOUT.as_secs(),
+                        "getUpdates timed out — cycling connection"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
             }
         };
         if payload["ok"].as_bool() != Some(true) {
@@ -467,4 +494,24 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
     // Wait for all permits to be returned (all tasks finished)
     let _ = tokio::time::timeout(Duration::from_secs(30), task_tracker.acquire_many(50)).await;
     tracing::info!("Shutdown complete.");
+}
+
+/// Fetch + parse a `getUpdates` response in one await.
+///
+/// Combines the previously-separate `.send().await` and `.json().await`
+/// into a single future so callers can wrap the entire round trip in
+/// a single `tokio::time::timeout`. The pre-T4 split allowed
+/// `.json()` to hang indefinitely on a half-broken TCP stream
+/// (incident 2026-05-10 12:47).
+async fn fetch_updates(
+    client: &reqwest::Client,
+    base: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, reqwest::Error> {
+    let resp = client
+        .post(format!("{base}/getUpdates"))
+        .json(body)
+        .send()
+        .await?;
+    resp.json::<serde_json::Value>().await
 }

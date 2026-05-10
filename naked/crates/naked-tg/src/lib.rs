@@ -22,6 +22,7 @@ pub mod rate_limit;
 pub mod render;
 pub mod research_html;
 pub mod scheduler;
+pub mod supervised;
 pub use scheduler as research_scheduler;
 pub mod guarded;
 pub mod markup;
