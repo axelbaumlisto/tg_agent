@@ -4,6 +4,9 @@ pub mod error;
 pub mod factory;
 pub mod openai_compat;
 pub mod resilient;
+pub mod timeout;
+
+pub use timeout::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_INTER_CHUNK_TIMEOUT, TimeoutProvider};
 
 pub use factory::{build_provider_from_config, create_provider};
 
