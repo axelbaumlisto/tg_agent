@@ -782,7 +782,8 @@ async fn steer_message_injected_between_iterations() {
     // Verify SteerReceived event was emitted.
     let mut saw_steer = false;
     while let Ok(ev) = rx.try_recv() {
-        if matches!(&ev, AgentEvent::SteerReceived { text } if text.contains("change direction")) {
+        if matches!(&ev, AgentEvent::SteerReceived { text, .. } if text.contains("change direction"))
+        {
             saw_steer = true;
         }
     }
@@ -1090,7 +1091,7 @@ async fn steer_during_tool_execution_is_buffered() {
     // Verify SteerReceived event was emitted:
     let mut saw_steer = false;
     while let Ok(ev) = rx.try_recv() {
-        if matches!(&ev, AgentEvent::SteerReceived { text } if text.contains("redirect to new task"))
+        if matches!(&ev, AgentEvent::SteerReceived { text, .. } if text.contains("redirect to new task"))
         {
             saw_steer = true;
         }

@@ -260,6 +260,24 @@ pub(crate) type SteerSenderMap =
 pub(crate) static STEER_SENDERS: LazyLock<tokio::sync::RwLock<SteerSenderMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
+/// PLAN_NEXT_SESSION §A.2 S6 — "↩️ Принято" temp confirmations
+/// awaiting deletion. Keyed by `(chat_id, thread_id, user_msg_id)`,
+/// where `user_msg_id` is the original Telegram message_id of the
+/// user's steer text. Value is `(chat_id, ack_message_id)` so the
+/// streaming-side handler can issue `bot.delete_message(chat, ack)`
+/// without needing to look up the chat again.
+///
+/// Inserted by `message_handler::handle_text` right after the bot
+/// posts "↩️ Принято — доставлю между шагами".
+/// Removed (and the message deleted) by the streaming pipeline when
+/// `AgentEvent::SteerReceived { msg_ids, .. }` arrives — the very
+/// moment the steer is in `history` and the model is guaranteed to
+/// see it on the next iteration.
+pub(crate) type SteerAckMap =
+    HashMap<(i64, Option<i32>, i32), (teloxide::types::ChatId, teloxide::types::MessageId)>;
+pub(crate) static STEER_ACK_IDS: LazyLock<tokio::sync::RwLock<SteerAckMap>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+
 /// Global rate limiter instance — accessible from commands.rs for /metrics.
 pub(crate) static RATE_LIMITER: LazyLock<naked_tg::rate_limit::RateLimiter> =
     LazyLock::new(naked_tg::rate_limit::RateLimiter::new);

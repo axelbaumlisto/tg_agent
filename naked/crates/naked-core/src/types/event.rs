@@ -72,8 +72,14 @@ pub enum AgentEvent {
         chunk: String,
     },
     /// A steer message from the user was injected into the active turn.
+    /// `text` is the merged combined text (joined with \n\n);
+    /// `msg_ids` lists the Telegram message ids from the original
+    /// `SteerMessage`s, in original arrival order. The bot uses
+    /// `msg_ids` to delete the matching "↩️ Принято" temp
+    /// confirmations once the steer is actually in history.
     SteerReceived {
         text: String,
+        msg_ids: Vec<i32>,
     },
     Error(String),
     Idle,
@@ -213,7 +219,7 @@ pub fn dispatch_event(handler: &mut dyn EventHandler, event: &AgentEvent) {
             handler.on_cycle_restarted(*cycle_number, *archived_messages, archive_path);
         }
         AgentEvent::ToolOutput { call_id, chunk } => handler.on_tool_output(call_id, chunk),
-        AgentEvent::SteerReceived { text } => handler.on_steer_received(text),
+        AgentEvent::SteerReceived { text, msg_ids: _ } => handler.on_steer_received(text),
         AgentEvent::Error(msg) => handler.on_error(msg),
         AgentEvent::Idle => handler.on_idle(),
     }

@@ -49,6 +49,12 @@ impl super::AgentLoop {
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        // Collect ids in original order before clearing pending. The
+        // bot uses these to delete the matching "↩️ Принято"
+        // temp confirmation messages once delivery is actually done
+        // (PLAN_NEXT_SESSION.md §A.2 S6).
+        let msg_ids: Vec<i32> = pending.iter().map(|m| m.msg_id).collect();
+
         // Track delivered msg_ids.
         for m in pending.iter() {
             delivered.insert(m.msg_id);
@@ -56,6 +62,11 @@ impl super::AgentLoop {
         pending.clear();
 
         history.push_user(&combined);
-        let _ = tx.send(AgentEvent::SteerReceived { text: combined }).await;
+        let _ = tx
+            .send(AgentEvent::SteerReceived {
+                text: combined,
+                msg_ids,
+            })
+            .await;
     }
 }

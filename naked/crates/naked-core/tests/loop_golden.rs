@@ -694,7 +694,7 @@ async fn g8_steer_message_injected_between_iterations() {
     assert!(
         events.iter().any(|e| matches!(
             &e,
-            AgentEvent::SteerReceived { text } if text.contains("change direction")
+            AgentEvent::SteerReceived { text, .. } if text.contains("change direction")
         )),
         "G8: SteerReceived event must be emitted"
     );

@@ -308,7 +308,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                     eprint!("\r\x1b[2K\x1b[90m  > {last}\x1b[0m");
                 }
             }
-            AgentEvent::SteerReceived { text } => {
+            AgentEvent::SteerReceived { text, msg_ids: _ } => {
                 eprintln!("\x1b[36m[steer: {text}]\x1b[0m");
             }
             AgentEvent::UsageUpdate(u) => {

@@ -245,12 +245,41 @@ pub(crate) async fn stream_response(
                     view.tool_output = Some(chunk);
                     dirty = true;
                 }
-                AgentEvent::SteerReceived { text } => {
+                AgentEvent::SteerReceived { text, msg_ids } => {
+                    // S6 of PLAN_NEXT_SESSION: visual proof of
+                    // delivery. Render the steer text as a <pre>
+                    // (code block) tool-line so the user sees their
+                    // exact words echoed back — and DELETE the
+                    // matching "↩️ Принято" temp confirmations
+                    // (the ones whose user-msg-ids appear in
+                    // `msg_ids`).
                     view.tool_lines.push(format!(
-                        "\u{21a9}\u{fe0f} <i>Steer: {}</i>",
+                        "✅ <b>Доставлено</b>\n<pre>{}</pre>",
                         crate::fmt_utils::escape_html_min(&text)
                     ));
                     dirty = true;
+
+                    // Drain ack ids matching the delivered steer
+                    // msg_ids and best-effort delete them. We don't
+                    // propagate delete errors — a stale ack is a
+                    // cosmetic problem, never worth crashing the
+                    // streaming pipeline over.
+                    let to_delete: Vec<(teloxide::types::ChatId, teloxide::types::MessageId)> = {
+                        let mut acks = crate::shared::STEER_ACK_IDS.write().await;
+                        msg_ids
+                            .iter()
+                            .filter_map(|mid| acks.remove(&(chat_id_raw, tid, *mid)))
+                            .collect()
+                    };
+                    for (chat, ack_id) in to_delete {
+                        if let Err(e) = bot.delete_message(chat, ack_id).await {
+                            tracing::debug!(
+                                chat = chat.0,
+                                msg = ack_id.0,
+                                "steer ack delete failed (likely already gone): {e}"
+                            );
+                        }
+                    }
                 }
                 AgentEvent::Error(e) => {
                     // "cancelled" = normal turn displacement, not a crash.
@@ -329,6 +358,30 @@ pub(crate) async fn stream_response(
     MODEL_SWITCHES.write().await.remove(&chat_key);
     QUEUE_COUNTS.write().await.remove(&chat_key);
     STEER_SENDERS.write().await.remove(&chat_key_for_steer);
+    // S6 cleanup: any ack ids still parked for this chat/thread are
+    // unreachable now (turn ended without an Idle-time SteerReceived
+    // for them). Best-effort delete — prevents the temp
+    // "Принято" message from sticking around forever.
+    {
+        let stale: Vec<(teloxide::types::ChatId, teloxide::types::MessageId)> = {
+            let mut acks = crate::shared::STEER_ACK_IDS.write().await;
+            let keys: Vec<_> = acks
+                .keys()
+                .filter(|(c, t, _)| *c == chat_id_raw && *t == tid)
+                .cloned()
+                .collect();
+            keys.into_iter().filter_map(|k| acks.remove(&k)).collect()
+        };
+        for (chat, ack_id) in stale {
+            if let Err(e) = bot.delete_message(chat, ack_id).await {
+                tracing::debug!(
+                    chat = chat.0,
+                    msg = ack_id.0,
+                    "end-of-turn steer ack cleanup failed: {e}"
+                );
+            }
+        }
+    }
 
     if aborted_for_switch {
         // Don't send final — the turn was interrupted.

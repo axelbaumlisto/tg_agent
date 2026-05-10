@@ -447,13 +447,23 @@ pub(crate) async fn handle_message(
         };
 
         if steered {
-            bot.send_message(
-                ctx.chat_id,
-                "\u{21a9}\u{fe0f} Принято \u{2014} доставлю между шагами",
-            )
-            .maybe_thread(ctx.thread_id)
-            .maybe_reply_to(ctx.reply_to)
-            .await?;
+            // S6: track the ack message id so the streaming pipeline
+            // can delete it once the steer is actually delivered
+            // (AgentEvent::SteerReceived). Without this the user is
+            // left with a permanent "Принято — доставлю" hanging
+            // in the chat even after the model already replied.
+            let ack = bot
+                .send_message(
+                    ctx.chat_id,
+                    "\u{21a9}\u{fe0f} Принято \u{2014} доставлю между шагами",
+                )
+                .maybe_thread(ctx.thread_id)
+                .maybe_reply_to(ctx.reply_to)
+                .await?;
+            crate::shared::STEER_ACK_IDS
+                .write()
+                .await
+                .insert((key.0, key.1, msg.id.0), (ctx.chat_id, ack.id));
         } else {
             // Steer channel not available — fall back to queue.
             match multimodal_blocks {
