@@ -245,6 +245,26 @@ impl TaskNotifier for NoopNotifier {
     }
 }
 
+/// Adapter: bridge a [`TaskNotifier`] to the supervisor's
+/// [`crate::supervised::PanicHook`] interface. F1 of
+/// `PLAN_NEXT_SESSION.md` removed the bespoke
+/// `lifecycle::supervised_run_loop`; this is the only piece of glue
+/// needed to keep the existing `notify_supervisor_panic`
+/// observability path intact when the research scheduler runs under
+/// the unified primitive.
+pub(crate) struct NotifierPanicHook(pub(crate) Arc<dyn TaskNotifier>);
+
+#[async_trait]
+impl crate::supervised::PanicHook for NotifierPanicHook {
+    async fn on_panic(&self, _task_name: &str, _attempt: u32, details: &str) {
+        // The legacy hook signature is `(details: &str)`. We pass
+        // through a pre-formatted string that already contains the
+        // task name + attempt number (built by
+        // `spawn_supervised_with_opts`).
+        self.0.notify_supervisor_panic(details).await;
+    }
+}
+
 /// The hook end of the scheduler — implements
 /// [`naked_core::research::SchedulerHook`] and pokes the scheduler loop on
 /// every spec mutation so reschedules are immediate (no need to wait for the
@@ -349,37 +369,56 @@ impl ResearchScheduler {
         // /commands but no research would ever fire again, and nobody would
         // know until users complained. The supervisor restarts the loop and
         // sends a `notify_supervisor_panic` so operators see the incident.
-        let supervisor_notifier = notifier.clone();
-        let supervisor_backoff = Duration::from_secs(5);
-        tokio::spawn(async move {
-            lifecycle::supervised_run_loop(
-                "research",
-                supervisor_notifier,
-                supervisor_backoff,
-                move || {
-                    let core = core.clone();
-                    let config = config.clone();
-                    let semaphore = semaphore.clone();
-                    let state = state.clone();
-                    let notifier = notifier.clone();
-                    let loop_notify = loop_notify.clone();
-                    let loop_shutdown = loop_shutdown.clone();
-                    async move {
-                        lifecycle::run_loop(
-                            core,
-                            config,
-                            semaphore,
-                            state,
-                            notifier,
-                            loop_notify,
-                            loop_shutdown,
-                        )
-                        .await;
-                    }
+        // F1: single supervisor primitive. Wrap `run_loop` in
+        // `spawn_supervised_with_opts` so a panic restarts the loop
+        // (with backoff) instead of silently detaching, and route
+        // panic events through the existing TaskNotifier via a
+        // tiny adapter. Constant 5s backoff matches the previous
+        // `supervised_run_loop` behaviour.
+        let panic_hook: std::sync::Arc<dyn crate::supervised::PanicHook> =
+            std::sync::Arc::new(NotifierPanicHook(notifier.clone()));
+        let _supervisor = crate::supervised::spawn_supervised_with_opts(
+            crate::supervised::SupervisorOptions {
+                name: "research",
+                backoff: crate::supervised::Backoff {
+                    initial: Duration::from_secs(5),
+                    max: Duration::from_secs(5),
+                    multiplier: 1,
                 },
-            )
-            .await;
-        });
+                // Scheduler-internal shutdown is signalled via the
+                // `Arc<Notify>` already passed to `run_loop`; when
+                // it fires, `run_loop` returns Ok and our supervisor
+                // sees a clean exit. So an externally-never-cancelled
+                // token is the right choice here — we don't want the
+                // supervisor to abort `run_loop` mid-iteration; the
+                // loop's own graceful-shutdown sweep MUST run.
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                max_attempts: None,
+                panic_hook: Some(panic_hook),
+            },
+            move |_inner_token| {
+                let core = core.clone();
+                let config = config.clone();
+                let semaphore = semaphore.clone();
+                let state = state.clone();
+                let notifier = notifier.clone();
+                let loop_notify = loop_notify.clone();
+                let loop_shutdown = loop_shutdown.clone();
+                async move {
+                    lifecycle::run_loop(
+                        core,
+                        config,
+                        semaphore,
+                        state,
+                        notifier,
+                        loop_notify,
+                        loop_shutdown,
+                    )
+                    .await;
+                    Ok::<(), anyhow::Error>(())
+                }
+            },
+        );
 
         (scheduler, hook)
     }

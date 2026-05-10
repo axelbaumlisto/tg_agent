@@ -319,90 +319,15 @@ pub(crate) async fn drain_resurrection_queue(
     consumed
 }
 
-/// Wrap a long-running async loop in a panic-catching supervisor.
-///
-/// Spawns the inner loop on a fresh tokio task; when that task panics, fires
-/// `notifier.notify_supervisor_panic`, sleeps `backoff`, and re-spawns. Returns
-/// only when the inner future completes cleanly or the inner task is cancelled
-/// (we don't want to fight `JoinHandle::abort` from the outside).
-///
-/// The supervisor also logs every panic at `error!` level so observability
-/// never depends solely on the notifier hook.
-///
-/// `make_loop_body` must be `FnMut` because we re-invoke it for every
-/// restart (each restart needs a fresh future).
-///
-/// SOLID: this is the single supervision primitive. `run_loop` plugs into it
-/// without knowing supervision details; tests plug in fake bodies the same way.
-pub async fn supervised_run_loop<F, Fut>(
-    name: &'static str,
-    notifier: Arc<dyn TaskNotifier>,
-    backoff: Duration,
-    make_loop_body: F,
-) where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    supervised_run_loop_capped(name, notifier, backoff, u32::MAX, make_loop_body).await
-}
-
-/// Same as [`supervised_run_loop`] but with a hard cap on restart attempts.
-/// Used by tests to keep pathological-panic scenarios bounded; production
-/// uses the uncapped variant.
-pub async fn supervised_run_loop_capped<F, Fut>(
-    name: &'static str,
-    notifier: Arc<dyn TaskNotifier>,
-    backoff: Duration,
-    max_attempts: u32,
-    mut make_loop_body: F,
-) where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        let body = make_loop_body();
-        let handle = tokio::spawn(body);
-        match handle.await {
-            Ok(()) => return,
-            Err(je) if je.is_cancelled() => {
-                tracing::info!(loop_name = %name, "supervised loop cancelled");
-                return;
-            }
-            Err(je) => {
-                let panic_msg = format_panic_payload(&je);
-                let details = format!(
-                    "scheduler '{name}' loop panicked (attempt {attempt}/{cap}): {panic_msg}",
-                    cap = if max_attempts == u32::MAX {
-                        "∞".to_string()
-                    } else {
-                        max_attempts.to_string()
-                    }
-                );
-                tracing::error!("{details}");
-                notifier.notify_supervisor_panic(&details).await;
-                if attempt >= max_attempts {
-                    tracing::error!(
-                        loop_name = %name,
-                        attempts = attempt,
-                        "supervised loop reached restart cap; giving up"
-                    );
-                    return;
-                }
-                if backoff > Duration::ZERO {
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-}
-
-pub(crate) fn format_panic_payload(je: &tokio::task::JoinError) -> String {
-    // `JoinError::into_panic` would consume; we want a borrowed inspection.
-    // Fall back to Debug — for `panic!("msg")` this includes the message.
-    format!("{je:?}")
-}
+// F1 of PLAN_NEXT_SESSION (2026-05-10): the bespoke
+// `supervised_run_loop` / `_capped` pair lived here. Both have been
+// folded into `crate::supervised::spawn_supervised_with_opts` (one
+// supervision primitive in the codebase, no duplication of the
+// catch-panic / backoff / notify-on-panic logic). The research
+// scheduler now spawns under that primitive directly
+// (see `scheduler::ResearchScheduler::start_with_notifier`); the
+// adapter that bridges `TaskNotifier` to the supervisor's
+// `PanicHook` lives at `scheduler::mod::NotifierPanicHook`.
 
 /// Graceful-shutdown sweep: abort every entry in the in-memory
 /// `running` map and flip the corresponding on-disk inflight ledger

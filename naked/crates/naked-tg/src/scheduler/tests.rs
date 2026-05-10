@@ -962,11 +962,45 @@ impl TaskNotifier for PanicCountingNotifier {
     }
 }
 
+// F1: post-consolidation, the panic-restart property is now tested
+// against `spawn_supervised_with_opts` directly. We keep these three
+// scheduler-level tests (renamed for clarity) so the integration
+// between TaskNotifier and the unified supervisor primitive remains
+// pinned — a regression on the adapter
+// (`crate::scheduler::NotifierPanicHook`) would otherwise only be
+// caught by manual prod observation.
+
+fn make_supervised_handle<F, Fut>(
+    name: &'static str,
+    notifier: Arc<dyn TaskNotifier>,
+    backoff_ms: u64,
+    max_attempts: Option<u32>,
+    factory: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut(tokio_util::sync::CancellationToken) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let panic_hook: Arc<dyn crate::supervised::PanicHook> =
+        Arc::new(crate::scheduler::NotifierPanicHook(notifier));
+    crate::supervised::spawn_supervised_with_opts(
+        crate::supervised::SupervisorOptions {
+            name,
+            backoff: crate::supervised::Backoff {
+                initial: Duration::from_millis(backoff_ms),
+                max: Duration::from_millis(backoff_ms.max(1)),
+                multiplier: 1,
+            },
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            max_attempts,
+            panic_hook: Some(panic_hook),
+        },
+        factory,
+    )
+}
+
 #[tokio::test]
 async fn supervisor_restarts_loop_after_panic_and_returns_when_clean() {
-    // Loop body that panics on the first call and returns Ok on the
-    // second. Supervisor MUST observe one panic, fire the notifier,
-    // restart, then exit cleanly.
     let entries = Arc::new(AtomicUsize::new(0));
     let notifier = Arc::new(PanicCountingNotifier {
         panics: AtomicUsize::new(0),
@@ -975,18 +1009,17 @@ async fn supervisor_restarts_loop_after_panic_and_returns_when_clean() {
     let trait_notifier: Arc<dyn TaskNotifier> = notifier.clone();
 
     let entries_clone = entries.clone();
-    let make_loop = move || {
+    let h = make_supervised_handle("test", trait_notifier, 10, None, move |_tok| {
         let entries_inner = entries_clone.clone();
         async move {
             let n = entries_inner.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 panic!("synthetic boom");
             }
+            Ok(())
         }
-    };
-
-    lifecycle::supervised_run_loop("test", trait_notifier, Duration::from_millis(10), make_loop)
-        .await;
+    });
+    h.await.unwrap();
 
     assert_eq!(
         entries.load(Ordering::SeqCst),
@@ -1005,9 +1038,6 @@ async fn supervisor_restarts_loop_after_panic_and_returns_when_clean() {
 
 #[tokio::test]
 async fn supervisor_caps_restart_attempts() {
-    // Pathological loop that always panics. Supervisor must give up
-    // after the configured cap so a poisoned scheduler can't busy-loop
-    // forever burning CPU + alert quota.
     let entries = Arc::new(AtomicUsize::new(0));
     let notifier = Arc::new(PanicCountingNotifier {
         panics: AtomicUsize::new(0),
@@ -1016,22 +1046,14 @@ async fn supervisor_caps_restart_attempts() {
     let trait_notifier: Arc<dyn TaskNotifier> = notifier.clone();
 
     let entries_clone = entries.clone();
-    let make_loop = move || {
+    let h = make_supervised_handle("test-cap", trait_notifier, 0, Some(3), move |_tok| {
         let entries_inner = entries_clone.clone();
         async move {
             entries_inner.fetch_add(1, Ordering::SeqCst);
             panic!("forever boom");
         }
-    };
-
-    lifecycle::supervised_run_loop_capped(
-        "test-cap",
-        trait_notifier,
-        Duration::from_millis(0),
-        3,
-        make_loop,
-    )
-    .await;
+    });
+    h.await.unwrap();
 
     assert_eq!(entries.load(Ordering::SeqCst), 3, "exactly 3 attempts");
     assert_eq!(
@@ -1047,14 +1069,14 @@ async fn supervisor_returns_immediately_when_loop_exits_cleanly() {
     let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
 
     let entries_clone = entries.clone();
-    let make_loop = move || {
+    let h = make_supervised_handle("clean", notifier, 99_000, None, move |_tok| {
         let entries_inner = entries_clone.clone();
         async move {
             entries_inner.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
-    };
-
-    lifecycle::supervised_run_loop("clean", notifier, Duration::from_secs(99), make_loop).await;
+    });
+    h.await.unwrap();
     assert_eq!(entries.load(Ordering::SeqCst), 1);
 }
 
