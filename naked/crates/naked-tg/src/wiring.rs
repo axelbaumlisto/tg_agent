@@ -110,6 +110,15 @@ pub(crate) async fn build() -> WiredBot {
     let liveness = Arc::new(naked_core::liveness::LivenessRegistry::new());
     liveness.register("tg_polling.tick");
     liveness.register("scheduler.tick");
+    // F4: install the singleton so `/health` (and any future
+    // ops-side reader) can reach the registry without us having to
+    // thread it through every command handler. set() returns Err if
+    // already installed; we ignore — a duplicate install during
+    // tests is harmless.
+    let _ = crate::shared::LIVENESS_REGISTRY.set(liveness.clone());
+    // Force-stamp process start time so `/health` uptime is honest
+    // (LazyLock is initialised on first deref).
+    let _ = *crate::shared::PROCESS_STARTED_AT;
 
     if config.research.enabled && _scheduler_lock.is_some() {
         let scheduler_cfg = research_scheduler::SchedulerConfig {

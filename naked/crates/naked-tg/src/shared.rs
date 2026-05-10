@@ -292,6 +292,25 @@ pub(crate) type ControlCardMap =
 pub(crate) static CONTROL_CARDS: LazyLock<tokio::sync::RwLock<ControlCardMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
+/// F4 of PLAN_NEXT_SESSION (2026-05-10): process-wide handle to the
+/// shared `LivenessRegistry`. Set exactly once by `wiring.rs::build`
+/// (alongside the same `Arc` it stashes in `WiredBot.liveness`); read
+/// by the `/health` slash-command and — when we add it later — by
+/// the `/metrics` text renderer.
+///
+/// `OnceLock` (rather than `LazyLock`) because there is exactly one
+/// correct value and it must be installed by wiring — we do NOT
+/// want a lazy default registry that silently shadows the real one.
+pub(crate) static LIVENESS_REGISTRY: std::sync::OnceLock<
+    std::sync::Arc<naked_core::liveness::LivenessRegistry>,
+> = std::sync::OnceLock::new();
+
+/// F4: process start time. Stamped on first read (effectively when
+/// the bot boots and any code path touches `shared`). `/health`
+/// renders `now - PROCESS_STARTED_AT` as the uptime line.
+pub(crate) static PROCESS_STARTED_AT: LazyLock<std::time::Instant> =
+    LazyLock::new(std::time::Instant::now);
+
 /// Global rate limiter instance — accessible from commands.rs for /metrics.
 pub(crate) static RATE_LIMITER: LazyLock<naked_tg::rate_limit::RateLimiter> =
     LazyLock::new(naked_tg::rate_limit::RateLimiter::new);
