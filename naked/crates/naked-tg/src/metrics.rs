@@ -413,6 +413,7 @@ pub fn serve_prometheus_if_enabled() {
             };
             tracing::info!("Prometheus /metrics listening on {addr}");
             for stream in listener.incoming() {
+                // REGISTRY-WAIVE: see BUG_REGISTRY B23 — verified intentional 2026-05-13
                 let Ok(mut stream) = stream else { continue };
                 use std::io::{Read, Write};
                 let mut buf = [0u8; 1024];

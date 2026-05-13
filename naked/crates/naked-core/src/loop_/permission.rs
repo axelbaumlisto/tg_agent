@@ -29,6 +29,7 @@ use crate::types::{AgentEvent, Permission, PermissionResponse};
 /// 8 arguments is the natural shape of "check this fingerprint, prompt
 /// the user if needed, emit events, return decision". Wrapping in a
 /// struct only adds noise; the call site is one line.
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn request_or_cached_approval(
     cache: &ApprovalCache,

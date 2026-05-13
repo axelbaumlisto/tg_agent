@@ -265,6 +265,7 @@ impl ModelHealth {
         kind: ObservationKind,
         detail: Option<String>,
     ) {
+        // REGISTRY-WAIVE: intentional fallback: poisoned RwLock → empty result
         let Ok(slot) = self.observer.read() else {
             return;
         };
@@ -460,6 +461,7 @@ impl ModelHealth {
     /// point-in-time clone; concurrent `record()` calls after this
     /// returns are not reflected.
     pub fn snapshot(&self) -> Vec<((String, String), HealthWindow)> {
+        // REGISTRY-WAIVE: intentional fallback: poisoned RwLock → empty result
         let Ok(rings) = self.rings.read() else {
             return Vec::new();
         };

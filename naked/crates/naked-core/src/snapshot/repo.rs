@@ -221,6 +221,7 @@ mod tests {
     #[test]
     fn capture_returns_id_and_no_changes_skipped() {
         let (_g, ws) = fresh_workspace();
+        // REGISTRY-WAIVE: snapshot non-critical: degrade silently if repo missing
         let Ok(repo) = SnapshotRepo::open_or_init(&ws) else {
             // git binary missing on CI is acceptable.
             return;
@@ -238,6 +239,7 @@ mod tests {
     #[test]
     fn list_orders_newest_first() {
         let (_g, ws) = fresh_workspace();
+        // REGISTRY-WAIVE: snapshot non-critical: degrade silently if repo missing
         let Ok(repo) = SnapshotRepo::open_or_init(&ws) else {
             return;
         };
@@ -253,6 +255,7 @@ mod tests {
     #[test]
     fn restore_overwrites_modified() {
         let (_g, ws) = fresh_workspace();
+        // REGISTRY-WAIVE: snapshot non-critical: degrade silently if repo missing
         let Ok(repo) = SnapshotRepo::open_or_init(&ws) else {
             return;
         };

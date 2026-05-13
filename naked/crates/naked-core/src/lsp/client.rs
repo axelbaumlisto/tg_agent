@@ -214,6 +214,7 @@ async fn read_loop(
         if reader.read_exact(&mut body).await.is_err() {
             return;
         }
+        // REGISTRY-WAIVE: intentional fallback: malformed entry → skip
         let Ok(value) = serde_json::from_slice::<Value>(&body) else {
             continue;
         };

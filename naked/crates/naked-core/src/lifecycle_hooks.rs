@@ -108,6 +108,7 @@ impl LifecycleHookRunner {
     }
 
     pub async fn load_from(&self, path: &Path) {
+        // REGISTRY-WAIVE: intentional fallback: missing path → empty result
         let Ok(text) = std::fs::read_to_string(path) else {
             return;
         };

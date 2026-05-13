@@ -62,6 +62,7 @@ impl super::AgentLoop {
         }
     }
 
+    // REGISTRY-WAIVE: type_complexity — refactor-defer
     #[allow(clippy::type_complexity)]
     pub(super) fn classify_tool_calls(
         &self,
@@ -148,6 +149,7 @@ impl super::AgentLoop {
     /// Record a tool result in history with context-aware truncation and
     /// loop-guard tracking. Centralises the pattern that was duplicated
     /// across readonly-batch and gated-tool execution paths.
+    // REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_tool_outcome(
         history: &mut crate::history::ConversationHistory,
@@ -172,6 +174,7 @@ impl super::AgentLoop {
     }
 
     /// Execute a single tool call with a heartbeat keepalive.
+    // REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_tool_with_heartbeat(
         &self,

@@ -31,6 +31,7 @@ pub(super) struct TurnStreamOutcome {
 }
 
 impl super::AgentLoop {
+    // REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn stream_one_turn(
         &self,

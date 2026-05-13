@@ -332,11 +332,13 @@ impl Tool for EditFileTool {
 }
 
 async fn is_binary(path: &Path) -> bool {
+    // REGISTRY-WAIVE: intentional fallback: open/read failure → empty
     let Ok(mut file) = tokio::fs::File::open(path).await else {
         return false;
     };
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; BINARY_SNIFF_SIZE];
+    // REGISTRY-WAIVE: intentional fallback: open/read failure → empty
     let Ok(n) = file.read(&mut buf).await else {
         return false;
     };

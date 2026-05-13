@@ -169,6 +169,7 @@ impl ObservationRecorder {
     /// are skipped silently (corrupt logs should not brick the daily
     /// digest).
     pub fn load(&self) -> Vec<ModelObservation> {
+        // REGISTRY-WAIVE: intentional fallback: missing path → empty result
         let Ok(contents) = std::fs::read_to_string(&self.path) else {
             return Vec::new();
         };

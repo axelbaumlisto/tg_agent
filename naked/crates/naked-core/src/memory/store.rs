@@ -174,6 +174,7 @@ impl MarkdownMemoryStore {
     /// load each file's contents on demand.
     pub fn list_daily(workspace: &Path, scope: &MemoryScope) -> Vec<NaiveDate> {
         let dir = scope_memory_dir(workspace, scope);
+        // REGISTRY-WAIVE: intentional fallback: missing path → empty result
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
@@ -392,6 +393,7 @@ fn dirs_home() -> PathBuf {
 /// re-sanitizes deterministically.
 pub fn list_user_scopes() -> Vec<MemoryScope> {
     let users_dir = MarkdownMemoryStore::naked_home().join("users");
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(read) = std::fs::read_dir(&users_dir) else {
         return Vec::new();
     };

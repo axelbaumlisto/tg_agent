@@ -42,6 +42,70 @@ pub(crate) struct WiredBot {
 /// Build the complete DI graph and return a ready-to-run [`WiredBot`].
 ///
 /// Must be called **after** tracing is initialised (in [`crate::bootstrap`]).
+/// BUG_REGISTRY D-BOOT-DESCRIBER-WARN: boot-time health check for the
+/// multimodal vision path. Emits a loud WARN if the default model
+/// can't accept image content blocks AND `tg_media.vision` describer
+/// fallback is unconfigured — in that state, every photo from a user
+/// pinned to the default model gets the "[⚠ vision not configured]"
+/// placeholder text and the image content is lost. INFO when healthy.
+///
+/// `pub(crate)` so this can be unit-tested without spinning up the
+/// full async wiring pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MultimodalDescriberHealth {
+    /// Default model is vision-capable; describer presence irrelevant.
+    DefaultVision,
+    /// Default model isn't vision-capable but describer fallback exists.
+    DescriberFallback,
+    /// Default model isn't vision-capable AND no describer — photos
+    /// from default-model users will be silently dropped.
+    Degraded,
+}
+
+pub(crate) fn check_multimodal_describer_health(
+    config: &naked_core::config::Config,
+) -> MultimodalDescriberHealth {
+    let default_provider = config.providers.get(&config.default_provider);
+    let default_is_vision = config
+        .tg_media
+        .is_vision_capable_with_provider(&config.default_model, default_provider);
+    let describer = config.tg_media.vision.is_some();
+    let outcome = match (default_is_vision, describer) {
+        (true, _) => MultimodalDescriberHealth::DefaultVision,
+        (false, true) => MultimodalDescriberHealth::DescriberFallback,
+        (false, false) => MultimodalDescriberHealth::Degraded,
+    };
+    match outcome {
+        MultimodalDescriberHealth::Degraded => {
+            tracing::warn!(
+                default_provider = %config.default_provider,
+                default_model = %config.default_model,
+                "multimodal degraded: default model is not vision-capable AND \
+                 no tg_media.vision describer fallback configured. \
+                 Photos from users on this model will be lost. \
+                 Either pin to a vision-capable model (e.g. qwen3-vl-plus) \
+                 or set tg_media.vision in naked.json."
+            );
+        }
+        MultimodalDescriberHealth::DefaultVision => {
+            tracing::info!(
+                default_provider = %config.default_provider,
+                default_model = %config.default_model,
+                "multimodal: default model is vision-capable"
+            );
+        }
+        MultimodalDescriberHealth::DescriberFallback => {
+            tracing::info!(
+                default_provider = %config.default_provider,
+                default_model = %config.default_model,
+                describer_model = ?config.tg_media.vision.as_ref().map(|v| &v.model),
+                "multimodal: default is text-only, describer fallback active"
+            );
+        }
+    }
+    outcome
+}
+
 pub(crate) async fn build() -> WiredBot {
     let config = Config::load().expect("Failed to load config");
     let provider =
@@ -105,6 +169,9 @@ pub(crate) async fn build() -> WiredBot {
         agent.set_permissions(permissions);
         tracing::info!("PLAN_QUALITY_v1 wiring installed: lsp + hooks + permissions");
     }
+
+    // BUG_REGISTRY D-BOOT-DESCRIBER-WARN (B05 regression guard).
+    check_multimodal_describer_health(&config);
 
     // Register telegram_attach tool — lets the agent send files to chat.
     // The attachment queue is per-turn (created in stream_response), but
@@ -476,5 +543,101 @@ async fn register_commands(bot: &Bot) {
     ];
     if let Err(e) = bot.set_my_commands(commands).await {
         tracing::warn!("Failed to set bot commands: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use naked_core::config::{Config, ProviderConfig, VisionProviderCfg};
+
+    /// Builds a minimal `Config` with the given default model and provider
+    /// + per-model vision capability + optional describer.
+    ///
+    /// KISS — no other fields set. Spread `..Default::default()` so future
+    /// schema additions don't break this helper (BUG_REGISTRY C2).
+    fn make_config(
+        default_model: &str,
+        default_provider_name: &str,
+        per_model_vision: Option<bool>,
+        describer: Option<VisionProviderCfg>,
+    ) -> Config {
+        let mut providers = std::collections::HashMap::new();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            default_model.to_string(),
+            naked_core::model_catalog::ModelCapabilities {
+                supports_vision: per_model_vision,
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            default_provider_name.to_string(),
+            ProviderConfig {
+                capabilities: caps,
+                ..Default::default()
+            },
+        );
+        let mut cfg = Config {
+            default_model: default_model.to_string(),
+            default_provider: default_provider_name.to_string(),
+            providers,
+            ..Default::default()
+        };
+        cfg.tg_media.vision = describer;
+        cfg
+    }
+
+    fn fake_describer() -> VisionProviderCfg {
+        VisionProviderCfg {
+            api_url: "https://example.com/v1/chat/completions".into(),
+            api_key: "$FAKE_KEY".into(),
+            model: "qwen3-vl-plus".into(),
+            max_tokens: 400,
+            prompt_override: None,
+        }
+    }
+
+    /// Default model is vision-capable → healthy regardless of describer.
+    #[test]
+    fn multimodal_default_vision_healthy_without_describer() {
+        let cfg = make_config("qwen3-vl-plus", "qwen", Some(true), None);
+        assert_eq!(
+            check_multimodal_describer_health(&cfg),
+            MultimodalDescriberHealth::DefaultVision
+        );
+    }
+
+    /// Default text-only + describer present → fallback active.
+    #[test]
+    fn multimodal_describer_fallback_active() {
+        let cfg = make_config("qwen3.6-plus", "qwen", Some(false), Some(fake_describer()));
+        assert_eq!(
+            check_multimodal_describer_health(&cfg),
+            MultimodalDescriberHealth::DescriberFallback
+        );
+    }
+
+    /// Default text-only + no describer → DEGRADED, warning emitted.
+    /// This is the regression guard for B05: shipping with this state
+    /// silently drops all photo attachments on the default model.
+    #[test]
+    fn multimodal_degraded_when_default_text_only_and_no_describer() {
+        let cfg = make_config("qwen3.6-plus", "qwen", Some(false), None);
+        assert_eq!(
+            check_multimodal_describer_health(&cfg),
+            MultimodalDescriberHealth::Degraded
+        );
+    }
+
+    /// Per-model caps `None` falls through to needles. With a non-vision
+    /// model name and no describer → degraded.
+    #[test]
+    fn multimodal_per_model_none_falls_through_to_needle_check() {
+        let cfg = make_config("qwen-turbo", "qwen", None, None);
+        assert_eq!(
+            check_multimodal_describer_health(&cfg),
+            MultimodalDescriberHealth::Degraded
+        );
     }
 }

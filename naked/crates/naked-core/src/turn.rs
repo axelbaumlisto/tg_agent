@@ -713,6 +713,7 @@ pub fn resolve_auto_model(
 
 /// Build a LoopConfig from session parameters.
 /// Extracted from dispatch_turn to reduce its size.
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_loop_config(
     max_iterations: usize,

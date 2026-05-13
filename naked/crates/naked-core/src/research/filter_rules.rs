@@ -357,6 +357,7 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
             // raise; a brief with a malformed regex is operator error,
             // not a contract surface. We log via clippy's let-else so
             // it's obvious if we ever decide to surface the panic.
+            // REGISTRY-WAIVE: see BUG_REGISTRY B23 — verified intentional 2026-05-13
             let Ok(re) = Regex::new(&format!("(?i){pattern}")) else {
                 return (0.0, false);
             };
@@ -372,6 +373,7 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
                 .get("regex")
                 .and_then(Value::as_str)
                 .unwrap_or(pattern_default);
+            // REGISTRY-WAIVE: see BUG_REGISTRY B23 — verified intentional 2026-05-13
             let Ok(re) = Regex::new(pattern) else {
                 return (0.0, false);
             };
@@ -385,6 +387,7 @@ pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
             };
             // Strip thousands separators (commas) and parse.
             let cleaned = grp.as_str().replace(',', "");
+            // REGISTRY-WAIVE: see BUG_REGISTRY B23 — verified intentional 2026-05-13
             let Ok(num) = cleaned.parse::<f64>() else {
                 return (0.0, false);
             };

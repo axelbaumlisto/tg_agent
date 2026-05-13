@@ -402,10 +402,12 @@ pub(crate) async fn purge_stale_tmp_files(store: &Arc<dyn ResearchStore>) {
     };
     let mut count = 0u32;
     let mut total_bytes = 0u64;
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(mut dir) = tokio::fs::read_dir(root).await else {
         return;
     };
     while let Ok(Some(entry)) = dir.next_entry().await {
+        // REGISTRY-WAIVE: see BUG_REGISTRY B23 — verified intentional 2026-05-13
         let Ok(ft) = entry.file_type().await else {
             continue;
         };
@@ -431,6 +433,7 @@ pub(crate) async fn purge_stale_tmp_files(store: &Arc<dyn ResearchStore>) {
             continue;
         }
         let spec_dir = path;
+        // REGISTRY-WAIVE: intentional fallback: missing path → empty result
         let Ok(mut sub) = tokio::fs::read_dir(&spec_dir).await else {
             continue;
         };

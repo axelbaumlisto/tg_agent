@@ -398,6 +398,7 @@ impl ResearchCoordinator {
         self.store.write_agent_brief(&spec.id, &md).await
     }
 
+    // REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_record(
         &self,
@@ -425,7 +426,9 @@ impl ResearchCoordinator {
     /// Variant of [`write_record`] that records gatekeeper verification stats.
     /// Pass `verification = None` for plain `run_once` rows, or `Some(stats)`
     /// for the final record emitted by `run_verified`.
+    // REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
     #[allow(clippy::too_many_arguments)]
+    // REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_record_with_verification(
         &self,

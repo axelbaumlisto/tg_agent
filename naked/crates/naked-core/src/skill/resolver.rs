@@ -136,6 +136,7 @@ impl SkillResolver {
     pub fn find_orphans(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut orphans = Vec::new();
         for root in &self.roots {
+            // REGISTRY-WAIVE: intentional fallback: missing path → empty result
             let Ok(entries) = std::fs::read_dir(root) else {
                 continue;
             };

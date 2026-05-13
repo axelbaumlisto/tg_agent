@@ -57,6 +57,7 @@ pub struct TestCore {
 
 impl TestCore {
     /// Build a minimal AgentCore for testing.
+    // REGISTRY-WAIVE: field_reassign_with_default — test-construction pattern (default + mutate)
     #[allow(clippy::field_reassign_with_default)]
     pub fn build() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");

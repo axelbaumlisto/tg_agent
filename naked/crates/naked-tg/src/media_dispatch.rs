@@ -214,6 +214,7 @@ pub struct NativeImage {
 /// Process one or more media items → produce the user-facing "media block"
 /// that gets prepended to the agent prompt. Errors degrade to `[⚠ … error: …]`
 /// and a path-only fallback whenever we've managed to save the file.
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_media_items(
     items: &[MediaItem],
@@ -320,6 +321,7 @@ pub(crate) fn decide_native_route(
     route_images_natively && static_image && !too_big
 }
 
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_one_media(
     item: &MediaItem,

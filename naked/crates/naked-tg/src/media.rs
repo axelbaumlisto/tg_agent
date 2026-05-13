@@ -126,6 +126,7 @@ pub fn sweep_old_artifacts(workspace: &Path, retention_days: u64) {
         return;
     }
     let root = artifacts_root(workspace);
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
@@ -136,6 +137,7 @@ pub fn sweep_old_artifacts(workspace: &Path, retention_days: u64) {
         None => return,
     };
     for entry in entries.flatten() {
+        // REGISTRY-WAIVE: see BUG_REGISTRY B23 — verified intentional 2026-05-13
         let Ok(meta) = entry.metadata() else { continue };
         if !meta.is_dir() {
             continue;

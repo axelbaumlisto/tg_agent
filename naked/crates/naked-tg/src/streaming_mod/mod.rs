@@ -88,6 +88,7 @@ impl CompositeView {
     }
 }
 
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 /// Apply a sub-agent progress event to the composite view.
 fn apply_sub_agent_event(

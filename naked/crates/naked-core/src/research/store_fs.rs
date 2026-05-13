@@ -524,6 +524,7 @@ impl InflightStore for FsResearchStore {
             if !inflight_path.exists() {
                 continue;
             }
+            // REGISTRY-WAIVE: intentional fallback: missing path → empty result
             let Ok(data) = fs::read_to_string(&inflight_path).await else {
                 continue;
             };
@@ -557,6 +558,7 @@ impl InflightStore for FsResearchStore {
             if !inflight_path.exists() {
                 continue;
             }
+            // REGISTRY-WAIVE: intentional fallback: missing path → empty result
             let Ok(data) = fs::read_to_string(&inflight_path).await else {
                 continue;
             };

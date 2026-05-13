@@ -30,6 +30,7 @@ impl Store {
     }
 
     pub fn load_from(path: &std::path::Path) -> Ruleset {
+        // REGISTRY-WAIVE: intentional fallback: missing path → empty result
         let Ok(text) = std::fs::read_to_string(path) else {
             return Ruleset::default();
         };

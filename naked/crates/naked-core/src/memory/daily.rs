@@ -68,6 +68,7 @@ fn lock_path(workspace: &Path, scope: &MemoryScope) -> PathBuf {
 /// Returns `true` when no successful digest has run today (UTC) yet.
 pub fn should_run_today(workspace: &Path, scope: &MemoryScope) -> bool {
     let path = lock_path(workspace, scope);
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return true;
     };

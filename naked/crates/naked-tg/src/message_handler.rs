@@ -71,6 +71,7 @@ impl BotDeps {
     }
 }
 
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_message(
     bot: Bot,

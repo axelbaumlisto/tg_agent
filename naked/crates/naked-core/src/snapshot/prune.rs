@@ -22,6 +22,7 @@ pub fn prune_older_than(max_age: Duration) -> usize {
     let Some(root) = super::paths::snapshots_root() else {
         return 0;
     };
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(entries) = std::fs::read_dir(&root) else {
         return 0;
     };
@@ -61,6 +62,7 @@ fn format_duration(d: Duration) -> String {
 
 fn purge_tmp_pack_files(git_dir: &Path) {
     let pack_dir = git_dir.join("objects").join("pack");
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(entries) = std::fs::read_dir(&pack_dir) else {
         return;
     };

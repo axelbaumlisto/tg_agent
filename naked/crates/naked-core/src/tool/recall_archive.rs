@@ -63,6 +63,7 @@ struct ArchiveDoc {
 fn read_archives(sessions_root: &Path, session_id: &str) -> Vec<ArchiveDoc> {
     let cycles_dir = sessions_root.join(session_id).join("cycles");
     let mut docs = Vec::new();
+    // REGISTRY-WAIVE: intentional fallback: missing path → empty result
     let Ok(entries) = std::fs::read_dir(&cycles_dir) else {
         return docs;
     };
@@ -72,10 +73,12 @@ fn read_archives(sessions_root: &Path, session_id: &str) -> Vec<ArchiveDoc> {
         .collect();
     files.sort_by_key(|e| e.file_name());
     for (cycle_idx, entry) in files.iter().enumerate() {
+        // REGISTRY-WAIVE: intentional fallback: missing path → empty result
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
         for (line_idx, line) in content.lines().enumerate() {
+            // REGISTRY-WAIVE: intentional fallback: malformed entry → skip
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
