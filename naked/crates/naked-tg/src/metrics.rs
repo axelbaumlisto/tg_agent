@@ -30,6 +30,17 @@ static DESCRIBER_FALLBACK: AtomicU64 = AtomicU64::new(0);
 /// Useful for spotting spam bursts or runaway retry loops in production.
 static RATE_LIMIT_DELAYED: AtomicU64 = AtomicU64::new(0);
 
+/// B45 wire-up (2026-05-13): credential redactions applied before sending
+/// outgoing HTML to Telegram. Increments each time `scan_and_redact` modified
+/// the payload (no-op calls don't count). Visible leak budget should stay 0;
+/// any non-zero value is a red flag that a tool / research output leaked an
+/// `api_key=` / `Bearer X` / `Authorization:` token into the assistant turn.
+static REDACTION_APPLIED: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_redaction_applied() {
+    REDACTION_APPLIED.fetch_add(1, Ordering::Relaxed);
+}
+
 // ── F3 of PLAN_NEXT_SESSION (2026-05-10) ──────────────────
 // Streaming-control-card button clicks. Two counters, one per
 // callback action. A high `STREAM_BUTTON_CLICK_ABORT` rate (relative
@@ -132,6 +143,7 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         transcription_fail_timeout: MEDIA_TRANSCRIPTION_FAIL_TIMEOUT.load(Ordering::Relaxed),
         transcription_fail_network: MEDIA_TRANSCRIPTION_FAIL_NETWORK.load(Ordering::Relaxed),
         transcription_fail_other: MEDIA_TRANSCRIPTION_FAIL_OTHER.load(Ordering::Relaxed),
+        redaction_applied: REDACTION_APPLIED.load(Ordering::Relaxed),
     }
 }
 
@@ -152,6 +164,8 @@ pub struct MediaRoutingSnapshot {
     pub transcription_fail_timeout: u64,
     pub transcription_fail_network: u64,
     pub transcription_fail_other: u64,
+    /// B45 wire-up: outgoing-msg credential redactions count.
+    pub redaction_applied: u64,
 }
 
 impl MediaRoutingSnapshot {
@@ -325,6 +339,9 @@ impl MediaRoutingSnapshot {
              naked_tg_media_transcription_failure_total{{reason=\"timeout\"}} {tr_timeout}\n\
              naked_tg_media_transcription_failure_total{{reason=\"network\"}} {tr_network}\n\
              naked_tg_media_transcription_failure_total{{reason=\"other\"}} {tr_other}\n\
+             # HELP naked_tg_redaction_applied_total (B45) Outgoing TG messages where scan_and_redact modified payload.\n\
+             # TYPE naked_tg_redaction_applied_total counter\n\
+             naked_tg_redaction_applied_total {redaction_applied}\n\
              {model_health_body}",
             native = self.native_route_chosen,
             oversize = self.native_route_downgraded_oversize,
@@ -359,6 +376,7 @@ impl MediaRoutingSnapshot {
             tr_timeout = self.transcription_fail_timeout,
             tr_network = self.transcription_fail_network,
             tr_other = self.transcription_fail_other,
+            redaction_applied = self.redaction_applied,
             model_health_body = model_health_body,
         )
     }

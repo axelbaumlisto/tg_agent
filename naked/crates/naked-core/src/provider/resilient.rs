@@ -304,6 +304,17 @@ impl Provider for ResilientProvider {
                                 .lock()
                                 .await
                                 .insert(idx, permanent_blacklist_until());
+                            // B46 / PLAN_PROVIDER_HEALTH_v1: auto-persist
+                            // dead key to state/naked.json so the next bot
+                            // restart doesn't re-probe it. Gated by
+                            // NAKED_AUTO_PERSIST_DEAD_KEYS=1 env (off by
+                            // default — see dead_key_persist module docs).
+                            if let Some(key_value) = self.providers[idx].key_hint() {
+                                let logical = super::logical_provider_name(provider.name());
+                                super::dead_key_persist::persist_dead_key(
+                                    logical, &key_value,
+                                );
+                            }
                         } else {
                             tracing::warn!(
                                 "Provider '{}' key dead: {e}, blacklisting for {}s",

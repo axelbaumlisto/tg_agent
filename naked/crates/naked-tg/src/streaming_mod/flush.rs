@@ -39,6 +39,25 @@ pub(crate) async fn send_final(
     // No-op if message doesn't mention vnc / VNC / noVNC keyword.
     validate_novnc_ip_tokens(html);
 
+    // B45 wire-up (2026-05-13): credential redactor.
+    // Scrubs `api_key=X`, `Bearer X`, `Authorization:`, `password=`, etc.
+    // before forwarding to Telegram. Returns original string if no match
+    // (fast-path) — only allocates when something is actually redacted.
+    let redacted = naked_core::research::tool::redact::scan_and_redact(html);
+    let html: &str = if redacted == html {
+        html
+    } else {
+        crate::metrics::record_redaction_applied();
+        tracing::warn!(
+            target: "naked_tg::redact",
+            chat = chat_id.0,
+            original_len = html.len(),
+            redacted_len = redacted.len(),
+            "B45: credential pattern stripped from outgoing message"
+        );
+        &redacted
+    };
+
     // Short: fits in one message
     if html.len() <= MAX_TG_MSG {
         edit_with_retry(&bot, chat_id, msg_id, html, true).await;

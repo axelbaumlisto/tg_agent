@@ -1,9 +1,10 @@
-// REGISTRY-WAIVE: B45 — credential scrubber ported from zeroclaws.
-// `scan_and_redact` is tested (tool_tests.rs) but NOT YET wired into the
-// outbound message path. Intended call site: streaming_mod/flush.rs::send_final
-// before forwarding research output to Telegram. Until wired, the function +
-// its internal Pattern/BearerPattern matchers + REDACTORS static are all dead
-// in the prod hot path. Keeping the module ready to plug in.
+// B45-wired (2026-05-13): credential scrubber called from
+// `streaming_mod/flush.rs::send_final` before every outgoing Telegram
+// message. Patterns: api_key=X / Bearer X / Authorization: X / password=X /
+// secret=X / token=X. Returns identical string if no match — zero-cost
+// fast-path. The Pattern / BearerPattern internal matchers stay
+// `pub(crate)`; module-level `#![allow(dead_code)]` still kept so test
+// fixtures + private utility functions don't trigger lint.
 #![allow(dead_code)]
 
 //! Credential/secret redaction for research output.
@@ -13,7 +14,7 @@
 /// misconfigured proxy or a `curl -H "Authorization: ..."` snippet doesn't
 /// leak by accident. Ported from zeroclaws `scan_and_redact_output`, but
 /// scoped to the small handful of patterns we actually see.
-pub(crate) fn scan_and_redact(text: &str) -> String {
+pub fn scan_and_redact(text: &str) -> String {
     // Cheap, layered regex: no backtracking, case-insensitive.
     // Matches "api_key=SOMETHING", "Bearer XXX", "Authorization: Token YYY",
     // and long `$ALLCAPS=SECRETVAL` env exports. All values collapse to

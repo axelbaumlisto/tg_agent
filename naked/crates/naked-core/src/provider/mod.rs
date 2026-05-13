@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod copilot;
+pub mod dead_key_persist; // B46 PLAN_PROVIDER_HEALTH_v1
 pub mod error;
 pub mod factory;
 pub mod openai_compat;
@@ -60,6 +61,30 @@ pub trait Provider: Send + Sync {
     /// delegate to the inner provider so the audit reaches the
     /// `ResilientProvider` at the bottom of the chain.
     async fn audit_keys_on_boot(&self) {}
+
+    /// B46 / PLAN_PROVIDER_HEALTH_v1: optional accessor for the literal
+    /// `api_key` value this provider holds. Used by
+    /// [`super::dead_key_persist::persist_dead_key`] when a key is
+    /// permanent-blacklisted at runtime, so we can write it back to
+    /// `state/naked.json::_dead_api_keys_auto_<date>`.
+    ///
+    /// Default: `None` (single-key auth-less providers — copilot via OAuth,
+    /// decorators, mocks). Override in concrete provider implementations
+    /// that actually keep an `api_key: String` field.
+    fn key_hint(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Strip `[key-N]` suffix from a tagged provider name to recover the
+/// logical provider key used in `state/naked.json::providers.<X>`.
+///
+/// `qwen[key-3]` → `qwen`; `qwen` (no suffix) → `qwen`.
+pub fn logical_provider_name(tagged: &str) -> &str {
+    match tagged.find("[key-") {
+        Some(i) => &tagged[..i],
+        None => tagged,
+    }
 }
 
 /// Pass-through impl so `Box<dyn Provider>` can stand in wherever
@@ -78,6 +103,9 @@ impl Provider for Box<dyn Provider> {
     }
     fn total_key_count(&self) -> usize {
         (**self).total_key_count()
+    }
+    fn key_hint(&self) -> Option<String> {
+        (**self).key_hint()
     }
     async fn stream_chat(
         &self,

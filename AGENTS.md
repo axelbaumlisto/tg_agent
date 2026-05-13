@@ -154,6 +154,39 @@ the current baseline. Compare deltas on follow-up runs.
 deployment. They are referenced via URLs / docs / comments only; do not
 commit host-local filesystem dependencies, secrets, or chat IDs.
 
+## Live TG e2e verification pattern (proven 2026-05-13)
+
+После больших refactor'ов (визибилити, провайдеры, tool factory) unit tests
+проверяют компиляцию, но не dispatch chain. Final gate — live
+request через реальный Telegram bot:
+
+```bash
+# Build + restart bot
+cd naked && cargo build --release --bin naked-tg && \
+  systemctl --user restart naked-tg.service
+
+# Snapshot metrics + read recent history
+export $(grep -E "^TELEGRAM_API" .env | xargs)
+NAKED_TG_SESSION=research_session \
+  python3 naked/skills/telegram-reader/scripts/tg_send.py last zGsR_bot --limit 5
+
+# Progressive depth tests
+NAKED_TG_SESSION=research_session python3 .../tg_send.py ask zGsR_bot "/help" --timeout 30
+NAKED_TG_SESSION=research_session python3 .../tg_send.py ask zGsR_bot "research_list_specs" --timeout 60
+NAKED_TG_SESSION=research_session python3 .../tg_send.py ask zGsR_bot "echo: ping pong" --timeout 30
+
+# Counter delta + journal check
+curl -s http://127.0.0.1:9898/metrics > /tmp/metrics_after.txt
+diff /tmp/metrics_before.txt /tmp/metrics_after.txt | grep -E "turn_completed|provider_perm"
+journalctl --user -u naked-tg.service --since "5 min ago" -p warning
+```
+
+Research account (`@Axelis_taurus_chats`, id `6196099449`) reserved
+именно для этого — не спамить в zverozabr primary. Session file:
+`naked/skills/telegram-reader/.session/research_session.session`.
+
+Documented in `naked/docs/postmortems/2026-05-13-phase4-tg-verification.md`.
+
 ## Multi-agent workflow (proven 2026-05-08–2026-05-09)
 
 Large architectural batches (T1-T26 across two waves, score 8.7 → 9.6)

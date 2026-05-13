@@ -46,6 +46,11 @@ impl Provider for OpenAiCompatProvider {
         &self.display_name
     }
 
+    fn key_hint(&self) -> Option<String> {
+        // B46: expose literal api_key for dead-key auto-persist.
+        Some(self.config.api_key.clone())
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         self.config
             .models_with_aliases()

@@ -34,11 +34,11 @@ use serde_json::json;
 
 mod handlers;
 pub(crate) mod output;
-pub(crate) mod redact;
+pub mod redact; // public so naked-tg::streaming_mod can call scan_and_redact()
 
 // `parse_listing_date` accessed via `crate::research::tool::output::X`,
-// `scan_and_redact` accessed via `super::redact::scan_and_redact` in tests.
-// No module-level re-exports needed.
+// `scan_and_redact` exported via `naked_core::research::tool::redact::scan_and_redact`
+// for streaming_mod/flush.rs (B45-wire-up 2026-05-13).
 // Used only by the test module via `use super::*;`.
 #[cfg(test)]
 pub(crate) use output::strip_source_attribution;

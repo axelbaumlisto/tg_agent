@@ -64,8 +64,16 @@ impl Config {
     }
 
     /// Parse from JSON string.
+    ///
+    /// B46 / PLAN_PROVIDER_HEALTH_v1: before deserializing, prune each
+    /// `providers.*.api_keys[]` array of entries present in any
+    /// `_dead_api_keys_*` / `_low_balance_keys_*` sibling array. This
+    /// runs unconditionally (no env gate) — if an operator-curated dead
+    /// list says a key is dead, we trust it.
     pub fn from_json_str(json: &str) -> Result<Self> {
-        serde_json::from_str(json).map_err(|e| AgentError::ConfigParse(e.to_string()))
+        let filtered =
+            filter_dead_keys_from_json(json).map_err(|e| AgentError::ConfigParse(e.to_string()))?;
+        serde_json::from_str(&filtered).map_err(|e| AgentError::ConfigParse(e.to_string()))
     }
 
     /// Search standard locations for config JSON.
@@ -175,6 +183,74 @@ impl Config {
     }
 }
 
+/// B46 boot-time filter: walk `providers.<name>`, gather all `_dead_api_keys_*`
+/// and `_low_balance_keys_*` sibling arrays, then remove any matching entries
+/// from `api_keys[]`. Primary `api_key` is left untouched (operator's call).
+///
+/// Returns the modified JSON (pretty-printed for stable diff) or the original
+/// string unchanged if the input has no `providers` object.
+pub fn filter_dead_keys_from_json(json: &str) -> std::result::Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("parse: {e}"))?;
+
+    let providers = match value.get_mut("providers").and_then(|v| v.as_object_mut()) {
+        Some(p) => p,
+        None => return Ok(json.to_string()),
+    };
+
+    let mut total_removed = 0_usize;
+    for (provider_name, pcfg) in providers.iter_mut() {
+        let Some(obj) = pcfg.as_object_mut() else {
+            continue;
+        };
+
+        // 1. Collect dead-keys from all `_dead_api_keys*` / `_low_balance_keys*`
+        //    sibling arrays.
+        let mut dead: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (key, val) in obj.iter() {
+            if (key.starts_with("_dead_api_keys") || key.starts_with("_low_balance_keys"))
+                && let Some(arr) = val.as_array()
+            {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        dead.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        if dead.is_empty() {
+            continue;
+        }
+
+        // 2. Prune api_keys[] of any entry present in `dead`.
+        if let Some(rotation) = obj.get_mut("api_keys").and_then(|v| v.as_array_mut()) {
+            let before = rotation.len();
+            rotation.retain(|v| match v.as_str() {
+                Some(s) => !dead.contains(s),
+                None => true,
+            });
+            let removed = before - rotation.len();
+            if removed > 0 {
+                total_removed += removed;
+                tracing::info!(
+                    target: "naked_core::config::loader",
+                    provider = %provider_name,
+                    removed,
+                    dead_buckets = dead.len(),
+                    "B46: dropped dead keys from rotation during config load"
+                );
+            }
+        }
+    }
+
+    if total_removed == 0 {
+        // Skip re-serialise to keep byte-identical output for non-dead configs.
+        return Ok(json.to_string());
+    }
+
+    serde_json::to_string_pretty(&value).map_err(|e| format!("serialise: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +282,77 @@ mod tests {
     #[test]
     fn from_json_str_invalid_json_is_error() {
         assert!(Config::from_json_str("not json").is_err());
+    }
+
+    // ─── B46 filter_dead_keys_from_json tests ──────────────────
+
+    #[test]
+    fn b46_filter_drops_keys_present_in_dead_bucket() {
+        let json = r#"{
+            "providers": {
+                "deepseek": {
+                    "type": "openai_compat",
+                    "api_key": "sk-alive",
+                    "api_keys": ["sk-alive", "sk-dead-1", "sk-dead-2", "sk-other"],
+                    "_dead_api_keys_auto_2026-05-13": ["sk-dead-1", "sk-dead-2"]
+                }
+            }
+        }"#;
+        let cfg = Config::from_json_str(json).unwrap();
+        let ds = cfg.providers.get("deepseek").unwrap();
+        assert_eq!(ds.api_keys, vec!["sk-alive", "sk-other"]);
+        assert_eq!(ds.api_key, "sk-alive");
+    }
+
+    #[test]
+    fn b46_filter_handles_low_balance_bucket_too() {
+        let json = r#"{
+            "providers": {
+                "deepseek": {
+                    "type": "openai_compat",
+                    "api_key": "sk-primary",
+                    "api_keys": ["sk-paused-1", "sk-active"],
+                    "_low_balance_keys_2026_05_13": ["sk-paused-1"]
+                }
+            }
+        }"#;
+        let cfg = Config::from_json_str(json).unwrap();
+        let ds = cfg.providers.get("deepseek").unwrap();
+        assert_eq!(ds.api_keys, vec!["sk-active"]);
+    }
+
+    #[test]
+    fn b46_filter_keeps_primary_intact_even_if_in_dead_list() {
+        // Primary marked dead in the bucket but we still keep it in api_key
+        // (operator's call to rotate primary; auto-persist never touches it).
+        let json = r#"{
+            "providers": {
+                "deepseek": {
+                    "type": "openai_compat",
+                    "api_key": "sk-PRIMARY-dead",
+                    "api_keys": ["sk-alive"],
+                    "_dead_api_keys_auto_2026-05-13": ["sk-PRIMARY-dead"]
+                }
+            }
+        }"#;
+        let cfg = Config::from_json_str(json).unwrap();
+        let ds = cfg.providers.get("deepseek").unwrap();
+        assert_eq!(ds.api_key, "sk-PRIMARY-dead");
+        assert_eq!(ds.api_keys, vec!["sk-alive"]);
+    }
+
+    #[test]
+    fn b46_filter_no_op_when_no_dead_buckets() {
+        let json = r#"{"providers":{"foo":{"type":"openai_compat","api_key":"sk","api_keys":["a","b"]}}}"#;
+        let out = filter_dead_keys_from_json(json).unwrap();
+        assert_eq!(out, json, "no-dead configs returned byte-identical");
+    }
+
+    #[test]
+    fn b46_filter_handles_missing_providers_object() {
+        let json = r#"{"unrelated": "value"}"#;
+        let out = filter_dead_keys_from_json(json).unwrap();
+        assert_eq!(out, json);
     }
 
     #[test]
