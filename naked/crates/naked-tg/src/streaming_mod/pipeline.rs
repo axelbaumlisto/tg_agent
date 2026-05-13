@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// PLAN_MEDIA_UX_v1 M4: single source of truth for the streaming
+/// control keyboard. Used by both `stream_response` (initial
+/// placeholder send) and may be re-attached by future callback
+/// paths if needed. Kept here so the literal lives in ONE place
+/// (DRY).
+pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
+    teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+        teloxide::types::InlineKeyboardButton::callback("⏹ Стоп", "stream:abort"),
+        teloxide::types::InlineKeyboardButton::callback("⏩ Send now", "stream:sendnow"),
+    ]])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_response(
     bot: Bot,
@@ -38,10 +50,22 @@ pub(crate) async fn stream_response(
     );
     send_typing_raw(http_client, base_url, chat_id_raw, tid).await;
 
+    // PLAN_MEDIA_UX_v1 M4 / BUG_REGISTRY B02: single-bubble
+    // stream-start. Previously sent TWO messages (⏳ placeholder
+    // + ⏯️ control card with buttons), creating empty visual
+    // clutter while the first chunk landed. Now ONE message
+    // carries both the placeholder content (edited as chunks
+    // arrive via edit_message_text) AND the [⏹ Стоп] [⏩ Send
+    // now] inline keyboard. Telegram's editMessageText preserves
+    // reply_markup when the `reply_markup` field is omitted, so
+    // the buttons ride untouched through every streaming flush.
+    // End-of-turn clears them with editMessageReplyMarkup (no
+    // `.reply_markup()` arg) instead of deleting the message.
     let placeholder = match bot
         .send_message(ctx.chat_id, "⏳")
         .maybe_thread(ctx.thread_id)
         .maybe_reply_to(ctx.reply_to)
+        .reply_markup(streaming_control_kb())
         .await
     {
         Ok(m) => m.id,
@@ -50,27 +74,10 @@ pub(crate) async fn stream_response(
             return;
         }
     };
-
-    // PLAN_NEXT_SESSION auto-fire UX: send a thin control card with
-    // [⏹ Стоп] [⏩ Send now] inline buttons under the placeholder.
-    // Stop = abort. Send now = abort + hint that pending input is
-    // preserved in history (the run.rs drain-on-exit fix). Card is
-    // deleted at end-of-turn so it never lingers.
-    let control_kb = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
-        teloxide::types::InlineKeyboardButton::callback("⏹ Стоп", "stream:abort"),
-        teloxide::types::InlineKeyboardButton::callback("⏩ Send now", "stream:sendnow"),
-    ]]);
-    if let Ok(card) = bot
-        .send_message(ctx.chat_id, "⏯️")
-        .maybe_thread(ctx.thread_id)
-        .reply_markup(control_kb)
+    crate::shared::CONTROL_CARDS
+        .write()
         .await
-    {
-        crate::shared::CONTROL_CARDS
-            .write()
-            .await
-            .insert((chat_id_raw, tid), (ctx.chat_id, card.id));
-    }
+        .insert((chat_id_raw, tid), (ctx.chat_id, placeholder));
 
     let typing_client = http_client.clone();
     let typing_base = base_url.to_string();
@@ -379,17 +386,22 @@ pub(crate) async fn stream_response(
     MODEL_SWITCHES.write().await.remove(&chat_key);
     QUEUE_COUNTS.write().await.remove(&chat_key);
     STEER_SENDERS.write().await.remove(&chat_key_for_steer);
-    // Auto-fire UX: remove the [⏹ Стоп] [⏩ Send now] card.
+    // PLAN_MEDIA_UX_v1 M4 / B02: clear the [⏹ Стоп] [⏩ Send now]
+    // inline keyboard from the placeholder (which now ALSO holds
+    // the final text). editMessageReplyMarkup without
+    // `.reply_markup()` sends empty markup, removing buttons but
+    // leaving the text intact. NOT delete_message — that would
+    // wipe the final assistant reply.
     if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
         .write()
         .await
         .remove(&(chat_id_raw, tid))
-        && let Err(e) = bot.delete_message(chat, mid).await
+        && let Err(e) = bot.edit_message_reply_markup(chat, mid).await
     {
         tracing::debug!(
             chat = chat.0,
             msg = mid.0,
-            "control card delete failed (likely already gone): {e}"
+            "control card clear failed (likely already cleared): {e}"
         );
     }
     // S6 cleanup: any ack ids still parked for this chat/thread are

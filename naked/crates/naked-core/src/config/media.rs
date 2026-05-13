@@ -96,8 +96,12 @@ impl TgMediaConfig {
     /// Resolution order (first hit wins):
     /// 1. `tg_media.model_vision_overrides[<substring>]` — most specific.
     /// 2. `provider.supports_vision = Some(true|false)` — provider-wide override.
-    /// 3. `BUILTIN_VISION_MODEL_NEEDLES` substring match.
-    /// 4. `tg_media.vision_model_extras` user-supplied substring match.
+    /// 3. `provider.capabilities[model].supports_vision = Some(true|false)`
+    ///    — per-model declaration in the provider catalog. **PLAN_MEDIA_UX_v1 M1**:
+    ///    without this step the per-model caps in `naked.json` were dead data
+    ///    for routing (BUG_REGISTRY B03).
+    /// 4. `BUILTIN_VISION_MODEL_NEEDLES` substring match.
+    /// 5. `tg_media.vision_model_extras` user-supplied substring match.
     pub fn is_vision_capable_with_provider(
         &self,
         model: &str,
@@ -113,6 +117,22 @@ impl TgMediaConfig {
             && let Some(force) = pc.supports_vision
         {
             return force;
+        }
+        // M1: per-model capabilities short-circuit. Try exact id first,
+        // then lowercase (catalog keys are case-sensitive but operators
+        // sometimes mix case). Only `Some(_)` short-circuits — `None`
+        // falls through to the needle/extras passes so undeclared models
+        // still match heuristically.
+        if let Some(pc) = provider {
+            let caps = pc
+                .capabilities
+                .get(model)
+                .or_else(|| pc.capabilities.get(&m));
+            if let Some(c) = caps
+                && let Some(force) = c.supports_vision
+            {
+                return force;
+            }
         }
         for needle in BUILTIN_VISION_MODEL_NEEDLES {
             if m.contains(needle) {
@@ -191,6 +211,14 @@ const BUILTIN_VISION_MODEL_NEEDLES: &[&str] = &[
     "qwen-vl",
     "qwen2-vl",
     "qwen2.5-vl",
+    // PLAN_MEDIA_UX_v1 M2: Qwen 3.x VL family (BUG_REGISTRY B04).
+    // Substring `qwen-vl` doesn't catch `qwen3-vl-plus` /
+    // `qwen3.5-vl-*` because the version digit sits between `qwen`
+    // and `-vl`.
+    "qwen3-vl",
+    "qwen3.5-vl",
+    "qwen-vl-max",
+    "qwen-vl-plus",
     "pixtral",
     "minicpm-v",
 ];
@@ -309,5 +337,113 @@ mod tests {
         assert!(cfg.is_vision_capable_model("gpt-4o"));
         assert!(cfg.is_vision_capable_model("grok-2-vision"));
         assert!(!cfg.is_vision_capable_model("gpt-3.5-turbo"));
+    }
+
+    // ─── PLAN_MEDIA_UX_v1 M1+M2 / BUG_REGISTRY B03+B04 / INV-1+INV-2 ───
+
+    fn make_provider_with_caps(
+        wide: Option<bool>,
+        per_model: &[(&str, Option<bool>)],
+    ) -> ProviderConfig {
+        let mut caps = std::collections::HashMap::new();
+        for (m, sv) in per_model {
+            caps.insert(
+                (*m).to_string(),
+                crate::model_catalog::ModelCapabilities {
+                    supports_vision: *sv,
+                    ..Default::default()
+                },
+            );
+        }
+        ProviderConfig {
+            supports_vision: wide,
+            capabilities: caps,
+            ..Default::default()
+        }
+    }
+
+    /// INV-1: per-model `capabilities[model].supports_vision = Some(true)`
+    /// must short-circuit to true even when provider-wide `supports_vision`
+    /// is `None` and no needle matches. Closes B03.
+    #[test]
+    fn per_model_caps_short_circuit_provider_wide_none() {
+        let cfg = TgMediaConfig::default();
+        let pc = make_provider_with_caps(None, &[("qwen3-vl-plus", Some(true))]);
+        assert!(
+            cfg.is_vision_capable_with_provider("qwen3-vl-plus", Some(&pc)),
+            "per-model caps supports_vision=true must take effect"
+        );
+    }
+
+    /// Negative twin of INV-1: explicit `Some(false)` must deny even if a
+    /// needle would have matched (operator override wins).
+    #[test]
+    fn per_model_caps_explicit_deny_overrides_needle() {
+        let cfg = TgMediaConfig::default();
+        let pc = make_provider_with_caps(None, &[("gpt-4o", Some(false))]);
+        assert!(
+            !cfg.is_vision_capable_with_provider("gpt-4o", Some(&pc)),
+            "explicit caps deny must beat builtin needle"
+        );
+    }
+
+    /// Resolution order: provider-wide `Some(_)` wins over per-model caps.
+    #[test]
+    fn provider_wide_supports_vision_outranks_per_model_caps() {
+        let cfg = TgMediaConfig::default();
+        let pc = make_provider_with_caps(Some(false), &[("qwen3-vl-plus", Some(true))]);
+        assert!(
+            !cfg.is_vision_capable_with_provider("qwen3-vl-plus", Some(&pc)),
+            "provider-wide deny must short-circuit before per-model caps"
+        );
+    }
+
+    /// Per-model `None` must fall through, not short-circuit to deny.
+    #[test]
+    fn per_model_caps_none_falls_through_to_needles() {
+        let cfg = TgMediaConfig::default();
+        let pc = make_provider_with_caps(None, &[("gpt-4o", None)]);
+        assert!(
+            cfg.is_vision_capable_with_provider("gpt-4o", Some(&pc)),
+            "per-model caps None must NOT block needle fallback"
+        );
+    }
+
+    /// INV-2: every Qwen 3.x VL variant resolves true via needles. Closes B04.
+    #[test]
+    fn qwen3_vl_needles_cover_all_known_variants() {
+        let cfg = TgMediaConfig::default();
+        for m in [
+            "qwen3-vl-plus",
+            "qwen3-vl-max",
+            "qwen3.5-vl-plus",
+            "qwen3.5-vl-max-latest",
+            "qwen-vl-plus-latest",
+            "qwen-vl-max",
+        ] {
+            assert!(
+                cfg.is_vision_capable_with_provider(m, None),
+                "needle did not match {m}"
+            );
+        }
+    }
+
+    /// Near-miss negatives: text-only Qwen variants must NOT match.
+    #[test]
+    fn near_miss_qwen_models_stay_non_vision() {
+        let cfg = TgMediaConfig::default();
+        for m in [
+            "qwen3.6-plus",
+            "qwen3.5-plus",
+            "qwen3-max",
+            "qwen3-coder-plus",
+            "qwen-plus",
+            "qwen-turbo",
+        ] {
+            assert!(
+                !cfg.is_vision_capable_with_provider(m, None),
+                "false positive: {m} matched a vision needle"
+            );
+        }
     }
 }

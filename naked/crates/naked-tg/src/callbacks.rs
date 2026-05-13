@@ -455,12 +455,15 @@ pub(crate) async fn handle_callback(
                     } else {
                         false
                     };
+                    // M4/B02: clear kbd from placeholder, don't
+                    // delete the message (it now holds the
+                    // streamed assistant content).
                     if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
                         .write()
                         .await
                         .remove(&(cid, tid))
                     {
-                        let _ = bot.delete_message(chat, mid).await;
+                        let _ = bot.edit_message_reply_markup(chat, mid).await;
                     }
                     if aborted {
                         "⏹ Остановлено"
@@ -509,12 +512,13 @@ pub(crate) async fn handle_callback(
                         } else {
                             false
                         };
+                        // M4/B02: clear kbd, don't delete content.
                         if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
                             .write()
                             .await
                             .remove(&(cid, tid))
                         {
-                            let _ = bot.delete_message(chat, mid).await;
+                            let _ = bot.edit_message_reply_markup(chat, mid).await;
                         }
                         if aborted {
                             "⏩ Нудж не прошёл — остановил. Отправь сообщение, весь контекст сохранён"

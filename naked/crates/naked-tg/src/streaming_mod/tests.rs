@@ -1120,4 +1120,40 @@ mod resilience_tests {
             );
         }
     }
+
+    // ─── PLAN_MEDIA_UX_v1 M4 / BUG_REGISTRY B02 ───
+    //
+    // INV-4 full version ("stream_start sends bot.send_message
+    // exactly ONCE") requires a teloxide Bot mock infra we don't
+    // have today — see BUG_REGISTRY D-INV-STREAM-BUBBLE-COUNT.
+    // Until then, this test pins the DRY helper that owns the
+    // single keyboard literal: if anyone re-introduces a second
+    // send_message at stream-start, the helper must be the only
+    // source of truth for the button layout.
+    #[test]
+    fn streaming_control_kb_has_two_buttons() {
+        let kb = crate::streaming::pipeline::streaming_control_kb();
+        let rows = kb.inline_keyboard;
+        assert_eq!(rows.len(), 1, "expected single row of buttons");
+        let row = &rows[0];
+        assert_eq!(row.len(), 2, "expected exactly 2 buttons");
+        // Order matters for muscle memory: abort first, sendnow second.
+        assert!(row[0].text.contains("Стоп"), "button 0 should be Stop");
+        assert!(
+            row[1].text.contains("Send now"),
+            "button 1 should be Send now"
+        );
+        // Callback data must match the dispatcher in callbacks.rs.
+        use teloxide::types::InlineKeyboardButtonKind;
+        let cb0 = match &row[0].kind {
+            InlineKeyboardButtonKind::CallbackData(d) => d.as_str(),
+            _ => panic!("button 0 must be CallbackData"),
+        };
+        let cb1 = match &row[1].kind {
+            InlineKeyboardButtonKind::CallbackData(d) => d.as_str(),
+            _ => panic!("button 1 must be CallbackData"),
+        };
+        assert_eq!(cb0, "stream:abort");
+        assert_eq!(cb1, "stream:sendnow");
+    }
 }

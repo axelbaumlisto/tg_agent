@@ -401,11 +401,85 @@ pub async fn download_to_artifacts(
     })
 }
 
+// ─────────────────────────── Error classifier (DRY) ──────────────────────
+
+/// Reason bucket for media-related upstream failures. Returned as a
+/// cardinality-safe `&'static str` so it can label Prometheus counters
+/// without unbounded growth. **PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01**:
+/// previously duplicated as an inline `match` ladder inside
+/// `media_dispatch.rs::process_one_media`. Lifted here for DRY reuse by
+/// both the transcription and the describer paths.
+pub fn classify_media_error(err: &anyhow::Error) -> &'static str {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    if msg.contains("401") || msg.contains("403") || msg.contains("unauthorized") {
+        "auth"
+    } else if msg.contains("429") || msg.contains("rate") {
+        "rate_limit"
+    } else if msg.contains("413") || msg.contains("too large") || msg.contains("payload") {
+        "payload"
+    } else if msg.contains("timeout") || msg.contains("timed out") {
+        "timeout"
+    } else if msg.contains("dns") || msg.contains("connect") || msg.contains("reset") {
+        "network"
+    } else {
+        "other"
+    }
+}
+
 // ─────────────────────────── Whisper transcription ───────────────────────
 
 /// Transcribe audio via an OpenAI-compatible `/audio/transcriptions` endpoint.
 /// Returns the plain transcript text.
+///
+/// **PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01**: previously silent on
+/// success. Now emits exactly ONE `tracing::info!` per call (success
+/// path) with `bytes_in` / `chars_out` / `duration_ms` / `model`, and
+/// bumps `naked_tg_media_transcription_total{outcome}` plus, on Err,
+/// `naked_tg_media_transcription_failure_total{reason}` via
+/// [`classify_media_error`]. Operators can now distinguish
+/// transcription-worked from transcription-silently-failed in journal
+/// and `/metrics`.
 pub async fn transcribe_audio(
+    http: Arc<Client>,
+    cfg: &AudioProviderCfg,
+    audio: &[u8],
+    file_name: &str,
+    mime: &str,
+) -> Result<String> {
+    let started = std::time::Instant::now();
+    let bytes_in = audio.len();
+    let result = transcribe_audio_inner(http, cfg, audio, file_name, mime).await;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match &result {
+        Ok(text) => {
+            crate::metrics::record_transcription("ok", None);
+            tracing::info!(
+                model = %cfg.model,
+                bytes_in,
+                chars_out = text.chars().count(),
+                duration_ms = elapsed_ms,
+                "transcription complete"
+            );
+        }
+        Err(e) => {
+            let reason = classify_media_error(e);
+            crate::metrics::record_transcription("fail", Some(reason));
+            tracing::warn!(
+                model = %cfg.model,
+                bytes_in,
+                duration_ms = elapsed_ms,
+                reason,
+                error = %e,
+                "transcription failed"
+            );
+        }
+    }
+    result
+}
+
+/// Internal body — split out so the wrapper above can observe the result
+/// with a single `match`. Pure I/O, no logging or counter bumps inside.
+async fn transcribe_audio_inner(
     http: Arc<Client>,
     cfg: &AudioProviderCfg,
     audio: &[u8],
@@ -654,6 +728,80 @@ pub fn truncate_for_inline(s: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01 / INV-5 ───
+
+    #[test]
+    fn classify_media_error_auth() {
+        let e = anyhow::anyhow!("HTTP 401 Unauthorized");
+        assert_eq!(classify_media_error(&e), "auth");
+        let e = anyhow::anyhow!("403 Forbidden");
+        assert_eq!(classify_media_error(&e), "auth");
+    }
+
+    #[test]
+    fn classify_media_error_rate_limit() {
+        let e = anyhow::anyhow!("HTTP 429 Too Many Requests");
+        assert_eq!(classify_media_error(&e), "rate_limit");
+        let e = anyhow::anyhow!("rate exceeded");
+        assert_eq!(classify_media_error(&e), "rate_limit");
+    }
+
+    #[test]
+    fn classify_media_error_payload() {
+        let e = anyhow::anyhow!("HTTP 413 Payload Too Large");
+        assert_eq!(classify_media_error(&e), "payload");
+        let e = anyhow::anyhow!("image too large");
+        assert_eq!(classify_media_error(&e), "payload");
+    }
+
+    #[test]
+    fn classify_media_error_timeout() {
+        let e = anyhow::anyhow!("operation timed out");
+        assert_eq!(classify_media_error(&e), "timeout");
+    }
+
+    #[test]
+    fn classify_media_error_network() {
+        let e = anyhow::anyhow!("failed to connect: DNS failure");
+        assert_eq!(classify_media_error(&e), "network");
+        let e = anyhow::anyhow!("connection reset by peer");
+        assert_eq!(classify_media_error(&e), "network");
+    }
+
+    #[test]
+    fn classify_media_error_other_is_default() {
+        let e = anyhow::anyhow!("some opaque server error");
+        assert_eq!(classify_media_error(&e), "other");
+    }
+
+    /// INV-5 instrumented: every successful record_transcription bumps
+    /// the ok counter; every fail bumps fail + the right reason bucket.
+    /// Uses the global static counters so this test must run alone for
+    /// deterministic deltas — we snapshot before/after.
+    #[test]
+    fn record_transcription_increments_outcome_buckets() {
+        let before = crate::metrics::snapshot();
+        crate::metrics::record_transcription("ok", None);
+        crate::metrics::record_transcription("fail", Some("auth"));
+        crate::metrics::record_transcription("fail", Some("timeout"));
+        crate::metrics::record_transcription("fail", None); // → "other"
+        let after = crate::metrics::snapshot();
+        assert_eq!(after.transcription_ok - before.transcription_ok, 1);
+        assert_eq!(after.transcription_fail - before.transcription_fail, 3);
+        assert_eq!(
+            after.transcription_fail_auth - before.transcription_fail_auth,
+            1
+        );
+        assert_eq!(
+            after.transcription_fail_timeout - before.transcription_fail_timeout,
+            1
+        );
+        assert_eq!(
+            after.transcription_fail_other - before.transcription_fail_other,
+            1
+        );
+    }
 
     #[test]
     fn sanitize_strips_path_sep_and_control() {

@@ -38,6 +38,41 @@ static RATE_LIMIT_DELAYED: AtomicU64 = AtomicU64::new(0);
 static STREAM_BUTTON_CLICK_ABORT: AtomicU64 = AtomicU64::new(0);
 static STREAM_BUTTON_CLICK_SENDNOW: AtomicU64 = AtomicU64::new(0);
 
+// ── PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01 ────────────────────
+// Audio-transcription observability. Two outcome buckets + six
+// failure-reason buckets keep cardinality bounded.
+static MEDIA_TRANSCRIPTION_OK: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL_AUTH: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL_RATE: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL_PAYLOAD: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL_NETWORK: AtomicU64 = AtomicU64::new(0);
+static MEDIA_TRANSCRIPTION_FAIL_OTHER: AtomicU64 = AtomicU64::new(0);
+
+/// Public bump for transcription outcome. `outcome` is "ok" or "fail";
+/// `reason` is `Some(_)` only when `outcome == "fail"`. Counter labels
+/// are cardinality-safe `&'static str` from [`crate::media::classify_media_error`].
+pub fn record_transcription(outcome: &str, reason: Option<&str>) {
+    match outcome {
+        "ok" => {
+            MEDIA_TRANSCRIPTION_OK.fetch_add(1, Ordering::Relaxed);
+        }
+        "fail" => {
+            MEDIA_TRANSCRIPTION_FAIL.fetch_add(1, Ordering::Relaxed);
+            match reason.unwrap_or("other") {
+                "auth" => MEDIA_TRANSCRIPTION_FAIL_AUTH.fetch_add(1, Ordering::Relaxed),
+                "rate_limit" => MEDIA_TRANSCRIPTION_FAIL_RATE.fetch_add(1, Ordering::Relaxed),
+                "payload" => MEDIA_TRANSCRIPTION_FAIL_PAYLOAD.fetch_add(1, Ordering::Relaxed),
+                "timeout" => MEDIA_TRANSCRIPTION_FAIL_TIMEOUT.fetch_add(1, Ordering::Relaxed),
+                "network" => MEDIA_TRANSCRIPTION_FAIL_NETWORK.fetch_add(1, Ordering::Relaxed),
+                _ => MEDIA_TRANSCRIPTION_FAIL_OTHER.fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        _ => {} // ignored — invariant: callers pass only "ok" or "fail"
+    }
+}
+
 /// Bumped by [`crate::callbacks::handle_callback`] for every
 /// `stream:abort` / `stream:sendnow` button press. The two-bucket
 /// split (rather than one labelled counter) keeps the renderer
@@ -89,6 +124,14 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         rate_limit_delayed: RATE_LIMIT_DELAYED.load(Ordering::Relaxed),
         stream_button_click_abort: STREAM_BUTTON_CLICK_ABORT.load(Ordering::Relaxed),
         stream_button_click_sendnow: STREAM_BUTTON_CLICK_SENDNOW.load(Ordering::Relaxed),
+        transcription_ok: MEDIA_TRANSCRIPTION_OK.load(Ordering::Relaxed),
+        transcription_fail: MEDIA_TRANSCRIPTION_FAIL.load(Ordering::Relaxed),
+        transcription_fail_auth: MEDIA_TRANSCRIPTION_FAIL_AUTH.load(Ordering::Relaxed),
+        transcription_fail_rate: MEDIA_TRANSCRIPTION_FAIL_RATE.load(Ordering::Relaxed),
+        transcription_fail_payload: MEDIA_TRANSCRIPTION_FAIL_PAYLOAD.load(Ordering::Relaxed),
+        transcription_fail_timeout: MEDIA_TRANSCRIPTION_FAIL_TIMEOUT.load(Ordering::Relaxed),
+        transcription_fail_network: MEDIA_TRANSCRIPTION_FAIL_NETWORK.load(Ordering::Relaxed),
+        transcription_fail_other: MEDIA_TRANSCRIPTION_FAIL_OTHER.load(Ordering::Relaxed),
     }
 }
 
@@ -100,6 +143,15 @@ pub struct MediaRoutingSnapshot {
     pub rate_limit_delayed: u64,
     pub stream_button_click_abort: u64,
     pub stream_button_click_sendnow: u64,
+    // PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01
+    pub transcription_ok: u64,
+    pub transcription_fail: u64,
+    pub transcription_fail_auth: u64,
+    pub transcription_fail_rate: u64,
+    pub transcription_fail_payload: u64,
+    pub transcription_fail_timeout: u64,
+    pub transcription_fail_network: u64,
+    pub transcription_fail_other: u64,
 }
 
 impl MediaRoutingSnapshot {
@@ -248,6 +300,18 @@ impl MediaRoutingSnapshot {
              # HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n\
              # TYPE naked_memory_pollution_count gauge\n\
              naked_memory_pollution_count {memory_pollution}\n\
+             # HELP naked_tg_media_transcription_total Audio transcription outcomes (label `outcome`: ok or fail).\n\
+             # TYPE naked_tg_media_transcription_total counter\n\
+             naked_tg_media_transcription_total{{outcome=\"ok\"}} {tr_ok}\n\
+             naked_tg_media_transcription_total{{outcome=\"fail\"}} {tr_fail}\n\
+             # HELP naked_tg_media_transcription_failure_total Audio transcription failures by classified reason (cardinality-safe).\n\
+             # TYPE naked_tg_media_transcription_failure_total counter\n\
+             naked_tg_media_transcription_failure_total{{reason=\"auth\"}} {tr_auth}\n\
+             naked_tg_media_transcription_failure_total{{reason=\"rate_limit\"}} {tr_rate}\n\
+             naked_tg_media_transcription_failure_total{{reason=\"payload\"}} {tr_payload}\n\
+             naked_tg_media_transcription_failure_total{{reason=\"timeout\"}} {tr_timeout}\n\
+             naked_tg_media_transcription_failure_total{{reason=\"network\"}} {tr_network}\n\
+             naked_tg_media_transcription_failure_total{{reason=\"other\"}} {tr_other}\n\
              {model_health_body}",
             native = self.native_route_chosen,
             oversize = self.native_route_downgraded_oversize,
@@ -271,6 +335,14 @@ impl MediaRoutingSnapshot {
             provider_perm_blacklist = provider_perm_blacklist,
             crash_notified = crash_notified,
             memory_pollution = memory_pollution,
+            tr_ok = self.transcription_ok,
+            tr_fail = self.transcription_fail,
+            tr_auth = self.transcription_fail_auth,
+            tr_rate = self.transcription_fail_rate,
+            tr_payload = self.transcription_fail_payload,
+            tr_timeout = self.transcription_fail_timeout,
+            tr_network = self.transcription_fail_network,
+            tr_other = self.transcription_fail_other,
             model_health_body = model_health_body,
         )
     }

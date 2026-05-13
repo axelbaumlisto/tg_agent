@@ -505,37 +505,36 @@ pub(crate) async fn process_one_media(
                         {
                             Ok(text) => format!("{header}\nDescription:\n{text}"),
                             Err(e) => {
-                                let msg = e.to_string();
-                                // Classify the failure so the user can act on it instead
-                                // of staring at an opaque 4xx. Only the most common
-                                // upstream errors are explicitly handled — the catch-all
-                                // arm preserves the raw error tail (truncated) for
-                                // debugging.
-                                let lc = msg.to_ascii_lowercase();
-                                let hint = if lc.contains("429") || lc.contains("rate") {
-                                    " (rate-limited \u{2014} the describer provider \
-                                     is throttling; consider a different model in \
-                                     `tg_media.vision`)"
-                                } else if lc.contains("401")
-                                    || lc.contains("403")
-                                    || lc.contains("unauthorized")
-                                {
-                                    " (auth rejected \u{2014} check the describer's \
-                                     `api_key`)"
-                                } else if lc.contains("413")
-                                    || lc.contains("too large")
-                                    || lc.contains("payload")
-                                {
-                                    " (image too large for the describer; lower \
-                                     `tg_media.limits.photo_max_bytes` or pick a \
-                                     model with a higher cap)"
-                                } else if lc.contains("timeout") || lc.contains("timed out") {
-                                    " (describer timed out; the upstream is slow \
-                                     or unreachable)"
-                                } else {
-                                    ""
+                                // M5/B01 DRY: classifier lifted to media.rs.
+                                let reason = media::classify_media_error(&e);
+                                let hint = match reason {
+                                    "rate_limit" => {
+                                        " (rate-limited \u{2014} the describer provider \
+                                                     is throttling; consider a different model in \
+                                                     `tg_media.vision`)"
+                                    }
+                                    "auth" => {
+                                        " (auth rejected \u{2014} check the describer's \
+                                                `api_key`)"
+                                    }
+                                    "payload" => {
+                                        " (image too large for the describer; lower \
+                                                   `tg_media.limits.photo_max_bytes` or pick a \
+                                                   model with a higher cap)"
+                                    }
+                                    "timeout" => {
+                                        " (describer timed out; the upstream is slow \
+                                                   or unreachable)"
+                                    }
+                                    _ => "",
                                 };
-                                tracing::warn!(error = %e, classified = %hint, "vision describer failed");
+                                tracing::warn!(
+                                    error = %e,
+                                    reason,
+                                    classified = %hint,
+                                    "vision describer failed"
+                                );
+                                let msg = e.to_string();
                                 let tail = msg.chars().take(180).collect::<String>();
                                 format!(
                                     "{header}\n[\u{26A0} vision describer failed{hint}: {tail}]"
