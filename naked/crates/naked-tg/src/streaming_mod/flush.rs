@@ -115,7 +115,13 @@ pub(crate) async fn ask_permission(
         Permission::Dangerous => "dangerous",
         Permission::ReadOnly => "read",
     };
-    let preview = format_input_preview(input, 200);
+    // BUG_REGISTRY B36: format_input_preview returns RAW string (may
+    // contain `<<` from bash heredoc, `<>` from comparisons, `&` from URLs).
+    // Without HTML-escape, Telegram rejects the message with HTTP 400
+    // "can't parse entities", `bot.send_message().is_err()`, and
+    // ask_permission returns false — looking exactly like the user
+    // pressed Deny. Real bug: user never saw the permission card.
+    let preview = escape_html(&format_input_preview(input, 200));
     let text = format!(
         "🔐 <b>{}</b> [{level}]({preview})\n\
          <i>💡 /yolo = авто-approve | read_file/search — авто</i>",
@@ -143,7 +149,17 @@ pub(crate) async fn ask_permission(
         .maybe_thread(ctx.thread_id)
         .await;
 
-    if sent.is_err() {
+    if let Err(e) = &sent {
+        // BUG_REGISTRY B23 (silent let-else) + B36 fallout:
+        // log loudly so operator can see HTML-injection / TG API failures
+        // instead of seeing fake "Permission denied by user" tool results.
+        tracing::error!(
+            tool = %tool_name,
+            error = %e,
+            preview = %preview,
+            "permission card send FAILED — user will see no prompt and \
+             tool will be auto-denied. Likely HTML injection in preview."
+        );
         pending.write().await.remove(call_id);
         return false;
     }

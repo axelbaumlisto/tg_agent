@@ -262,6 +262,50 @@ mod tests {
         assert!(result.len() < 200);
     }
 
+    // ─── BUG_REGISTRY B36 regression guard ───
+    //
+    // ask_permission MUST html-escape the preview before embedding in
+    // a parse_mode=Html message. format_input_preview returns RAW;
+    // bash heredocs ("<< 'EOF'") and URLs with query strings ("&")
+    // routinely appear in tool inputs. Pre-fix: TG returned 400, send
+    // failed silently, tool was auto-denied without operator seeing
+    // any prompt. Test asserts that for inputs containing HTML
+    // metacharacters, escape_html on the preview neutralises them.
+    #[test]
+    fn preview_with_heredoc_does_not_break_html() {
+        let input = serde_json::json!({
+            "command": "python3 << 'EOF'\nimport json\nEOF",
+            "timeout": 15
+        });
+        let raw = format_input_preview(&input, 200);
+        // Raw MUST contain unsafe `<` (the bug input).
+        assert!(raw.contains("<<"), "setup invariant: heredoc has <<");
+        // After escape_html, no raw `<` should remain — only entity-escaped.
+        let escaped = crate::markup::escape_html(&raw);
+        assert!(
+            !escaped.contains("<") && !escaped.contains(">"),
+            "escape_html must remove raw angle brackets: {escaped}"
+        );
+        assert!(
+            escaped.contains("&lt;") || escaped.contains("&amp;"),
+            "escape_html must produce HTML entities: {escaped}"
+        );
+    }
+
+    #[test]
+    fn preview_with_url_ampersand_does_not_break_html() {
+        let input = serde_json::json!({
+            "url": "https://example.com/?a=1&b=2&c=3"
+        });
+        let raw = format_input_preview(&input, 200);
+        assert!(raw.contains("&"), "setup: URL has unescaped &");
+        let escaped = crate::markup::escape_html(&raw);
+        assert!(
+            !escaped.contains("a=1&b="),
+            "escape_html must split raw & to &amp;: {escaped}"
+        );
+    }
+
     // ── md_to_tg_html ────────────────────────────────────────────────────
 
     #[test]

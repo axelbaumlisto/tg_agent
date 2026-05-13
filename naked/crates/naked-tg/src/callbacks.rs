@@ -5,6 +5,25 @@
 use super::fmt_utils::escape_html_min;
 use super::*;
 
+/// Synthetic steer text injected when the user taps `[⏩ Send now]`
+/// on a streaming control card. Intent: **clarification signal** —
+/// "user is correcting course, pay attention to what they're saying".
+/// The model decides how to adapt; if it doesn't pivot, user has
+/// manual recourse (`[⏹ Стоп]` button or a fresh follow-up message).
+///
+/// Kept as a `const` so it's grep-able and tweakable from one place.
+/// History:
+///   v1 (≤2026-05-13 13:30): prescriptive "don't call tools,
+///       summarize" — locked model into specific action.
+///   v2 (2026-05-13 14:30): course-change signal — too verbose,
+///       still slightly prescriptive ("re-evaluate the plan").
+///   v3 (2026-05-13 14:50): minimal clarification signal, caps for
+///       emphasis. User instruction:
+///       «промт может быть уточняющий, поищи "Пользователь
+///        уточняет, обрати внимание на что он пишет"».
+pub(crate) const SEND_NOW_NUDGE_TEXT: &str =
+    "[⏩ Send now] ПОЛЬЗОВАТЕЛЬ УТОЧНЯЕТ — обрати внимание на то, что он пишет.";
+
 // ── Callback handler (permissions) ──────────────────────────────────────────
 
 pub(crate) async fn handle_callback(
@@ -479,7 +498,10 @@ pub(crate) async fn handle_callback(
                     // assistant message-end will tear it down through
                     // the streaming pipeline's end-of-turn cleanup.
                     let key = (cid, tid);
-                    let nudge_text = "[⏩ Send now] Пользователь просит ответить немедленно с тем, что уже собрано. Не вызывай больше инструменты, резюмируй и выдавай финальный ответ.";
+                    // Clean steer signal — user is course-correcting,
+                    // model decides how to adapt. See SEND_NOW_NUDGE_TEXT
+                    // const at top of this file for rationale.
+                    let nudge_text = SEND_NOW_NUDGE_TEXT;
                     let nudged = {
                         let map = crate::shared::STEER_SENDERS.read().await;
                         if let Some(steer_tx) = map.get(&key) {
