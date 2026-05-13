@@ -349,6 +349,16 @@ impl super::AgentLoop {
                     for p in &paths {
                         let diags = mgr.diagnostics_for(&self.config.cwd, p).await;
                         if !diags.is_empty() {
+                            // R5 of PLAN_RESILIENCE_v1: bump counter
+                            // + info log so operators see LSP fire
+                            // in journalctl, not just at debug.
+                            crate::types::LSP_DIAGNOSTIC_EMITTED_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::info!(
+                                file = %p.display(),
+                                count = diags.len(),
+                                "lsp: emitted post-edit diagnostics"
+                            );
                             let body = crate::lsp::render_for_model(p, &diags);
                             history.push_user(&body);
                         }

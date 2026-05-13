@@ -83,11 +83,19 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
             .await;
         if !crashed_sessions.is_empty() {
             let entries = channel_map.all_entries().await;
+            // R4 of PLAN_RESILIENCE_v1: track TG-bound vs. research
+            // sessions separately. Research sessions don't have a
+            // user-facing chat (no entry in channel_map.jsonl) and
+            // get resurrected by the scheduler — they don't need a
+            // notification.
             let mut notified = 0u32;
-            for (chat_id, thread_id_raw, session_id) in &entries {
-                if !crashed_sessions.contains(session_id) {
+            let mut research_orphans = 0u32;
+            for session_id in &crashed_sessions {
+                let mapping = entries.iter().find(|(_, _, sid)| sid == session_id);
+                let Some((chat_id, thread_id_raw, _sid)) = mapping else {
+                    research_orphans += 1;
                     continue;
-                }
+                };
                 let cid = ChatId(*chat_id);
                 let tid = if *thread_id_raw != 0 {
                     Some(teloxide::types::ThreadId(teloxide::types::MessageId(
@@ -96,16 +104,34 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                 } else {
                     None
                 };
-                let text = "⚠️ Бот перезапустился. Последний запрос потерян — повтори.";
+                let short = &session_id[..session_id.len().min(8)];
+                let text = format!(
+                    "⚠️ Бот перезапустился. Последний запрос (сессия {short}…) потерян — повтори."
+                );
                 let mut req = bot.send_message(cid, text);
                 if let Some(t) = tid {
                     req = req.message_thread_id(t);
                 }
-                let _ = req.await;
-                notified += 1;
+                match req.await {
+                    Ok(_) => {
+                        notified += 1;
+                        naked_core::types::CRASH_RECOVERY_NOTIFIED_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            chat = chat_id,
+                            session = %session_id,
+                            "crash recovery notify failed (chat blocked / not found?): {e}"
+                        );
+                    }
+                }
             }
             tracing::info!(
-                "crash recovery: {} session(s) interrupted, notified {notified} chat(s)",
+                total = crashed_sessions.len(),
+                notified = notified,
+                research_orphans = research_orphans,
+                "crash recovery: {} session(s) interrupted, notified {notified} chat(s), {research_orphans} research (will resurrect via scheduler)",
                 crashed_sessions.len()
             );
         }

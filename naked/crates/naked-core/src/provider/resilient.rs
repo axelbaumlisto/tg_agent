@@ -11,8 +11,20 @@ use crate::types::{ModelInfo, StreamChunk};
 
 use super::{ChatRequest, Provider};
 
-/// How long a key stays blacklisted after a terminal error (401/402/403).
+/// How long a key stays blacklisted after a TRANSIENT terminal
+/// error (rate-limit, transient 5xx). PERMANENT errors
+/// (auth-failed / payment-required, see
+/// [`ProviderError::is_permanent_key_failure`]) use a far-future
+/// instant so the key is effectively removed from rotation for
+/// the lifetime of the process.
 const BLACKLIST_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Far-future cutoff used for permanently-blacklisted keys. ~100
+/// years from epoch — well beyond any plausible process lifetime
+/// but doesn't risk i64 overflow in arithmetic.
+fn permanent_blacklist_until() -> Instant {
+    Instant::now() + std::time::Duration::from_secs(60 * 60 * 24 * 365 * 100)
+}
 
 /// Wraps multiple providers with automatic failover.
 ///
@@ -72,6 +84,81 @@ impl ResilientProvider {
                 (p.name().to_string(), alive)
             })
             .collect()
+    }
+
+    /// R2 of PLAN_RESILIENCE_v1: probe each provider key with a
+    /// minimal request (5s timeout per key) so permanent failures
+    /// (auth/payment) get marked BEFORE the first real turn.
+    ///
+    /// Cost: N tiny HTTP requests per boot, N parallel via
+    /// `join_all`. Fire-and-forget from `wiring.rs` so boot time
+    /// is unaffected (audit completes in the background; first
+    /// few turns may still try a dead key, but subsequent ones
+    /// skip it).
+    pub async fn audit_keys_on_boot(&self, probe_model: &str) {
+        use futures_util::future::join_all;
+        let probe_req = ChatRequest {
+            model: probe_model.to_string(),
+            system: String::new(),
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": "hi"
+            })],
+            tools: Vec::new(),
+            max_tokens: 1,
+            temperature: None,
+            reasoning: None,
+        };
+        let timeout = std::time::Duration::from_secs(5);
+        let probes = self.providers.iter().enumerate().map(|(idx, p)| {
+            let req = probe_req.clone();
+            async move {
+                match tokio::time::timeout(timeout, p.stream_chat(req)).await {
+                    Ok(Ok(_stream)) => (idx, true, None),
+                    Ok(Err(e)) => {
+                        let permanent = matches!(
+                            &e,
+                            AgentError::ProviderTyped(pe)
+                                if pe.is_permanent_key_failure()
+                        );
+                        (idx, !permanent, Some((permanent, e.to_string())))
+                    }
+                    Err(_elapsed) => (idx, true, None), // timeout → inconclusive, treat as alive
+                }
+            }
+        });
+        let outcomes = join_all(probes).await;
+        let mut bl = self.blacklist.lock().await;
+        let mut alive = 0usize;
+        let mut dead = 0usize;
+        for (idx, is_alive, err) in &outcomes {
+            if *is_alive {
+                alive += 1;
+                continue;
+            }
+            dead += 1;
+            if let Some((permanent, _msg)) = err
+                && *permanent
+            {
+                bl.insert(*idx, permanent_blacklist_until());
+                crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let provider_name = self
+            .providers
+            .first()
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|| "<unknown>".into());
+        tracing::info!(
+            provider = %provider_name,
+            alive = alive,
+            dead = dead,
+            total = self.providers.len(),
+            "provider audit: {}/{} keys alive",
+            alive,
+            self.providers.len()
+        );
     }
 }
 
@@ -162,15 +249,38 @@ impl Provider for ResilientProvider {
                         (pe.is_key_dead(), pe.is_model_dead())
                     };
                     if key_dead {
-                        tracing::warn!(
-                            "Provider '{}' key dead: {e}, blacklisting for {}s",
-                            provider.name(),
-                            BLACKLIST_TTL.as_secs()
-                        );
-                        self.blacklist
-                            .lock()
-                            .await
-                            .insert(idx, Instant::now() + BLACKLIST_TTL);
+                        // R1 of PLAN_RESILIENCE_v1: distinguish
+                        // PERMANENT (auth/payment) from TRANSIENT
+                        // key failures. Permanent keys are removed
+                        // from rotation for the process lifetime;
+                        // transient keys use the existing 3600s
+                        // blacklist + retry pattern.
+                        let permanent = match &e {
+                            AgentError::ProviderTyped(pe) => pe.is_permanent_key_failure(),
+                            _ => false,
+                        };
+                        if permanent {
+                            tracing::warn!(
+                                "Provider '{}' key PERMANENTLY blacklisted (auth/payment): {e}",
+                                provider.name(),
+                            );
+                            crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.blacklist
+                                .lock()
+                                .await
+                                .insert(idx, permanent_blacklist_until());
+                        } else {
+                            tracing::warn!(
+                                "Provider '{}' key dead: {e}, blacklisting for {}s",
+                                provider.name(),
+                                BLACKLIST_TTL.as_secs()
+                            );
+                            self.blacklist
+                                .lock()
+                                .await
+                                .insert(idx, Instant::now() + BLACKLIST_TTL);
+                        }
                     } else if model_dead {
                         // Model doesn't exist - no point trying other keys.
                         tracing::warn!(

@@ -139,6 +139,21 @@ impl MediaRoutingSnapshot {
         // not the bin crate's `crate::*` namespace.
         let supervisor_restart =
             naked_tg::supervised::SUPERVISOR_PANIC_RESTART_COUNT.load(Ordering::Relaxed);
+        // R5 of PLAN_RESILIENCE_v1: per-feature counters for the
+        // PLAN_QUALITY_v1 modules. All start at 0 and stay there
+        // unless the corresponding feature actually fires — a
+        // flat-zero rate is a real signal the module isn't active.
+        let snapshot_capture = naked_core::types::SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed);
+        let lsp_emitted = naked_core::types::LSP_DIAGNOSTIC_EMITTED_COUNT.load(Ordering::Relaxed);
+        let permission_match =
+            naked_core::types::PERMISSION_RULE_MATCH_COUNT.load(Ordering::Relaxed);
+        let hook_fire = naked_core::types::LIFECYCLE_HOOK_FIRE_COUNT.load(Ordering::Relaxed);
+        let subagent_resolve =
+            naked_core::types::SUBAGENT_ROLE_RESOLVE_COUNT.load(Ordering::Relaxed);
+        let provider_perm_blacklist =
+            naked_core::types::PROVIDER_PERMANENT_BLACKLIST_COUNT.load(Ordering::Relaxed);
+        let crash_notified =
+            naked_core::types::CRASH_RECOVERY_NOTIFIED_COUNT.load(Ordering::Relaxed);
         // Pollution sentinel from `naked-housekeep.timer`: 0 unless the
         // daily sweep found `research:*` lines in global MEMORY.md. Non-zero
         // means the research-leak fix regressed and operator should
@@ -209,6 +224,27 @@ impl MediaRoutingSnapshot {
              # HELP naked_tg_stream_button_click_sendnow_total Clicks of the [⏩ Send now] inline button on the streaming control card.\n\
              # TYPE naked_tg_stream_button_click_sendnow_total counter\n\
              naked_tg_stream_button_click_sendnow_total {btn_sendnow}\n\
+             # HELP naked_core_snapshot_capture_total Side-git pre-turn workspace snapshots captured by `dispatch_turn`.\n\
+             # TYPE naked_core_snapshot_capture_total counter\n\
+             naked_core_snapshot_capture_total {snapshot_capture}\n\
+             # HELP naked_core_lsp_diagnostic_emitted_total Non-empty LSP diagnostics blocks injected into history after edit tools.\n\
+             # TYPE naked_core_lsp_diagnostic_emitted_total counter\n\
+             naked_core_lsp_diagnostic_emitted_total {lsp_emitted}\n\
+             # HELP naked_core_permission_rule_match_total Non-`Ask` decisions from the pattern-based permission ruleset.\n\
+             # TYPE naked_core_permission_rule_match_total counter\n\
+             naked_core_permission_rule_match_total {permission_match}\n\
+             # HELP naked_core_lifecycle_hook_fire_total Lifecycle hooks that actually matched and executed.\n\
+             # TYPE naked_core_lifecycle_hook_fire_total counter\n\
+             naked_core_lifecycle_hook_fire_total {hook_fire}\n\
+             # HELP naked_core_subagent_role_resolve_total Sub-agent calls whose `mode` parameter resolved to a canonical role.\n\
+             # TYPE naked_core_subagent_role_resolve_total counter\n\
+             naked_core_subagent_role_resolve_total {subagent_resolve}\n\
+             # HELP naked_core_provider_permanent_blacklist_total Provider keys permanently removed from rotation due to auth/payment errors.\n\
+             # TYPE naked_core_provider_permanent_blacklist_total counter\n\
+             naked_core_provider_permanent_blacklist_total {provider_perm_blacklist}\n\
+             # HELP naked_core_crash_recovery_notified_total Users notified about interrupted sessions on bot boot.\n\
+             # TYPE naked_core_crash_recovery_notified_total counter\n\
+             naked_core_crash_recovery_notified_total {crash_notified}\n\
              # HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n\
              # TYPE naked_memory_pollution_count gauge\n\
              naked_memory_pollution_count {memory_pollution}\n\
@@ -227,6 +263,13 @@ impl MediaRoutingSnapshot {
             supervisor_restart = supervisor_restart,
             btn_abort = self.stream_button_click_abort,
             btn_sendnow = self.stream_button_click_sendnow,
+            snapshot_capture = snapshot_capture,
+            lsp_emitted = lsp_emitted,
+            permission_match = permission_match,
+            hook_fire = hook_fire,
+            subagent_resolve = subagent_resolve,
+            provider_perm_blacklist = provider_perm_blacklist,
+            crash_notified = crash_notified,
             memory_pollution = memory_pollution,
             model_health_body = model_health_body,
         )

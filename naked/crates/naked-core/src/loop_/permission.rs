@@ -61,6 +61,13 @@ pub(super) async fn request_or_cached_approval(
             .or_else(|| input.get("command").and_then(serde_json::Value::as_str))
             .unwrap_or("");
         let action = rs_lock.read().await.evaluate(tool_name, target);
+        // R5 of PLAN_RESILIENCE_v1: count non-Ask outcomes so
+        // operators can see in /metrics whether their ruleset
+        // is firing. Ask is the default and stays uncounted.
+        if !matches!(action, crate::permissions::Action::Ask) {
+            crate::types::PERMISSION_RULE_MATCH_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match action {
             crate::permissions::Action::Allow => {
                 cache.approve(fingerprint);

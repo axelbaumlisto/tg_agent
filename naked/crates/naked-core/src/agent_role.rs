@@ -597,7 +597,7 @@ impl CanonicalRole {
 #[must_use]
 pub fn canonicalize_role(s: &str) -> Option<CanonicalRole> {
     let lower = s.trim().to_ascii_lowercase();
-    Some(match lower.as_str() {
+    let role = match lower.as_str() {
         "general" | "worker" | "default" | "general-purpose" => CanonicalRole::General,
         "explore" | "explorer" | "exploration" => CanonicalRole::Explore,
         "plan" | "planning" | "awaiter" => CanonicalRole::Plan,
@@ -606,7 +606,12 @@ pub fn canonicalize_role(s: &str) -> Option<CanonicalRole> {
         "verifier" | "verify" | "verification" | "validator" | "tester" => CanonicalRole::Verifier,
         "custom" => CanonicalRole::Custom,
         _ => return None,
-    })
+    };
+    // R5 of PLAN_RESILIENCE_v1: count successful role resolves so
+    // a flat-zero rate signals the model never invokes sub_agent
+    // with the canonical taxonomy (or the wiring is broken).
+    crate::types::SUBAGENT_ROLE_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(role)
 }
 
 /// Build a freshly-configured [`AgentRole`] for a canonical role.

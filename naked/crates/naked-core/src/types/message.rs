@@ -83,6 +83,63 @@ pub static STEER_SOFT_INTERRUPTED_COUNT: std::sync::atomic::AtomicU64 =
 pub static STEER_DRAINED_ON_ABORT_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// ── R5 of PLAN_RESILIENCE_v1 (2026-05-13) ────────────────────────
+//
+// Observability for PLAN_QUALITY_v1 modules. The 48h log audit
+// on 2026-05-13 found zero journal hits for snapshot/LSP/hook/
+// permission events because all fire-paths used `tracing::debug!`.
+// These counters give operators a per-feature heartbeat in /metrics
+// independent of the log level.
+
+/// Bumped once per successful `SnapshotRepo::capture` invocation
+/// in `session_ops::turn::dispatch_turn`. Phase label distinguishes
+/// pre-turn from post-turn but for now we only fire pre-turn.
+pub static SNAPSHOT_CAPTURE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped once per non-empty `LspManager::diagnostics_for` result.
+/// The label dimension we'd want (language) is collapsed into a
+/// single counter — dashboards already split by file extension via
+/// the synthetic system message body.
+pub static LSP_DIAGNOSTIC_EMITTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped on every `Ruleset::evaluate` that produces a non-`Ask`
+/// action (i.e. an actual rule hit). Stays at 0 until a user
+/// installs a non-empty `~/.naked/permissions.json` or hits
+/// `[✅ Always]` (when that UX lands).
+pub static PERMISSION_RULE_MATCH_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped each time `LifecycleHookRunner::run` actually fires a
+/// configured hook (matcher matched the key). Currently 0 until a
+/// user installs `~/.naked/hooks.json`.
+pub static LIFECYCLE_HOOK_FIRE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bumped per call to `agent_role::canonicalize_role` that returns
+/// `Some(...)` — i.e. the model invoked sub_agent with a valid role
+/// alias. Zero would mean either no sub-agent calls or the model is
+/// always passing unknown aliases (worth investigating).
+pub static SUBAGENT_ROLE_RESOLVE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// R1 of PLAN_RESILIENCE_v1: bumped each time a key is
+/// PERMANENTLY blacklisted by `ResilientProvider` (auth-failed /
+/// payment-required errors). Distinct from the existing
+/// `transient_blacklist` count (which is implicit, not exposed).
+/// A flat-zero rate after the bot has run a while means every
+/// provider key is healthy.
+pub static PROVIDER_PERMANENT_BLACKLIST_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// R4 of PLAN_RESILIENCE_v1: bumped on every successful
+/// `notify_chat_about_crash` send. Distinct from the existing
+/// log "notified N chat(s)" so the count is observable from
+/// /metrics without grepping the journal.
+pub static CRASH_RECOVERY_NOTIFIED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Strip every embedded `@@NAKED_IMG_REF@@…` segment (sentinel + the
 /// optional `/<hash>` or `{...json}` tail that follows it on the same line)
 /// from `text`. Returns the cleaned string and bumps `SENTINEL_LEAK_COUNT`

@@ -152,11 +152,19 @@ impl AgentCore {
         let ws_side = session.workspace.clone();
         tokio::task::spawn_blocking(move || {
             match crate::snapshot::SnapshotRepo::open_or_init(&ws_side) {
-                Ok(repo) => {
-                    if let Err(e) = repo.capture(&format!("pre-turn:{turn_seq}")) {
-                        tracing::debug!("pre-turn side snapshot skipped: {e}");
+                Ok(repo) => match repo.capture(&format!("pre-turn:{turn_seq}")) {
+                    Ok(Some(id)) => {
+                        // R5 of PLAN_RESILIENCE_v1: bump counter +
+                        // info-level log so operators see snapshots
+                        // in journalctl, not just at debug.
+                        crate::types::SNAPSHOT_CAPTURE_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let short = &id.as_str()[..id.as_str().len().min(8)];
+                        tracing::info!(seq = turn_seq, id = short, "pre-turn snapshot captured");
                     }
-                }
+                    Ok(None) => tracing::debug!("pre-turn snapshot: no changes to capture"),
+                    Err(e) => tracing::debug!("pre-turn side snapshot skipped: {e}"),
+                },
                 Err(e) => tracing::debug!("pre-turn side snapshot init skipped: {e}"),
             }
         });

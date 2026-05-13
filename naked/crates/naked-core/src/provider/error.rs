@@ -133,6 +133,22 @@ impl ProviderError {
         )
     }
 
+    /// R1 of PLAN_RESILIENCE_v1: is this key-failure **permanent**?
+    /// Auth-failed (401/403 invalid_token) and payment-required (402
+    /// membership) errors won't fix themselves over a 3600s blacklist
+    /// window — retrying them just burns the same error response and
+    /// pollutes counters. Permanent failures get removed from rotation
+    /// for the lifetime of the process; an operator restart rechecks.
+    ///
+    /// Conservative: returns true ONLY for known permanent classes.
+    /// Rate-limit / 5xx / network errors stay transient.
+    pub fn is_permanent_key_failure(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::AuthFailed { .. } | ProviderError::PaymentRequired { .. }
+        )
+    }
+
     /// Is this a model-level failure (abort, don’t cycle keys)?
     pub fn is_model_dead(&self) -> bool {
         matches!(self, ProviderError::ModelNotFound { .. })

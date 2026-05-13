@@ -8,6 +8,14 @@
 pub(crate) async fn run() {
     naked_tg::guarded::install_panic_hook();
 
+    // R3 of PLAN_RESILIENCE_v1: refuse to run if naked-tg.service
+    // is active under systemd AND we're not the systemd-launched
+    // process. Without this guard, an accidental `naked-tg --help`
+    // (or a stale cron / supervisor script) SIGKILLs the live
+    // service via the pid-lock kill-stale logic below. Caught in
+    // the 48h log audit twice (2026-05-10 18:48 + 2026-05-11 00:05).
+    refuse_if_systemd_active_and_not_launched_by_systemd();
+
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let naked_dir = std::path::PathBuf::from(&home).join(".naked");
     let log_dir = naked_dir.join("logs");
@@ -78,4 +86,70 @@ pub(crate) async fn run() {
     // Build the DI graph, then hand off to the event loop.
     let wired = crate::wiring::build().await;
     crate::runtime::run_event_loop(wired).await;
+}
+
+/// R3 of PLAN_RESILIENCE_v1: refuse to start if `naked-tg.service`
+/// is active under systemd AND the current process was NOT
+/// launched by systemd. Bypass via `NAKED_BYPASS_SYSTEMD_GUARD=1`.
+fn refuse_if_systemd_active_and_not_launched_by_systemd() {
+    if env_truthy("NAKED_BYPASS_SYSTEMD_GUARD") {
+        return;
+    }
+    // INVOCATION_ID is set by systemd for every unit-launched
+    // process. Present → we ARE systemd-launched → carry on.
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        return;
+    }
+    let active = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "naked-tg.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if active {
+        eprintln!(
+            "❌ naked-tg.service is already running under systemd.\n\
+             \n\
+             Running the binary directly will SIGKILL the live process\n\
+             via the pid-lock kill-stale logic (see AGENTS.md).\n\
+             \n\
+             Either stop the service first:\n\
+               systemctl --user stop naked-tg.service\n\
+             or set the explicit opt-out:\n\
+               NAKED_BYPASS_SYSTEMD_GUARD=1 naked-tg ...\n"
+        );
+        std::process::exit(2);
+    }
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_truthy;
+
+    #[test]
+    fn truthy_classifier_set() {
+        for v in ["1", "true", "yes", "on", "TRUE", "On"] {
+            assert!(
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                "value '{v}' must classify as truthy"
+            );
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(
+                !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                "value '{v}' must NOT classify as truthy"
+            );
+        }
+        let _ = env_truthy("NAKED_BYPASS_SYSTEMD_GUARD");
+    }
 }

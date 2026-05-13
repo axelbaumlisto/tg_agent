@@ -134,6 +134,16 @@ impl LifecycleHookRunner {
             if !regex_matches(&hook.matcher, key) {
                 continue;
             }
+            // R5 of PLAN_RESILIENCE_v1: count actual fires (post-match)
+            // so a flat-zero rate flags either no installed hooks or
+            // hooks that never match. Pre-match no-ops don't count.
+            crate::types::LIFECYCLE_HOOK_FIRE_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                event = ?event,
+                hook_cmd_prefix = hook.command.chars().take(40).collect::<String>(),
+                "lifecycle hook fired"
+            );
             let cmd = substitute_vars(&hook.command, vars);
             let outcome = run_shell_with_timeout(&cmd, Duration::from_secs(hook.timeout_sec)).await;
             match outcome {
