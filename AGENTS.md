@@ -88,6 +88,19 @@ git push forgejo main
 naked/scripts/export_github_sanitized.sh
 ```
 
+## Auto-detection registry (read FIRST on any new task)
+
+Before drafting any plan or making non-trivial edits, consult
+[`naked/docs/BUG_REGISTRY.md`](naked/docs/BUG_REGISTRY.md) —
+specifically `§ 5 Agent self-check` for the M1-M7 / P1-P4 /
+PL1-PL5 / C1-C4 rows. The registry catalogues 34 recurring bug
+classes and 27 decomposed detection tasks so that the SAME bug
+never needs the user to nudge me a second time.
+
+New bug class discovered? Add a `B-NN` entry there BEFORE writing
+the fix, then a matching `D-*` task in `§ 4` if no existing
+detection layer would catch a re-occurrence.
+
 ## Conventions
 
 - **Editing scripts in `naked/scripts/`** — some deployments use
