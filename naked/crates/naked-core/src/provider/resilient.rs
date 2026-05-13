@@ -179,7 +179,16 @@ impl Provider for ResilientProvider {
     }
 
     fn blacklisted_key_count(&self) -> usize {
-        let bl = self.blacklist.blocking_lock();
+        // 2026-05-13 fix: `blocking_lock` PANICS when called on a tokio
+        // runtime worker thread ("Cannot block the current thread from
+        // within a runtime"). Reproduced via `/health` from TG which
+        // crashed the message-handler task on commit 097f308c.
+        // Use try_lock() and return 0 on contention — the count is
+        // diagnostic-only, never a correctness signal.
+        // REGISTRY-WAIVE: B23 — diagnostic-only fail-open; on contention return 0 (no panic).
+        let Ok(bl) = self.blacklist.try_lock() else {
+            return 0;
+        };
         let now = Instant::now();
         bl.values().filter(|&&exp| now < exp).count()
     }
