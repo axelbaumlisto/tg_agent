@@ -61,8 +61,12 @@ pub mod norm;
 pub mod price;
 
 pub use merge::reconcile;
-pub use norm::{canonicalize_url, normalize_title};
-pub use price::{ExtractedPrice, extract_price, to_usd};
+pub use norm::canonicalize_url;
+pub(crate) use norm::normalize_title; // used by memory_diff
+pub use price::extract_price;
+// `price::to_usd` and `price::ExtractedPrice` stay pub(crate) at their
+// definition site — reconciler_tests.rs imports them via explicit
+// `use super::price::{to_usd, ExtractedPrice}` paths.
 
 #[cfg(test)]
 #[path = "../reconciler_tests.rs"]

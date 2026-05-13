@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! B4.5-1b filter-rules engine + intent-aware rule builder.
 //!
 //! Bit-exact Rust port of the **pure-CPU** path of:
@@ -48,7 +55,7 @@ use serde_json::{Map, Value, json};
 /// byte-for-byte — re-ordering or pruning this list will silently
 /// drop the negative-score rule and "Sign Up | LinkedIn" cards will
 /// resurface in `maybe.jsonl` (regression group 23 catches it).
-pub const NOISE_TOKENS: &[&str] = &[
+pub(crate) const NOISE_TOKENS: &[&str] = &[
     "sign up",
     "sign in",
     "log in",
@@ -88,7 +95,7 @@ pub const NOISE_TOKENS: &[&str] = &[
 /// positives in development (`backend → back`).
 ///
 /// Bit-exact mirror of `brief_autopilot._stem_keyword`.
-pub fn stem_keyword(kw: &str) -> String {
+pub(crate) fn stem_keyword(kw: &str) -> String {
     let len = kw.chars().count();
     if len < 4 {
         return kw.to_string();
@@ -149,7 +156,7 @@ fn chars_take(s: &str, n: usize) -> String {
 /// |  -30  | noise / nav copy in title (sign up, cookies, …)  |
 ///
 /// Bit-exact mirror of `brief_autopilot._filter_rules_for_intent`.
-pub fn rules_for_intent(intent: &Value) -> Vec<Value> {
+pub(crate) fn rules_for_intent(intent: &Value) -> Vec<Value> {
     let mut rules: Vec<Value> = vec![
         json!({
             "name": "title not empty", "type": "regex_match",
@@ -277,7 +284,7 @@ fn rule_score(rule: &Value, key: &str) -> f64 {
 /// caller. Mirrors `validate_generic_brief._apply_rule` exactly,
 /// including the side-effect on `range_number` rules (which mutate
 /// the finding by adding `_extracted[name] = num`).
-pub fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
+pub(crate) fn apply_rule(rule: &Value, finding: &mut Value) -> (f64, bool) {
     let rtype = match rule.get("type").and_then(Value::as_str) {
         Some(t) => t,
         None => return (0.0, false),

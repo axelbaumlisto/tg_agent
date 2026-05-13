@@ -255,7 +255,7 @@ fn translate_punct(c: char) -> Option<&'static str> {
 /// **Not for fuzzy matching.** See module-level docstring; for
 /// Jaccard similarity use
 /// [`crate::research::spec::normalize_title_for_similarity`].
-pub fn normalize_title(title: &str) -> String {
+pub(crate) fn normalize_title(title: &str) -> String {
     if title.is_empty() {
         return String::new();
     }

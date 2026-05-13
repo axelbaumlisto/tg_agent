@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Filesystem-backed research store implementation.
 
 use std::collections::HashSet;
@@ -33,7 +40,7 @@ impl FsResearchStore {
         }
     }
 
-    pub fn with_default_root() -> Self {
+    pub(crate) fn with_default_root() -> Self {
         Self::new(research_root())
     }
 

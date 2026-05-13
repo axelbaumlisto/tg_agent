@@ -32,7 +32,7 @@ pub mod store_fs;
 pub mod tool;
 pub mod validators;
 
-pub use context::ResearchContext;
+pub use context::ResearchContext; // tests/e2e_*.rs
 pub use coordinator::{
     AgentRunner, CoordinatorConfig, ResearchCoordinator, RunReport, StopReason, VerifiedRunReport,
     parse_provider_model_pair,
@@ -47,22 +47,22 @@ pub use ops_tool_extra::{
     ResearchSetTargetTool,
 };
 pub use patch::{PatchField, ResearchPatch, apply_research_patch};
-pub use run_events::{EventKind, RunEvent, RunEventRegistry};
+pub(crate) use run_events::RunEventRegistry; // used by services/research + research_ops
+pub use run_events::{EventKind, RunEvent};
 pub use runlog::write_research_memory_link_for;
-pub use scheduler_hook::{NoopSchedulerHook, SchedulerEvent, SchedulerHook, noop_hook};
-pub use spec::{
-    Cursor, Finding, ResearchSpec, RunRecord, canonicalize_url, dedup_hash, new_research_id,
-    normalize_title_for_similarity, titles_are_similar,
-};
+pub(crate) use scheduler_hook::noop_hook; // internal: services/research
+pub use scheduler_hook::{NoopSchedulerHook, SchedulerEvent, SchedulerHook};
+pub(crate) use spec::new_research_id; // used by research_ops / services
+pub use spec::{Finding, ResearchSpec, RunRecord, canonicalize_url, dedup_hash};
 pub use state_view::{StateView, render_state};
 pub use store::{
-    ArtifactStore, FindingStore, InflightStore, ReportStore, ResearchStore, RunStore, SpecStore,
-    research_root,
+    FindingStore, InflightStore, ReportStore, ResearchStore, RunStore, SpecStore, research_root,
+    research_runlog_path,
 };
+// ArtifactStore stays pub(crate) at definition site (no external consumers).
 pub use store_fs::FsResearchStore;
-pub use tool::{
-    ResearchListTool, ResearchSaveCursorTool, ResearchSaveTool, ResearchStatusTool, scan_and_redact,
-};
+pub use tool::{ResearchListTool, ResearchSaveCursorTool, ResearchSaveTool, ResearchStatusTool};
+// scan_and_redact is pub(crate); callers use `tool::redact::scan_and_redact`.
 
 // ── ResearchRunner trait (ISP: tools see only what they need) ────────────
 

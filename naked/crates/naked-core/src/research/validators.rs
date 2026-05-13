@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Pre-save validators for `research_save`.
 //!
 //! Two categories, both cheap enough to run inside the tool handler before
@@ -88,7 +95,7 @@ impl UrlSpecificity {
         }
     }
 
-    pub fn is_concrete(&self) -> bool {
+    pub(crate) fn is_concrete(&self) -> bool {
         matches!(self, UrlSpecificity::ConcreteListing)
     }
 }
@@ -137,7 +144,7 @@ const CAPTCHA_STUB_MARKERS: &[&str] = &[
 /// Returns the first matching captcha-stub marker (lowercased) when
 /// `body` looks like the agent tried to save a placeholder page
 /// instead of real listing content. `None` otherwise.
-pub fn looks_like_captcha_stub(body: &str) -> Option<&'static str> {
+pub(crate) fn looks_like_captcha_stub(body: &str) -> Option<&'static str> {
     let lowered = body.to_lowercase();
     for marker in CAPTCHA_STUB_MARKERS {
         if lowered.contains(marker) {

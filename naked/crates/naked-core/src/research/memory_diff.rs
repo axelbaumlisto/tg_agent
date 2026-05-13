@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! B6 memory_diff — state-of-knowledge tracker.
 //!
 //! Bit-exact Rust port of `scripts/memory_diff.py`. Compares two
@@ -152,7 +159,7 @@ fn detect_deltas(old_item: &Value, new_item: &Value) -> Vec<&'static str> {
 /// `unchanged`, `summary`). The lists preserve input order:
 /// `new`/`unchanged`/`changed` follow `new`'s first-seen order;
 /// `gone` follows `old`'s first-seen order.
-pub fn diff_findings(old: &[Value], new: &[Value]) -> Value {
+pub(crate) fn diff_findings(old: &[Value], new: &[Value]) -> Value {
     // Build identity → finding maps. Last-write-wins for duplicate
     // keys; first-seen order for the position vector. Python uses
     // dict insertion-order; we mimic with a parallel Vec<&str>.
@@ -231,7 +238,7 @@ pub fn diff_findings(old: &[Value], new: &[Value]) -> Value {
 /// Load a JSONL findings snapshot. Empty / missing → `vec![]`.
 /// Malformed lines are skipped silently (defensive — a single bad
 /// line shouldn't tank a 7-day diff).
-pub fn load_snapshot(path: &Path) -> Vec<Value> {
+pub(crate) fn load_snapshot(path: &Path) -> Vec<Value> {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -288,7 +295,7 @@ pub fn list_snapshots(report_dir: &Path) -> Vec<PathBuf> {
 ///
 /// * `old_snapshot` — path of the older snapshot (or `null`)
 /// * `new_snapshot` — path of the newer snapshot (or `null`)
-pub fn diff_reports(report_dir: &Path, since: Option<&str>) -> Value {
+pub(crate) fn diff_reports(report_dir: &Path, since: Option<&str>) -> Value {
     let snaps = list_snapshots(report_dir);
     if snaps.is_empty() {
         let mut out = diff_findings(&[], &[]);

@@ -63,7 +63,7 @@ impl SchedulerHook for NoopSchedulerHook {
 }
 
 /// Convenience constructor for an [`Arc<dyn SchedulerHook>`].
-pub fn noop_hook() -> Arc<dyn SchedulerHook> {
+pub(crate) fn noop_hook() -> Arc<dyn SchedulerHook> {
     Arc::new(NoopSchedulerHook)
 }
 

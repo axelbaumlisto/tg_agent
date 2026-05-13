@@ -11,7 +11,7 @@ use crate::tool::Tool;
 use crate::types::{Permission, ToolResult, ToolSpec};
 
 use super::super::store::ResearchStore;
-use super::super::tool::parse_listing_date;
+use super::super::tool::output::parse_listing_date;
 
 // ─── research_metrics ───────────────────────────────────────────────────────
 

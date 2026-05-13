@@ -1,3 +1,4 @@
+use super::redact::scan_and_redact; // pub(crate); tool/mod.rs no longer re-exports
 use super::*;
 use crate::research::spec::ResearchSpec;
 use crate::research::store_fs::FsResearchStore;

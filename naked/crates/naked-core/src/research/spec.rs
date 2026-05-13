@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Data model for the research subsystem.
 //!
 //! Two principal records:
@@ -360,7 +367,7 @@ pub fn content_hash(excerpt: &str) -> String {
 /// and "70m² căn hộ 2PN" both normalize closer to each other than to a
 /// completely different property. Not perfect — just good enough to catch
 /// obvious same-property reposts with slightly different titles.
-pub fn normalize_title_for_similarity(title: &str) -> String {
+pub(crate) fn normalize_title_for_similarity(title: &str) -> String {
     // 1. Unicode to ASCII-ish via char-by-char lowercasing (no external crate).
     //    We keep only letters, digits, and spaces — everything else becomes a space.
     let normalized: String = title
@@ -410,7 +417,7 @@ pub fn normalize_title_for_similarity(title: &str) -> String {
 /// same listing posted twice with slightly different wording.
 ///
 /// Used by the store to warn about near-duplicates even when the URL differs.
-pub fn titles_are_similar(a: &str, b: &str) -> bool {
+pub(crate) fn titles_are_similar(a: &str, b: &str) -> bool {
     let a_norm = normalize_title_for_similarity(a);
     let b_norm = normalize_title_for_similarity(b);
     let a_tokens: std::collections::HashSet<&str> = a_norm.split_whitespace().collect();
@@ -430,7 +437,7 @@ pub fn titles_are_similar(a: &str, b: &str) -> bool {
 /// Slugify a topic into a filesystem-safe prefix, e.g.
 /// `"Jaguar XF used cheap"` → `"jaguar-xf-used-cheap"`.
 /// Conservative: ASCII-only, `[a-z0-9-]+`, collapses runs of separators.
-pub fn slugify(topic: &str) -> String {
+pub(crate) fn slugify(topic: &str) -> String {
     let mut out = String::with_capacity(topic.len());
     let mut last_was_sep = true;
     for ch in topic.chars() {
@@ -528,7 +535,7 @@ fn short_slug(topic: &str) -> String {
 /// for a per-user research store. Collision is handled at the persistence
 /// layer (`ResearchStore::save_spec` rejects duplicates) — caller can
 /// retry, the id is cheap to regenerate.
-pub fn new_research_id(topic: &str) -> String {
+pub(crate) fn new_research_id(topic: &str) -> String {
     let slug = short_slug(topic);
     let uuid = uuid::Uuid::new_v4().simple().to_string();
     format!("{slug}-{}", &uuid[..4])

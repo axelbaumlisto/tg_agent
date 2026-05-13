@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Research context — ambient state for research runs.
 
 use std::sync::Arc;
@@ -24,7 +31,7 @@ impl ResearchContext {
         Self::default()
     }
 
-    pub fn set_id(&self, id: Option<String>) {
+    pub(crate) fn set_id(&self, id: Option<String>) {
         if let Ok(mut g) = self.inner.write() {
             *g = id;
         }
@@ -34,7 +41,7 @@ impl ResearchContext {
         self.inner.read().ok().and_then(|g| g.clone())
     }
 
-    pub fn set_run_id(&self, id: Option<String>) {
+    pub(crate) fn set_run_id(&self, id: Option<String>) {
         if let Ok(mut g) = self.run_id.write() {
             *g = id;
         }
@@ -47,27 +54,27 @@ impl ResearchContext {
     /// Attach (or replace) the run-event registry used by tools to
     /// push waterfall events. Cheap — the registry is `Arc`-wrapped
     /// internally.
-    pub fn set_run_events(&self, reg: Option<super::run_events::RunEventRegistry>) {
+    pub(crate) fn set_run_events(&self, reg: Option<super::run_events::RunEventRegistry>) {
         if let Ok(mut g) = self.run_events.write() {
             *g = reg;
         }
     }
 
-    pub fn run_events(&self) -> Option<super::run_events::RunEventRegistry> {
+    pub(crate) fn run_events(&self) -> Option<super::run_events::RunEventRegistry> {
         self.run_events.read().ok().and_then(|g| g.clone())
     }
 
     /// Increment the per-run save counter. Called by `ResearchSaveTool`
     /// after a successful append (skipped saves do not count). Saturates
     /// at u32::MAX — we only ever check `> 0`.
-    pub fn note_save(&self) {
+    pub(crate) fn note_save(&self) {
         if let Ok(mut g) = self.saves.write() {
             *g = g.saturating_add(1);
         }
     }
 
     /// Number of successful saves recorded for the current bound run.
-    pub fn save_count(&self) -> u32 {
+    pub(crate) fn save_count(&self) -> u32 {
         self.saves.read().map(|g| *g).unwrap_or(0)
     }
 
@@ -75,7 +82,7 @@ impl ResearchContext {
     /// `set_id`/`set_run_id`-like rebind paths so a freshly-acquired
     /// context starts at 0 saves regardless of what the previous run
     /// observed.
-    pub fn reset_saves(&self) {
+    pub(crate) fn reset_saves(&self) {
         if let Ok(mut g) = self.saves.write() {
             *g = 0;
         }

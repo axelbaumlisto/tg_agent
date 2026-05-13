@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Credential/secret redaction for research output.
 
 /// Crude credential/secret redactor. Runs before we forward any research
@@ -5,7 +12,7 @@
 /// misconfigured proxy or a `curl -H "Authorization: ..."` snippet doesn't
 /// leak by accident. Ported from zeroclaws `scan_and_redact_output`, but
 /// scoped to the small handful of patterns we actually see.
-pub fn scan_and_redact(text: &str) -> String {
+pub(crate) fn scan_and_redact(text: &str) -> String {
     // Cheap, layered regex: no backtracking, case-insensitive.
     // Matches "api_key=SOMETHING", "Bearer XXX", "Authorization: Token YYY",
     // and long `$ALLCAPS=SECRETVAL` env exports. All values collapse to
@@ -152,7 +159,7 @@ mod matcher {
         }
     }
 
-    pub struct BearerPattern {
+    pub(crate) struct BearerPattern {
         prefix: String,
     }
 

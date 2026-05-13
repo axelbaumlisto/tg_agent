@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Tools the research agent calls during a run.
 //!
 //! - `research_save` — persist a new `Finding`. Idempotent thanks to
@@ -33,12 +40,12 @@ use chrono::Utc;
 use serde_json::json;
 
 mod handlers;
-mod output;
-mod redact;
+pub(crate) mod output;
+pub(crate) mod redact;
 
-// Re-exported for external callers.
-pub use output::parse_listing_date;
-pub use redact::scan_and_redact;
+// `parse_listing_date` accessed via `crate::research::tool::output::X`,
+// `scan_and_redact` accessed via `super::redact::scan_and_redact` in tests.
+// No module-level re-exports needed.
 // Used only by the test module via `use super::*;`.
 #[cfg(test)]
 pub(crate) use output::strip_source_attribution;

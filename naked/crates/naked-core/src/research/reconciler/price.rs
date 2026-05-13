@@ -1,3 +1,10 @@
+// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
+// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
+// the crate; they were hidden by `pub` visibility (dead_code lint exempts
+// pub items). Audit + delete is queued as separate B45 cleanup task.
+// Until then, this allow keeps the clippy gate green.
+#![allow(dead_code)]
+
 //! Price extraction and FX conversion (B5-3).
 //!
 //! Public API:
@@ -401,7 +408,7 @@ pub fn extract_price(text: &str, default_currency: Option<&str>) -> Option<Extra
 /// Mirrors Python `to_usd(price: dict, fx_rates=None) -> float|None`
 /// with the dict-input flattened into an explicit `(amount, currency)`
 /// pair — no `Option` keys to second-guess.
-pub fn to_usd(amount: f64, currency: &str, fx_rates: Option<&[(&str, f64)]>) -> Option<f64> {
+pub(crate) fn to_usd(amount: f64, currency: &str, fx_rates: Option<&[(&str, f64)]>) -> Option<f64> {
     if !amount.is_finite() {
         return None;
     }

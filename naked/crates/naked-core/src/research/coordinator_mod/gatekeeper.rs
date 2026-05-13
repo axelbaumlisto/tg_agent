@@ -5,7 +5,7 @@ use super::FuzzyFingerprint;
 use super::GatekeeperVerdict;
 use super::ResearchCoordinator;
 use crate::error::Result;
-use crate::research::tool::parse_listing_date;
+use crate::research::tool::output::parse_listing_date;
 use chrono::Utc;
 use std::time::Duration;
 

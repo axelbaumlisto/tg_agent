@@ -123,7 +123,7 @@ pub(crate) fn strip_source_attribution(text: &str) -> String {
 /// Try to parse a free-form listing date string into a NaiveDate.
 /// Handles: `YYYY-MM-DD`, `DD/MM/YYYY`, `DD-MM-YYYY`, `DD.MM.YYYY`,
 /// relative Vietnamese (`hôm nay`, `hôm qua`, `N ngày trước`), and `unknown`.
-pub fn parse_listing_date(s: &str) -> Option<NaiveDate> {
+pub(crate) fn parse_listing_date(s: &str) -> Option<NaiveDate> {
     let s = s.trim().to_lowercase();
     if s.is_empty() || s == "unknown" {
         return None;
