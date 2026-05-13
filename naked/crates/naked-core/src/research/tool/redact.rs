@@ -213,14 +213,17 @@ mod matcher {
     fn match_key_literal(hay: &str, start: usize, key: &str) -> Option<usize> {
         // Support `[_-]?` meta inside keys like `api[_-]?key` — interpret as:
         // try literal match with `_`, `-`, or none between the segments on `[`.
+        //
+        // B48 (2026-05-13): use `str::get()` for safe slicing — caller walks
+        // byte-by-byte (Pattern::replace_all) but `start` may land mid-UTF-8
+        // when haystack contains multi-byte chars (`💭` thinking marker, etc).
+        // `get` returns None on non-char-boundary; panics avoided.
         if key.contains("[_-]?") {
             let parts: Vec<&str> = key.split("[_-]?").collect();
             let mut end = start;
             for (i, part) in parts.iter().enumerate() {
-                if end + part.len() > hay.len() {
-                    return None;
-                }
-                if &hay[end..end + part.len()] != *part {
+                let slice = hay.get(end..end + part.len())?;
+                if slice != *part {
                     return None;
                 }
                 end += part.len();
@@ -233,10 +236,9 @@ mod matcher {
             }
             return Some(end);
         }
-        if start + key.len() > hay.len() {
-            return None;
-        }
-        if &hay[start..start + key.len()] == key {
+        // B48 same safety pattern as above — use get() for the plain-key path too.
+        let slice = hay.get(start..start + key.len())?;
+        if slice == key {
             return Some(start + key.len());
         }
         None

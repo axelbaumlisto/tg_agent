@@ -222,3 +222,25 @@ fn redact_handles_quoted_values() {
     assert!(!out.contains("topsecret"), "got: {out}");
     assert!(!out.contains("xyz"), "got: {out}");
 }
+
+#[test]
+fn redact_does_not_panic_on_multibyte_utf8_thinking_content() {
+    // B48 regression: redactor walked byte-by-byte and tried to slice
+    // `&hay[end..end + part.len()]` where `end` could fall mid-emoji.
+    // Repro string from the original panic (2026-05-13 deepseek-v4-flash via airpx):
+    let s = "deepseek v4 flash is online.\n\n<blockquote expandable>\u{1F4AD} <b>thinking</b>\nuser wanted exactly 5 words";
+    // Should NOT panic. May be no-op (no credential patterns matched).
+    let out = scan_and_redact(s);
+    // Output preserves the emoji and structure intact.
+    assert!(out.contains("\u{1F4AD}"), "thinking emoji preserved");
+    assert!(out.contains("v4 flash"), "text preserved");
+}
+
+#[test]
+fn redact_with_real_credentials_amid_multibyte() {
+    // Mix of safe multi-byte text + actual credential to redact.
+    let s = "\u{1F4AD} request had api_key=AKIAEXAMPLE_SECRET_VALUE inside";
+    let out = scan_and_redact(s);
+    assert!(!out.contains("AKIAEXAMPLE_SECRET_VALUE"), "got: {out}");
+    assert!(out.contains("\u{1F4AD}"), "emoji preserved: {out}");
+}
