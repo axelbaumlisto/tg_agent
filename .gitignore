@@ -1,22 +1,20 @@
-.env
 
+/[0-9]
+.env
 # Local agent / session caches
 .naked/
-
-# Stray result dumps (real results live in naked/results/)
-/results/
-
-# Stray stdout redirects from ad-hoc shell sessions
-/[0-9]
-
-# Rust agent local/runtime state
-/naked/target/
-/naked/.secrets/
-/naked/.naked/
-/naked/.local/
-/naked/.playwright-mcp/
-/naked/tmp/
 /naked/data/research_runs/
+/naked/.local/
+/naked/.naked/
+/naked/.playwright-mcp/
 /naked/results/autopilot/_logs/
+/naked/.secrets/
+/naked/target/
+/naked/tmp/
+progress.md
+/results/
 *.runlog
+# Rust agent local/runtime state
 STATUS.txt
+# Stray result dumps (real results live in naked/results/)
+# Stray stdout redirects from ad-hoc shell sessions

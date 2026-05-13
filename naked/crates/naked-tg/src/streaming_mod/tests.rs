@@ -951,10 +951,21 @@ mod tests {
     }
 
     // ─── BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard) ───
+    //
+    // B43 (выявлен 2026-05-13): все 4 теста работают с shared mutable static
+    // `NOVNC_IP_ALLOWLIST` и global `IP_TOKEN_HALLUCINATION_COUNT`. При параллельном
+    // запуске (cargo test default) это вызывает race: test A очищает allowlist,
+    // test B видит empty и идёт по fail-open пути. Сериализуем через
+    // std::sync::Mutex (без новых deps; serial_test не используем).
+    fn ip_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     /// No noVNC keyword → no-op, counter unchanged.
     #[test]
     fn validate_ip_tokens_skips_when_no_vnc_keyword() {
+        let _guard = ip_test_lock();
         let before = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
             .load(std::sync::atomic::Ordering::Relaxed);
         crate::streaming::flush::validate_novnc_ip_tokens(
@@ -968,6 +979,7 @@ mod tests {
     /// Allow-list empty → fail-open, no warnings.
     #[test]
     fn validate_ip_tokens_fail_open_when_allowlist_empty() {
+        let _guard = ip_test_lock();
         {
             let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
             g.clear();
@@ -985,6 +997,7 @@ mod tests {
     /// Allow-list populated + hallucinated IP → counter bumped.
     #[test]
     fn validate_ip_tokens_detects_hallucination() {
+        let _guard = ip_test_lock();
         {
             let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
             g.clear();
@@ -1010,6 +1023,7 @@ mod tests {
     /// Allow-list populated + known good IP → no counter bump.
     #[test]
     fn validate_ip_tokens_passes_known_good_ip() {
+        let _guard = ip_test_lock();
         {
             let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
             g.clear();
