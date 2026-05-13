@@ -49,20 +49,26 @@ pub(crate) async fn build() -> WiredBot {
     let agent = Arc::new(AgentCore::new(config.clone(), provider));
     agent.init_self_ref();
 
-    // R2 of PLAN_RESILIENCE_v1: fire-and-forget boot-time key audit.
-    // ResilientProvider (at the bottom of the
-    // TimeoutProvider<Box<dyn Provider>> chain) probes each
-    // configured key with a 1-token request and permanent-blacklists
-    // anything that returns 401/402 BEFORE the first real turn.
-    // The audit completes in the background; first few turns may
-    // still try a dead key, but subsequent ones skip it. Counter
-    // `naked_core_provider_permanent_blacklist_total` increments
-    // for each permanent-dead key found.
+    // R2 of PLAN_RESILIENCE_v1: fire-and-forget boot-time key audit
+    // for EVERY configured provider. Each provider's chain (key
+    // rotation + nested fallbacks) gets probed in parallel.
+    // Permanent failures (401/402) bump
+    // `naked_core_provider_permanent_blacklist_total` and remove
+    // the key from rotation before the first real turn would hit
+    // it. The audit runs in the background so boot time is
+    // unaffected; first few turns may still try a dead key.
     {
         let agent_for_audit = agent.clone();
+        let provider_names: Vec<String> = config.providers.keys().cloned().collect();
         tokio::spawn(async move {
-            let provider = agent_for_audit.provider_for("").await;
-            provider.audit_keys_on_boot().await;
+            // Sequential rather than join_all — avoids pulling in
+            // futures_util at this layer. Audits are fast (5s
+            // timeout per probe) so serial is fine.
+            for name in provider_names {
+                let p = agent_for_audit.provider_for(&name).await;
+                p.audit_keys_on_boot().await;
+            }
+            tracing::info!("R2 boot-time provider audit complete for all configured providers");
         });
     }
 

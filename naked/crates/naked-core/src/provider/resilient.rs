@@ -188,10 +188,20 @@ impl Provider for ResilientProvider {
         self.providers.len()
     }
 
-    /// R2 wiring: probe-model picked from the first underlying
-    /// provider's `models()` listing so the audit picks the same
-    /// model the loop would use for a real request.
+    /// R2 wiring: recursive audit.
+    ///   (a) Each inner provider's own audit_keys_on_boot runs
+    ///       first (nested ResilientProvider audits its keys).
+    ///   (b) Then outer-level probe: try each pseudo-provider with
+    ///       a 1-token request so a totally-dead provider chain
+    ///       gets marked at this level.
     async fn audit_keys_on_boot(&self) {
+        use futures_util::future::join_all;
+        // (a) Recurse into inner providers in parallel.
+        let inner_audits = self.providers.iter().map(|p| p.audit_keys_on_boot());
+        join_all(inner_audits).await;
+
+        // (b) Outer-level: probe each pseudo-provider so a
+        //     totally-dead provider also gets blacklisted here.
         let probe_model = self
             .providers
             .first()
@@ -204,7 +214,7 @@ impl Provider for ResilientProvider {
                     .first()
                     .map(|p| p.name())
                     .unwrap_or("<empty>"),
-                "audit_keys_on_boot: no model configured, skipping"
+                "audit_keys_on_boot: no model configured, skipping outer probe"
             );
             return;
         }
