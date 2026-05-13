@@ -164,7 +164,13 @@ fn apply_reasoning_params(body: &mut serde_json::Value, base_url: &str, reasonin
         // reasons regardless, but sending the param is harmless.
         || url_lc.contains("kimi.com")
         || url_lc.contains("moonshot.cn")
-        || url_lc.contains("moonshot.ai");
+        || url_lc.contains("moonshot.ai")
+        // 2026-05-13: airpx.cc OpenAI-compat proxy fronts claude-4-6,
+        // deepseek-v4-*, gpt-5.x, gemini-3.* — все эти models thinking-
+        // capable. Per their docs (airpx.cc/v1): supports `reasoning_effort`
+        // (OpenAI style) and `thinking.budget_tokens` (Anthropic style).
+        // Forwarding `reasoning_effort` covers OpenAI-compat path.
+        || url_lc.contains("airpx.cc");
     match reasoning {
         Some("off") if supports_enable_thinking => {
             body["enable_thinking"] = serde_json::json!(false);
