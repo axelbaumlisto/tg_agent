@@ -1048,10 +1048,32 @@ mod tests {
             model: "whisper-large-v3".into(),
             language: None,
         };
-        match transcribe_audio(http_for_test(), &cfg, &bytes, "test_tone.ogg", "audio/ogg").await {
-            Ok(text) => eprintln!("  transcript: {text:?}"),
+        // PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01: end-to-end observability
+        // check — either the ok or fail counter MUST increment, never both,
+        // never neither. This was the silent-success class that originally
+        // motivated M5.
+        let before = crate::metrics::snapshot();
+        let result =
+            transcribe_audio(http_for_test(), &cfg, &bytes, "test_tone.ogg", "audio/ogg").await;
+        let after = crate::metrics::snapshot();
+        let ok_delta = after.transcription_ok - before.transcription_ok;
+        let fail_delta = after.transcription_fail - before.transcription_fail;
+        assert_eq!(
+            ok_delta + fail_delta,
+            1,
+            "INV-5: exactly one of transcription_ok / transcription_fail must increment per call"
+        );
+        match result {
+            Ok(text) => {
+                eprintln!("  transcript: {text:?}");
+                assert_eq!(ok_delta, 1, "Ok path must bump transcription_ok");
+            }
             Err(e) if e.to_string().contains("empty text") => {
                 eprintln!("  transcript: <empty> (acceptable for pure tone)");
+                assert_eq!(
+                    fail_delta, 1,
+                    "empty-text Err path must bump transcription_fail"
+                );
             }
             Err(e) => panic!("transcription failed: {e}"),
         }
@@ -1064,6 +1086,30 @@ mod tests {
         max_tokens: u32,
         prompt_override: Option<String>,
     ) -> Option<VisionProviderCfg> {
+        // PLAN_MEDIA_UX_v1 M3: prefer the configured production describer
+        // (qwen3-vl-plus via Alibaba Dashscope). Verified live 2026-05-13:
+        // correctly identifies SMPTE color bars in test_image.png.
+        for var in [
+            "DASHSCOPE_API_KEY_2",
+            "DASHSCOPE_API_KEY",
+            "DASHSCOPE_API_KEY_4",
+        ] {
+            if std::env::var(var)
+                .ok()
+                .filter(|v| !v.is_empty() && !v.starts_with('$'))
+                .is_some()
+            {
+                eprintln!("  vision provider: qwen3-vl-plus via ${var}");
+                return Some(VisionProviderCfg {
+                    api_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+                        .into(),
+                    api_key: format!("${var}"),
+                    model: "qwen3-vl-plus".into(),
+                    max_tokens,
+                    prompt_override,
+                });
+            }
+        }
         if std::env::var("GROQ_API_KEY")
             .ok()
             .filter(|v| !v.is_empty())
@@ -1143,6 +1189,30 @@ mod tests {
         // response (the testsrc pattern produces > 20 char descriptions across
         // every vision model we ship support for).
         assert!(text.len() > 20, "description too short: {text:?}");
+        // Sanity: the SMPTE color-bar test pattern should produce a description
+        // mentioning either colour names, the word 'color', 'bar', or 'pattern'.
+        // Models we support today (Groq llama-4-scout, xAI grok-2-vision, OpenAI
+        // gpt-4o-mini, Qwen3-VL-Plus) ALL hit at least one of these keywords on
+        // the test fixture — verified live 2026-05-13.
+        let lc = text.to_ascii_lowercase();
+        let recognises_pattern = [
+            "color",
+            "colour",
+            "цвет",
+            "bar",
+            "полос",
+            "pattern",
+            "test",
+            "тест",
+            "smpte",
+            "rainbow",
+        ]
+        .iter()
+        .any(|kw| lc.contains(kw));
+        assert!(
+            recognises_pattern,
+            "vision describer didn't recognise SMPTE test pattern in fixture: {text:?}"
+        );
     }
 
     /// Live: verify `prompt_override` actually substitutes `{caption}` and that
