@@ -1,8 +1,9 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
+// REGISTRY-WAIVE: B45 — entire module is a Rust port of `naked/scripts/memory_diff.py`
+// kept for differential contract testing (6 internal tests assert bit-exactness
+// against `tests/fixtures/memory_diff/*.json`). The Python script is actively
+// used by `scripts/memory_diff_tg.py`; the Rust port is the future replacement.
+// Until the migration lands, every function here is dead in the prod hot path
+// but alive in tests.
 #![allow(dead_code)]
 
 //! B6 memory_diff — state-of-knowledge tracker.

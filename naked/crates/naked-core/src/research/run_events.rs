@@ -1,10 +1,3 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
-#![allow(dead_code)]
-
 //! In-memory per-run event registry for live-progress UIs.
 //!
 //! Research runs live inside the coordinator's `drain_events` loop and
@@ -170,6 +163,7 @@ impl RunEventRegistry {
     /// blocking scope. Uses `try_write`; silently drops the event if
     /// the lock is contended (the next tick will re-capture state
     /// anyway).
+    #[cfg(test)] // B45: only callsite is in this file's test mod.
     pub(crate) fn push_blocking(&self, run_id: &str, event: RunEvent) {
         if let Ok(mut map) = self.inner.try_write() {
             map.entry(run_id.to_string())

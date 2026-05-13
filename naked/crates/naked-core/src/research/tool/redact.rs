@@ -1,8 +1,9 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
+// REGISTRY-WAIVE: B45 — credential scrubber ported from zeroclaws.
+// `scan_and_redact` is tested (tool_tests.rs) but NOT YET wired into the
+// outbound message path. Intended call site: streaming_mod/flush.rs::send_final
+// before forwarding research output to Telegram. Until wired, the function +
+// its internal Pattern/BearerPattern matchers + REDACTORS static are all dead
+// in the prod hot path. Keeping the module ready to plug in.
 #![allow(dead_code)]
 
 //! Credential/secret redaction for research output.

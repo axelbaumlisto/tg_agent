@@ -1,10 +1,3 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
-#![allow(dead_code)]
-
 //! Pre-save validators for `research_save`.
 //!
 //! Two categories, both cheap enough to run inside the tool handler before
@@ -93,10 +86,6 @@ impl UrlSpecificity {
         UrlSpecificity::CategoryPage {
             reason: "path has no per-item id (no `-id<digits>` / numeric run)".to_string(),
         }
-    }
-
-    pub(crate) fn is_concrete(&self) -> bool {
-        matches!(self, UrlSpecificity::ConcreteListing)
     }
 }
 

@@ -1,10 +1,3 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
-#![allow(dead_code)]
-
 //! Research context — ambient state for research runs.
 
 use std::sync::Arc;
@@ -49,15 +42,6 @@ impl ResearchContext {
 
     pub fn run_id(&self) -> Option<String> {
         self.run_id.read().ok().and_then(|g| g.clone())
-    }
-
-    /// Attach (or replace) the run-event registry used by tools to
-    /// push waterfall events. Cheap — the registry is `Arc`-wrapped
-    /// internally.
-    pub(crate) fn set_run_events(&self, reg: Option<super::run_events::RunEventRegistry>) {
-        if let Ok(mut g) = self.run_events.write() {
-            *g = reg;
-        }
     }
 
     pub(crate) fn run_events(&self) -> Option<super::run_events::RunEventRegistry> {

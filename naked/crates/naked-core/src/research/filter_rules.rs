@@ -1,8 +1,10 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
+// REGISTRY-WAIVE: B45 — `score_finding` is the actively-used export (called
+// from naked-cli/bin/validate_brief.rs). The helpers below (NOISE_TOKENS,
+// stem_keyword, rules_for_intent, has_cyrillic_lower, has_ascii_alpha_lower,
+// chars_take) are alive in `filter_rules_tests.rs` but not yet invoked by
+// production scoring. They cover B4.5-1b contract surface that activate when
+// intent-tuning is wired in. Module-level allow chosen over per-item to avoid
+// 6 separate annotations.
 #![allow(dead_code)]
 
 //! B4.5-1b filter-rules engine + intent-aware rule builder.

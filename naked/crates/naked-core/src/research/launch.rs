@@ -1,10 +1,3 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
-#![allow(dead_code)]
-
 //! Launch acknowledgement + verification outcomes.
 //!
 //! `research_launch` today returns `{"status":"launched","verified":true}`
@@ -43,12 +36,6 @@ pub enum LaunchOutcome {
     Verified { pid: u64, run_id: String },
     /// Queued but did not start within `verify_within`.
     FailedToStart { reason: String },
-}
-
-impl LaunchOutcome {
-    pub(crate) fn is_verified(&self) -> bool {
-        matches!(self, LaunchOutcome::Verified { .. })
-    }
 }
 
 /// Poll-driven verifier used by the tool handler. `probe` is an async

@@ -1,10 +1,3 @@
-// REGISTRY-WAIVE: B45 (dead-code revealed by Phase D' pub→pub(crate) flip).
-// PLAN_SKILL_VS_CORE_v1 audit found 55 items in research/ never used inside
-// the crate; they were hidden by `pub` visibility (dead_code lint exempts
-// pub items). Audit + delete is queued as separate B45 cleanup task.
-// Until then, this allow keeps the clippy gate green.
-#![allow(dead_code)]
-
 //! B4.6 quality_assessor — `honest-unknown` detector for the research pipeline.
 //!
 //! Bit-exact Rust port of `scripts/quality_assessor.py`. Runs the same
@@ -94,6 +87,7 @@ impl Thresholds {
     /// defaults for any missing key. Mirrors Python's
     /// `{**DEFAULT_THRESHOLDS, **(thresholds or {})}` merge — a
     /// caller can pass a partial dict and the rest is inherited.
+    #[cfg(test)] // B45: callsite is in this file's test mod only.
     pub(crate) fn from_json(v: &Value) -> Self {
         let d = Self::default();
         let obj = match v.as_object() {
