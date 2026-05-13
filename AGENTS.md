@@ -101,6 +101,27 @@ New bug class discovered? Add a `B-NN` entry there BEFORE writing
 the fix, then a matching `D-*` task in `§ 4` if no existing
 detection layer would catch a re-occurrence.
 
+**Mechanical gates already installed** (2026-05-13):
+- **L1** lints: `naked/scripts/registry_lint.sh` (7 checks:
+  WORKSPACE-TEST, NO-TARGET, ALLOW-SCOPE, SILENT-LET-ELSE,
+  TAUTOLOGY, DEPS, PLAN-PUSH) — runs first in `pre-commit-check.sh`.
+- **L3** integration: `naked-core/tests/config_invariants.rs` sweeps
+  production `state/naked.json` for INV-1 / INV-2 / INV-3 consistency.
+- **L4** boot: `wiring::check_multimodal_describer_health` +
+  `boot_caps_invariant_sweep` + `D-BOOT-VISION-PROBE` (1×1 PNG
+  content-shape probe). All fire on every restart, log INFO/WARN.
+- **L5** metrics: `/metrics` exposes 22+ counters including
+  `naked_core_provider_vision_capability_mismatch_total` (B06),
+  `naked_tg_media_transcription_total{outcome}` (B01).
+- **L6** audit: `naked/scripts/audit_all.sh` orchestrates 3
+  sub-detectors (dead-key cycle, metric-vs-log, vision-cap); cron-
+  ready; exit 1 on regression for `tg_alert.sh` integration.
+- **L7** process: this file + `naked/docs/postmortems/_template.md`
+  for structured retrospectives + `recall_load_rules` at session start.
+
+**Before any new audit, run** `naked/scripts/audit_all.sh` to get
+the current baseline. Compare deltas on follow-up runs.
+
 ## Conventions
 
 - **Editing scripts in `naked/scripts/`** — some deployments use
