@@ -7,6 +7,34 @@ use super::*;
 /// placeholder send) and may be re-attached by future callback
 /// paths if needed. Kept here so the literal lives in ONE place
 /// (DRY).
+/// PLAN_MEDIA_UX_v1 M4 / BUG_REGISTRY D-INV-STREAM-BUBBLE-COUNT.
+///
+/// Sends the SINGLE stream-start message: a placeholder text ("⏳")
+/// with the inline-keyboard control card attached. Returns the
+/// message id on success, None on error (already logged).
+///
+/// Extracted from `stream_response` so wiremock tests can assert it
+/// calls `bot.send_message` exactly ONCE — the regression guard for
+/// B02 (3-bubble stream-start that motivated M4).
+pub(crate) async fn send_stream_placeholder(
+    bot: &Bot,
+    ctx: &ChatCtx,
+) -> Option<teloxide::types::MessageId> {
+    match bot
+        .send_message(ctx.chat_id, "⏳")
+        .maybe_thread(ctx.thread_id)
+        .maybe_reply_to(ctx.reply_to)
+        .reply_markup(streaming_control_kb())
+        .await
+    {
+        Ok(m) => Some(m.id),
+        Err(e) => {
+            tracing::error!("Failed to send placeholder: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
     teloxide::types::InlineKeyboardMarkup::new(vec![vec![
         teloxide::types::InlineKeyboardButton::callback("⏹ Стоп", "stream:abort"),
@@ -14,6 +42,7 @@ pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
     ]])
 }
 
+// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stream_response(
     bot: Bot,
@@ -61,18 +90,9 @@ pub(crate) async fn stream_response(
     // the buttons ride untouched through every streaming flush.
     // End-of-turn clears them with editMessageReplyMarkup (no
     // `.reply_markup()` arg) instead of deleting the message.
-    let placeholder = match bot
-        .send_message(ctx.chat_id, "⏳")
-        .maybe_thread(ctx.thread_id)
-        .maybe_reply_to(ctx.reply_to)
-        .reply_markup(streaming_control_kb())
-        .await
-    {
-        Ok(m) => m.id,
-        Err(e) => {
-            tracing::error!("Failed to send placeholder: {e}");
-            return;
-        }
+    let placeholder = match send_stream_placeholder(&bot, &ctx).await {
+        Some(id) => id,
+        None => return,
     };
     crate::shared::CONTROL_CARDS
         .write()

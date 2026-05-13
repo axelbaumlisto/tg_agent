@@ -16,6 +16,7 @@ async fn t08_session_persistence() {
     let mut session = Session::new(
         tmp.path().to_path_buf(),
         SYS.into(),
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         SessionMetadata {
             name: Some("e2e-test".into()),
             provider: config.default_provider.clone(),
@@ -596,6 +597,7 @@ async fn t53_session_store_no_unwrap_panic() {
     let session = Session::new(
         tmp.path().to_path_buf(),
         "sys".into(),
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         SessionMetadata {
             name: Some("Test Session".into()),
             provider: "test".into(),
@@ -628,6 +630,7 @@ async fn t59_no_cross_session_leak() {
     let s1 = Session::new(
         tmp.path().to_path_buf(),
         "sys".into(),
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         SessionMetadata {
             name: Some("Secret Session".into()),
             provider: "test".into(),
@@ -639,6 +642,7 @@ async fn t59_no_cross_session_leak() {
     let mut s2 = Session::new(
         tmp.path().to_path_buf(),
         "sys".into(),
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         SessionMetadata {
             name: Some("My Session".into()),
             provider: "test".into(),

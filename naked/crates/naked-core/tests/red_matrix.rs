@@ -103,6 +103,7 @@ async fn red_b2_tool_result_content_round_trips() {
     let mut session = Session::new(
         tmp.path().to_path_buf(),
         "system".into(),
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         SessionMetadata {
             name: None,
             provider: "p".into(),

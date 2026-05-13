@@ -906,6 +906,52 @@ mod tests {
         Bot::new("0:TEST_TOKEN").set_api_url(url)
     }
 
+    /// BUG_REGISTRY D-INV-STREAM-BUBBLE-COUNT (B02 / INV-4 full version):
+    /// stream-start MUST send exactly ONE Telegram API request, not
+    /// two (the old `⏳` placeholder + `⏯️` control card pattern).
+    /// Uses the same wiremock infra as send_text_hits_mock_server_with_sendmessage.
+    #[tokio::test]
+    async fn stream_start_sends_exactly_one_message_with_inline_kbd() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 1, "type": "private", "first_name": "u"},
+                    "text": "\u{23F3}"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let bot = mock_bot(&server.uri());
+        let ctx = crate::shared::ChatCtx {
+            chat_id: ChatId(1),
+            thread_id: None,
+            reply_to: None,
+        };
+        let _ = crate::streaming::pipeline::send_stream_placeholder(&bot, &ctx).await;
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "INV-4: stream-start must send exactly ONE TG API request \
+             (placeholder with inline keyboard); got {}",
+            received.len()
+        );
+
+        // Verify the single request carries inline keyboard.
+        let req = &received[0];
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        assert!(
+            body.contains("reply_markup") || body.contains("inline_keyboard"),
+            "stream-start request must carry inline keyboard: body={body}"
+        );
+    }
+
     #[tokio::test]
     async fn send_text_hits_mock_server_with_sendmessage() {
         let server = MockServer::start().await;
@@ -1123,13 +1169,11 @@ mod resilience_tests {
 
     // ─── PLAN_MEDIA_UX_v1 M4 / BUG_REGISTRY B02 ───
     //
-    // INV-4 full version ("stream_start sends bot.send_message
-    // exactly ONCE") requires a teloxide Bot mock infra we don't
-    // have today — see BUG_REGISTRY D-INV-STREAM-BUBBLE-COUNT.
-    // Until then, this test pins the DRY helper that owns the
-    // single keyboard literal: if anyone re-introduces a second
-    // send_message at stream-start, the helper must be the only
-    // source of truth for the button layout.
+    // Pins the DRY helper that owns the single keyboard literal:
+    // if anyone re-introduces a second send_message at stream-start,
+    // the helper must remain the only source of truth for the
+    // button layout. Full one-bubble assertion uses wiremock — see
+    // resilience_tests::stream_start_sends_exactly_one_message_with_inline_kbd.
     #[test]
     fn streaming_control_kb_has_two_buttons() {
         let kb = crate::streaming::pipeline::streaming_control_kb();

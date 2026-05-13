@@ -4,6 +4,7 @@ use chrono::Utc;
 use tempfile::tempdir;
 
 fn make_spec(id: &str, topic: &str) -> ResearchSpec {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     ResearchSpec {
         id: id.to_string(),
         topic: topic.to_string(),
@@ -27,6 +28,7 @@ fn make_spec(id: &str, topic: &str) -> ResearchSpec {
 
 fn make_finding(spec_id: &str, url: &str) -> Finding {
     use crate::research::spec::host_path_hash;
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     Finding {
         id: uuid::Uuid::new_v4().simple().to_string(),
         research_id: spec_id.to_string(),

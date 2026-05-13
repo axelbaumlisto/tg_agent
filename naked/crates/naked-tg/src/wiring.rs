@@ -42,6 +42,26 @@ pub(crate) struct WiredBot {
 /// Build the complete DI graph and return a ready-to-run [`WiredBot`].
 ///
 /// Must be called **after** tracing is initialised (in [`crate::bootstrap`]).
+/// BUG_REGISTRY D-INV-AUDIT-ALL-PROVIDERS: iterates every provider
+/// name, resolves it via the `resolve` closure, and calls
+/// `audit_keys_on_boot()` on the result. Sequential to avoid pulling
+/// `futures_util` into naked-tg; each individual audit internally
+/// runs its key probes in parallel via `join_all`.
+///
+/// `pub(crate)` so wiring.rs::tests can verify the loop hits EVERY
+/// provider, not just the default — the bug that originally needed
+/// to ship as part of R2 wiring iteration (commit `38c608b6`).
+pub(crate) async fn audit_all_providers<F, Fut>(provider_names: Vec<String>, resolve: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = std::sync::Arc<dyn naked_core::provider::Provider>>,
+{
+    for name in provider_names {
+        let provider = resolve(name).await;
+        provider.audit_keys_on_boot().await;
+    }
+}
+
 /// BUG_REGISTRY D-BOOT-VISION-PROBE (B06): outcome of a single
 /// vision content-shape probe. Used to classify whether a provider
 /// that CLAIMS multimodal capability actually accepts OpenAI-style
@@ -283,24 +303,17 @@ pub(crate) async fn build() -> WiredBot {
     agent.init_self_ref();
 
     // R2 of PLAN_RESILIENCE_v1: fire-and-forget boot-time key audit
-    // for EVERY configured provider. Each provider's chain (key
-    // rotation + nested fallbacks) gets probed in parallel.
-    // Permanent failures (401/402) bump
-    // `naked_core_provider_permanent_blacklist_total` and remove
-    // the key from rotation before the first real turn would hit
-    // it. The audit runs in the background so boot time is
-    // unaffected; first few turns may still try a dead key.
+    // for EVERY configured provider. See audit_all_providers below —
+    // extracted for testability (D-INV-AUDIT-ALL-PROVIDERS).
     {
         let agent_for_audit = agent.clone();
         let provider_names: Vec<String> = config.providers.keys().cloned().collect();
         tokio::spawn(async move {
-            // Sequential rather than join_all — avoids pulling in
-            // futures_util at this layer. Audits are fast (5s
-            // timeout per probe) so serial is fine.
-            for name in provider_names {
-                let p = agent_for_audit.provider_for(&name).await;
-                p.audit_keys_on_boot().await;
-            }
+            audit_all_providers(provider_names, |name| {
+                let agent = agent_for_audit.clone();
+                async move { agent.provider_for(&name).await }
+            })
+            .await;
             tracing::info!("R2 boot-time provider audit complete for all configured providers");
         });
     }
@@ -1039,6 +1052,89 @@ mod tests {
             VisionShapeOutcome::Inconclusive(_) => {}
             other => panic!("auth error should be inconclusive, got {other:?}"),
         }
+    }
+
+    // ─── D-INV-AUDIT-ALL-PROVIDERS (Phase 2 hard task) ───
+
+    /// Counter-bumping Provider stub. Each call to audit_keys_on_boot
+    /// increments AUDIT_COUNT; the closing test asserts the count
+    /// equals the number of provider names passed in.
+    struct CountingProvider {
+        count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl naked_core::provider::Provider for CountingProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<naked_core::types::tool::ModelInfo> {
+            vec![]
+        }
+        fn blacklisted_key_count(&self) -> usize {
+            0
+        }
+        fn total_key_count(&self) -> usize {
+            1
+        }
+        async fn stream_chat(
+            &self,
+            _req: naked_core::provider::ChatRequest,
+        ) -> naked_core::error::Result<
+            std::pin::Pin<
+                Box<dyn futures_util::Stream<Item = naked_core::types::StreamChunk> + Send>,
+            >,
+        > {
+            unreachable!("audit stub should never call stream_chat")
+        }
+        async fn audit_keys_on_boot(&self) {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Regression guard: the audit loop MUST call audit_keys_on_boot
+    /// on every provider name passed in, not just the first / default.
+    /// Originally a wiring bug (commit `38c608b6` only audited default).
+    #[tokio::test]
+    async fn audit_all_providers_calls_each_provider_once() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let names = vec![
+            "qwen".to_string(),
+            "kimi-code".to_string(),
+            "deepseek".to_string(),
+            "openai".to_string(),
+        ];
+        let count_for_closure = count.clone();
+        audit_all_providers(names.clone(), |name| {
+            let count = count_for_closure.clone();
+            async move {
+                std::sync::Arc::new(CountingProvider { count, name })
+                    as std::sync::Arc<dyn naked_core::provider::Provider>
+            }
+        })
+        .await;
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            names.len(),
+            "audit must call audit_keys_on_boot on every provider name"
+        );
+    }
+
+    /// Empty provider list — audit must be a no-op, not panic.
+    #[tokio::test]
+    async fn audit_all_providers_empty_list_is_noop() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_closure = count.clone();
+        audit_all_providers(vec![], |name| {
+            let count = count_for_closure.clone();
+            async move {
+                std::sync::Arc::new(CountingProvider { count, name })
+                    as std::sync::Arc<dyn naked_core::provider::Provider>
+            }
+        })
+        .await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

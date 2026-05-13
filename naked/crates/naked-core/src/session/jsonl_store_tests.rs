@@ -4,6 +4,7 @@ use base64::Engine;
 use std::path::Path;
 
 fn test_metadata() -> SessionMetadata {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     SessionMetadata {
         name: None,
         provider: "anthropic".into(),

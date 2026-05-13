@@ -2,6 +2,7 @@ use super::*;
 use tempfile::tempdir;
 
 fn cfg_with(path: PathBuf) -> ModelHealthConfig {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     ModelHealthConfig {
         enabled: true,
         log_path: Some(path),

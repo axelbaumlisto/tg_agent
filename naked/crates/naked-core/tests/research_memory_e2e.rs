@@ -30,6 +30,7 @@ use tempfile::tempdir;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 fn make_spec(id: &str, topic: &str) -> ResearchSpec {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     ResearchSpec {
         id: id.to_string(),
         topic: topic.to_string(),
@@ -53,6 +54,7 @@ fn make_spec(id: &str, topic: &str) -> ResearchSpec {
 
 fn finding(spec_id: &str, url: &str, run_id: &str) -> Finding {
     use naked_core::research::spec::{content_hash, host_path_hash};
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     Finding {
         id: uuid::Uuid::new_v4().simple().to_string(),
         research_id: spec_id.to_string(),

@@ -104,6 +104,7 @@ struct EchoTool;
 #[async_trait]
 impl Tool for EchoTool {
     fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         ToolSpec {
             name: "echo".into(),
             description: "Echo input".into(),

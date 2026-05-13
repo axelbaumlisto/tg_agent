@@ -580,6 +580,7 @@ pub fn build_load_specs(tag: &str, n: usize, tmp: &Path) -> Vec<TurnSpec> {
             2 => {
                 let path = tmp.join(format!("load_{i}.txt"));
                 let data = format!("{tag}_DATA_{i}");
+                // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
                 TurnSpec {
                     prompt: format!(
                         "Write '{}' to {} using write_file.",
@@ -596,6 +597,7 @@ pub fn build_load_specs(tag: &str, n: usize, tmp: &Path) -> Vec<TurnSpec> {
                 let written_at = i - 1;
                 let path = tmp.join(format!("load_{written_at}.txt"));
                 let token = format!("{tag}_DATA_{written_at}");
+                // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
                 TurnSpec {
                     prompt: format!("Read the file {} and tell me its content.", path.display()),
                     expect_text: Some(token),
@@ -609,6 +611,7 @@ pub fn build_load_specs(tag: &str, n: usize, tmp: &Path) -> Vec<TurnSpec> {
                 let path = tmp.join(format!("load_{written_at}.txt"));
                 let old_token = format!("{tag}_DATA_{written_at}");
                 let new_token = format!("{tag}_EDIT_{i}");
+                // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
                 TurnSpec {
                     prompt: format!(
                         "Use edit_file to replace '{}' with '{}' in {}.",
@@ -634,6 +637,7 @@ pub fn build_load_specs(tag: &str, n: usize, tmp: &Path) -> Vec<TurnSpec> {
             // 6: grep_search — find token in files
             6 => {
                 let token = format!("{tag}_");
+                // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
                 TurnSpec {
                     prompt: format!(
                         "Use grep_search to find '{}' in {}. Report matches.",
@@ -663,6 +667,7 @@ pub fn build_load_specs(tag: &str, n: usize, tmp: &Path) -> Vec<TurnSpec> {
             _ => {
                 let path = tmp.join(format!("chain_{i}.txt"));
                 let data = format!("{tag}_CHAIN_{i}");
+                // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
                 TurnSpec {
                     prompt: format!(
                         "Write '{}' to {} then read it back. Confirm the content.",
@@ -1019,6 +1024,7 @@ pub struct SessionStats {
 
 impl SessionStats {
     pub fn new(label: &'static str) -> Self {
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         Self {
             label,
             responses: 0,

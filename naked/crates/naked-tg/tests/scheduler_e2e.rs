@@ -46,6 +46,7 @@ fn make_store() -> (TempDir, Arc<dyn ResearchStore>) {
 }
 
 fn make_spec(id: &str, interval: Option<u64>, paused: bool) -> ResearchSpec {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     ResearchSpec {
         id: id.into(),
         topic: format!("topic for {id}"),

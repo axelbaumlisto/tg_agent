@@ -72,6 +72,7 @@ fn make_core(research_root: std::path::PathBuf) -> (TempDir, Arc<AgentCore>) {
 }
 
 fn make_spec(id: &str) -> ResearchSpec {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
     ResearchSpec {
         id: id.into(),
         topic: format!("boot-test topic {id}"),

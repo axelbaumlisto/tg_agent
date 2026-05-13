@@ -48,6 +48,7 @@ struct EchoTool;
 #[async_trait::async_trait]
 impl Tool for EchoTool {
     fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         ToolSpec {
             name: "echo".into(),
             description: "Echo input".into(),
@@ -547,6 +548,7 @@ async fn loop_permission_denied_skips_tool() {
     #[async_trait::async_trait]
     impl Tool for DangerTool {
         fn spec(&self) -> ToolSpec {
+            // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
             ToolSpec {
                 name: "danger".into(),
                 description: "Dangerous".into(),
@@ -1002,6 +1004,7 @@ impl SlowTool {
 #[async_trait::async_trait]
 impl Tool for SlowTool {
     fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         ToolSpec {
             name: "slow".into(),
             description: "Sleeps 200ms then returns".into(),

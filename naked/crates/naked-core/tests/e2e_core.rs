@@ -1144,6 +1144,7 @@ async fn t70_workspace_root_as_cwd() {
     let session = Session::new(
         workspace.clone(),
         SYS.into(),
+        // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
         SessionMetadata {
             name: None,
             provider: "test".into(),
