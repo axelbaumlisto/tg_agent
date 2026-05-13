@@ -42,6 +42,175 @@ pub(crate) struct WiredBot {
 /// Build the complete DI graph and return a ready-to-run [`WiredBot`].
 ///
 /// Must be called **after** tracing is initialised (in [`crate::bootstrap`]).
+/// BUG_REGISTRY D-BOOT-VISION-PROBE (B06): outcome of a single
+/// vision content-shape probe. Used to classify whether a provider
+/// that CLAIMS multimodal capability actually accepts OpenAI-style
+/// `image_url` content blocks. Inconclusive outcomes are treated as
+/// success — we only want to flag *definite* shape mismatches.
+#[derive(Debug, Clone)]
+pub(crate) enum VisionShapeOutcome {
+    /// The provider accepted the image_url shape. May still have
+    /// rejected our specific 1×1 PNG ("image too small") — that's
+    /// content, not shape. Either way the capability is real.
+    Accepted,
+    /// The provider rejected the shape itself (e.g. "unknown variant
+    /// `image_url`, expected `text`"). Caps are wrong.
+    ShapeMismatch(String),
+    /// Auth / rate-limit / timeout / network. Can't tell. Skip.
+    Inconclusive(String),
+}
+
+/// Pure classifier for an error message returned by a vision probe.
+/// Extracted for unit-testing without spinning up live providers.
+pub(crate) fn classify_vision_probe_error(msg: &str) -> VisionShapeOutcome {
+    let lc = msg.to_ascii_lowercase();
+    // Definite shape-mismatch signals across the providers we care about:
+    //   * serde-de error: "unknown variant `image_url`, expected `text`"
+    //   * "expected text" / "only text content"
+    //   * "does not support image" / "text-only model"
+    if lc.contains("unknown variant")
+        || lc.contains("expected text")
+        || lc.contains("expected `text`")
+        || lc.contains("only text content")
+        || lc.contains("does not support image")
+        || lc.contains("text-only model")
+        || lc.contains("multimodal not supported")
+    {
+        return VisionShapeOutcome::ShapeMismatch(msg.chars().take(180).collect());
+    }
+    // "Image too small" / "min size" / size-related rejections — shape
+    // accepted, content rejected. Either way the capability is real.
+    if lc.contains("image must be")
+        || lc.contains("too small")
+        || lc.contains("min") && lc.contains("size")
+        || lc.contains("width")
+        || lc.contains("height")
+    {
+        return VisionShapeOutcome::Accepted;
+    }
+    // Auth, rate, timeout, network — can't tell, treat as inconclusive.
+    VisionShapeOutcome::Inconclusive(msg.chars().take(180).collect())
+}
+
+/// 1×1 transparent PNG (the smallest valid PNG payload). Used as the
+/// probe content — we expect every real vision API to either accept
+/// or reject it with a SIZE error, but never a SHAPE error.
+const VISION_PROBE_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/// Send a 1×1 image_url to the provider's stream_chat and classify
+/// the response. 8-second timeout per probe so total D-BOOT-VISION-PROBE
+/// time is bounded by (number of vision-claimed models × 8 s); typically
+/// 5–10 s in practice.
+pub(crate) async fn probe_vision_content_shape(
+    provider: &dyn naked_core::provider::Provider,
+    model: &str,
+) -> VisionShapeOutcome {
+    use naked_core::provider::ChatRequest;
+    let req = ChatRequest {
+        model: model.into(),
+        system: String::new(),
+        messages: vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{VISION_PROBE_PIXEL_PNG_B64}")
+                }}
+            ]
+        })],
+        tools: vec![],
+        max_tokens: 1,
+        temperature: None,
+        reasoning: None,
+    };
+    let timeout = std::time::Duration::from_secs(8);
+    match tokio::time::timeout(timeout, provider.stream_chat(req)).await {
+        Ok(Ok(_stream)) => VisionShapeOutcome::Accepted,
+        Ok(Err(e)) => classify_vision_probe_error(&e.to_string()),
+        Err(_) => VisionShapeOutcome::Inconclusive("timeout".into()),
+    }
+}
+
+/// BUG_REGISTRY D-BOOT-CAPS-INVARIANT: enforces INV-1 + INV-2 at
+/// boot time. Returns the number of (provider, model) pairs whose
+/// declared caps disagree with the routing function. Logs WARN per
+/// violation with file:line-style context for the operator.
+///
+/// `pub(crate)` for unit-testing without spinning up async wiring.
+/// `NAKED_STRICT_CAPS=1` env: escalate WARN → `std::process::exit(3)`
+/// so misconfiguration can't reach prod silently.
+pub(crate) fn boot_caps_invariant_sweep(config: &naked_core::config::Config) -> usize {
+    let mut violations: Vec<String> = Vec::new();
+
+    for (provider_name, provider) in &config.providers {
+        // INV-1: per-model caps.supports_vision=Some(true) must route as true.
+        for (model_id, caps) in &provider.capabilities {
+            if caps.supports_vision == Some(true) {
+                let routable = config
+                    .tg_media
+                    .is_vision_capable_with_provider(model_id, Some(provider));
+                if !routable {
+                    violations.push(format!(
+                        "INV-1 {provider_name}/{model_id}: caps.supports_vision=Some(true) \
+                         but is_vision_capable_with_provider=false"
+                    ));
+                }
+            }
+        }
+        // INV-2: every model id matching vision-naming pattern must route OR
+        // have explicit Some(false) deny.
+        for model_id in &provider.models {
+            let lc = model_id.to_ascii_lowercase();
+            let looks_vision =
+                lc.contains("vl") || lc.contains("vision") || lc.contains("multimodal");
+            if !looks_vision {
+                continue;
+            }
+            let routable = config
+                .tg_media
+                .is_vision_capable_with_provider(model_id, Some(provider));
+            if routable {
+                continue;
+            }
+            let explicit_deny = provider
+                .capabilities
+                .get(model_id)
+                .and_then(|c| c.supports_vision)
+                == Some(false);
+            if !explicit_deny {
+                violations.push(format!(
+                    "INV-2 {provider_name}/{model_id}: name suggests vision but \
+                     is_vision_capable_with_provider=false and no explicit deny"
+                ));
+            }
+        }
+    }
+
+    let count = violations.len();
+    for v in &violations {
+        tracing::warn!(violation = %v, "caps invariant violation at boot");
+    }
+
+    if count == 0 {
+        tracing::info!(
+            providers = config.providers.len(),
+            "caps invariant sweep clean (INV-1 + INV-2)"
+        );
+    } else if std::env::var_os("NAKED_STRICT_CAPS").is_some_and(|v| v == "1") {
+        // Strict mode — fail boot rather than ship broken caps to prod.
+        eprintln!(
+            "❌ {} caps invariant violation(s) at boot and NAKED_STRICT_CAPS=1; refusing to start",
+            count
+        );
+        for v in &violations {
+            eprintln!("   {v}");
+        }
+        std::process::exit(3);
+    }
+
+    count
+}
+
 /// BUG_REGISTRY D-BOOT-DESCRIBER-WARN: boot-time health check for the
 /// multimodal vision path. Emits a loud WARN if the default model
 /// can't accept image content blocks AND `tg_media.vision` describer
@@ -172,6 +341,81 @@ pub(crate) async fn build() -> WiredBot {
 
     // BUG_REGISTRY D-BOOT-DESCRIBER-WARN (B05 regression guard).
     check_multimodal_describer_health(&config);
+
+    // BUG_REGISTRY D-BOOT-CAPS-INVARIANT (B03+B04 boot-time enforcement).
+    // Walks every (provider, model) pair declared in config.providers,
+    // checks INV-1 + INV-2 hold at boot. Mismatches log WARN with the
+    // exact offending pair so operator sees them on every restart, not
+    // only when a user happens to send a photo to that model.
+    // Set `NAKED_STRICT_CAPS=1` to escalate WARN → process exit 3.
+    boot_caps_invariant_sweep(&config);
+
+    // BUG_REGISTRY D-BOOT-VISION-PROBE (B06): for every (provider, model)
+    // pair with caps.supports_vision=Some(true), send a tiny request with
+    // an `image_url` content block and classify the API's response. If
+    // the provider rejects the SHAPE ("unknown variant", "expected text"),
+    // it doesn't actually support OpenAI-style multimodal even though we
+    // think it does — bump counter + WARN with remediation. Other errors
+    // (auth, rate, timeout, image-too-small) are inconclusive and skipped.
+    // Fire-and-forget so boot is not blocked.
+    {
+        let agent_for_probe = agent.clone();
+        let pairs: Vec<(String, String)> = config
+            .providers
+            .iter()
+            .flat_map(|(pname, pcfg)| {
+                pcfg.capabilities
+                    .iter()
+                    .filter(|(_, c)| c.supports_vision == Some(true))
+                    .map(|(model_id, _)| (pname.clone(), model_id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if !pairs.is_empty() {
+            tokio::spawn(async move {
+                let total = pairs.len();
+                let mut mismatch = 0usize;
+                for (pname, model) in pairs {
+                    let provider = agent_for_probe.provider_for(&pname).await;
+                    match probe_vision_content_shape(&*provider, &model).await {
+                        VisionShapeOutcome::Accepted => {
+                            tracing::debug!(
+                                provider = %pname,
+                                model = %model,
+                                "vision shape probe ok"
+                            );
+                        }
+                        VisionShapeOutcome::ShapeMismatch(reason) => {
+                            mismatch += 1;
+                            naked_core::types::PROVIDER_VISION_CAP_MISMATCH_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                provider = %pname,
+                                model = %model,
+                                reason = %reason,
+                                "vision capability mismatch — caps claim supports_vision=true \
+                                 but API rejects image_url content shape. Flip caps to false \
+                                 in naked.json or stop pinning sessions to this model."
+                            );
+                        }
+                        VisionShapeOutcome::Inconclusive(reason) => {
+                            tracing::debug!(
+                                provider = %pname,
+                                model = %model,
+                                reason = %reason,
+                                "vision shape probe inconclusive"
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    pairs = total,
+                    mismatch = mismatch,
+                    "D-BOOT-VISION-PROBE complete"
+                );
+            });
+        }
+    }
 
     // Register telegram_attach tool — lets the agent send files to chat.
     // The attachment queue is per-turn (created in stream_response), but
@@ -639,5 +883,192 @@ mod tests {
             check_multimodal_describer_health(&cfg),
             MultimodalDescriberHealth::Degraded
         );
+    }
+
+    // ─── D-BOOT-CAPS-INVARIANT (B03+B04 enforcement at boot) ───
+
+    fn make_provider_with_models_and_caps(
+        models: &[&str],
+        per_model: &[(&str, Option<bool>)],
+    ) -> ProviderConfig {
+        let mut caps = std::collections::HashMap::new();
+        for (m, sv) in per_model {
+            caps.insert(
+                (*m).to_string(),
+                naked_core::model_catalog::ModelCapabilities {
+                    supports_vision: *sv,
+                    ..Default::default()
+                },
+            );
+        }
+        ProviderConfig {
+            models: models.iter().map(|s| s.to_string()).collect(),
+            capabilities: caps,
+            ..Default::default()
+        }
+    }
+
+    /// Clean config: every vision-capable model is routable, every
+    /// vision-named model resolves. Zero violations expected.
+    #[test]
+    fn boot_caps_sweep_clean_config_returns_zero() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "qwen".to_string(),
+            make_provider_with_models_and_caps(
+                &["qwen3.6-plus", "qwen3-vl-plus"],
+                &[("qwen3-vl-plus", Some(true))],
+            ),
+        );
+        let cfg = Config {
+            default_model: "qwen3.6-plus".into(),
+            default_provider: "qwen".into(),
+            providers,
+            ..Default::default()
+        };
+        assert_eq!(boot_caps_invariant_sweep(&cfg), 0);
+    }
+
+    /// Synthetic INV-1 violation: a provider claims caps.supports_vision=true
+    /// for a model that the routing function (via provider-wide override =
+    /// Some(false)) maps to false. Sweep must flag it.
+    #[test]
+    fn boot_caps_sweep_detects_inv1_violation() {
+        let mut providers = std::collections::HashMap::new();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            "fake-model".to_string(),
+            naked_core::model_catalog::ModelCapabilities {
+                supports_vision: Some(true),
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "fakep".to_string(),
+            ProviderConfig {
+                models: vec!["fake-model".into()],
+                supports_vision: Some(false), // provider-wide deny outranks per-model
+                capabilities: caps,
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            default_model: "fake-model".into(),
+            default_provider: "fakep".into(),
+            providers,
+            ..Default::default()
+        };
+        assert_eq!(boot_caps_invariant_sweep(&cfg), 1);
+    }
+
+    /// INV-2 violation: model named `*-vision-pro` but not matched by any
+    /// needle and no explicit deny in caps.
+    #[test]
+    fn boot_caps_sweep_detects_inv2_violation() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "someprovider".to_string(),
+            make_provider_with_models_and_caps(
+                &["my-special-vision-pro"], // contains 'vision' but no needle
+                &[],                        // no caps entry at all
+            ),
+        );
+        // Force provider-wide to None so default-fallthrough applies.
+        let cfg = Config {
+            default_model: "my-special-vision-pro".into(),
+            default_provider: "someprovider".into(),
+            providers,
+            ..Default::default()
+        };
+        // The substring `vision` IS in BUILTIN_VISION_MODEL_NEEDLES via
+        // `gpt-4-vision` / `grok-2-vision` etc. — actually `vision` itself
+        // is a substring of every one of those needles, but the matcher
+        // does substring `m.contains(needle)`, not the other way. So
+        // "my-special-vision-pro".contains("vision") would only match if
+        // "vision" is in the needle list — which it isn't (it's always
+        // prefixed). Let's verify by direct call:
+        //   - looks_vision flag: true (contains "vision")
+        //   - is_vision_capable_with_provider: should be false (no needle
+        //     matches plain "vision" without prefix)
+        // Therefore sweep flags it.
+        let result = boot_caps_invariant_sweep(&cfg);
+        assert_eq!(
+            result, 1,
+            "expected exactly 1 INV-2 violation for 'my-special-vision-pro'"
+        );
+    }
+
+    // ─── D-BOOT-VISION-PROBE classifier tests (B06) ───
+
+    #[test]
+    fn classify_vision_probe_unknown_variant_is_shape_mismatch() {
+        // Real deepseek-v4-pro error text from earlier curl probe.
+        let err = "Failed to deserialize the JSON body into the target type: \
+                   messages[0]: unknown variant `image_url`, expected `text`";
+        match classify_vision_probe_error(err) {
+            VisionShapeOutcome::ShapeMismatch(_) => {}
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_vision_probe_image_too_small_is_accepted() {
+        // Real qwen3-vl-plus error from our M3 verification probe.
+        let err = "<400> InternalError.Algo.InvalidParameter: \
+                   The image length and width do not meet the model restrictions. \
+                   [height:1 or width:1 must be larger than 10]";
+        match classify_vision_probe_error(err) {
+            VisionShapeOutcome::Accepted => {}
+            other => panic!("expected Accepted (size, not shape), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_vision_probe_text_only_model_is_shape_mismatch() {
+        let err = "This is a text-only model and does not support image inputs.";
+        match classify_vision_probe_error(err) {
+            VisionShapeOutcome::ShapeMismatch(_) => {}
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_vision_probe_auth_is_inconclusive() {
+        let err = "HTTP 401 Unauthorized";
+        match classify_vision_probe_error(err) {
+            VisionShapeOutcome::Inconclusive(_) => {}
+            other => panic!("auth error should be inconclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_vision_probe_rate_limit_is_inconclusive() {
+        let err = "HTTP 429 Too Many Requests";
+        match classify_vision_probe_error(err) {
+            VisionShapeOutcome::Inconclusive(_) => {}
+            other => panic!("rate limit should be inconclusive, got {other:?}"),
+        }
+    }
+
+    /// INV-2 explicit-deny escape hatch: same model name but caps say
+    /// Some(false) explicitly. Operator says "yes I know, it's not actually
+    /// vision". Sweep must accept that.
+    #[test]
+    fn boot_caps_sweep_accepts_explicit_inv2_deny() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "someprovider".to_string(),
+            make_provider_with_models_and_caps(
+                &["my-special-vision-pro"],
+                &[("my-special-vision-pro", Some(false))], // explicit deny
+            ),
+        );
+        let cfg = Config {
+            default_model: "my-special-vision-pro".into(),
+            default_provider: "someprovider".into(),
+            providers,
+            ..Default::default()
+        };
+        assert_eq!(boot_caps_invariant_sweep(&cfg), 0);
     }
 }

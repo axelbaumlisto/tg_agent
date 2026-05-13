@@ -140,6 +140,15 @@ pub static PROVIDER_PERMANENT_BLACKLIST_COUNT: std::sync::atomic::AtomicU64 =
 pub static CRASH_RECOVERY_NOTIFIED_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// BUG_REGISTRY D-BOOT-VISION-PROBE (B06): bumped each time a
+/// (provider, model) pair declared as vision-capable in caps
+/// (`supports_vision: true`) is found at boot to actually REJECT
+/// the OpenAI-style `image_url` content shape. e.g. deepseek v4-pro
+/// returns 400 "unknown variant `image_url`, expected `text`".
+/// Operator should flip caps.supports_vision to false in naked.json.
+pub static PROVIDER_VISION_CAP_MISMATCH_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Strip every embedded `@@NAKED_IMG_REF@@…` segment (sentinel + the
 /// optional `/<hash>` or `{...json}` tail that follows it on the same line)
 /// from `text`. Returns the cleaned string and bumps `SENTINEL_LEAK_COUNT`
