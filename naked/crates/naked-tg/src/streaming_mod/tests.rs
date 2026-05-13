@@ -950,6 +950,82 @@ mod tests {
         Bot::new("0:TEST_TOKEN").set_api_url(url)
     }
 
+    // ─── BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard) ───
+
+    /// No noVNC keyword → no-op, counter unchanged.
+    #[test]
+    fn validate_ip_tokens_skips_when_no_vnc_keyword() {
+        let before = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::streaming::flush::validate_novnc_ip_tokens(
+            "some response with random IP 80.65.225.177:6080 but no keyword",
+        );
+        let after = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before, "no vnc keyword → no counter bump");
+    }
+
+    /// Allow-list empty → fail-open, no warnings.
+    #[test]
+    fn validate_ip_tokens_fail_open_when_allowlist_empty() {
+        {
+            let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
+            g.clear();
+        }
+        let before = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::streaming::flush::validate_novnc_ip_tokens(
+            "open noVNC at http://1.2.3.4:6080/vnc.html",
+        );
+        let after = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before, "empty allow-list → fail-open");
+    }
+
+    /// Allow-list populated + hallucinated IP → counter bumped.
+    #[test]
+    fn validate_ip_tokens_detects_hallucination() {
+        {
+            let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
+            g.clear();
+            g.push("65.108.226.226:6080".into());
+            g.push("100.80.12.120:6080".into());
+            g.push("clipshot.cc:443".into());
+        }
+        let before = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // B37 reproduction: hallucinated 80.65.225.177:6080.
+        crate::streaming::flush::validate_novnc_ip_tokens(
+            "Открывай noVNC: http://80.65.225.177:6080/vnc.html?autoconnect=true",
+        );
+        let after = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "hallucinated IP should bump counter: before={before} after={after}"
+        );
+        crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap().clear();
+    }
+
+    /// Allow-list populated + known good IP → no counter bump.
+    #[test]
+    fn validate_ip_tokens_passes_known_good_ip() {
+        {
+            let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
+            g.clear();
+            g.push("100.80.12.120:6080".into());
+        }
+        let before = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::streaming::flush::validate_novnc_ip_tokens(
+            "noVNC: http://100.80.12.120:6080/vnc.html",
+        );
+        let after = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before, "known-good IP → no bump");
+        crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap().clear();
+    }
+
     /// BUG_REGISTRY D-INV-STREAM-BUBBLE-COUNT (B02 / INV-4 full version):
     /// stream-start MUST send exactly ONE Telegram API request, not
     /// two (the old `⏳` placeholder + `⏯️` control card pattern).

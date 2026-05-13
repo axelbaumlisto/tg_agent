@@ -149,6 +149,22 @@ pub static CRASH_RECOVERY_NOTIFIED_COUNT: std::sync::atomic::AtomicU64 =
 pub static PROVIDER_VISION_CAP_MISMATCH_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// BUG_REGISTRY D-CONFIG-MTIME-WATCH (B42 detector): bumped each
+/// time the bot detects that `state/naked.json` was modified by an
+/// external process (mtime or sha256 differs from the boot snapshot).
+/// Catches B42 — silent revert of config by recreate scripts or
+/// concurrent agent sessions.
+pub static CONFIG_EXTERNAL_WRITE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard): bumped
+/// each time an outgoing assistant message mentions noVNC/VNC
+/// keyword AND contains an `IP:port` token that's NOT in the
+/// boot-cached allow-list (from `novnc.sh url`). Catches B37 —
+/// model hallucinating IP/port pairs when asked for noVNC creds.
+pub static IP_TOKEN_HALLUCINATION_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Strip every embedded `@@NAKED_IMG_REF@@…` segment (sentinel + the
 /// optional `/<hash>` or `{...json}` tail that follows it on the same line)
 /// from `text`. Returns the cleaned string and bumps `SENTINEL_LEAK_COUNT`

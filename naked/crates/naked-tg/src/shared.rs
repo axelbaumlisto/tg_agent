@@ -292,6 +292,20 @@ pub(crate) type ControlCardMap =
 pub(crate) static CONTROL_CARDS: LazyLock<tokio::sync::RwLock<ControlCardMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
+/// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard).
+///
+/// Populated at boot by `wiring::populate_novnc_ip_allowlist` from the
+/// `novnc.sh url` JSON output. Stream-side code reads it to validate
+/// outgoing assistant messages that mention noVNC — if a message
+/// contains an `IP:port` token NOT in this list, we bump
+/// `IP_TOKEN_HALLUCINATION_COUNT` and log WARN.
+///
+/// `std::sync::RwLock` (not `tokio::sync::RwLock`) because the access
+/// pattern is many-readers, one-writer (only boot), and we want
+/// non-blocking reads from the stream hot path.
+pub(crate) static NOVNC_IP_ALLOWLIST: LazyLock<std::sync::RwLock<Vec<String>>> =
+    LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+
 /// F4 of PLAN_NEXT_SESSION (2026-05-10): process-wide handle to the
 /// shared `LivenessRegistry`. Set exactly once by `wiring.rs::build`
 /// (alongside the same `Arc` it stashes in `WiredBot.liveness`); read

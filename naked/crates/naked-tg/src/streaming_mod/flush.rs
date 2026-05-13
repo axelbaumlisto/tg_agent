@@ -34,6 +34,11 @@ pub(crate) async fn send_final(
 ) {
     let chat_id = ctx.chat_id;
 
+    // BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard):
+    // scan outgoing HTML for hallucinated noVNC IPs before sending.
+    // No-op if message doesn't mention vnc / VNC / noVNC keyword.
+    validate_novnc_ip_tokens(html);
+
     // Short: fits in one message
     if html.len() <= MAX_TG_MSG {
         edit_with_retry(&bot, chat_id, msg_id, html, true).await;
@@ -220,4 +225,111 @@ pub(crate) async fn flush_live(
         *html_broken = true;
     }
     true
+}
+
+/// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard).
+///
+/// Scans an outgoing HTML/text message for `IP:port` tokens and
+/// compares against `NOVNC_IP_ALLOWLIST` (populated at boot from
+/// `novnc.sh url`). If the message mentions a noVNC-related keyword
+/// AND contains an IP token that's NOT in the allow-list, bumps
+/// `IP_TOKEN_HALLUCINATION_COUNT` and logs WARN. Soft-warn — does not
+/// block the send.
+///
+/// Trigger keywords: "vnc", "VNC", "noVNC", "novnc" (case-insensitive
+/// via lowercase comparison). Without one of these we don't run the
+/// check (would false-positive on every screenshot URL etc.).
+///
+/// Allow-list is permissive: matches if the candidate IP appears
+/// anywhere in any allow-list entry (so `100.80.12.120` matches
+/// `100.80.12.120:6080`).
+pub(crate) fn validate_novnc_ip_tokens(html: &str) {
+    let lc = html.to_ascii_lowercase();
+    if !(lc.contains("vnc") || lc.contains("novnc")) {
+        return;
+    }
+    // Cheap manual IP scanner: walk bytes, group sequences of digits
+    // separated by '.' — when we see 4 groups, we have an IPv4. Append
+    // `:port` if followed by `:<digits>`. Avoids regex dep.
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let mut suspicious: Vec<String> = Vec::new();
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // Try to consume octet.dotted.notation starting here.
+        let start = i;
+        let mut octets = 0;
+        let mut cursor = i;
+        while octets < 4 && cursor < bytes.len() {
+            let octet_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor == octet_start {
+                break;
+            }
+            octets += 1;
+            if octets < 4 {
+                if cursor < bytes.len() && bytes[cursor] == b'.' {
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if octets == 4 {
+            // Got an IPv4. Try to consume :port.
+            let ip_end = cursor;
+            let token_end = if cursor < bytes.len() && bytes[cursor] == b':' {
+                let port_start = cursor + 1;
+                let mut p = port_start;
+                while p < bytes.len() && bytes[p].is_ascii_digit() {
+                    p += 1;
+                }
+                if p > port_start { p } else { ip_end }
+            } else {
+                ip_end
+            };
+            let token = &html[start..token_end];
+            // Compare against allow-list.
+            let ok = {
+                let guard = crate::shared::NOVNC_IP_ALLOWLIST.read();
+                match guard {
+                    Ok(list) => {
+                        if list.is_empty() {
+                            // Allow-list not populated — fail-open
+                            true
+                        } else {
+                            list.iter().any(|entry| {
+                                // Match if token is prefix or substring of allow entry
+                                entry.contains(token) || token.contains(entry.as_str())
+                            })
+                        }
+                    }
+                    Err(_) => true, // poisoned lock — fail-open
+                }
+            };
+            if !ok {
+                suspicious.push(token.to_string());
+            }
+            i = token_end;
+            continue;
+        }
+        i = cursor.max(start + 1);
+    }
+    if !suspicious.is_empty() {
+        naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.fetch_add(
+            suspicious.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        tracing::warn!(
+            suspicious = ?suspicious,
+            "B37: outgoing message mentions noVNC AND contains IP:port tokens \
+             NOT in the boot-cached allow-list from novnc.sh url. Likely \
+             model-hallucinated credentials. Cross-check against `novnc.sh url`."
+        );
+    }
 }

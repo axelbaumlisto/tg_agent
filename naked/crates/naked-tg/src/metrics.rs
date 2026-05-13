@@ -208,6 +208,8 @@ impl MediaRoutingSnapshot {
             naked_core::types::CRASH_RECOVERY_NOTIFIED_COUNT.load(Ordering::Relaxed);
         let vision_mismatch =
             naked_core::types::PROVIDER_VISION_CAP_MISMATCH_COUNT.load(Ordering::Relaxed);
+        let cfg_ext_write = naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT.load(Ordering::Relaxed);
+        let ip_hallucin = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed);
         // Pollution sentinel from `naked-housekeep.timer`: 0 unless the
         // daily sweep found `research:*` lines in global MEMORY.md. Non-zero
         // means the research-leak fix regressed and operator should
@@ -302,6 +304,12 @@ impl MediaRoutingSnapshot {
              # HELP naked_core_provider_vision_capability_mismatch_total (B06) caps.supports_vision=true but API rejects image_url content shape.\n\
              # TYPE naked_core_provider_vision_capability_mismatch_total counter\n\
              naked_core_provider_vision_capability_mismatch_total {vision_mismatch}\n\
+             # HELP naked_core_config_external_write_total (B42) state/naked.json modified by external process detected by D-CONFIG-MTIME-WATCH.\n\
+             # TYPE naked_core_config_external_write_total counter\n\
+             naked_core_config_external_write_total {cfg_ext_write}\n\
+             # HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n\
+             # TYPE naked_core_ip_token_hallucination_total counter\n\
+             naked_core_ip_token_hallucination_total {ip_hallucin}\n\
              # HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n\
              # TYPE naked_memory_pollution_count gauge\n\
              naked_memory_pollution_count {memory_pollution}\n\
@@ -340,6 +348,8 @@ impl MediaRoutingSnapshot {
             provider_perm_blacklist = provider_perm_blacklist,
             crash_notified = crash_notified,
             vision_mismatch = vision_mismatch,
+            cfg_ext_write = cfg_ext_write,
+            ip_hallucin = ip_hallucin,
             memory_pollution = memory_pollution,
             tr_ok = self.transcription_ok,
             tr_fail = self.transcription_fail,

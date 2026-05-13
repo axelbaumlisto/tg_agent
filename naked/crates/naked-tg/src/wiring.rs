@@ -62,6 +62,173 @@ where
     }
 }
 
+/// BUG_REGISTRY D-CONFIG-MTIME-WATCH (B42 detector).
+///
+/// Records the (mtime, sha256) of `state/naked.json` at boot and
+/// spawns a 60-second-interval poller. If the file changes between
+/// polls, log WARN + bump `CONFIG_EXTERNAL_WRITE_COUNT`. B42 in
+/// the wild: `state/naked.json` had silently reverted to a stale
+/// IP between 14:38 and 15:42 on 2026-05-13; this detector turns
+/// that class of fault visible per restart.
+///
+/// The bot writes to `state/naked.json` itself via certain ops
+/// (e.g. `naked memory store`), so the watcher's purpose is
+/// surface-level monitoring, not strict enforcement. Operator
+/// reads the journal to investigate, not to act on automatically.
+fn spawn_config_mtime_watcher() {
+    let path = match std::env::var("NAKED_CONFIG") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            tracing::debug!("config-mtime-watch: no NAKED_CONFIG env, skipping");
+            return;
+        }
+    };
+    let initial = match snapshot_config_file(&path) {
+        Some(snap) => snap,
+        None => {
+            tracing::debug!(path = %path.display(), "config-mtime-watch: snapshot failed, skipping");
+            return;
+        }
+    };
+    tracing::info!(
+        path = %path.display(),
+        mtime = %initial.mtime_human,
+        hash = %initial.hash_hex,
+        "config-mtime-watch armed"
+    );
+    let path_for_task = path.clone();
+    tokio::spawn(async move {
+        let mut last = initial;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await; // consume first immediate tick
+        loop {
+            interval.tick().await;
+            let Some(current) = snapshot_config_file(&path_for_task) else {
+                continue;
+            };
+            if current.hash_hex != last.hash_hex {
+                naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    path = %path_for_task.display(),
+                    prev_hash = %last.hash_hex,
+                    curr_hash = %current.hash_hex,
+                    prev_mtime = %last.mtime_human,
+                    curr_mtime = %current.mtime_human,
+                    "B42: state/naked.json modified externally between polls. \
+                     Either a cron/recreate script touched it, or another agent \
+                     session wrote to it. Cross-check with audit_window.sh + \
+                     systemd journal for the suspected writer."
+                );
+                last = current;
+            }
+        }
+    });
+}
+
+/// Snapshot of a file's identity at a point in time: mtime + DefaultHasher
+/// digest of contents. Cheap enough to run every 60s; DefaultHasher over
+/// ~50 KB `naked.json` is ~30us on this hardware. We don't need
+/// cryptographic strength here — only fast difference detection.
+///
+/// REGISTRY-WAIVE B32 (DEPS): intentionally re-uses std::hash instead
+/// of pulling sha2 as a new dep; same pattern as snapshot/ module.
+#[derive(Clone, Debug)]
+struct ConfigSnapshot {
+    /// 64-bit hash of file contents (DefaultHasher, NOT cryptographic).
+    hash_hex: String,
+    mtime_human: String,
+}
+
+fn snapshot_config_file(path: &std::path::Path) -> Option<ConfigSnapshot> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    let mtime_human = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}", d.as_secs()),
+        Err(_) => "<epoch>".to_string(),
+    };
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    let hash_hex = format!("{:016x}", h.finish());
+    Some(ConfigSnapshot {
+        hash_hex,
+        mtime_human,
+    })
+}
+
+/// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard).
+///
+/// At boot, call `naked/skills/novnc-browser/scripts/novnc.sh url`
+/// and parse the JSON to extract known-good IP/port pairs (from the
+/// `canonical`, `tailscale`, `public` fields). Cache them in a static
+/// `OnceLock<Vec<String>>` so stream-level code can compare outgoing
+/// noVNC mentions against the allow-list without re-invoking the
+/// script every time.
+///
+/// Fail-open: if the script is unreachable / returns non-JSON, the
+/// allow-list stays empty and `validate_ip_tokens()` becomes a no-op.
+/// That's intentional — a broken novnc.sh is its own visible problem,
+/// we don't want to add a second symptom.
+fn populate_novnc_ip_allowlist() {
+    let script = "/home/spex/work/tg_agent/naked/skills/novnc-browser/scripts/novnc.sh";
+    let output = match std::process::Command::new("bash")
+        .arg(script)
+        .arg("url")
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            tracing::debug!("novnc-ip-allowlist: novnc.sh url failed; allow-list empty");
+            return;
+        }
+    };
+    // novnc.sh output parse — fail-open by design; empty allow-list →
+    // validate_novnc_ip_tokens becomes no-op (B37 detection doc).
+    // REGISTRY-WAIVE: intentional fallback: malformed output → skip
+    let Ok(text) = String::from_utf8(output) else {
+        return;
+    };
+    // REGISTRY-WAIVE: intentional fallback: malformed JSON → skip
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let mut ips: Vec<String> = Vec::new();
+    for field in ["canonical", "tailscale", "public"] {
+        let Some(url) = value.get(field).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Extract host (and port if present) from URL form.
+        if let Some(host_port) = extract_host_port(url) {
+            ips.push(host_port);
+        }
+    }
+    // Also push the clipshot.cc canonical hostname (not IP, but it's
+    // a stable allow-list entry).
+    if value.get("canonical").is_some() {
+        ips.push("clipshot.cc:443".into());
+    }
+    if !ips.is_empty() {
+        tracing::info!(allowlist = ?ips, "novnc-ip-allowlist populated");
+        if let Ok(mut guard) = crate::shared::NOVNC_IP_ALLOWLIST.write() {
+            *guard = ips;
+        }
+    }
+}
+
+/// Parse the host[:port] out of a URL form like
+///   `http://65.108.226.226:6080/vnc.html?...`
+///   `https://clipshot.cc/debug/vnc/...`
+/// Returns `"host:port"` if explicit port given, else `"host"`.
+fn extract_host_port(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some(rest[..host_end].to_string())
+}
+
 /// BUG_REGISTRY D-BOOT-CONFIG-SYMLINK (B41 regression guard).
 ///
 /// AGENTS.md decree: `naked/naked.json -> ../state/naked.json` (symlink,
@@ -542,11 +709,23 @@ pub(crate) async fn build() -> WiredBot {
     // gets replaced by a stale copy (B41), bot can load wrong config.
     check_config_symlink_invariant();
 
+    // BUG_REGISTRY D-CONFIG-MTIME-WATCH (B42 detector): record boot
+    // snapshot of state/naked.json (mtime+sha256), spawn periodic
+    // poller that bumps CONFIG_EXTERNAL_WRITE_COUNT + WARN if changed.
+    spawn_config_mtime_watcher();
+
     // BUG_REGISTRY D-CHECK-SYSPROMPT-PATHS (B38/B37 regression guard).
     // Scans the loaded system_prompt for file paths and asserts each
     // exists. Catches stale references like ~/.zeroclaw/workspace/
     // before the model sees them and confabulates.
     check_system_prompt_paths();
+
+    // BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream-level guard):
+    // pre-populate the IP allow-list from `novnc.sh url` so the
+    // stream pipeline can validate outgoing noVNC mentions against
+    // a known-good set. Fire-and-forget — if novnc.sh is unreachable,
+    // allow-list stays empty and IP validation is a no-op (fail-open).
+    populate_novnc_ip_allowlist();
 
     // BUG_REGISTRY D-BOOT-DESCRIBER-WARN (B05 regression guard).
     check_multimodal_describer_health(&config);
