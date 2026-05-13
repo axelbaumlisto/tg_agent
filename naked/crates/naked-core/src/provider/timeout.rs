@@ -100,6 +100,10 @@ impl<P: Provider> Provider for TimeoutProvider<P> {
         self.inner.total_key_count()
     }
 
+    async fn audit_keys_on_boot(&self) {
+        self.inner.audit_keys_on_boot().await
+    }
+
     async fn stream_chat(
         &self,
         request: ChatRequest,

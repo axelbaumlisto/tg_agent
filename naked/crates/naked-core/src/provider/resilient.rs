@@ -95,7 +95,8 @@ impl ResilientProvider {
     /// is unaffected (audit completes in the background; first
     /// few turns may still try a dead key, but subsequent ones
     /// skip it).
-    pub async fn audit_keys_on_boot(&self, probe_model: &str) {
+    /// Internal: explicit-model variant for tests + manual ops.
+    pub async fn audit_keys_on_boot_with_model(&self, probe_model: &str) {
         use futures_util::future::join_all;
         let probe_req = ChatRequest {
             model: probe_model.to_string(),
@@ -185,6 +186,29 @@ impl Provider for ResilientProvider {
 
     fn total_key_count(&self) -> usize {
         self.providers.len()
+    }
+
+    /// R2 wiring: probe-model picked from the first underlying
+    /// provider's `models()` listing so the audit picks the same
+    /// model the loop would use for a real request.
+    async fn audit_keys_on_boot(&self) {
+        let probe_model = self
+            .providers
+            .first()
+            .and_then(|p| p.models().first().map(|m| m.model_id.clone()))
+            .unwrap_or_default();
+        if probe_model.is_empty() {
+            tracing::debug!(
+                provider = self
+                    .providers
+                    .first()
+                    .map(|p| p.name())
+                    .unwrap_or("<empty>"),
+                "audit_keys_on_boot: no model configured, skipping"
+            );
+            return;
+        }
+        self.audit_keys_on_boot_with_model(&probe_model).await;
     }
 
     async fn stream_chat(

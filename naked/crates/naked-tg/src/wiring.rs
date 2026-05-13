@@ -49,6 +49,23 @@ pub(crate) async fn build() -> WiredBot {
     let agent = Arc::new(AgentCore::new(config.clone(), provider));
     agent.init_self_ref();
 
+    // R2 of PLAN_RESILIENCE_v1: fire-and-forget boot-time key audit.
+    // ResilientProvider (at the bottom of the
+    // TimeoutProvider<Box<dyn Provider>> chain) probes each
+    // configured key with a 1-token request and permanent-blacklists
+    // anything that returns 401/402 BEFORE the first real turn.
+    // The audit completes in the background; first few turns may
+    // still try a dead key, but subsequent ones skip it. Counter
+    // `naked_core_provider_permanent_blacklist_total` increments
+    // for each permanent-dead key found.
+    {
+        let agent_for_audit = agent.clone();
+        tokio::spawn(async move {
+            let provider = agent_for_audit.provider_for("").await;
+            provider.audit_keys_on_boot().await;
+        });
+    }
+
     // PLAN_QUALITY_v1 wiring (T2/T5/T6): install pluggable managers.
     // Each is opt-in via config / disk presence; missing = silent
     // off-path (zero overhead).

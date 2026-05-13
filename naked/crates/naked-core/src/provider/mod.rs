@@ -49,6 +49,17 @@ pub trait Provider: Send + Sync {
     fn total_key_count(&self) -> usize {
         1
     }
+
+    /// R2 of PLAN_RESILIENCE_v1: optional boot-time key audit.
+    /// Implementations that hold multiple keys (`ResilientProvider`)
+    /// override this to probe each key and permanent-blacklist any
+    /// that return 401/402. Default: no-op (single-key providers
+    /// have nothing to audit).
+    ///
+    /// Decorators (`TimeoutProvider`, `Box<dyn Provider>`) MUST
+    /// delegate to the inner provider so the audit reaches the
+    /// `ResilientProvider` at the bottom of the chain.
+    async fn audit_keys_on_boot(&self) {}
 }
 
 /// Pass-through impl so `Box<dyn Provider>` can stand in wherever
@@ -73,6 +84,9 @@ impl Provider for Box<dyn Provider> {
         request: ChatRequest,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         (**self).stream_chat(request).await
+    }
+    async fn audit_keys_on_boot(&self) {
+        (**self).audit_keys_on_boot().await
     }
 }
 
