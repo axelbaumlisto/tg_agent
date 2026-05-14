@@ -22,10 +22,51 @@ pub(crate) struct SubAgentState {
     tool_count: u32,
 }
 
+/// One chronological entry in the turn's event timeline.
+///
+/// Events are pushed in arrival order; renderer iterates the `Vec`
+/// strictly head-to-tail. Adjacent `ReasoningDelta` / `TextDelta`
+/// events are coalesced at render time into single visual blocks.
+///
+/// Why this exists (PLAN_TG_INTERLEAVED_v1 §2): the previous model
+/// stored `thinking: String`, `tool_lines: Vec<String>`, and
+/// `response_text: String` as three parallel streams without
+/// timestamps. Renderer was forced to emit "all tools first, all text
+/// last", breaking chronology. This enum captures the true sequence.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // SubAgentReference + Note used optionally
+pub(crate) enum TurnEvent {
+    /// Reasoning fragment (model's hidden CoT). Coalesced with adjacent.
+    ReasoningDelta(String),
+    /// Assistant text fragment (markdown). Coalesced with adjacent.
+    TextDelta(String),
+    /// Tool invocation started. Pair with subsequent `ToolResult` by `idx`.
+    ToolStart {
+        name: String,
+        args_preview: String,
+        idx: u32,
+    },
+    /// Tool finished. `idx` links back to the matching `ToolStart`.
+    ToolResult {
+        idx: u32,
+        ok: bool,
+        output: String,
+    },
+    /// Reference into the `sub_agents` map; renders as the sub-agent's
+    /// current status line at this position in the timeline.
+    SubAgentReference { agent_id: String },
+    /// Out-of-band note (stall warnings, steer-received echoes, etc.).
+    /// Rendered as plain italic line in chronology.
+    Note(String),
+}
+
 pub(crate) struct CompositeView {
     thinking: String,
     in_thinking: bool,
-    tool_lines: Vec<String>,
+    /// Chronological timeline. **The single source of truth for ordering.**
+    pub(crate) events: Vec<TurnEvent>,
+    /// Counter for next `ToolStart.idx` — monotonically increasing per turn.
+    pub(crate) next_tool_idx: u32,
     sub_agents: std::collections::HashMap<String, SubAgentState>,
     sub_agent_order: Vec<String>,
     response_text: String,
@@ -45,6 +86,11 @@ pub(crate) struct CompositeView {
     queue_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Set when a provider error occurs — used to show retry buttons after final.
     pub(crate) had_provider_error: bool,
+    /// PLAN_TG_INTERLEAVED_v1 Q4: count of events dropped by the
+    /// most recent `render_final` head-truncation. flush.rs reads this
+    /// after rendering; if > 0, it knows to attach the full-history
+    /// HTML document so nothing is lost.
+    pub(crate) last_dropped_events: std::sync::atomic::AtomicUsize,
 }
 
 const SPINNER: &[&str] = &["⏳", "⌛", "⏳", "⌛"];
@@ -54,7 +100,8 @@ impl CompositeView {
         Self {
             thinking: String::new(),
             in_thinking: false,
-            tool_lines: Vec::new(),
+            events: Vec::new(),
+            next_tool_idx: 0,
             sub_agents: std::collections::HashMap::new(),
             sub_agent_order: Vec::new(),
             response_text: String::new(),
@@ -69,6 +116,7 @@ impl CompositeView {
             started_at: std::time::Instant::now(),
             queue_counter,
             had_provider_error: false,
+            last_dropped_events: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

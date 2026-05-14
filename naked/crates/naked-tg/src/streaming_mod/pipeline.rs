@@ -163,13 +163,15 @@ pub(crate) async fn stream_response(
             let elapsed = last_event_at.elapsed().as_secs();
             if stall_level == 0 && elapsed >= 60 {
                 stall_level = 1;
-                view.tool_lines
-                    .push("⚠️ Нет ответа 60с — возможно, зависло".to_string());
+                view.events.push(TurnEvent::Note(
+                    "⚠️ Нет ответа 60с — возможно, зависло".to_string(),
+                ));
                 dirty = true;
             } else if stall_level == 1 && elapsed >= 120 {
                 stall_level = 2;
-                view.tool_lines
-                    .push("🔴 Зависло 2 мин — /abort чтобы прервать".to_string());
+                view.events.push(TurnEvent::Note(
+                    "🔴 Зависло 2 мин — /abort чтобы прервать".to_string(),
+                ));
                 dirty = true;
             }
         }
@@ -301,10 +303,10 @@ pub(crate) async fn stream_response(
                     // matching "↩️ Принято" temp confirmations
                     // (the ones whose user-msg-ids appear in
                     // `msg_ids`).
-                    view.tool_lines.push(format!(
+                    view.events.push(TurnEvent::Note(format!(
                         "✅ <b>Доставлено</b>\n<pre>{}</pre>",
                         crate::fmt_utils::escape_html_min(&text)
-                    ));
+                    )));
                     dirty = true;
 
                     // Drain ack ids matching the delivered steer
@@ -325,6 +327,31 @@ pub(crate) async fn stream_response(
                                 chat = chat.0,
                                 msg = ack_id.0,
                                 "steer ack delete failed (likely already gone): {e}"
+                            );
+                        }
+                    }
+
+                    // User-requested 2026-05-13 (img_20260513_e710.png):
+                    // also delete the user's ORIGINAL steer message,
+                    // since the streaming view now эхоит the same text
+                    // as `✅ Доставлено → <pre>...</pre>`. Leaving the
+                    // user msg below the streaming bubble is redundant
+                    // visual noise.
+                    //
+                    // Best-effort: bot can only delete user messages
+                    // in groups where it has `can_delete_messages`
+                    // admin perm, AND within 48h. In private chats
+                    // (where the bot lacks that capability) the delete
+                    // simply returns Forbidden — we log at debug
+                    // (never error) so this can't crash streaming.
+                    for mid in &msg_ids {
+                        let tg_mid = teloxide::types::MessageId(*mid);
+                        if let Err(e) = bot.delete_message(ctx.chat_id, tg_mid).await {
+                            tracing::debug!(
+                                chat = ctx.chat_id.0,
+                                msg = *mid,
+                                "steer user-msg delete skipped \
+                                 (not admin / >48h / private chat / already gone): {e}"
                             );
                         }
                     }

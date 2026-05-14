@@ -96,7 +96,13 @@ impl Config {
                 .unwrap_or_else(|| self.default_model.clone()),
             max_tokens: session.max_tokens.unwrap_or(self.max_tokens),
             temperature: session.temperature.or(self.temperature),
-            context_window: session.context_window.or(self.context_window),
+            // B50: do NOT auto-merge global config.context_window here.
+            // The global value would silently override per-provider and
+            // per-model `capabilities.<model>.context_window` (1M for qwen,
+            // deepseek, claude-4-6 etc.) when no session override exists.
+            // Resolution now happens in `session_ops::turn::pre_compact`
+            // with proper precedence: session > capability > provider > global.
+            context_window: session.context_window,
             max_iterations: session.max_iterations.unwrap_or(self.max_iterations),
             // Session reasoning wins; otherwise inherit `Config.default_reasoning`
             // so e.g. the bot launches every chat at the configured global
@@ -149,6 +155,44 @@ pub fn expand_tilde(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B50 regression guard: `merge_session` must NOT auto-merge the
+    /// global `Config.context_window` into `EffectiveSessionConfig`.
+    /// Doing so silently overrides per-provider / per-capability values
+    /// that are typically much larger (1M for qwen / deepseek / claude-4-6).
+    /// Resolution is delegated to `session_ops::turn::pre_compact` which
+    /// applies the proper precedence: session > capability > provider > global.
+    #[test]
+    fn b50_merge_session_does_not_inherit_global_context_window() {
+        use super::SessionConfig;
+        let global = Config {
+            context_window: Some(200_000),
+            ..Config::default()
+        };
+        let session = SessionConfig::default(); // no override
+        let eff = global.merge_session(&session);
+        assert_eq!(
+            eff.context_window, None,
+            "global Config.context_window must NOT leak into EffectiveSessionConfig \
+             (B50 — was causing 1M-capable models to compact at 200K)"
+        );
+    }
+
+    /// Sanity: explicit session override DOES make it through.
+    #[test]
+    fn b50_session_override_context_window_is_preserved() {
+        use super::SessionConfig;
+        let global = Config {
+            context_window: Some(200_000),
+            ..Config::default()
+        };
+        let session = SessionConfig {
+            context_window: Some(500_000),
+            ..SessionConfig::default()
+        };
+        let eff = global.merge_session(&session);
+        assert_eq!(eff.context_window, Some(500_000));
+    }
 
     #[test]
     fn expand_tilde_home() {

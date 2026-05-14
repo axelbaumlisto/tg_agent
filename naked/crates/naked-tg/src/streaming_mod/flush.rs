@@ -58,9 +58,33 @@ pub(crate) async fn send_final(
         &redacted
     };
 
+    // PLAN_TG_INTERLEAVED_v1 Q4: head-truncate path.
+    // If render_final dropped any chronological events to fit in one
+    // message, ALSO attach the full-history HTML document so the user
+    // can review what was cut. Inline still shows the last (newest)
+    // part — head-truncate keeps the tail.
+    let dropped = view
+        .last_dropped_events
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     // Short: fits in one message
     if html.len() <= MAX_TG_MSG {
         edit_with_retry(&bot, chat_id, msg_id, html, true).await;
+        if dropped > 0 {
+            // Inline was head-truncated — attach full timeline.
+            let html_doc = render_html_document(view);
+            let input_file = teloxide::types::InputFile::memory(html_doc)
+                .file_name("transcript.html");
+            if let Err(e) = bot
+                .send_document(chat_id, input_file)
+                .caption(format!("📄 Full timeline (+{dropped} earlier events)"))
+                .maybe_thread(ctx.thread_id)
+                .maybe_reply_to(ctx.reply_to)
+                .await
+            {
+                tracing::warn!("head-truncate full-timeline send_document failed: {e}");
+            }
+        }
         return;
     }
 

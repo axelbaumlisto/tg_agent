@@ -101,15 +101,26 @@ impl AgentCore {
             }
         }
 
-        // Resolve context window
-        let provider_ctx = self
-            .config()
-            .providers
-            .get(&provider_name)
-            .and_then(|pc| pc.context_window);
+        // B50: resolve context window with proper precedence
+        // (the global `Config.context_window` is now LAST resort, not first;
+        // see commit history for the regression that motivated this).
+        //   1. SessionConfig override         (`/context_window` user choice)
+        //   2. capabilities.<model>.context_window  (per-model authoritative)
+        //   3. providers.<x>.context_window         (per-provider)
+        //   4. global Config.context_window         (sane fallback)
+        //   5. hardcoded `model_context_window()`   (legacy table)
+        let cfg = self.config();
+        let provider_pc = cfg.providers.get(&provider_name);
+        let model_cap_ctx = provider_pc
+            .and_then(|pc| pc.capabilities.get(&model))
+            .and_then(|cap| cap.context_window);
+        let provider_ctx = provider_pc.and_then(|pc| pc.context_window);
+        let global_ctx = cfg.context_window;
         let cw = effective
             .context_window
+            .or(model_cap_ctx)
             .or(provider_ctx)
+            .or(global_ctx)
             .unwrap_or_else(|| history::model_context_window(&model));
         session.history.set_context_window_tokens(cw);
         tracing::info!(

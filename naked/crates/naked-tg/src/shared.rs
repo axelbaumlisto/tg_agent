@@ -43,7 +43,10 @@ pub(crate) const MAX_TG_MSG: usize = TG_MSG_LIMIT;
 pub(crate) const TYPING_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const REASONING_TAIL: usize = 600;
-pub(crate) const TOOL_WINDOW: usize = 5;
+// PLAN_TG_INTERLEAVED_v1: TOOL_WINDOW removed — the old
+// `tool_lines: Vec<String>` field is replaced by `events: Vec<TurnEvent>`
+// with budget-driven head-truncation, so a fixed last-N window is no
+// longer needed. (Kept in git history if anyone needs the constant.)
 pub(crate) const MAX_THINKING_BYTES: usize = 64_000;
 /// Hard cap on the reasoning chain we ship in the *final* TG message
 /// (inside `<blockquote expandable>`). Telegram caps a message at 4096
