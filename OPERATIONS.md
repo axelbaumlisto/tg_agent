@@ -62,6 +62,28 @@ not managed here, such as:
 Configure those services via `.env`, not by committing host-specific
 paths or credentials.
 
+## Caddy reverse-proxy
+
+Production TLS edge for `clipshot.cc` is a `spex-caddy` Docker container.
+Source-controlled Caddyfile lives in [`naked/ops/caddy/Caddyfile`](naked/ops/caddy/Caddyfile);
+production install point is `/home/spex/app/caddy/Caddyfile`.
+
+Recommended symlink so repo ⇒ prod is one-direction:
+
+```bash
+sudo ln -sf /home/spex/work/tg_agent/naked/ops/caddy/Caddyfile \
+            /home/spex/app/caddy/Caddyfile
+```
+
+Reload after edits (zero-downtime):
+
+```bash
+docker exec spex-caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+See [`naked/ops/caddy/README.md`](naked/ops/caddy/README.md) for routes,
+anti-footguns, and smoke tests.
+
 ## Disk Hygiene
 
 `naked/target/` is build cache and can be regenerated with Cargo.

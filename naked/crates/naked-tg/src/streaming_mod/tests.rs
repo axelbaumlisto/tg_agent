@@ -1040,6 +1040,38 @@ mod tests {
         crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap().clear();
     }
 
+    /// T12 — clipshot.cc canonical URLs (incl. /debug/cdp/ TLS CDP proxy)
+    /// must NOT trigger a hallucination warning. The validator already
+    /// short-circuits on no-IP-pattern, but we add explicit coverage
+    /// because bot's chronological event log frequently emits these URLs
+    /// (e.g. `✍️ tools: cdp_dump_cookies via https://clipshot.cc/debug/cdp/...`).
+    #[test]
+    fn validate_ip_tokens_accepts_clipshot_canonical_urls() {
+        let _guard = ip_test_lock();
+        {
+            let mut g = crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap();
+            g.clear();
+            g.push("clipshot.cc:443".into());
+            g.push("100.80.12.120:6080".into());
+        }
+        let before = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // All 3 canonical entry points emitted by post-B53 code paths.
+        // None contain raw IPv4 → validator's IP scanner finds nothing.
+        crate::streaming::flush::validate_novnc_ip_tokens(
+            "noVNC: https://clipshot.cc/vnc \
+             cdp: https://clipshot.cc/debug/cdp/json/version \
+             web: https://clipshot.cc/debug/vnc/vnc.html?autoconnect=true",
+        );
+        let after = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "clipshot.cc canonical URLs must not trigger B37 (no raw IPs)"
+        );
+        crate::shared::NOVNC_IP_ALLOWLIST.write().unwrap().clear();
+    }
+
     /// BUG_REGISTRY D-INV-STREAM-BUBBLE-COUNT (B02 / INV-4 full version):
     /// stream-start MUST send exactly ONE Telegram API request, not
     /// two (the old `⏳` placeholder + `⏯️` control card pattern).
