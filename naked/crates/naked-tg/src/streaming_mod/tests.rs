@@ -1349,10 +1349,7 @@ mod resilience_tests {
         assert_eq!(row.len(), 2, "expected exactly 2 buttons");
         // Order matters for muscle memory: abort first, sendnow second.
         assert!(row[0].text.contains("Stop"), "button 0 should be Stop");
-        assert!(
-            row[1].text.contains("Send"),
-            "button 1 should be Send"
-        );
+        assert!(row[1].text.contains("Send"), "button 1 should be Send");
         // Callback data must match the dispatcher in callbacks.rs.
         use teloxide::types::InlineKeyboardButtonKind;
         let cb0 = match &row[0].kind {

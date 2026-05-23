@@ -77,7 +77,7 @@ pub(crate) async fn send_final(
                 teloxide::types::InputFile::memory(html_doc).file_name("transcript.html");
             if let Err(e) = bot
                 .send_document(chat_id, input_file)
-                .caption(format!("📄 Full timeline (+{dropped} earlier events)"))
+                .caption(format!("📄 Full timeline (+{dropped} tool events)"))
                 .maybe_thread(ctx.thread_id)
                 .maybe_reply_to(ctx.reply_to)
                 .await

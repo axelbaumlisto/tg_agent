@@ -487,6 +487,40 @@ impl CompositeView {
         const SINGLE_MESSAGE_TARGET: usize = MAX_TG_MSG - 100;
         let budget = SINGLE_MESSAGE_TARGET.saturating_sub(footer_rendered.len());
 
+        // Priority: if response_text is non-empty, show it in the
+        // inline message.  Full chronology (tool calls, reasoning)
+        // goes into the attached HTML — the user should not have to
+        // open an attachment just to read the answer.
+        let text = self.response_text.trim();
+        if !text.is_empty() {
+            let body = md_to_tg_html(text);
+            let body = if body.len() <= budget {
+                body
+            } else {
+                // Truncate to budget on a char boundary and add ellipsis.
+                let trunc = head_truncate(&body, budget.saturating_sub(1));
+                format!("{trunc}…")
+            };
+            // Count non-text events for the HTML attachment trigger.
+            let tool_events = self
+                .events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        TurnEvent::ToolStart { .. } | TurnEvent::ToolResult { .. }
+                    )
+                })
+                .count();
+            self.last_dropped_events
+                .store(tool_events, std::sync::atomic::Ordering::Relaxed);
+            let mut out = String::with_capacity(body.len() + footer_rendered.len() + 8);
+            out.push_str(&body);
+            out.push_str(&footer_rendered);
+            return out;
+        }
+
+        // No response text (tool-only turn): fall back to chrono timeline.
         let blocks = self.render_chrono_blocks(false, 600);
         let (chrono, dropped) = Self::join_with_head_truncate(&blocks, budget);
         // Stash drop count so `flush.rs::send_final` knows whether to
