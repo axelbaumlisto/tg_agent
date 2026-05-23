@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// User-owned definition of a research task.
 ///
@@ -429,19 +430,32 @@ pub(crate) fn titles_are_similar(a: &str, b: &str) -> bool {
 
 /// Slugify a topic into a filesystem-safe prefix, e.g.
 /// `"Jaguar XF used cheap"` → `"jaguar-xf-used-cheap"`.
+/// `"Mua bán căn hộ"` → `"mua-ban-can-ho"`.
 /// Conservative: ASCII-only, `[a-z0-9-]+`, collapses runs of separators.
+/// NFD-strips diacritical marks before filtering so Vietnamese / accented
+/// Latin degrades gracefully instead of producing noise like `mua-b-n`.
 pub(crate) fn slugify(topic: &str) -> String {
     let mut out = String::with_capacity(topic.len());
     let mut last_was_sep = true;
-    for ch in topic.chars() {
-        let c = ch.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-            last_was_sep = false;
-        } else if !last_was_sep {
-            out.push('-');
-            last_was_sep = true;
-        }
+    // NFD decomposes accented chars (ă → a + combining breve), then we
+    // skip combining marks (Unicode category Mn) so only the base letter
+    // survives as ASCII.
+    for ch in topic.nfd() {
+        // Đ/đ (D-stroke) doesn't decompose via NFD — map manually.
+        let c = match ch {
+            'Đ' | 'đ' => 'd',
+            _ if ch.is_ascii_alphanumeric() => ch.to_ascii_lowercase(),
+            _ if unicode_normalization::char::is_combining_mark(ch) => continue,
+            _ => {
+                if !last_was_sep {
+                    out.push('-');
+                    last_was_sep = true;
+                }
+                continue;
+            }
+        };
+        out.push(c);
+        last_was_sep = false;
     }
     let trimmed = out.trim_matches('-').to_string();
     if trimmed.is_empty() {
@@ -469,33 +483,42 @@ const SHORT_SLUG_STOP: &[&str] = &[
 /// stopword tokens are dropped so a topic like "Da Nang commercial real
 /// estate 50–250m² 1500–3000USD" collapses to `danang-commercial-realty`.
 ///
+/// NFD-strips diacritical marks before filtering to ASCII so Vietnamese
+/// topics produce readable slugs (`can-ho-chung` not `c-n-h-chung`).
+///
 /// Falls back to whatever `slugify` produces when the topic carries no
-/// usable words (e.g. all-numeric or all-stopwords).
+/// usable words (e.g. all-numeric, all-stopwords, pure Cyrillic).
 fn short_slug(topic: &str) -> String {
     let lowered = topic.to_lowercase();
-    let words: Vec<String> = lowered
-        .split(|c: char| !c.is_alphanumeric())
+    // NFD decompose + strip combining marks + map đ→d, then keep ASCII only.
+    let normalized: String = lowered
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .map(|c| match c {
+            'đ' => 'd',
+            other => other,
+        })
+        .collect();
+    let words: Vec<String> = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(|raw| {
-            // Keep only ASCII letters/digits — non-ASCII is dropped because
-            // file/URL targets need to stay short and unambiguous.
-            let cleaned: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-            if cleaned.is_empty() {
+            if raw.is_empty() {
                 return None;
             }
             // Drop pure-digit tokens (prices, areas) and known stopwords.
-            if cleaned.chars().all(|c| c.is_ascii_digit()) {
+            if raw.chars().all(|c| c.is_ascii_digit()) {
                 return None;
             }
-            if SHORT_SLUG_STOP.contains(&cleaned.as_str()) {
+            if SHORT_SLUG_STOP.contains(&raw) {
                 return None;
             }
             // Drop very short non-alphabetic tokens left over from currency
             // / range markers ("k", "m") so they never end up as the only
             // word in the id.
-            if cleaned.len() <= 1 {
+            if raw.len() <= 1 {
                 return None;
             }
-            Some(cleaned.chars().take(12).collect::<String>())
+            Some(raw.chars().take(12).collect::<String>())
         })
         .collect();
 

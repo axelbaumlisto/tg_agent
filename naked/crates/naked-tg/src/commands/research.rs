@@ -109,9 +109,11 @@ research-skill через LLM."
                         Some(secs) => format_interval(secs),
                         None => "manual".to_string(),
                     };
+                    let short_topic: String = s.topic.chars().take(60).collect();
+                    let ellip = if s.topic.chars().count() > 60 { "…" } else { "" };
                     out.push_str(&format!(
-                        "{status} `{}` — {}\n   schedule: {} · findings: {}",
-                        s.id, s.topic, schedule, total
+                        "{status} `{}`\n   {short_topic}{ellip}\n   schedule: {} · findings: {}",
+                        s.id, schedule, total
                     ));
                     if s.paused
                         && let Some(reason) = s.pause_reason.as_deref()

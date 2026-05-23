@@ -110,6 +110,13 @@ fn slugify_handles_unicode_by_dropping_non_ascii() {
     assert_eq!(slugify("ягуар"), "research");
     // Mixed — keeps the ASCII parts.
     assert_eq!(slugify("ягуар cheap car"), "cheap-car");
+    // Vietnamese diacritical marks stripped, base Latin letters survive.
+    assert_eq!(slugify("Mua bán căn hộ"), "mua-ban-can-ho");
+    assert_eq!(slugify("Đà Nẵng"), "da-nang");
+    assert_eq!(
+        slugify("Cho thuê mặt bằng kinh doanh"),
+        "cho-thue-mat-bang-kinh-doanh"
+    );
 }
 
 #[test]
@@ -181,6 +188,25 @@ fn new_research_id_handles_cyrillic_topic_safely() {
     let id = new_research_id("Найди коммерческую недвижимость в Дананге");
     let tail = id.split('-').next_back().unwrap();
     assert_eq!(tail.len(), 4, "got id={id}");
+}
+
+#[test]
+fn new_research_id_vietnamese_topic_readable() {
+    // Vietnamese with diacriticals should produce readable slug, not noise.
+    let id = new_research_id("Cho thuê căn hộ chung cư Đà Nẵng 2 phòng ngủ");
+    let parts: Vec<&str> = id.split('-').collect();
+    // short_slug picks 3 meaningful words + 4-hex suffix
+    // "cho" is 3 chars (kept), "thue" (from thuê), "can" (from căn)
+    assert_eq!(parts.last().unwrap().len(), 4, "got id={id}");
+    assert!(
+        parts[0].chars().all(|c| c.is_ascii_alphanumeric()),
+        "slug parts should be ASCII: id={id}"
+    );
+    // Should NOT contain single-letter noise segments
+    assert!(
+        !parts[..parts.len() - 1].iter().any(|p| p.len() <= 1),
+        "no single-char segments: id={id}"
+    );
 }
 
 // ── normalize_title / titles_are_similar ────────────────────────────
