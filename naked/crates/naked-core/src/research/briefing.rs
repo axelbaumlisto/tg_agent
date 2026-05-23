@@ -21,6 +21,8 @@
 //! tweaked these in the past and we don't want stale numbers in the prose.
 
 use crate::config::ResearchConfig;
+use crate::research::store::ResearchStore;
+use std::sync::Arc;
 
 /// Compact briefing (≈800 chars) embedded in every research-enabled session
 /// prompt. Designed to give the LLM the minimum it needs to answer
@@ -168,6 +170,43 @@ pub fn full(cfg: &ResearchConfig) -> String {
         verify = cfg.verify_by_default,
         max_rounds = cfg.gatekeeper.max_rounds,
     )
+}
+
+/// Build a numbered index of all research specs for LLM context.
+///
+/// Output looks like:
+/// ```text
+/// ## Current research specs
+/// 1. solid-principles-rust-57e0 — SOLID в Rust 2024 — статьи (8 findings)
+/// 2. high-rise-buildings-f72b — Высотки >40 этажей Дананг (11 findings)
+/// ```
+///
+/// The LLM can then resolve "запусти 2" → `research_run(spec_id="high-rise-buildings-f72b")`.
+pub async fn spec_index(store: &Arc<dyn ResearchStore>) -> String {
+    let specs = match store.list_specs().await {
+        Ok(s) if !s.is_empty() => s,
+        _ => return String::new(),
+    };
+    let mut out = String::from(
+        "## Current research specs\n\
+         When user refers to a research by number, use the ID from this list.\n",
+    );
+    for (i, s) in specs.iter().enumerate() {
+        let n = i + 1;
+        let total = store.count_findings(&s.id).await.unwrap_or(0);
+        let status = if s.paused { "⏸" } else { "▶" };
+        let short_topic: String = s.topic.chars().take(60).collect();
+        let ellip = if s.topic.chars().count() > 60 {
+            "…"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "{status} {n}. `{}` — {short_topic}{ellip} ({total} findings)\n",
+            s.id,
+        ));
+    }
+    out
 }
 
 #[cfg(test)]

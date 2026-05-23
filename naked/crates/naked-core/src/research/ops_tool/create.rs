@@ -152,7 +152,7 @@ impl Tool for ResearchListSpecsTool {
         }
 
         let mut items = Vec::with_capacity(specs.len());
-        for s in &specs {
+        for (i, s) in specs.iter().enumerate() {
             let total = self.store.count_findings(&s.id).await.unwrap_or(0);
             // Pull a small window so we can prefer a record that carries
             // verification stats (the trailing `<run>-verified` summary)
@@ -183,6 +183,7 @@ impl Tool for ResearchListSpecsTool {
                     })
                 });
             items.push(json!({
+                "index": i + 1,
                 "id": s.id,
                 "topic": s.topic,
                 "paused": s.paused,

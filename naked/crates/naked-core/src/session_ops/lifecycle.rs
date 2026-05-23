@@ -83,6 +83,11 @@ impl AgentCore {
         if self.config().research.enabled {
             full_prompt.push_str("\n\n---\n");
             full_prompt.push_str(&research::briefing::short(&self.config().research));
+            let idx = research::briefing::spec_index(&self.research_store()).await;
+            if !idx.is_empty() {
+                full_prompt.push('\n');
+                full_prompt.push_str(&idx);
+            }
         }
 
         if channel == "telegram" {
