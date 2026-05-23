@@ -430,6 +430,10 @@ impl research::ResearchRunner for AgentCore {
         let cfg = &self.config().research;
         (cfg.verify_by_default, cfg.gatekeeper.max_rounds)
     }
+
+    async fn delete_research(&self, id: &str) -> Result<()> {
+        self.delete_research(id).await
+    }
 }
 
 #[cfg(test)]

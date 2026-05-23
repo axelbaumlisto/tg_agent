@@ -176,7 +176,8 @@ pub(crate) fn research_tools(
         tools.push(Box::new(ResearchUpdateSpecTool::new(runner_weak.clone())));
         tools.push(Box::new(ResearchSetScheduleTool::new(runner_weak.clone())));
         tools.push(Box::new(ResearchPauseTool::new(runner_weak.clone())));
-        tools.push(Box::new(ResearchResumeTool::new(runner_weak)));
+        tools.push(Box::new(ResearchResumeTool::new(runner_weak.clone())));
+        tools.push(Box::new(ResearchDeleteTool::new(runner_weak)));
     }
 
     tools

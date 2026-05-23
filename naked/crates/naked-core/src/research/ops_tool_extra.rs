@@ -106,6 +106,60 @@ impl Tool for ResearchResumeTool {
     }
 }
 
+// ─── research_delete ─────────────────────────────────────────────────────
+
+pub struct ResearchDeleteTool {
+    runner: Weak<dyn super::ResearchRunner>,
+}
+
+impl ResearchDeleteTool {
+    pub fn new(runner: Weak<dyn super::ResearchRunner>) -> Self {
+        Self { runner }
+    }
+}
+
+#[async_trait]
+impl Tool for ResearchDeleteTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "research_delete".into(),
+            description: "Delete a research spec and all its data (findings, runs, cursors). \
+                          Irreversible."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "spec_id": {
+                        "type": "string",
+                        "description": "Research spec ID to delete."
+                    }
+                },
+                "required": ["spec_id"]
+            }),
+            permission: Permission::Dangerous,
+        }
+    }
+
+    async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
+        let spec_id = match input.get("spec_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return ToolResult::err("missing `spec_id`"),
+        };
+        let runner = match self.runner.upgrade() {
+            Some(c) => c,
+            None => return ToolResult::err("agent core is no longer available"),
+        };
+        // Verify exists
+        if let Err(e) = runner.load_research(&spec_id).await {
+            return ToolResult::err(format!("spec `{spec_id}` not found: {e}"));
+        }
+        if let Err(e) = runner.delete_research(&spec_id).await {
+            return ToolResult::err(format!("failed to delete `{spec_id}`: {e}"));
+        }
+        ToolResult::ok(format!("deleted `{spec_id}` and all its data"))
+    }
+}
+
 // ─── research_set_schedule ──────────────────────────────────────────────────
 
 /// Thin tool dedicated to schedule/pause changes — exists alongside

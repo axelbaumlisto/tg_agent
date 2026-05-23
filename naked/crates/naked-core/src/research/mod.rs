@@ -84,4 +84,5 @@ pub trait ResearchRunner: Send + Sync {
         max_rounds: u32,
     ) -> crate::error::Result<VerifiedRunReport>;
     fn research_verify_config(&self) -> (bool, u32);
+    async fn delete_research(&self, id: &str) -> crate::error::Result<()>;
 }
