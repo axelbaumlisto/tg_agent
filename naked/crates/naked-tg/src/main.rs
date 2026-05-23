@@ -7,7 +7,6 @@
 
 // ── Sub-module declarations (must live in the crate root) ─────────────────
 mod album;
-mod channel_map;
 mod media;
 mod metrics;
 
@@ -29,12 +28,9 @@ mod streaming;
 // ── Re-export child-module items consumed by grandchild modules ───────────
 // These allow `use super::*;` in grandchild modules (commands/*, streaming_mod/*)
 // to resolve the symbols without modification.
-pub(crate) use commands::{
-    drop_slash_for_persona, get_or_create_session, handle_command,
-    research::launch_research_run_with_ui,
-};
+pub(crate) use commands::{drop_slash_for_persona, get_or_create_session, handle_command};
 pub(crate) use media_dispatch::{extract_media_items, process_media_items, send_text};
-pub(crate) use streaming::{send_long_text, stream_response};
+pub(crate) use streaming::stream_response;
 
 // ── Structural pipeline modules ────────────────────────────────────────────
 mod bootstrap;

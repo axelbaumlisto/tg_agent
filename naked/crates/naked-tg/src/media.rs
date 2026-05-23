@@ -714,14 +714,10 @@ pub fn truncate_for_inline(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         return s.to_string();
     }
-    let mut end = limit;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    let truncated = naked_core::util::head_truncate(s, limit);
     format!(
-        "{}\n\n[... truncated: {} bytes omitted ...]",
-        &s[..end],
-        s.len() - end
+        "{truncated}\n\n[... truncated: {} bytes omitted ...]",
+        s.len() - truncated.len()
     )
 }
 

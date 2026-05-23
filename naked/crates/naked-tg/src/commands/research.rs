@@ -1,298 +1,31 @@
-//! Research command handlers + research UI helpers.
+//! Research command handlers.
 //!
-//! Extracted from commands.rs.
+//! B4 (PLAN_RESEARCH_FLOW_CLOSURE_v1): `launch_research_run_with_ui`,
+//! `finalize_research_ui`, `ResearchOutcome`, and the heartbeat-waterfall
+//! UI have been removed.  All research runs now go through the unified
+//! synthetic-dispatch path (`synthetic_dispatch::dispatch_for_chat`) which
+//! lets the agent's normal turn loop handle progress output and abort.
 
-use super::super::fmt_utils::{escape_html_min, format_age, format_interval, safe_slug};
+use super::super::fmt_utils::{format_age, format_interval};
 use super::super::*;
-use naked_tg::guarded::spawn_guarded;
 
-pub(crate) async fn launch_research_run_with_ui(
-    bot: Bot,
-    agent: Arc<AgentCore>,
-    config: Config,
-    chat_id: ChatId,
-    thread_id: Option<ThreadId>,
-    spec_id: String,
-) -> String {
-    let verify = config.research.verify_by_default;
-    let max_rounds = config.research.gatekeeper.max_rounds;
-    let iteration_cap = config.research.max_iterations.max(1);
-
-    let spec_topic = match agent.research_store().load_spec(&spec_id).await {
-        Ok(s) => s.topic,
-        Err(e) => {
-            return format!("error: spec `{spec_id}` not found ({e})");
-        }
-    };
-    let findings_baseline = agent
-        .research_store()
-        .count_findings(&spec_id)
-        .await
-        .unwrap_or(0);
-
-    let started_at = chrono::Utc::now();
-    let progress0 = HeartbeatProgress {
-        topic: spec_topic.clone(),
-        started_at,
-        findings_total: findings_baseline,
-        findings_baseline,
-        iteration_estimate: None,
-        iteration_cap,
-    };
-    let initial_body = render_waterfall(&spec_id, &progress0, &[], started_at);
-
-    let placeholder = match bot
-        .send_message(chat_id, &initial_body)
-        .maybe_thread(thread_id)
-        .reply_markup(keyboard_stop(&spec_id))
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            return format!("error: failed to post placeholder: {e}");
-        }
-    };
-    let msg_id = placeholder.id;
-
-    // Oneshot carries the research future's result to the heartbeat
-    // task. Using a channel (rather than `JoinHandle`) means the
-    // heartbeat can `select!` on both the tick and the completion.
-    let (done_tx, done_rx) = oneshot::channel::<ResearchOutcome>();
-
-    let agent_for_run = agent.clone();
-    let spec_for_run = spec_id.clone();
-    tokio::spawn(async move {
-        let outcome = if verify {
-            match agent_for_run
-                .run_research_verified(&spec_for_run, max_rounds)
-                .await
-            {
-                Ok(vr) => ResearchOutcome::Verified(Box::new(vr)),
-                Err(e) => ResearchOutcome::Error(format!("{e:#}")),
-            }
-        } else {
-            match agent_for_run.run_research(&spec_for_run).await {
-                Ok(r) => ResearchOutcome::Plain(Box::new(r)),
-                Err(e) => ResearchOutcome::Error(format!("{e:#}")),
-            }
-        };
-        let _ = done_tx.send(outcome);
-    });
-
-    // Heartbeat loop: edit the placeholder every 20 s with the latest
-    // waterfall, or take the completion branch as soon as the run
-    // future resolves.
-    let agent_for_hb = agent.clone();
-    let bot_for_hb = bot.clone();
-    let spec_for_hb = spec_id.clone();
-    let topic_for_hb = spec_topic.clone();
-    spawn_guarded(
-        bot_for_hb.clone(),
-        chat_id,
-        thread_id,
-        "research-ui",
-        async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(20));
-            // Skip the immediate tick — the placeholder already reflects the
-            // initial state.
-            tick.tick().await;
-            let mut done_rx = done_rx;
-            let outcome: ResearchOutcome = loop {
-                tokio::select! {
-                    res = &mut done_rx => {
-                        break res.unwrap_or(ResearchOutcome::Error(
-                            "internal: research task dropped".to_string(),
-                        ));
-                    }
-                    _ = tick.tick() => {
-                        let events = agent_for_hb
-                            .research_run_events_snapshot(&spec_for_hb, 16)
-                            .await;
-                        let total = agent_for_hb
-                            .research_store()
-                            .count_findings(&spec_for_hb)
-                            .await
-                            .unwrap_or(findings_baseline);
-                        let progress = HeartbeatProgress {
-                            topic: topic_for_hb.clone(),
-                            started_at,
-                            findings_total: total,
-                            findings_baseline,
-                            iteration_estimate: None,
-                            iteration_cap,
-                        };
-                        let body = render_waterfall(
-                            &spec_for_hb,
-                            &progress,
-                            &events,
-                            chrono::Utc::now(),
-                        );
-                        let edit = bot_for_hb
-                            .edit_message_text(chat_id, msg_id, body)
-                            .reply_markup(keyboard_stop(&spec_for_hb))
-                            .await;
-                        if let Err(e) = edit {
-                            // Don't bail — a transient 400 "message is not
-                            // modified" or rate-limit is routine. We keep
-                            // ticking; the next edit will succeed or the
-                            // completion path will replace the message anyway.
-                            tracing::debug!(spec_id = %spec_for_hb, ?e, "heartbeat edit failed");
-                        }
-                    }
-                }
-            };
-
-            finalize_research_ui(
-                &bot_for_hb,
-                chat_id,
-                thread_id,
-                msg_id,
-                &agent_for_hb,
-                &spec_for_hb,
-                &topic_for_hb,
-                findings_baseline,
-                started_at,
-                outcome,
-            )
-            .await;
-        },
-    );
-
-    String::new()
-}
-
-/// Result of a background `run_research*` call, shuttled from the
-/// launcher task to the heartbeat's completion branch. Boxed so the
-/// enum stays small and copy-cheap for the oneshot channel.
-pub(crate) enum ResearchOutcome {
-    Plain(Box<naked_core::research::RunReport>),
-    Verified(Box<naked_core::research::VerifiedRunReport>),
-    Error(String),
-}
-
-// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn finalize_research_ui(
-    bot: &Bot,
-    chat_id: ChatId,
-    thread_id: Option<ThreadId>,
-    msg_id: MessageId,
-    agent: &Arc<AgentCore>,
-    spec_id: &str,
-    topic: &str,
-    findings_baseline: u32,
-    started_at: chrono::DateTime<chrono::Utc>,
-    outcome: ResearchOutcome,
-) {
-    let store = agent.research_store();
-    let total_after = store.count_findings(spec_id).await.unwrap_or(0);
-    let new_this_run = total_after.saturating_sub(findings_baseline);
-    let elapsed = (chrono::Utc::now() - started_at).num_seconds().max(0);
-
-    let (summary, run_id_opt, is_error) = match &outcome {
-        ResearchOutcome::Plain(r) => {
-            let mut s = format!(
-                "✅ <b>{}</b> — run complete\nspec <code>{}</code> · +{} finding(s) · total {} · {}s · stop={}",
-                escape_html_min(topic),
-                escape_html_min(spec_id),
-                r.new_findings,
-                r.total_findings_after,
-                elapsed,
-                r.stop_reason.as_str(),
-            );
-            s.push('\n');
-            (s, Some(r.run_id.clone()), false)
-        }
-        ResearchOutcome::Verified(vr) => {
-            let r = &vr.last_run;
-            let s = format!(
-                "✅ <b>{}</b> — run complete (gatekeeper {} round(s))\nspec <code>{}</code> · +{} new · total {} · removed={} · replacements={} · final={} · {}s\n",
-                escape_html_min(topic),
-                vr.verification_rounds,
-                escape_html_min(spec_id),
-                r.new_findings,
-                r.total_findings_after,
-                vr.dead_removed,
-                vr.replacements_found,
-                vr.final_findings,
-                elapsed,
-            );
-            (s, Some(r.run_id.clone()), false)
-        }
-        ResearchOutcome::Error(err) => (
-            format!(
-                "❌ research run <code>{}</code> failed after {}s\n<pre>{}</pre>",
-                escape_html_min(spec_id),
-                elapsed,
-                escape_html_min(err),
-            ),
-            None,
-            true,
-        ),
-    };
-
-    let _ = bot
-        .edit_message_text(chat_id, msg_id, &summary)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(keyboard_after_complete(spec_id))
-        .await;
-
-    if is_error {
-        return;
-    }
-
-    // Render and ship the HTML report. Failure to materialise the
-    // report is non-fatal — the run summary is already on the chat and
-    // the caller can always pull `report.md` from disk.
-    let report_md = match store.read_report(spec_id).await {
-        Ok(Some(md)) => md,
-        Ok(None) => {
-            tracing::info!(spec_id, "no report.md to ship (empty run)");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(spec_id, ?e, "reading report.md failed");
-            return;
-        }
-    };
-
-    let meta = ReportMeta {
-        spec_id,
-        topic,
-        run_id: run_id_opt.as_deref(),
-        findings_total: total_after,
-        new_findings: new_this_run,
-        generated_at: chrono::Utc::now(),
-    };
-    let html = render_report_html(&meta, &report_md);
-    let filename = format!("research-{}.html", safe_slug(spec_id));
-    let caption = format!(
-        "📄 Report for {} · {} finding(s) (+{} this run)",
-        topic, total_after, new_this_run,
-    );
-    let input = teloxide::types::InputFile::memory(html).file_name(filename);
-    if let Err(e) = bot
-        .send_document(chat_id, input)
-        .caption(caption)
-        .maybe_thread(thread_id)
-        .await
-    {
-        tracing::warn!(spec_id, ?e, "send_document(report.html) failed");
-    }
-}
+// Dead-code marker — the legacy orchestration layer (heartbeat waterfall,
+// stop/restart keyboards, ResearchOutcome enum, finalize_research_ui) is gone.
+// All research runs go through synthetic_dispatch::dispatch_for_chat.
 
 /// `/research ...` — operator surface in Telegram for the research subsystem.
 ///
 /// Mirrors the CLI (`naked research ...`) with two concessions:
-///   1. `run` is spawned into a background task and replies "launched" so we
-///      don't hold up the bot loop for the full agent turn (can be 20+ min).
-///      The run result is not pushed back to this chat unless the spec has
-///      its own `deliver_to` config (future v6); operators tail the log.
+///   1. `run` injects a synthetic prompt into the current chat session via
+///      [`naked_tg::synthetic::dispatch_for_chat`] so the agent's
+///      normal turn loop calls `research_run(spec_id=X)`.  Abort works via
+///      the standard `/abort` command or the ⏹ inline button.
 ///   2. `schedule <id> <cron>` is stubbed with an explicit "not implemented
 ///      yet" reply — systemd timer templating is deferred to v6.
 pub(crate) async fn handle_research_cmd(
     bot: &Bot,
     agent: &Arc<AgentCore>,
+    channel_map: &Arc<ChannelSessionMap>,
     config: &Config,
     ctx: &ChatCtx,
     text: &str,
@@ -310,7 +43,7 @@ pub(crate) async fn handle_research_cmd(
     let reply = match sub.as_str() {
         "" | "help" => "\
 /research new <topic>          create a new research spec
-/research ls                    list specs with schedule + last-run metrics
+/research ls | list             list specs with schedule + last-run metrics
 /research show <id>             show spec summary + recent findings
 /research state <id>            deep scheduler state — inflight ledger, failure streak, recent runs
 /research fresh <id>            show only findings from the latest run
@@ -321,7 +54,7 @@ pub(crate) async fn handle_research_cmd(
 /research resume <id>           resume scheduled runs
 /research reset <id>            clear failure streak + pause_reason and resume (rearm after fixing the cause)
 /research stop <id>             alias for pause
-/research rm <id>               delete all data for a spec
+/research rm | delete <id>      delete all data for a spec
 /research schedule <id> on <interval>   schedule periodic runs (e.g. 30m, 1h, 1d, or seconds)
 /research schedule <id> off              clear schedule
 /research schedule <id> status           show current schedule
@@ -353,7 +86,12 @@ research-skill через LLM."
                 }
             }
         }
-        "ls" => match agent.list_research().await {
+        // T1 (PLAN_RESEARCH_AGENT_FLOW_v1): `list` alias for `ls`.
+        // Operator instinct: every other tool calls it `list`. Without this
+        // alias `/research list` would hit the soft-fallback arm and create
+        // a spec with topic="list" (incident 2026-05-16 14:14 UTC,
+        // BUG_REGISTRY B55 COMMAND-FALLTHROUGH-CREATES-RESOURCE).
+        "ls" | "list" => match agent.list_research().await {
             Ok(list) if list.is_empty() => "No research specs defined.".to_string(),
             Ok(list) => {
                 let store = agent.research_store();
@@ -460,18 +198,28 @@ research-skill через LLM."
             format_research_show(agent, &tail, sub == "fresh" || sub == "delta").await
         }
         "run" => {
+            // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): inject a synthetic prompt
+            // into the current chat session.  The agent's normal turn loop
+            // interprets it as a `research_run(spec_id=X)` tool call.  The
+            // standard ⭕ Abort button + `/abort` work identically to any
+            // other turn — INV-CANCEL-1 satisfied.
             if tail.is_empty() {
                 "Usage: /research run <id>".to_string()
             } else {
-                launch_research_run_with_ui(
-                    bot.clone(),
-                    agent.clone(),
-                    config.clone(),
-                    ctx.chat_id,
-                    ctx.thread_id,
-                    tail.clone(),
+                match naked_tg::synthetic::dispatch_for_chat(
+                    agent,
+                    channel_map,
+                    ctx.chat_id.0,
+                    ctx.raw_thread_id(),
+                    &tail,
                 )
                 .await
+                {
+                    Ok((sid, _handle)) => {
+                        format!("\u{1f52c} research run `{tail}` dispatched (session {sid})")
+                    }
+                    Err(e) => format!("error dispatching research run: {e}"),
+                }
             }
         }
         "ask" => {
@@ -519,7 +267,8 @@ research-skill через LLM."
                 }
             }
         }
-        "rm" => {
+        // T1 alias: `delete` for symmetry с `list`/`ls`.
+        "rm" | "delete" => {
             if tail.is_empty() {
                 "Usage: /research rm <id>".to_string()
             } else {
@@ -585,12 +334,9 @@ research-skill через LLM."
             // slash handler used to reply "unknown subcommand" and the LLM
             // never saw the request (see plan `fix_research_routing_and_anti-block`).
             //
-            // Same UX as `/research run <id>`: we hand off to
-            // `launch_research_run_with_ui`, which posts the live
-            // waterfall + Stop & clarify button and ships the HTML
-            // report on completion. Returning the empty string keeps
-            // the trailing `send_message` quiet — the placeholder is
-            // the acknowledgement.
+            // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): same synthetic-dispatch
+            // path as the explicit `/research run <id>` arm.  The agent's
+            // turn loop calls `research_run` which does the actual work.
             let topic = if tail.is_empty() {
                 other.to_string()
             } else {
@@ -612,19 +358,25 @@ research-skill через LLM."
                         "🚀 создал `{}` — запускаю фоновый прогон…\nтема: {}",
                         spec_id, spec.topic
                     );
-                    let _ = bot
-                        .send_message(ctx.chat_id, header)
-                        .maybe_thread(ctx.thread_id)
-                        .await;
-                    launch_research_run_with_ui(
-                        bot.clone(),
-                        agent.clone(),
-                        config.clone(),
-                        ctx.chat_id,
-                        ctx.thread_id,
-                        spec_id,
+                    let _ = crate::shared::safe_send(
+                        bot, ctx, header, None,
+                    ).await;
+                    match naked_tg::synthetic::dispatch_for_chat(
+                        agent,
+                        channel_map,
+                        ctx.chat_id.0,
+                        ctx.raw_thread_id(),
+                        &spec_id,
                     )
                     .await
+                    {
+                        Ok((sid, _handle)) => {
+                            format!(
+                                "\u{1f52c} dispatched `{spec_id}` (session {sid})"
+                            )
+                        }
+                        Err(e) => format!("dispatch error: {e}"),
+                    }
                 }
                 Err(e) => format!(
                     "не смог создать research spec из `{other} {tail}`: {e}\n\
@@ -811,5 +563,96 @@ fn format_run_list(runs: &[naked_core::research::RunRecord], out: &mut String) {
             ));
         }
         out.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! T1 (PLAN_RESEARCH_AGENT_FLOW_v1): regression tests for subcommand
+    //! aliases. These read the file source itself because handle_research_cmd
+    //! needs a real Bot + AgentCore to invoke — too heavy for a parser test.
+    //!
+    //! The dispatching match-arm string literals are part of the public UX
+    //! contract: adding/removing them changes how operators invoke commands.
+    //! Source-text assertion is the simplest defence against silent removal.
+
+    fn source() -> &'static str {
+        include_str!("research.rs")
+    }
+
+    #[test]
+    fn list_alias_is_handled_with_ls() {
+        // /research list and /research ls must both list specs.
+        // Without this match arm `list` falls into the soft-fallback
+        // arm which creates a spec named `list-c1e4` (incident 2026-05-16).
+        let src = source();
+        assert!(
+            src.contains("\"ls\" | \"list\" =>"),
+            "list alias for ls missing — see B55 in BUG_REGISTRY.md. \
+             Required: match arm `\"ls\" | \"list\" =>`"
+        );
+    }
+
+    #[test]
+    fn delete_alias_is_handled_with_rm() {
+        let src = source();
+        assert!(
+            src.contains("\"rm\" | \"delete\" =>"),
+            "delete alias for rm missing — symmetry with ls|list alias"
+        );
+    }
+
+    #[test]
+    fn help_documents_list_alias() {
+        let src = source();
+        assert!(
+            src.contains("/research ls | list"),
+            "help text must show both ls and list to operators"
+        );
+    }
+
+    #[test]
+    fn help_documents_delete_alias() {
+        let src = source();
+        assert!(
+            src.contains("/research rm | delete"),
+            "help text must show both rm and delete to operators"
+        );
+    }
+
+    #[test]
+    fn soft_fallback_arm_still_exists() {
+        let src = source();
+        assert!(
+            src.contains("Soft-fallback"),
+            "soft-fallback arm comment missing — free-text research path \
+             must remain for ergonomic `/research <тема>` invocations"
+        );
+    }
+
+    // ---- B1 closure sentinel tests (replaced T2.6 sentinels) ----
+
+    #[test]
+    fn run_subcommand_uses_synthetic_dispatch() {
+        // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): the 'run' arm must use
+        // `dispatch_for_chat` (the unified synthetic path), NOT the
+        // legacy function.
+        let src = source();
+        assert!(
+            src.contains("synthetic_dispatch::dispatch_for_chat"),
+            "'run' arm must route through synthetic_dispatch::dispatch_for_chat"
+        );
+        // Ensure the legacy function is not CALLED anywhere in the
+        // non-test portion.  We search for the call-site pattern
+        // (trailing `(`) rather than the bare name, because comments
+        // and this test itself legitimately mention it.
+        let call_pattern = "launch_research_run_with_ui(";
+        let first_test_marker = "#[cfg(test)]";
+        let prod_code = src.split(first_test_marker).next().unwrap_or("");
+        assert!(
+            !prod_code.contains(call_pattern),
+            "Legacy function call must not appear in production code \
+             after B1 closure — all paths go through synthetic dispatch."
+        );
     }
 }

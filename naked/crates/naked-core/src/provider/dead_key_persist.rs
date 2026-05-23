@@ -83,7 +83,7 @@ fn mask_key(key: &str) -> String {
     if key.len() <= 14 {
         return "<masked-short>".into();
     }
-    format!("{}...{}", &key[..10], &key[key.len() - 4..])
+    format!("{}...{}", &key[..10], &key[key.len() - 4..]) // REGISTRY-WAIVE: B48 — API key is ASCII
 }
 
 /// Today's date in YYYY-MM-DD UTC. Used as suffix for the auto-dead array.

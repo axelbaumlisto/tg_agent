@@ -320,9 +320,7 @@ impl Provider for ResilientProvider {
                             // default — see dead_key_persist module docs).
                             if let Some(key_value) = self.providers[idx].key_hint() {
                                 let logical = super::logical_provider_name(provider.name());
-                                super::dead_key_persist::persist_dead_key(
-                                    logical, &key_value,
-                                );
+                                super::dead_key_persist::persist_dead_key(logical, &key_value);
                             }
                         } else {
                             tracing::warn!(

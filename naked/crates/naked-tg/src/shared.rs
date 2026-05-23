@@ -24,18 +24,19 @@ pub(crate) use naked_core::types::{
 };
 
 // ── Re-export from sibling crate modules ──────────────────────────────────
-pub(crate) use crate::channel_map::{ChannelSessionMap, format_tg_channel_id};
+pub(crate) use naked_tg::channel_map::{ChannelSessionMap, format_tg_channel_id};
 
 // ── Re-export naked_tg library helpers used throughout ──────────────────────
 pub(crate) use naked_tg::helpers::parse_interval;
 pub(crate) use naked_tg::markup::{self, MAX_TG_MSG as TG_MSG_LIMIT};
 pub(crate) use naked_tg::memory_scheduler;
-pub(crate) use naked_tg::research_html::{ReportMeta, render_report_html};
+// B4: ReportMeta + render_report_html were only used by finalize_research_ui
+// (now removed).  research_html.rs remains in the lib for potential future
+// direct-HTML export use cases.
 pub(crate) use naked_tg::research_scheduler;
-pub(crate) use naked_tg::research_ui::{
-    HeartbeatProgress, PendingClarification, keyboard_after_complete,
-    keyboard_paused_awaiting_clarification, keyboard_stop, render_waterfall,
-};
+// B4: research_ui re-exports removed — legacy launch_research_run_with_ui gone.
+// render_waterfall / HeartbeatProgress / keyboard_* are now only used by
+// research_ui.rs's own unit tests.
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -167,43 +168,171 @@ impl SendExt for teloxide::requests::MultipartRequest<teloxide::payloads::SendDo
     }
 }
 
-// ── Reply helpers (DRY: replaces 43× repeated send_message chains) ──────────
+// ── Safe send (PLAN_TG_SAFE_SEND_v1) ──────────────────────────────────
+//
+// ONE strategy for all outgoing text:
+//   ≤ 4096 bytes  → send_message (normal)
+//   ≤ 8192 bytes  → split into 2 chunks, send sequentially
+//   > 8192 bytes  → tail-4000 in chat + full text as HTML attachment
 
-/// Send a plain-text message. Handles thread_id automatically.
+const SAFE_SEND_FILE_THRESHOLD: usize = MAX_TG_MSG * 2;
+const SAFE_SEND_TAIL_BUDGET: usize = 3900; // leave room for footer
+
+/// Take the **last** `limit` bytes of `s`, char-boundary safe.
+/// Prepends `…` when truncated.
+pub(crate) fn tail_truncate(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let start = s.len().saturating_sub(limit);
+    let start = s.ceil_char_boundary(start);
+    format!("\u{2026}{}", &s[start..])
+}
+
+/// Wrap plain text into a minimal dark-themed HTML document.
+pub(crate) fn wrap_html_doc(text: &str, title: &str) -> Vec<u8> {
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{ --bg:#1e1e2e; --fg:#cdd6f4; }}
+body {{ background:var(--bg); color:var(--fg); font-family:monospace; font-size:14px;
+  line-height:1.6; padding:24px; max-width:900px; margin:0 auto; white-space:pre-wrap; word-break:break-word; }}
+@media(prefers-color-scheme:light) {{ :root {{ --bg:#eff1f5; --fg:#4c4f69; }} }}
+</style></head><body>{body}</body></html>"#,
+        title = markup::escape_html(title),
+        body = markup::escape_html(text),
+    )
+    .into_bytes()
+}
+
+/// Unified safe-send: handles any length of text.
+///
+/// - ≤ 4096: single `send_message`
+/// - ≤ 8192: split into 2 chunks
+/// - > 8192: tail-truncated message + full text as HTML attachment
+pub(crate) async fn safe_send(
+    bot: &Bot,
+    ctx: &ChatCtx,
+    text: String,
+    mode: Option<teloxide::types::ParseMode>,
+) -> ResponseResult<Message> {
+    // Short path: fits in one message.
+    if text.len() <= MAX_TG_MSG {
+        let mut req = bot
+            .send_message(ctx.chat_id, &text)
+            .maybe_thread(ctx.thread_id);
+        if let Some(m) = mode {
+            req = req.parse_mode(m);
+        }
+        return req.await;
+    }
+
+    // Medium path: split into 2 chunks.
+    if text.len() <= SAFE_SEND_FILE_THRESHOLD {
+        let chunks = split_html(&text, MAX_TG_MSG - 100);
+        let mut last_msg = None;
+        for chunk in &chunks {
+            let mut req = bot
+                .send_message(ctx.chat_id, chunk.as_str())
+                .maybe_thread(ctx.thread_id);
+            if let Some(m) = mode {
+                req = req.parse_mode(m);
+            }
+            match req.await {
+                Ok(m) => last_msg = Some(m),
+                Err(e) => {
+                    // HTML parse error → retry without parse_mode.
+                    tracing::warn!("safe_send chunk (mode={mode:?}) failed: {e}, retrying plain");
+                    let fallback = bot
+                        .send_message(ctx.chat_id, chunk.as_str())
+                        .maybe_thread(ctx.thread_id)
+                        .await;
+                    if let Ok(m) = fallback {
+                        last_msg = Some(m);
+                    }
+                }
+            }
+        }
+        // Return last successful message, or fabricate an error.
+        return last_msg.ok_or_else(|| {
+            teloxide::RequestError::Api(teloxide::ApiError::Unknown("all chunks failed".into()))
+        });
+    }
+
+    // Long path: tail in chat + full HTML attachment.
+    let tail = tail_truncate(&text, SAFE_SEND_TAIL_BUDGET);
+    let visible = format!("{tail}\n\n\u{1f4c4} <i>Full text attached</i>");
+    let mut req = bot
+        .send_message(ctx.chat_id, &visible)
+        .maybe_thread(ctx.thread_id)
+        .parse_mode(teloxide::types::ParseMode::Html);
+    if let Some(teloxide::types::ParseMode::Html) = mode {
+        // already set
+    } else {
+        // Force HTML for the footer italic; tail is plain text anyway.
+        req = req.parse_mode(teloxide::types::ParseMode::Html);
+    }
+    let msg = req.await?;
+
+    // Attach full text as HTML file.
+    let doc = wrap_html_doc(&text, "Full message");
+    let input = teloxide::types::InputFile::memory(doc).file_name("message.html");
+    if let Err(e) = bot
+        .send_document(ctx.chat_id, input)
+        .caption("\u{1f4c4} Full text")
+        .maybe_thread(ctx.thread_id)
+        .await
+    {
+        tracing::warn!("safe_send: send_document failed: {e}");
+    }
+    Ok(msg)
+}
+
+/// Send a plain-text message. Delegates to [`safe_send`].
 pub(crate) async fn reply_text(
     bot: &Bot,
     ctx: &ChatCtx,
     text: impl Into<String>,
 ) -> ResponseResult<Message> {
-    bot.send_message(ctx.chat_id, text)
-        .maybe_thread(ctx.thread_id)
-        .await
+    safe_send(bot, ctx, text.into(), None).await
 }
 
-/// Send an HTML-formatted message. Handles thread_id + ParseMode::Html.
+/// Send an HTML-formatted message. Delegates to [`safe_send`].
 pub(crate) async fn reply_html(
     bot: &Bot,
     ctx: &ChatCtx,
     text: impl Into<String>,
 ) -> ResponseResult<Message> {
-    bot.send_message(ctx.chat_id, text)
-        .parse_mode(teloxide::types::ParseMode::Html)
-        .maybe_thread(ctx.thread_id)
-        .await
+    safe_send(
+        bot,
+        ctx,
+        text.into(),
+        Some(teloxide::types::ParseMode::Html),
+    )
+    .await
 }
 
 /// Send an HTML message with an inline keyboard.
+/// If text overflows, keyboard is dropped and [`safe_send`] handles it.
 pub(crate) async fn reply_html_kb(
     bot: &Bot,
     ctx: &ChatCtx,
     text: impl Into<String>,
     kb: teloxide::types::InlineKeyboardMarkup,
 ) -> ResponseResult<Message> {
-    bot.send_message(ctx.chat_id, text)
-        .parse_mode(teloxide::types::ParseMode::Html)
-        .reply_markup(kb)
-        .maybe_thread(ctx.thread_id)
-        .await
+    let text = text.into();
+    if text.len() <= MAX_TG_MSG {
+        return bot
+            .send_message(ctx.chat_id, text)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .reply_markup(kb)
+            .maybe_thread(ctx.thread_id)
+            .await;
+    }
+    // Overflow: keyboard doesn't survive chunking/attachment. Drop it.
+    safe_send(bot, ctx, text, Some(teloxide::types::ParseMode::Html)).await
 }
 
 pub(crate) async fn send_typing_raw(
@@ -245,9 +374,10 @@ pub(crate) async fn send_typing_raw(
 
 pub(crate) static SLASH_HINT_SHOWN: LazyLock<tokio::sync::RwLock<HashSet<i64>>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashSet::new()));
-pub(crate) type PendingClarificationMap = HashMap<(i64, Option<i32>), PendingClarification>;
-pub(crate) static PENDING_CLARIFICATIONS: LazyLock<tokio::sync::RwLock<PendingClarificationMap>> =
-    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
+// T3.3 (PLAN_RESEARCH_AGENT_FLOW_v1): PENDING_CLARIFICATIONS map removed.
+// Was a per-(chat,thread) HashMap of paused research runs awaiting a
+// clarification reply. Replaced by single-mechanism flow: just send a new
+// message or `/research run <id>` to relaunch.
 pub(crate) type ModelSwitchMap =
     HashMap<(i64, Option<i32>), naked_tg::model_switch::SharedModelSwitch>;
 pub(crate) static MODEL_SWITCHES: LazyLock<tokio::sync::RwLock<ModelSwitchMap>> =
@@ -475,5 +605,92 @@ pub(crate) async fn run_health_server(port: u16) {
             );
             let _ = stream.write_all(response.as_bytes()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod safe_send_tests {
+    use super::*;
+
+    // ── tail_truncate ─────────────────────────────────────────────
+
+    #[test]
+    fn tail_within_limit_unchanged() {
+        assert_eq!(tail_truncate("hello", 100), "hello");
+    }
+
+    #[test]
+    fn tail_at_limit_unchanged() {
+        let s = "a".repeat(4096);
+        assert_eq!(tail_truncate(&s, 4096), s);
+    }
+
+    #[test]
+    fn tail_over_limit_keeps_end() {
+        let s = format!("{}TAIL", "x".repeat(5000));
+        let t = tail_truncate(&s, 100);
+        assert!(t.len() <= 103); // 100 + … (3 bytes)
+        assert!(t.ends_with("TAIL"), "must keep tail: {t}");
+        assert!(t.starts_with('…'));
+    }
+
+    #[test]
+    fn tail_multibyte_safe() {
+        let s = "ю".repeat(1000); // 2000 bytes
+        let t = tail_truncate(&s, 500);
+        assert!(t.len() <= 503);
+        assert!(t.starts_with('…'));
+    }
+
+    // ── wrap_html_doc ───────────────────────────────────────────
+
+    #[test]
+    fn wrap_html_doc_contains_doctype_and_body() {
+        let doc = wrap_html_doc("hello world", "Test");
+        let html = String::from_utf8(doc).unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("hello world"));
+        assert!(html.contains("Test")); // title
+    }
+
+    #[test]
+    fn wrap_html_doc_escapes_html_entities() {
+        let doc = wrap_html_doc("<script>alert(1)</script>", "XSS");
+        let html = String::from_utf8(doc).unwrap();
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    // ── structural sentinels ─────────────────────────────────────
+
+    #[test]
+    fn reply_text_delegates_to_safe_send() {
+        let src = include_str!("shared.rs");
+        // Split at #[cfg(test)] to check prod code only.
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("safe_send(bot, ctx, text.into(), None)"),
+            "reply_text must delegate to safe_send"
+        );
+    }
+
+    #[test]
+    fn send_long_text_removed() {
+        let src = include_str!("shared.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            !prod.contains("fn send_long_text"),
+            "send_long_text must not exist in shared.rs (use safe_send)"
+        );
+    }
+
+    #[test]
+    fn tg_truncate_removed() {
+        let src = include_str!("shared.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            !prod.contains("fn tg_truncate"),
+            "tg_truncate must not exist (replaced by tail_truncate + safe_send)"
+        );
     }
 }

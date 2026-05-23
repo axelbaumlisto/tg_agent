@@ -343,7 +343,8 @@ mod tests {
 
     #[test]
     fn b46_filter_no_op_when_no_dead_buckets() {
-        let json = r#"{"providers":{"foo":{"type":"openai_compat","api_key":"sk","api_keys":["a","b"]}}}"#;
+        let json =
+            r#"{"providers":{"foo":{"type":"openai_compat","api_key":"sk","api_keys":["a","b"]}}}"#;
         let out = filter_dead_keys_from_json(json).unwrap();
         assert_eq!(out, json, "no-dead configs returned byte-identical");
     }

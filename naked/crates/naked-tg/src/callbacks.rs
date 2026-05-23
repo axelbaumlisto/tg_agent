@@ -267,39 +267,68 @@ pub(crate) async fn handle_callback(
             let spec_id = parts[2].to_string();
             match action {
                 "stop" => {
-                    let cancelled = agent.cancel_research_run(&spec_id).await;
+                    // B4 (PLAN_RESEARCH_FLOW_CLOSURE_v1): unified abort.
+                    // All research runs now create proper sessions in
+                    // ChannelSessionMap, so agent.abort(session_id) is the
+                    // only cancel mechanism.  The legacy cancel_research_run
+                    // fallback has been removed (INV-CANCEL-1).
+                    let cancel_started = std::time::Instant::now();
+                    let aborted = if let Some(msg) = &q.message
+                        && let Some(regular) = msg.regular_message()
+                    {
+                        let cid = regular.chat.id;
+                        let tid = regular.thread_id;
+                        if let Some(session_id) = channel_map.get(cid.0, tid.map(|t| t.0.0)).await {
+                            tracing::debug!(
+                                spec_id = %spec_id,
+                                %session_id,
+                                "stop callback: aborting via agent.abort(session_id)"
+                            );
+                            agent.abort(&session_id).await;
+                            true
+                        } else {
+                            tracing::warn!(
+                                spec_id = %spec_id,
+                                "stop callback: no session found for spec — run may have already finished"
+                            );
+                            false
+                        }
+                    } else {
+                        tracing::warn!(
+                            spec_id = %spec_id,
+                            "stop callback: no message context to resolve session"
+                        );
+                        false
+                    };
+                    let elapsed_ms = cancel_started.elapsed().as_millis() as u64;
+                    crate::metrics::record_research_cancel_propagation(elapsed_ms);
+
                     if let Some(msg) = &q.message
                         && let Some(regular) = msg.regular_message()
                     {
-                        let cid_raw = regular.chat.id.0;
-                        let tid_raw = regular.thread_id.map(|t| t.0.0);
-                        let note = if cancelled {
+                        let note = if aborted {
                             format!(
-                                "⏸ Paused <code>{}</code>\n\nReply with a clarification — the next message in this chat will be appended to the spec's topic and a Restart button will appear.",
-                                escape_html_min(&spec_id)
+                                "⏸ Aborted <code>{spec}</code>.\n\
+                                 Reply with a clarification or relaunch with \
+                                 <code>/research run {spec}</code>.",
+                                spec = escape_html_min(&spec_id)
                             )
                         } else {
                             format!(
-                                "ℹ️ Run <code>{}</code> already finished.\nYou can still type a note and press Restart on the final message.",
+                                "ℹ️ Run <code>{}</code> already finished.\n\
+                                 Reply with a note or relaunch with \
+                                 <code>/research run {}</code>.",
+                                escape_html_min(&spec_id),
                                 escape_html_min(&spec_id)
                             )
                         };
                         let _ = bot
                             .edit_message_text(regular.chat.id, regular.id, note)
                             .parse_mode(ParseMode::Html)
-                            .reply_markup(keyboard_paused_awaiting_clarification(&spec_id))
                             .await;
-                        PENDING_CLARIFICATIONS.write().await.insert(
-                            (cid_raw, tid_raw),
-                            PendingClarification {
-                                spec_id: spec_id.clone(),
-                                message_id: regular.id,
-                                paused_at: chrono::Utc::now(),
-                            },
-                        );
                     }
                     bot.answer_callback_query(q.id.clone())
-                        .text(if cancelled { "Paused" } else { "Already done" })
+                        .text(if aborted { "Aborted" } else { "Already done" })
                         .await?;
                 }
                 "restart" => {
@@ -316,29 +345,46 @@ pub(crate) async fn handle_callback(
                             return Ok(());
                         }
                     };
-                    let cid_raw = chat_id.0;
-                    let tid_raw = thread_id.map(|t| t.0.0);
-                    PENDING_CLARIFICATIONS
-                        .write()
-                        .await
-                        .remove(&(cid_raw, tid_raw));
+                    // T3.3 (PLAN_RESEARCH_AGENT_FLOW_v1): PENDING_CLARIFICATIONS
+                    // removed — clarification = next normal user message in
+                    // thread (no special UI). Re-run is just `/research run X`.
                     bot.answer_callback_query(q.id.clone())
                         .text("Restarting…")
                         .await?;
-                    let reply = launch_research_run_with_ui(
-                        bot.clone(),
-                        agent.clone(),
-                        config.clone(),
-                        chat_id,
-                        thread_id,
-                        spec_id,
+                    // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): restart goes
+                    // through the unified synthetic dispatch path.
+                    match naked_tg::synthetic::dispatch_for_chat(
+                        &agent,
+                        &channel_map,
+                        chat_id.0,
+                        thread_id.map(|teloxide::types::ThreadId(mid)| mid.0),
+                        &spec_id,
                     )
-                    .await;
-                    if !reply.is_empty() {
-                        let _ = bot
-                            .send_message(chat_id, reply)
-                            .maybe_thread(thread_id)
+                    .await
+                    {
+                        Ok((sid, _handle)) => {
+                            let _ = bot
+                                .send_message(
+                                    chat_id,
+                                    format!("\u{1f52c} restarted `{spec_id}` (session {sid})"),
+                                )
+                                .maybe_thread(thread_id)
+                                .await;
+                        }
+                        Err(e) => {
+                            let err_ctx = ChatCtx {
+                                chat_id,
+                                thread_id,
+                                reply_to: None,
+                            };
+                            let _ = crate::shared::safe_send(
+                                &bot,
+                                &err_ctx,
+                                format!("restart error: {e}"),
+                                None,
+                            )
                             .await;
+                        }
                     }
                 }
                 _ => {
@@ -650,4 +696,76 @@ async fn build_model_keyboard(
     }
 
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    //! T3.1+T3.2 regression tests (PLAN_RESEARCH_AGENT_FLOW_v1 Wave C).
+    //!
+    //! We verify the stop-callback logic via source-text assertions
+    //! (same pattern as research.rs T1 tests) because handle_callback
+    //! requires a real Bot + AgentCore + ChannelSessionMap to invoke —
+    //! too heavy for a unit test.
+    //!
+    //! The source-text assertions cover the public contract:
+    //!   - channel_map lookup to resolve session (T3.1)
+    //!   - agent.abort(session_id) as the ONLY cancel path (B4 closure)
+    //!   - no legacy cancel_research_run fallback (INV-CANCEL-1)
+
+    fn source() -> &'static str {
+        include_str!("callbacks.rs")
+    }
+
+    #[test]
+    fn stop_callback_resolves_session_via_channel_map() {
+        // T3.1 + B4: channel_map.get() resolves the session for
+        // agent.abort.  No legacy fallback remains (INV-CANCEL-1).
+        let src = source();
+        assert!(
+            src.contains("channel_map.get(cid.0, tid"),
+            "stop callback must call channel_map.get() to resolve session_id \
+             for agent.abort (INV-CANCEL-1)"
+        );
+    }
+
+    #[test]
+    fn stop_callback_calls_agent_abort_when_session_active() {
+        // T3.2: agent.abort(session_id) must be called when channel_map
+        // returns Some. This is the same path as /abort command.
+        let src = source();
+        assert!(
+            src.contains("agent.abort(&session_id).await"),
+            "stop callback must call agent.abort(&session_id) when session is \
+             found via channel_map — unifies with /abort command path (B56)"
+        );
+    }
+
+    #[test]
+    fn stop_callback_has_no_legacy_cancel_fallback() {
+        // B4 (PLAN_RESEARCH_FLOW_CLOSURE_v1): the legacy
+        // cancel_research_run fallback has been removed.  All runs
+        // create proper sessions, so agent.abort(session_id) is the
+        // only mechanism (INV-CANCEL-1).
+        let src = source();
+        // Split at #[cfg(test)] to only check production code.
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            !prod.contains("cancel_research_run("),
+            "stop callback must NOT call cancel_research_run — B4 removed \
+             the legacy fallback; agent.abort is the only path"
+        );
+    }
+
+    #[test]
+    fn stop_callback_uses_aborted_not_paused_wording() {
+        // T3.2: the stop arm now says "Aborted" not "Paused" (the word
+        // "Paused" implies the run is resumable; abort is terminal for
+        // the current turn).
+        let src = source();
+        // Verify the new message is present
+        assert!(
+            src.contains("Aborted <code>"),
+            "stop arm must display 'Aborted' wording, not 'Paused' (T3.2)"
+        );
+    }
 }

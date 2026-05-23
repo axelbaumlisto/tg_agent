@@ -12,8 +12,8 @@ use teloxide::prelude::*;
 use naked_core::AgentCore;
 use naked_core::config::Config;
 
-use crate::channel_map::ChannelSessionMap;
 use crate::shared::{RATE_LIMITER, memory_scheduler, research_scheduler};
+use naked_tg::channel_map::ChannelSessionMap;
 
 /// All state produced by [`build`] and consumed by the event loop.
 pub(crate) struct WiredBot {
@@ -39,612 +39,19 @@ pub(crate) struct WiredBot {
     pub(crate) liveness: Arc<naked_core::liveness::LivenessRegistry>,
 }
 
-/// Build the complete DI graph and return a ready-to-run [`WiredBot`].
-///
-/// Must be called **after** tracing is initialised (in [`crate::bootstrap`]).
-/// BUG_REGISTRY D-INV-AUDIT-ALL-PROVIDERS: iterates every provider
-/// name, resolves it via the `resolve` closure, and calls
-/// `audit_keys_on_boot()` on the result. Sequential to avoid pulling
-/// `futures_util` into naked-tg; each individual audit internally
-/// runs its key probes in parallel via `join_all`.
-///
-/// `pub(crate)` so wiring.rs::tests can verify the loop hits EVERY
-/// provider, not just the default — the bug that originally needed
-/// to ship as part of R2 wiring iteration (commit `38c608b6`).
-pub(crate) async fn audit_all_providers<F, Fut>(provider_names: Vec<String>, resolve: F)
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = std::sync::Arc<dyn naked_core::provider::Provider>>,
-{
-    for name in provider_names {
-        let provider = resolve(name).await;
-        provider.audit_keys_on_boot().await;
-    }
-}
+pub(crate) mod health;
+pub(crate) mod invariants;
 
-/// BUG_REGISTRY D-CONFIG-MTIME-WATCH (B42 detector).
-///
-/// Records the (mtime, sha256) of `state/naked.json` at boot and
-/// spawns a 60-second-interval poller. If the file changes between
-/// polls, log WARN + bump `CONFIG_EXTERNAL_WRITE_COUNT`. B42 in
-/// the wild: `state/naked.json` had silently reverted to a stale
-/// IP between 14:38 and 15:42 on 2026-05-13; this detector turns
-/// that class of fault visible per restart.
-///
-/// The bot writes to `state/naked.json` itself via certain ops
-/// (e.g. `naked memory store`), so the watcher's purpose is
-/// surface-level monitoring, not strict enforcement. Operator
-/// reads the journal to investigate, not to act on automatically.
-fn spawn_config_mtime_watcher() {
-    let path = match std::env::var("NAKED_CONFIG") {
-        Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => {
-            tracing::debug!("config-mtime-watch: no NAKED_CONFIG env, skipping");
-            return;
-        }
-    };
-    let initial = match snapshot_config_file(&path) {
-        Some(snap) => snap,
-        None => {
-            tracing::debug!(path = %path.display(), "config-mtime-watch: snapshot failed, skipping");
-            return;
-        }
-    };
-    tracing::info!(
-        path = %path.display(),
-        mtime = %initial.mtime_human,
-        hash = %initial.hash_hex,
-        "config-mtime-watch armed"
-    );
-    let path_for_task = path.clone();
-    tokio::spawn(async move {
-        let mut last = initial;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await; // consume first immediate tick
-        loop {
-            interval.tick().await;
-            let Some(current) = snapshot_config_file(&path_for_task) else {
-                continue;
-            };
-            if current.hash_hex != last.hash_hex {
-                naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    path = %path_for_task.display(),
-                    prev_hash = %last.hash_hex,
-                    curr_hash = %current.hash_hex,
-                    prev_mtime = %last.mtime_human,
-                    curr_mtime = %current.mtime_human,
-                    "B42: state/naked.json modified externally between polls. \
-                     Either a cron/recreate script touched it, or another agent \
-                     session wrote to it. Cross-check with audit_window.sh + \
-                     systemd journal for the suspected writer."
-                );
-                last = current;
-            }
-        }
-    });
-}
-
-/// Snapshot of a file's identity at a point in time: mtime + DefaultHasher
-/// digest of contents. Cheap enough to run every 60s; DefaultHasher over
-/// ~50 KB `naked.json` is ~30us on this hardware. We don't need
-/// cryptographic strength here — only fast difference detection.
-///
-/// REGISTRY-WAIVE B32 (DEPS): intentionally re-uses std::hash instead
-/// of pulling sha2 as a new dep; same pattern as snapshot/ module.
-#[derive(Clone, Debug)]
-struct ConfigSnapshot {
-    /// 64-bit hash of file contents (DefaultHasher, NOT cryptographic).
-    hash_hex: String,
-    mtime_human: String,
-}
-
-fn snapshot_config_file(path: &std::path::Path) -> Option<ConfigSnapshot> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let bytes = std::fs::read(path).ok()?;
-    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-    let mtime_human = match mtime.duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => format!("{}", d.as_secs()),
-        Err(_) => "<epoch>".to_string(),
-    };
-    let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
-    let hash_hex = format!("{:016x}", h.finish());
-    Some(ConfigSnapshot {
-        hash_hex,
-        mtime_human,
-    })
-}
-
-/// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard).
-///
-/// At boot, call `naked/skills/novnc-browser/scripts/novnc.sh url`
-/// and parse the JSON to extract known-good IP/port pairs (from the
-/// `canonical`, `tailscale`, `public` fields). Cache them in a static
-/// `OnceLock<Vec<String>>` so stream-level code can compare outgoing
-/// noVNC mentions against the allow-list without re-invoking the
-/// script every time.
-///
-/// Fail-open: if the script is unreachable / returns non-JSON, the
-/// allow-list stays empty and `validate_ip_tokens()` becomes a no-op.
-/// That's intentional — a broken novnc.sh is its own visible problem,
-/// we don't want to add a second symptom.
-fn populate_novnc_ip_allowlist() {
-    let script = "/home/spex/work/tg_agent/naked/skills/novnc-browser/scripts/novnc.sh";
-    let output = match std::process::Command::new("bash")
-        .arg(script)
-        .arg("url")
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => {
-            tracing::debug!("novnc-ip-allowlist: novnc.sh url failed; allow-list empty");
-            return;
-        }
-    };
-    // novnc.sh output parse — fail-open by design; empty allow-list →
-    // validate_novnc_ip_tokens becomes no-op (B37 detection doc).
-    // REGISTRY-WAIVE: intentional fallback: malformed output → skip
-    let Ok(text) = String::from_utf8(output) else {
-        return;
-    };
-    // REGISTRY-WAIVE: intentional fallback: malformed JSON → skip
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let mut ips: Vec<String> = Vec::new();
-    for field in ["canonical", "tailscale", "public"] {
-        let Some(url) = value.get(field).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        // Extract host (and port if present) from URL form.
-        if let Some(host_port) = extract_host_port(url) {
-            ips.push(host_port);
-        }
-    }
-    // Also push the clipshot.cc canonical hostname (not IP, but it's
-    // a stable allow-list entry).
-    if value.get("canonical").is_some() {
-        ips.push("clipshot.cc:443".into());
-    }
-    if !ips.is_empty() {
-        tracing::info!(allowlist = ?ips, "novnc-ip-allowlist populated");
-        if let Ok(mut guard) = crate::shared::NOVNC_IP_ALLOWLIST.write() {
-            *guard = ips;
-        }
-    }
-}
-
-/// Parse the host[:port] out of a URL form like
-///   `http://65.108.226.226:6080/vnc.html?...`
-///   `https://clipshot.cc/debug/vnc/...`
-/// Returns `"host:port"` if explicit port given, else `"host"`.
-fn extract_host_port(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    Some(rest[..host_end].to_string())
-}
-
-/// BUG_REGISTRY D-BOOT-CONFIG-SYMLINK (B41 regression guard).
-///
-/// AGENTS.md decree: `naked/naked.json -> ../state/naked.json` (symlink,
-/// gitignored). When this gets replaced by a regular file (as happened
-/// 2026-05-13: divergent snapshot copy lay around since May 12), bot can
-/// load the wrong config — specifically `state/naked.json` (via the
-/// `NAKED_CONFIG` env in systemd unit) had stale Playwright CDP IP
-/// 172.19.0.2 while `naked/naked.json` had the up-to-date 172.19.0.3,
-/// or vice versa. Easy fix at boot: warn loudly.
-///
-/// Returns true if invariant holds, false if it's broken. Not strict
-/// (no process exit) — the operator may have a legitimate reason for a
-/// regular file (e.g. running with NAKED_CONFIG pointing elsewhere).
-/// Set `NAKED_STRICT_CONFIG_SYMLINK=1` to escalate WARN → exit 4.
-pub(crate) fn check_config_symlink_invariant() -> bool {
-    let repo_root = std::env::var("NAKED_REPO_ROOT").unwrap_or_else(|_| {
-        // Default: walk up from CWD until we find a directory containing
-        // both `naked/` and `state/`. Fallback to `..` from cwd.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let mut p = cwd.as_path();
-        loop {
-            if p.join("naked").is_dir() && p.join("state").is_dir() {
-                return p.display().to_string();
-            }
-            match p.parent() {
-                Some(parent) => p = parent,
-                None => return cwd.display().to_string(),
-            }
-        }
-    });
-    let link_path = std::path::PathBuf::from(&repo_root).join("naked/naked.json");
-    if !link_path.exists() {
-        tracing::debug!(
-            path = %link_path.display(),
-            "config-symlink check skipped: naked/naked.json absent"
-        );
-        return true;
-    }
-    let meta = match std::fs::symlink_metadata(&link_path) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "config-symlink: failed to stat");
-            return false;
-        }
-    };
-    if !meta.file_type().is_symlink() {
-        let strict = std::env::var_os("NAKED_STRICT_CONFIG_SYMLINK").is_some_and(|v| v == "1");
-        tracing::warn!(
-            path = %link_path.display(),
-            "B41: naked/naked.json is NOT a symlink (AGENTS.md says it must be \
-             a symlink to ../state/naked.json). Likely cause: someone replaced \
-             the link with a copy. Bot may load wrong config. Fix: \
-             `mv naked/naked.json /tmp/.orphan && ln -s ../state/naked.json naked/naked.json`"
-        );
-        if strict {
-            eprintln!("❌ B41: naked/naked.json must be symlink (NAKED_STRICT_CONFIG_SYMLINK=1)");
-            std::process::exit(4);
-        }
-        return false;
-    }
-    let target = match std::fs::read_link(&link_path) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!(error = %e, "config-symlink: failed to read link target");
-            return false;
-        }
-    };
-    let target_str = target.display().to_string();
-    // Accept `../state/naked.json` or absolute equivalent.
-    let canonical_ok =
-        target_str == "../state/naked.json" || target_str.ends_with("/state/naked.json");
-    if !canonical_ok {
-        tracing::warn!(
-            target = %target_str,
-            "B41: naked/naked.json symlink points at unexpected target (expected ../state/naked.json)"
-        );
-        return false;
-    }
-    tracing::info!(
-        target = %target_str,
-        "config-symlink invariant OK"
-    );
-    true
-}
-
-/// BUG_REGISTRY D-CHECK-SYSPROMPT-PATHS (B38/B37 regression guard).
-///
-/// Scans `~/.naked/system_prompt.md` for path-like tokens (file paths
-/// referenced inside backticks or after `»`/`->`/`→`) and asserts each
-/// exists on disk. When system_prompt drifts to reference stale paths
-/// (~/.zeroclaw/workspace/ etc.), model is told to call scripts that
-/// aren't there — then confabulates output.
-///
-/// Returns number of broken paths. Soft-warn only. Recognised path
-/// patterns:
-///   - `/home/spex/...` absolute
-///   - `~/.naked/...` / `~/work/...` tilde-prefixed (expanded against $HOME)
-///   - `./skills/...` / `./scripts/...` repo-relative (expanded vs $HOME)
-pub(crate) fn check_system_prompt_paths() -> usize {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let prompt_path = format!("{home}/.naked/system_prompt.md");
-    let src = match std::fs::read_to_string(&prompt_path) {
-        Ok(s) => s,
-        Err(_) => {
-            tracing::debug!(
-                path = %prompt_path,
-                "sysprompt-paths check skipped: system_prompt.md absent"
-            );
-            return 0;
-        }
-    };
-
-    // Regex over the prompt body for path tokens inside backticks.
-    // Keep this conservative: only flag tokens that LOOK like real paths
-    // (must end in .sh / .py / .md / .json / .session / .so or have at
-    // least two path segments under a known prefix). False-positive guard:
-    // skip http(s) URLs.
-    let mut candidates = std::collections::BTreeSet::<String>::new();
-    for line in src.lines() {
-        for token in line.split(['`', '\'', '"', ' ']) {
-            let t = token.trim_end_matches(&['.', ',', ')', '»', '—', ';', ':'][..]);
-            // Filters:
-            //   - URL (http/https/etc.)
-            //   - empty / env-var ref
-            //   - template placeholder paths containing `<token>` like
-            //     `<slug>`, `<id>`, `<chat>` — system_prompt uses these
-            //     to document parametric paths, not real ones.
-            if t.is_empty()
-                || t.starts_with("http")
-                || t.contains("://")
-                || t.contains('<')
-                || t.contains('>')
-            {
-                continue;
-            }
-            // Strip leading `~` -> HOME.
-            let expanded = if let Some(rest) = t.strip_prefix("~/") {
-                format!("{home}/{rest}")
-            } else if t.starts_with('/') {
-                t.to_string()
-            } else {
-                continue;
-            };
-            // Look for file-extension or known-prefix anchors.
-            let looks_like_path = expanded.contains('/')
-                && (expanded.ends_with(".sh")
-                    || expanded.ends_with(".py")
-                    || expanded.ends_with(".md")
-                    || expanded.ends_with(".json")
-                    || expanded.ends_with(".session")
-                    || expanded.ends_with(".rs")
-                    || expanded.ends_with(".toml")
-                    || expanded.starts_with(&format!("{home}/.naked/"))
-                    || expanded.starts_with("/home/"));
-            if looks_like_path {
-                candidates.insert(expanded);
-            }
-        }
-    }
-
-    let mut broken: Vec<String> = Vec::new();
-    for c in &candidates {
-        if !std::path::Path::new(c).exists() {
-            broken.push(c.clone());
-        }
-    }
-    if broken.is_empty() {
-        tracing::info!(
-            paths_checked = candidates.len(),
-            "sysprompt-paths invariant OK"
-        );
-        return 0;
-    }
-    tracing::warn!(
-        broken_count = broken.len(),
-        total_checked = candidates.len(),
-        "B38/B37 sysprompt-paths: paths referenced in system_prompt.md don't exist on disk"
-    );
-    for b in &broken {
-        tracing::warn!(missing = %b, "sysprompt-paths: broken reference");
-    }
-    broken.len()
-}
-
-/// BUG_REGISTRY D-BOOT-VISION-PROBE (B06): outcome of a single
-/// vision content-shape probe. Used to classify whether a provider
-/// that CLAIMS multimodal capability actually accepts OpenAI-style
-/// `image_url` content blocks. Inconclusive outcomes are treated as
-/// success — we only want to flag *definite* shape mismatches.
-#[derive(Debug, Clone)]
-pub(crate) enum VisionShapeOutcome {
-    /// The provider accepted the image_url shape. May still have
-    /// rejected our specific 1×1 PNG ("image too small") — that's
-    /// content, not shape. Either way the capability is real.
-    Accepted,
-    /// The provider rejected the shape itself (e.g. "unknown variant
-    /// `image_url`, expected `text`"). Caps are wrong.
-    ShapeMismatch(String),
-    /// Auth / rate-limit / timeout / network. Can't tell. Skip.
-    Inconclusive(String),
-}
-
-/// Pure classifier for an error message returned by a vision probe.
-/// Extracted for unit-testing without spinning up live providers.
-pub(crate) fn classify_vision_probe_error(msg: &str) -> VisionShapeOutcome {
-    let lc = msg.to_ascii_lowercase();
-    // Definite shape-mismatch signals across the providers we care about:
-    //   * serde-de error: "unknown variant `image_url`, expected `text`"
-    //   * "expected text" / "only text content"
-    //   * "does not support image" / "text-only model"
-    if lc.contains("unknown variant")
-        || lc.contains("expected text")
-        || lc.contains("expected `text`")
-        || lc.contains("only text content")
-        || lc.contains("does not support image")
-        || lc.contains("text-only model")
-        || lc.contains("multimodal not supported")
-    {
-        return VisionShapeOutcome::ShapeMismatch(msg.chars().take(180).collect());
-    }
-    // "Image too small" / "min size" / size-related rejections — shape
-    // accepted, content rejected. Either way the capability is real.
-    if lc.contains("image must be")
-        || lc.contains("too small")
-        || lc.contains("min") && lc.contains("size")
-        || lc.contains("width")
-        || lc.contains("height")
-    {
-        return VisionShapeOutcome::Accepted;
-    }
-    // Auth, rate, timeout, network — can't tell, treat as inconclusive.
-    VisionShapeOutcome::Inconclusive(msg.chars().take(180).collect())
-}
-
-/// 1×1 transparent PNG (the smallest valid PNG payload). Used as the
-/// probe content — we expect every real vision API to either accept
-/// or reject it with a SIZE error, but never a SHAPE error.
-const VISION_PROBE_PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-
-/// Send a 1×1 image_url to the provider's stream_chat and classify
-/// the response. 8-second timeout per probe so total D-BOOT-VISION-PROBE
-/// time is bounded by (number of vision-claimed models × 8 s); typically
-/// 5–10 s in practice.
-pub(crate) async fn probe_vision_content_shape(
-    provider: &dyn naked_core::provider::Provider,
-    model: &str,
-) -> VisionShapeOutcome {
-    use naked_core::provider::ChatRequest;
-    let req = ChatRequest {
-        model: model.into(),
-        system: String::new(),
-        messages: vec![serde_json::json!({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "hi"},
-                {"type": "image_url", "image_url": {
-                    "url": format!("data:image/png;base64,{VISION_PROBE_PIXEL_PNG_B64}")
-                }}
-            ]
-        })],
-        tools: vec![],
-        max_tokens: 1,
-        temperature: None,
-        reasoning: None,
-    };
-    let timeout = std::time::Duration::from_secs(8);
-    match tokio::time::timeout(timeout, provider.stream_chat(req)).await {
-        Ok(Ok(_stream)) => VisionShapeOutcome::Accepted,
-        Ok(Err(e)) => classify_vision_probe_error(&e.to_string()),
-        Err(_) => VisionShapeOutcome::Inconclusive("timeout".into()),
-    }
-}
-
-/// BUG_REGISTRY D-BOOT-CAPS-INVARIANT: enforces INV-1 + INV-2 at
-/// boot time. Returns the number of (provider, model) pairs whose
-/// declared caps disagree with the routing function. Logs WARN per
-/// violation with file:line-style context for the operator.
-///
-/// `pub(crate)` for unit-testing without spinning up async wiring.
-/// `NAKED_STRICT_CAPS=1` env: escalate WARN → `std::process::exit(3)`
-/// so misconfiguration can't reach prod silently.
-pub(crate) fn boot_caps_invariant_sweep(config: &naked_core::config::Config) -> usize {
-    let mut violations: Vec<String> = Vec::new();
-
-    for (provider_name, provider) in &config.providers {
-        // INV-1: per-model caps.supports_vision=Some(true) must route as true.
-        for (model_id, caps) in &provider.capabilities {
-            if caps.supports_vision == Some(true) {
-                let routable = config
-                    .tg_media
-                    .is_vision_capable_with_provider(model_id, Some(provider));
-                if !routable {
-                    violations.push(format!(
-                        "INV-1 {provider_name}/{model_id}: caps.supports_vision=Some(true) \
-                         but is_vision_capable_with_provider=false"
-                    ));
-                }
-            }
-        }
-        // INV-2: every model id matching vision-naming pattern must route OR
-        // have explicit Some(false) deny.
-        for model_id in &provider.models {
-            let lc = model_id.to_ascii_lowercase();
-            let looks_vision =
-                lc.contains("vl") || lc.contains("vision") || lc.contains("multimodal");
-            if !looks_vision {
-                continue;
-            }
-            let routable = config
-                .tg_media
-                .is_vision_capable_with_provider(model_id, Some(provider));
-            if routable {
-                continue;
-            }
-            let explicit_deny = provider
-                .capabilities
-                .get(model_id)
-                .and_then(|c| c.supports_vision)
-                == Some(false);
-            if !explicit_deny {
-                violations.push(format!(
-                    "INV-2 {provider_name}/{model_id}: name suggests vision but \
-                     is_vision_capable_with_provider=false and no explicit deny"
-                ));
-            }
-        }
-    }
-
-    let count = violations.len();
-    for v in &violations {
-        tracing::warn!(violation = %v, "caps invariant violation at boot");
-    }
-
-    if count == 0 {
-        tracing::info!(
-            providers = config.providers.len(),
-            "caps invariant sweep clean (INV-1 + INV-2)"
-        );
-    } else if std::env::var_os("NAKED_STRICT_CAPS").is_some_and(|v| v == "1") {
-        // Strict mode — fail boot rather than ship broken caps to prod.
-        eprintln!(
-            "❌ {} caps invariant violation(s) at boot and NAKED_STRICT_CAPS=1; refusing to start",
-            count
-        );
-        for v in &violations {
-            eprintln!("   {v}");
-        }
-        std::process::exit(3);
-    }
-
-    count
-}
-
-/// BUG_REGISTRY D-BOOT-DESCRIBER-WARN: boot-time health check for the
-/// multimodal vision path. Emits a loud WARN if the default model
-/// can't accept image content blocks AND `tg_media.vision` describer
-/// fallback is unconfigured — in that state, every photo from a user
-/// pinned to the default model gets the "[⚠ vision not configured]"
-/// placeholder text and the image content is lost. INFO when healthy.
-///
-/// `pub(crate)` so this can be unit-tested without spinning up the
-/// full async wiring pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultimodalDescriberHealth {
-    /// Default model is vision-capable; describer presence irrelevant.
-    DefaultVision,
-    /// Default model isn't vision-capable but describer fallback exists.
-    DescriberFallback,
-    /// Default model isn't vision-capable AND no describer — photos
-    /// from default-model users will be silently dropped.
-    Degraded,
-}
-
-pub(crate) fn check_multimodal_describer_health(
-    config: &naked_core::config::Config,
-) -> MultimodalDescriberHealth {
-    let default_provider = config.providers.get(&config.default_provider);
-    let default_is_vision = config
-        .tg_media
-        .is_vision_capable_with_provider(&config.default_model, default_provider);
-    let describer = config.tg_media.vision.is_some();
-    let outcome = match (default_is_vision, describer) {
-        (true, _) => MultimodalDescriberHealth::DefaultVision,
-        (false, true) => MultimodalDescriberHealth::DescriberFallback,
-        (false, false) => MultimodalDescriberHealth::Degraded,
-    };
-    match outcome {
-        MultimodalDescriberHealth::Degraded => {
-            tracing::warn!(
-                default_provider = %config.default_provider,
-                default_model = %config.default_model,
-                "multimodal degraded: default model is not vision-capable AND \
-                 no tg_media.vision describer fallback configured. \
-                 Photos from users on this model will be lost. \
-                 Either pin to a vision-capable model (e.g. qwen3-vl-plus) \
-                 or set tg_media.vision in naked.json."
-            );
-        }
-        MultimodalDescriberHealth::DefaultVision => {
-            tracing::info!(
-                default_provider = %config.default_provider,
-                default_model = %config.default_model,
-                "multimodal: default model is vision-capable"
-            );
-        }
-        MultimodalDescriberHealth::DescriberFallback => {
-            tracing::info!(
-                default_provider = %config.default_provider,
-                default_model = %config.default_model,
-                describer_model = ?config.tg_media.vision.as_ref().map(|v| &v.model),
-                "multimodal: default is text-only, describer fallback active"
-            );
-        }
-    }
-    outcome
-}
+#[cfg(test)]
+use health::{MultimodalDescriberHealth, classify_vision_probe_error};
+use health::{
+    VisionShapeOutcome, audit_all_providers, boot_caps_invariant_sweep,
+    check_multimodal_describer_health, probe_vision_content_shape,
+};
+use invariants::{
+    check_config_symlink_invariant, check_system_prompt_paths, populate_novnc_ip_allowlist,
+    spawn_config_mtime_watcher,
+};
 
 pub(crate) async fn build() -> WiredBot {
     let config = Config::load().expect("Failed to load config");
@@ -876,21 +283,13 @@ pub(crate) async fn build() -> WiredBot {
     // (LazyLock is initialised on first deref).
     let _ = *crate::shared::PROCESS_STARTED_AT;
 
-    if config.research.enabled && _scheduler_lock.is_some() {
-        let scheduler_cfg = research_scheduler::SchedulerConfig {
-            verify_by_default: config.research.verify_by_default,
-            max_verification_rounds: config.research.gatekeeper.max_rounds,
-            max_concurrent_runs: config.research.max_concurrent_runs.max(1),
-            task_timeout: std::time::Duration::from_secs(config.research.task_timeout_seconds),
-            max_retries_before_alert: config.research.max_retries_before_alert,
-            liveness: Some(liveness.clone()),
-            ..Default::default()
-        };
-        let (_scheduler, hook) =
-            research_scheduler::ResearchScheduler::start(Arc::downgrade(&agent), scheduler_cfg);
-        agent.set_scheduler_hook(hook);
-        tracing::info!("research scheduler online");
-    }
+    // T2.6 (PLAN_RESEARCH_AGENT_FLOW_v1): scheduler init moved BELOW
+    // bot + channel_map creation so we can capture them in the
+    // SyntheticDispatchFn closure. See [`research_scheduler_with_dispatch`]
+    // helper invoked after bot is ready. Hook installation moved with
+    // it — nothing between this point and bot creation requires the
+    // research scheduler hook (memory_scheduler + hooks/init_mcp are
+    // independent of research).
 
     // Daily-memory digest scheduler. Runs `memory::daily::run_daily`
     // for the project + every on-disk user scope at the configured
@@ -990,10 +389,10 @@ pub(crate) async fn build() -> WiredBot {
                         ?tid,
                         remaining_h,
                         "restored yolo for session {} ({remaining_h}h left)",
-                        &session_id[..8]
+                        &session_id[..8] // REGISTRY-WAIVE: B48 — session ID is ASCII hex
                     );
                 } else {
-                    tracing::info!(cid, ?tid, "yolo expired for session {}", &session_id[..8]);
+                    tracing::info!(cid, ?tid, "yolo expired for session {}", &session_id[..8]); // REGISTRY-WAIVE: B48 — session ID is ASCII hex
                 }
             }
             if let Some(tools) = &sc.allow_list {
@@ -1006,7 +405,7 @@ pub(crate) async fn build() -> WiredBot {
                         ?tid,
                         n = tools.len(),
                         "restored allow-list for session {}",
-                        &session_id[..8]
+                        &session_id[..8] // REGISTRY-WAIVE: B48 — session ID is ASCII hex
                     );
                 }
             }
@@ -1127,6 +526,73 @@ pub(crate) async fn build() -> WiredBot {
         .send()
         .await;
     tracing::info!("Webhook cleared, starting polling loop");
+
+    // T2.6 (PLAN_RESEARCH_AGENT_FLOW_v1): build the synthetic-message
+    // dispatch closure now that Bot + channel_map + agent are all in
+    // scope. The scheduler will call this when a spec is due AND has
+    // `chat_id` configured — the synthetic message lands in the
+    // operator's chat thread, gets a normal session via channel_map,
+    // and streams through the same pipeline as user-typed messages.
+    // The standard ⏹ Abort button is attached automatically; `/abort`
+    // command works the same way (B57 mitigation).
+    if config.research.enabled && _scheduler_lock.is_some() {
+        // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): the dispatch closure is
+        // now a thin shim over `synthetic::dispatch_for_chat` so the
+        // scheduler path AND the operator `/research run X` path share
+        // the same flow. The session-creation policy lives in synthetic.rs.
+        let dispatch_fn: naked_tg::synthetic::SyntheticDispatchFn = {
+            let agent = agent.clone();
+            let channel_map = channel_map.clone();
+            std::sync::Arc::new(move |msg: naked_tg::synthetic::SyntheticMessage| {
+                let agent = agent.clone();
+                let channel_map = channel_map.clone();
+                Box::pin(async move {
+                    let spec_id_owned =
+                        msg.source.spec_id().map(str::to_string).unwrap_or_default();
+                    match naked_tg::synthetic::dispatch_for_chat(
+                        &agent,
+                        &channel_map,
+                        msg.chat_id,
+                        msg.thread_id,
+                        &spec_id_owned,
+                    )
+                    .await
+                    {
+                        Ok((sid, _handle)) => {
+                            tracing::info!(
+                                session_id = %sid,
+                                spec_id = %spec_id_owned,
+                                "synthetic dispatch: turn submitted via wiring closure"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                spec_id = %spec_id_owned,
+                                error = %e,
+                                "synthetic dispatch failed; scheduler will retry next tick"
+                            );
+                        }
+                    }
+                })
+            })
+        };
+        let scheduler_cfg = research_scheduler::SchedulerConfig {
+            verify_by_default: config.research.verify_by_default,
+            max_verification_rounds: config.research.gatekeeper.max_rounds,
+            max_concurrent_runs: config.research.max_concurrent_runs.max(1),
+            task_timeout: std::time::Duration::from_secs(config.research.task_timeout_seconds),
+            max_retries_before_alert: config.research.max_retries_before_alert,
+            liveness: Some(liveness.clone()),
+            dispatch_fn: Some(dispatch_fn),
+            ..Default::default()
+        };
+        let (_scheduler, hook) =
+            research_scheduler::ResearchScheduler::start(Arc::downgrade(&agent), scheduler_cfg);
+        agent.set_scheduler_hook(hook);
+        tracing::info!(
+            "research scheduler online (synthetic dispatch wired; T2.6 PLAN_RESEARCH_AGENT_FLOW_v1)"
+        );
+    }
 
     let rate_limiter = RATE_LIMITER.clone();
 

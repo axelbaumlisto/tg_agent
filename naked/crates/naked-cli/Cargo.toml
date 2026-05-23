@@ -19,6 +19,9 @@ path = "src/bin/validate_brief.rs"
 
 [dependencies]
 naked-core = { path = "../naked-core" }
+# RATIONALE: `naked tg` CLI subcommand reuses MockDispatcher + SyntheticMessage
+# + ChannelSessionMap as off-bot diagnostic surface; presentation layer only.
+naked-tg = { path = "../naked-tg" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }

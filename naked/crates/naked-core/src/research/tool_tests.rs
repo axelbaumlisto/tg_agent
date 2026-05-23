@@ -59,13 +59,82 @@ async fn research_save_stores_and_dedups() {
     assert_eq!(store.count_findings("r1").await.unwrap(), 1);
 }
 
+// ── T5.1 tests (PLAN_RESEARCH_AGENT_FLOW_v1) ───────────────────────────────
+// Verify explicit spec_id arg: no active context required when spec_id is
+// passed. Also verify arg wins over context (DIP / Tell-Don't-Ask).
+
+#[tokio::test]
+async fn research_save_with_explicit_spec_id_no_context() {
+    // T5.1: spec_id arg means no active context needed
+    let (_tmp, store, ctx) = setup(); // ctx has no id set
+    store
+        .create_spec(&make_spec("explicit-spec"))
+        .await
+        .unwrap();
+    let tool = ResearchSaveTool::new(store.clone(), ctx, Default::default());
+    let cwd = std::env::current_dir().unwrap();
+    let r = tool
+        .execute(
+            json!({
+                "spec_id": "explicit-spec",
+                "url": "https://ex.com/via-spec-id",
+                "title": "Via explicit spec_id"
+            }),
+            &cwd,
+        )
+        .await;
+    assert!(
+        !r.is_error,
+        "should succeed with explicit spec_id: {}",
+        r.output
+    );
+    assert!(
+        r.output.contains("\"stored\":true"),
+        "finding should be stored: {}",
+        r.output
+    );
+    assert_eq!(store.count_findings("explicit-spec").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn research_save_explicit_spec_id_overrides_context() {
+    // T5.1: explicit spec_id takes priority over active context id
+    let (_tmp, store, ctx) = setup();
+    store.create_spec(&make_spec("ctx-spec")).await.unwrap();
+    store.create_spec(&make_spec("arg-spec")).await.unwrap();
+    ctx.set_id(Some("ctx-spec".into()));
+    let tool = ResearchSaveTool::new(store.clone(), ctx, Default::default());
+    let cwd = std::env::current_dir().unwrap();
+    let r = tool
+        .execute(
+            json!({
+                "spec_id": "arg-spec",
+                "url": "https://ex.com/arg-wins",
+                "title": "Arg wins"
+            }),
+            &cwd,
+        )
+        .await;
+    assert!(!r.is_error, "should succeed: {}", r.output);
+    // arg-spec gets the finding, ctx-spec stays empty
+    assert_eq!(store.count_findings("arg-spec").await.unwrap(), 1);
+    assert_eq!(store.count_findings("ctx-spec").await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn research_save_rejects_missing_context() {
+    // T5.1 backward compat: still fails when NEITHER spec_id arg NOR context
     let (_tmp, store, ctx) = setup();
     let tool = ResearchSaveTool::new(store.clone(), ctx, Default::default());
     let cwd = std::env::current_dir().unwrap();
     let r = tool.execute(json!({"url":"https://ex.com/a"}), &cwd).await;
     assert!(r.is_error);
+    // Error message should explain both ways to fix it
+    assert!(
+        r.output.contains("spec_id") || r.output.contains("research context"),
+        "error should mention spec_id or context: {}",
+        r.output
+    );
 }
 
 #[tokio::test]

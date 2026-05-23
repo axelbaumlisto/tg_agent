@@ -12,18 +12,19 @@ pub(crate) mod tools;
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
+/// T3 (PLAN_v13_SOLID_AUDIT): takes `&BotDeps` for shared infra.
 pub(crate) async fn handle_command(
-    bot: &Bot,
+    deps: &crate::message_handler::BotDeps,
     _msg: &Message,
     text: &str,
-    agent: &Arc<AgentCore>,
-    channel_map: &Arc<ChannelSessionMap>,
-    config: &Config,
     ctx: ChatCtx,
     pending_perms: &PendingPermissions,
-    attribution_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<bool, teloxide::RequestError> {
+    let bot = &deps.bot;
+    let agent = &deps.agent;
+    let channel_map = &deps.channel_map;
+    let config = &deps.config;
+    let attribution_flag = &deps.attribution_flag;
     let chat_id = ctx.chat_id.0;
 
     let cmd_word = text.split_whitespace().next().unwrap_or("");
@@ -79,6 +80,7 @@ pub(crate) async fn handle_command(
             research::handle_research_cmd(
                 bot,
                 agent,
+                channel_map,
                 config,
                 &ctx,
                 effective_text,

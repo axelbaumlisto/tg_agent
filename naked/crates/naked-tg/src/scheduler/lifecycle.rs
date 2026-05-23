@@ -479,3 +479,74 @@ pub(crate) async fn sleep_until_next(d: Duration) {
     let deadline = Instant::now() + d;
     sleep(deadline.saturating_duration_since(Instant::now())).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use naked_core::research::{Inflight, RunState};
+
+    fn make_inflight(spec_id: &str, state: RunState, resurrected: bool) -> Inflight {
+        Inflight {
+            spec_id: spec_id.to_string(),
+            state,
+            scheduled_after_resurrection: resurrected,
+            attempt: 1,
+            ..Inflight::scheduled(spec_id.to_string(), 1)
+        }
+    }
+
+    #[test]
+    fn plan_resurrection_drains_empty_nonterminal() {
+        let result = plan_resurrection_drains(&[], &HashSet::new(), 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn plan_resurrection_drains_zero_slots() {
+        let items = vec![make_inflight("a", RunState::Scheduled, true)];
+        let result = plan_resurrection_drains(&items, &HashSet::new(), 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn plan_resurrection_drains_picks_resurrected_scheduled_only() {
+        let items = vec![
+            make_inflight("a", RunState::Scheduled, true), // eligible
+            make_inflight("b", RunState::Running, true),   // wrong state
+            make_inflight("c", RunState::Scheduled, false), // not resurrected
+        ];
+        let result = plan_resurrection_drains(&items, &HashSet::new(), 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "a");
+    }
+
+    #[test]
+    fn plan_resurrection_drains_skips_already_running() {
+        let items = vec![make_inflight("a", RunState::Scheduled, true)];
+        let mut running = HashSet::new();
+        running.insert("a".to_string());
+        let result = plan_resurrection_drains(&items, &running, 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn plan_resurrection_drains_respects_slot_cap() {
+        let items: Vec<_> = (0..10)
+            .map(|i| make_inflight(&format!("s-{i}"), RunState::Scheduled, true))
+            .collect();
+        let result = plan_resurrection_drains(&items, &HashSet::new(), 3);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn plan_resurrection_drains_sorted_alphabetically() {
+        let items = vec![
+            make_inflight("zulu", RunState::Scheduled, true),
+            make_inflight("alpha", RunState::Scheduled, true),
+            make_inflight("mike", RunState::Scheduled, true),
+        ];
+        let result = plan_resurrection_drains(&items, &HashSet::new(), 10);
+        let ids: Vec<&str> = result.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zulu"]);
+    }
+}

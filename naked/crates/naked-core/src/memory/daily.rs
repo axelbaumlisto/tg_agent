@@ -228,7 +228,7 @@ pub fn recent_shift_block(
         return None;
     }
     if out.len() > cfg.recent_shift_max_chars {
-        out.truncate(cfg.recent_shift_max_chars);
+        out.truncate(out.floor_char_boundary(cfg.recent_shift_max_chars));
         out.push_str("\n…[truncated]");
     }
     Some(out)

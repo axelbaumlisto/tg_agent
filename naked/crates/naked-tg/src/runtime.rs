@@ -12,7 +12,9 @@ use teloxide::types::CallbackQuery;
 use crate::album;
 use crate::callbacks::handle_callback;
 use crate::message_handler::BotDeps;
-use crate::shared::{HashMap, PendingPermissions, RwLock, STEER_SENDERS, run_health_server};
+use crate::shared::{
+    ChatCtx, HashMap, PendingPermissions, RwLock, STEER_SENDERS, run_health_server,
+};
 use crate::wiring::WiredBot;
 
 /// Run the Telegram polling event loop until shutdown.
@@ -59,11 +61,18 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                 crate::markup::escape_html(&err_short),
             ));
         }
-        let text = lines.join("\n");
-        let _ = bot
-            .send_message(owner_chat, &text)
-            .parse_mode(teloxide::types::ParseMode::Html)
-            .await;
+        let mcp_ctx = ChatCtx {
+            chat_id: owner_chat,
+            thread_id: None,
+            reply_to: None,
+        };
+        let _ = crate::shared::safe_send(
+            &bot,
+            &mcp_ctx,
+            lines.join("\n"),
+            Some(teloxide::types::ParseMode::Html),
+        )
+        .await;
     }
 
     if config.telegram.allowed_chat_ids.is_empty() {

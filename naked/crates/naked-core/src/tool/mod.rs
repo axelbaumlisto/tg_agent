@@ -22,6 +22,7 @@ pub mod recall_archive;
 pub mod registry;
 pub mod remember;
 pub mod remote;
+pub mod research_run;
 pub mod revert_turn;
 pub mod review_tool;
 pub mod schema_sanitize;

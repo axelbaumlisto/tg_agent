@@ -58,7 +58,8 @@ pub(crate) fn handle_thinking_delta(view: &mut CompositeView, text: &str) -> Vie
     }
     // PLAN_TG_INTERLEAVED_v1 §2.2: also push event to timeline so the
     // renderer can interleave thinking with text/tools chronologically.
-    view.events.push(TurnEvent::ReasoningDelta(text.to_string()));
+    view.events
+        .push(TurnEvent::ReasoningDelta(text.to_string()));
     ViewAction::Dirty
 }
 
@@ -112,8 +113,7 @@ pub(crate) fn handle_tool_end(
     // that hasn't been paired with a ToolResult yet). Falls back to 0 if
     // unmatchable, which is harmless — idx is only used for visual pairing.
     let mut matched_idx: u32 = 0;
-    let mut seen_results: std::collections::HashSet<u32> =
-        std::collections::HashSet::new();
+    let mut seen_results: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for ev in view.events.iter().rev() {
         match ev {
             TurnEvent::ToolResult { idx, .. } => {

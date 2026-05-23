@@ -6,7 +6,7 @@ mod handlers;
 mod helpers;
 mod pipeline;
 pub(crate) use delta::render_html_document;
-pub(crate) use flush::{ask_permission, flush_live, send_final, send_long_text};
+pub(crate) use flush::{ask_permission, flush_live, send_final};
 pub(crate) use handlers::ViewAction;
 pub(crate) use helpers::*;
 pub(crate) use pipeline::stream_response;
@@ -47,11 +47,7 @@ pub(crate) enum TurnEvent {
         idx: u32,
     },
     /// Tool finished. `idx` links back to the matching `ToolStart`.
-    ToolResult {
-        idx: u32,
-        ok: bool,
-        output: String,
-    },
+    ToolResult { idx: u32, ok: bool, output: String },
     /// Reference into the `sub_agents` map; renders as the sub-agent's
     /// current status line at this position in the timeline.
     SubAgentReference { agent_id: String },
@@ -136,8 +132,6 @@ impl CompositeView {
     }
 }
 
-// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
-#[allow(clippy::too_many_arguments)]
 /// Apply a sub-agent progress event to the composite view.
 fn apply_sub_agent_event(
     view: &mut CompositeView,

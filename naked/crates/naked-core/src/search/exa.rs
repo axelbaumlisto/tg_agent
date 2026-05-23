@@ -99,14 +99,7 @@ impl SearchEngine for ExaEngine {
 }
 
 fn truncate_at_char_boundary(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
+    crate::util::head_truncate(s, max).to_string()
 }
 
 #[cfg(test)]

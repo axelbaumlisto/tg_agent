@@ -11,7 +11,7 @@ pub(crate) async fn copilot_login_cmd() -> Result<()> {
 
     if let Some(token) = copilot::load_copilot_token() {
         let masked = if token.len() > 8 {
-            format!("{}…{}", &token[..4], &token[token.len() - 4..])
+            format!("{}…{}", &token[..4], &token[token.len() - 4..]) // REGISTRY-WAIVE: B48 — API token is ASCII
         } else {
             "****".to_string()
         };

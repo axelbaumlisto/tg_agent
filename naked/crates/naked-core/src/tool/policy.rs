@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use crate::types::Permission;
+use crate::util::head_truncate;
 
 /// Decision for a single tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,7 +262,11 @@ impl PolicyRule for SelfProtectRule {
         {
             return Some(ToolDecision::Deny(format!(
                 "\u{1f6e1}\u{fe0f} Self-protection: bash command would modify own source code. Blocked: `{}`",
-                if cmd.len() > 80 { &cmd[..80] } else { cmd }
+                if cmd.len() > 80 {
+                    head_truncate(cmd, 80)
+                } else {
+                    cmd
+                }
             )));
         }
 

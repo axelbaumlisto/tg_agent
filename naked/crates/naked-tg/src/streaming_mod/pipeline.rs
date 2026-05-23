@@ -42,20 +42,21 @@ pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
     ]])
 }
 
-// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
-#[allow(clippy::too_many_arguments)]
+/// T3 (PLAN_v13_SOLID_AUDIT): takes `&BotDeps` for shared infra
+/// instead of 7 individual args.  Turn-specific params remain separate.
 pub(crate) async fn stream_response(
-    bot: Bot,
+    deps: &crate::message_handler::BotDeps,
     ctx: ChatCtx,
     handle: AgentHandle,
-    channel_map: &ChannelSessionMap,
-    pending_perms: &PendingPermissions,
     model_tag: String,
-    http_client: &reqwest::Client,
-    base_url: &str,
-    tg_attach_queue: &naked_tg::tg_attach::AttachmentQueue,
-    rate_limiter: &naked_tg::rate_limit::RateLimiter,
 ) {
+    let bot = deps.bot.clone();
+    let channel_map = &deps.channel_map;
+    let pending_perms = &deps.pending_perms;
+    let http_client = &deps.http_client;
+    let base_url: &str = &deps.base_url;
+    let tg_attach_queue = &deps.tg_attach_queue;
+    let rate_limiter = &deps.rate_limiter;
     let AgentHandle {
         mut events,
         permissions,
@@ -199,11 +200,13 @@ pub(crate) async fn stream_response(
                     let (_, detail_msg) =
                         handlers::handle_tool_end(&mut view, &name, is_error, &output);
                     if let Some(msg) = detail_msg {
-                        let _ = bot
-                            .send_message(ctx.chat_id, &msg)
-                            .maybe_thread(ctx.thread_id)
-                            .parse_mode(teloxide::types::ParseMode::Html)
-                            .await;
+                        let _ = crate::shared::safe_send(
+                            &bot,
+                            &ctx,
+                            msg,
+                            Some(teloxide::types::ParseMode::Html),
+                        )
+                        .await;
                     }
                     dirty = true;
                 }
@@ -268,12 +271,13 @@ pub(crate) async fn stream_response(
                         files_count,
                         summary_hint.as_deref(),
                     );
-                    let _ = bot
-                        .send_message(ctx.chat_id, &note)
-                        .maybe_thread(ctx.thread_id)
-                        .maybe_reply_to(ctx.reply_to)
-                        .parse_mode(teloxide::types::ParseMode::Html)
-                        .await;
+                    let _ = crate::shared::safe_send(
+                        &bot,
+                        &ctx,
+                        note,
+                        Some(teloxide::types::ParseMode::Html),
+                    )
+                    .await;
                 }
                 AgentEvent::CycleRestarted { .. } => {}
                 AgentEvent::Heartbeat => {

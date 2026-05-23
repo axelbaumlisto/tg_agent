@@ -9,6 +9,7 @@ use anyhow::Result;
 use naked_core::AgentCore;
 use naked_core::config::Config;
 use naked_core::types::{AgentEvent, AgentHandle, PermissionResponse, TurnUsage};
+use naked_core::util::head_truncate;
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -201,7 +202,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                 };
                 if output.len() > 500 {
                     eprintln!("{color}{icon} {name}\x1b[0m ({}b)", output.len());
-                    eprintln!("\x1b[2m{}\x1b[0m", &output[..500]);
+                    eprintln!("\x1b[2m{}\x1b[0m", head_truncate(&output, 500));
                 } else if !output.is_empty() {
                     eprintln!("{color}{icon} {name}\x1b[0m");
                     eprintln!("\x1b[2m{output}\x1b[0m");
@@ -249,7 +250,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                 match sa_ev {
                     SubAgentEvent::Started { prompt_preview } => {
                         let short = if prompt_preview.len() > 80 {
-                            &prompt_preview[..80]
+                            head_truncate(&prompt_preview, 80)
                         } else {
                             &prompt_preview
                         };
@@ -260,7 +261,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                         input_preview,
                     } => {
                         let short = if input_preview.len() > 60 {
-                            &input_preview[..60]
+                            head_truncate(&input_preview, 60)
                         } else {
                             &input_preview
                         };

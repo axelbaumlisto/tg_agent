@@ -73,8 +73,8 @@ pub(crate) async fn send_final(
         if dropped > 0 {
             // Inline was head-truncated — attach full timeline.
             let html_doc = render_html_document(view);
-            let input_file = teloxide::types::InputFile::memory(html_doc)
-                .file_name("transcript.html");
+            let input_file =
+                teloxide::types::InputFile::memory(html_doc).file_name("transcript.html");
             if let Err(e) = bot
                 .send_document(chat_id, input_file)
                 .caption(format!("📄 Full timeline (+{dropped} earlier events)"))
@@ -132,20 +132,8 @@ pub(crate) async fn send_final(
     }
 }
 
-pub(crate) async fn send_long_text(
-    bot: &Bot,
-    ctx: ChatCtx,
-    text: &str,
-) -> Result<(), teloxide::RequestError> {
-    if text.len() <= MAX_TG_MSG {
-        reply_text(bot, &ctx, text).await?;
-        return Ok(());
-    }
-    for chunk in split_html(text, MAX_TG_MSG - 100) {
-        reply_text(bot, &ctx, chunk).await?;
-    }
-    Ok(())
-}
+// send_long_text removed (PLAN_TG_SAFE_SEND_v1 T3).
+// All callers use crate::shared::safe_send now.
 
 // ── Permission prompt ───────────────────────────────────────────────────────
 

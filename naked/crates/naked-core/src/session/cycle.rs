@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::types::ConversationMessage;
+use crate::util::head_truncate;
 use crate::working_set::WorkingSet;
 
 pub const DEFAULT_CYCLE_THRESHOLD_TOKENS: u64 = 768_000;
@@ -113,13 +114,13 @@ pub fn build_checkpoint(
             crate::types::Role::System => continue,
         };
         let snippet = if text.len() > 400 {
-            format!("{}...", &text[..400])
+            format!("{}...", head_truncate(&text, 400))
         } else {
             text
         };
         briefing.push_str(&format!("[{role}] {snippet}\n"));
         if briefing.len() >= budget {
-            briefing.truncate(budget);
+            briefing.truncate(briefing.floor_char_boundary(budget));
             briefing.push_str("...\n");
             break;
         }

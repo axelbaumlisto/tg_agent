@@ -1517,6 +1517,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "naked-core",
+ "naked-tg",
  "serde_json",
  "tokio",
  "tokio-stream",

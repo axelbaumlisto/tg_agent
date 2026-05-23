@@ -1,6 +1,15 @@
-//! Telegram-side rendering helpers for the live `/research run` UX.
+//! Research UI rendering helpers.
 //!
-//! Kept in its own module so `main.rs` stays focused on message
+//! **Status (B4, PLAN_RESEARCH_FLOW_CLOSURE_v1)**: the binary no longer
+//! imports anything from this module — `launch_research_run_with_ui` and
+//! `finalize_research_ui` have been removed, and all research runs go
+//! through `synthetic_dispatch::dispatch_for_chat`.
+//!
+//! The module is retained in the **lib** crate with its unit tests as a
+//! reference implementation and because `render_waterfall` may be useful
+//! for future `/research state <id>` catalog browsing.
+//!
+//! If no new consumer appears by next major cleanup, delete entirely.
 //! dispatch. The functions here are pure — no bot / network
 //! interaction — which lets us unit-test the waterfall layout without
 //! standing up a `teloxide` fake.
@@ -33,15 +42,10 @@ pub fn keyboard_after_complete(spec_id: &str) -> InlineKeyboardMarkup {
     )]])
 }
 
-/// Keyboard shown after a Stop & clarify pause: operator is invited
-/// to send a clarification message, which the TG handler accumulates
-/// into the spec's topic before offering restart.
-pub fn keyboard_paused_awaiting_clarification(spec_id: &str) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-        "▶ Restart with clarification",
-        format!("r:restart:{spec_id}"),
-    )]])
-}
+// T3.3 (PLAN_RESEARCH_AGENT_FLOW_v1): `keyboard_paused_awaiting_clarification`
+// removed — was inline button "▶ Restart with clarification" attached after
+// the obsolete Stop & clarify flow. Single-mechanism replacement: operator
+// runs `/research run <spec>` to relaunch or sends a normal message.
 
 /// Everything the waterfall renderer needs to know that *isn't* in
 /// the events themselves. Cheap to assemble from the coordinator's
@@ -160,21 +164,10 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// Pending clarification state per chat. When the operator taps "Stop
-/// & clarify" we stash the spec id here and wait for the next user
-/// message in that chat/thread to append to the spec's topic.
-///
-/// The key is `(chat_id, thread_id)` — groups with multiple threads
-/// legitimately run one research per thread, so clarifications must
-/// scope to the conversation that initiated the pause. `i64` + raw
-/// `i32` keys keep the map trivially hashable without threading
-/// teloxide types into the public API.
-#[derive(Debug, Clone)]
-pub struct PendingClarification {
-    pub spec_id: String,
-    pub message_id: teloxide::types::MessageId,
-    pub paused_at: DateTime<Utc>,
-}
+// T3.3 (PLAN_RESEARCH_AGENT_FLOW_v1): `PendingClarification` struct removed
+// along with the global PENDING_CLARIFICATIONS map. The state machine it
+// represented (per-chat paused-awaiting-clarification) collapsed into the
+// regular agent flow: just send a new message or invoke `/research run`.
 
 #[cfg(test)]
 mod tests {

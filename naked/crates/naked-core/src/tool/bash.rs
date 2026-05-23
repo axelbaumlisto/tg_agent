@@ -474,15 +474,9 @@ fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let cut = s.len() - end;
-    format!(
-        "{}\n\n[output truncated — exceeded {max_bytes} bytes, {cut} bytes cut]",
-        &s[..end]
-    )
+    let truncated = crate::util::head_truncate(s, max_bytes);
+    let cut = s.len() - truncated.len();
+    format!("{truncated}\n\n[output truncated — exceeded {max_bytes} bytes, {cut} bytes cut]",)
 }
 
 #[cfg(test)]
@@ -550,7 +544,7 @@ fn format_bash_output(
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         combined.hash(&mut hasher);
         let hash = format!("{:x}", hasher.finish());
-        let hash = &hash[..8];
+        let hash = &hash[..8]; // REGISTRY-WAIVE: B48 — hex hash is ASCII
         let path = format!("/tmp/naked_bash_{hash}.log");
         let full = if raw_stderr.is_empty() {
             raw_stdout.to_string()

@@ -29,12 +29,15 @@ impl Tool for ResearchSaveTool {
                 If the URL already exists, the finding is UPDATED with the new data \
                 (returned as `updated:true`). If the URL is new, a new finding is \
                 created. Use this to fix quality issues on existing findings by \
-                re-saving with the same URL and more complete data. Requires an \
-                active research context (set by /research run or the coordinator)."
+                re-saving with the same URL and more complete data. \
+                Pass `spec_id` explicitly to target a specific research spec, \
+                or omit it to use the active research context \
+                (set by /research run or the coordinator)."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "spec_id":      { "type": "string", "description": "Research spec ID to save to. Optional if running inside a /research run context; required otherwise. Prefer explicit spec_id for clarity." },
                     "url":          { "type": "string", "description": "Full URL of the item (required). Real URL only — never invent." },
                     "title":        { "type": "string", "description": "Short human title (≤200 chars)" },
                     "excerpt":      { "type": "string", "description": "ALL actionable details from the page: contacts (phone, name, messenger), area (m²), floor, conditions, amenities, neighbourhood, transport — everything that makes this finding useful without revisiting the URL. Up to 2000 chars." },
@@ -49,9 +52,22 @@ impl Tool for ResearchSaveTool {
     }
 
     async fn execute(&self, input: Value, _cwd: &Path) -> ToolResult {
-        let Some(id) = self.context.id() else {
+        // T5.1 (PLAN_RESEARCH_AGENT_FLOW_v1): explicit spec_id arg takes priority over
+        // active context, enabling research_save to be called without a coordinator
+        // session (e.g. from research_run tool or any agent turn with spec_id known).
+        // Fallback to self.context.id() preserves full backward compatibility for
+        // existing coordinator-driven research runs (B57 migration path).
+        let id = input
+            .get("spec_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from)
+            .or_else(|| self.context.id());
+        let Some(id) = id else {
             return ToolResult::err(
-                "no active research context — call this tool only inside /research run",
+                "no active research context and no `spec_id` argument — \
+                 pass spec_id explicitly (e.g. research_save(spec_id=\"my-spec\", url=...)) \
+                 or call inside /research run",
             );
         };
         let url = match input.get("url").and_then(|v| v.as_str()) {

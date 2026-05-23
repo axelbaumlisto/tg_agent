@@ -5,6 +5,7 @@ pub(crate) mod chat;
 pub(crate) mod copilot;
 pub(crate) mod memory;
 pub(crate) mod skills;
+pub(crate) mod tg;
 pub(crate) mod vacuum;
 
 use anyhow::Result;
@@ -44,6 +45,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
         "research" => return crate::research::research_cmd(&args[2..]).await,
         "agent" => return agent::agent_cmd(&args[2..]).await,
         "skills" => return skills::skills_cmd(&args[2..]).await,
+        "tg" => return tg::tg_cmd(&args[2..]).await,
         _ => {}
     }
 
@@ -61,6 +63,7 @@ fn print_usage() {
     println!("  memory            Persistent memory management");
     println!("  research          Research subsystem operator commands");
     println!("  skills            Inspect the skill registry");
+    println!("  tg                Telegram subsystem helpers (off-bot; mocks + diagnostics)");
     println!("  vacuum-sessions   Migrate and GC session artifacts");
     println!();
     println!("Run `naked <subcommand> help` for subcommand-specific usage.");

@@ -2,7 +2,6 @@
 //!
 //! Extracted from main.rs.
 
-use super::fmt_utils::escape_html_min;
 use super::*;
 
 #[derive(Clone)]
@@ -47,48 +46,32 @@ impl BotDeps {
             album = album_size,
         );
 
-        async move {
-            handle_message(
-                self.bot,
-                msg,
-                self.agent,
-                self.channel_map,
-                self.config,
-                self.pending_perms,
-                self.http_client,
-                self.base_url,
-                self.rate_limiter,
-                self.attribution_flag,
-                self.bot_token,
-                self.bot_identity,
-                self.tg_attach_queue,
-                extra_album_msgs,
-            )
+        async move { handle_message(self, msg, extra_album_msgs).await }
+            .instrument(span)
             .await
-        }
-        .instrument(span)
-        .await
     }
 }
 
-// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
-#[allow(clippy::too_many_arguments)]
+/// Core message handler — dispatches text, media, and commands.
+///
+/// T3 (PLAN_v13_SOLID_AUDIT): takes `BotDeps` instead of 14 individual args.
 pub(crate) async fn handle_message(
-    bot: Bot,
+    deps: BotDeps,
     msg: Message,
-    agent: Arc<AgentCore>,
-    channel_map: Arc<ChannelSessionMap>,
-    config: Config,
-    pending_perms: PendingPermissions,
-    http_client: Arc<reqwest::Client>,
-    base_url: Arc<String>,
-    rate_limiter: naked_tg::rate_limit::RateLimiter,
-    attribution_flag: Arc<std::sync::atomic::AtomicBool>,
-    bot_token: Arc<String>,
-    bot_identity: Arc<naked_tg::bot_identity::BotIdentity>,
-    tg_attach_queue: naked_tg::tg_attach::AttachmentQueue,
     extra_album_msgs: Vec<Message>,
 ) -> Result<(), teloxide::RequestError> {
+    // Borrow from deps; field access via `deps.X` where needed.
+    // Short aliases for the most-used fields.
+    let bot = &deps.bot;
+    let agent = &deps.agent;
+    let channel_map = &deps.channel_map;
+    let config = &deps.config;
+    let pending_perms = &deps.pending_perms;
+    let attribution_flag = &deps.attribution_flag;
+    let http_client = &deps.http_client;
+    let base_url = &deps.base_url;
+    let bot_token: &str = &deps.bot_token;
+    let bot_identity = &deps.bot_identity;
     let ctx = ChatCtx::from_msg(&msg);
     let chat_id_raw = ctx.chat_id.0;
 
@@ -143,67 +126,18 @@ pub(crate) async fn handle_message(
 
     // Permission check before spending any time on media processing or
     // touching the agent core.
-    if !is_allowed(chat_id_raw, &config) {
+    if !is_allowed(chat_id_raw, config) {
         tracing::warn!("Rejected message from chat_id={chat_id_raw}");
         return Ok(());
     }
 
-    // Research clarification intercept. A prior `r:stop:<spec>` callback
-    // stashed a `PendingClarification` keyed on (chat, thread); the next
-    // non-empty text message becomes a topic update + "Restart" prompt.
-    // We intercept before the addressing gate because DMs are the normal
-    // research delivery surface and we don't want to force a bot mention
-    // in private chats just to reply to an inline button.
-    if let Some(text) = text_direct
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && !text.starts_with('/')
-    {
-        let key = (chat_id_raw, ctx.raw_thread_id());
-        let maybe_pending = PENDING_CLARIFICATIONS.write().await.remove(&key);
-        if let Some(pending) = maybe_pending {
-            let spec_id = pending.spec_id;
-            let store = agent.research_store();
-            let outcome = match store.load_spec(&spec_id).await {
-                Ok(mut spec) => {
-                    let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string();
-                    if !spec.topic.trim_end().ends_with('\n') && !spec.topic.is_empty() {
-                        spec.topic.push('\n');
-                    }
-                    spec.topic.push_str(&format!("\nUPDATE {stamp}: {text}"));
-                    store.save_spec(&spec).await
-                }
-                Err(e) => Err(e),
-            };
-            match outcome {
-                Ok(()) => {
-                    let body = format!(
-                        "✅ Clarification saved to <code>{}</code>.\nTap below to relaunch with the updated topic.",
-                        escape_html_min(&spec_id)
-                    );
-                    let _ = bot
-                        .edit_message_text(ctx.chat_id, pending.message_id, body)
-                        .parse_mode(ParseMode::Html)
-                        .reply_markup(keyboard_paused_awaiting_clarification(&spec_id))
-                        .await;
-                }
-                Err(e) => {
-                    let body = format!(
-                        "⚠️ Could not save clarification for <code>{}</code>: {}",
-                        escape_html_min(&spec_id),
-                        escape_html_min(&format!("{e:#}"))
-                    );
-                    let _ = bot
-                        .send_message(ctx.chat_id, body)
-                        .parse_mode(ParseMode::Html)
-                        .maybe_thread(ctx.thread_id)
-                        .await;
-                }
-            }
-            return Ok(());
-        }
-    }
+    // T3.3 (PLAN_RESEARCH_AGENT_FLOW_v1): Research clarification intercept
+    // was here. Removed — a paused research run is now resumed naturally
+    // via `/research run <spec>` (or `/abort` cancels the in-flight turn).
+    // Clarifications = just type a new message and re-run; no magic
+    // PENDING_CLARIFICATIONS state machine, no special restart button.
+    // See BUG_REGISTRY B56 (parallel-cancel-mechanisms): keeping the bot
+    // free of bespoke clarification state aligns with single-mechanism flow.
 
     // Group-chat addressing gate. Privacy mode is OFF for this bot
     // (`can_read_all_group_messages: true` from getMe), so Telegram
@@ -213,7 +147,7 @@ pub(crate) async fn handle_message(
     // only **respond** when the message is explicitly addressed to us
     // — see `naked_tg::bot_identity::is_addressed_to_bot` for the
     // exact rules. Private chats always pass this gate.
-    if !naked_tg::bot_identity::is_addressed_to_bot(&msg, &bot_identity) {
+    if !naked_tg::bot_identity::is_addressed_to_bot(&msg, bot_identity) {
         // INFO-level on purpose: in groups with privacy-mode OFF this
         // is the only way to confirm "yes, we saw the message, and we
         // intentionally chose not to respond". The volume is bounded
@@ -279,27 +213,24 @@ pub(crate) async fn handle_message(
     // Pass-2: if there's media, acknowledge and process it (download + transform).
     let media_processed = if !media_items.is_empty() {
         let _ = send_text(
-            &bot,
+            bot,
             ctx.chat_id,
             ctx.thread_id,
             "\u{1F4E5} processing media\u{2026}",
         )
         .await;
-        Some(
-            process_media_items(
-                &media_items,
-                &bot_token,
-                &config,
-                http_client.clone(),
-                base_url.clone(),
-                caption.as_deref(),
-                msg.id.0,
-                route_images_natively,
-                native_cap_bytes,
-                &pre_model,
-            )
-            .await,
-        )
+        let media_ctx = crate::media_dispatch::MediaCtx {
+            bot_token,
+            config,
+            http: http_client.clone(),
+            base_url: base_url.clone(),
+            user_caption: caption.as_deref(),
+            msg_id: msg.id.0,
+            route_images_natively,
+            native_cap_bytes,
+            active_model: &pre_model,
+        };
+        Some(process_media_items(&media_items, &media_ctx).await)
     } else {
         None
     };
@@ -365,7 +296,7 @@ pub(crate) async fn handle_message(
         // dispatch and (on the first hit per chat) drop a one-line hint
         // so the operator knows the silence is intentional. See
         // `Config.chat_personas` in `naked-core::config` for the contract.
-        if drop_slash_for_persona(&bot, chat_id_raw, &msg, &config).await {
+        if drop_slash_for_persona(bot, chat_id_raw, &msg, config).await {
             return Ok(());
         }
         // `/start@zGsR_bot args` → `/start args` so command parsing
@@ -374,20 +305,9 @@ pub(crate) async fn handle_message(
         // addressing gate above (returned as not-addressed), so any
         // `@bot` suffix that survives to this point either targets
         // us or doesn't exist at all.
-        let canonical = naked_tg::bot_identity::strip_bot_command_suffix(&text, &bot_identity)
+        let canonical = naked_tg::bot_identity::strip_bot_command_suffix(&text, bot_identity)
             .unwrap_or_else(|| text.clone());
-        let handled = handle_command(
-            &bot,
-            &msg,
-            &canonical,
-            &agent,
-            &channel_map,
-            &config,
-            ctx,
-            &pending_perms,
-            &attribution_flag,
-        )
-        .await?;
+        let handled = handle_command(&deps, &msg, &canonical, ctx, pending_perms).await?;
         if handled {
             return Ok(());
         }
@@ -398,7 +318,7 @@ pub(crate) async fn handle_message(
     // a session if one didn't exist yet.
     let session_id = match existing_session_id {
         Some(sid) => sid,
-        None => get_or_create_session(ctx, &agent, &channel_map, &config).await,
+        None => get_or_create_session(ctx, agent, channel_map, config).await,
     };
 
     // Build optional native-multimodal blocks. When present, these go through
@@ -533,27 +453,101 @@ pub(crate) async fn handle_message(
     let handle = match send_result {
         Ok(h) => h,
         Err(e) => {
-            bot.send_message(ctx.chat_id, format!("Error: {e}"))
-                .maybe_thread(ctx.thread_id)
-                .maybe_reply_to(ctx.reply_to)
-                .await?;
+            crate::shared::safe_send(bot, &ctx, format!("Error: {e}"), None).await?;
             return Ok(());
         }
     };
 
-    stream_response(
-        bot,
-        ctx,
-        handle,
-        &channel_map,
-        &pending_perms,
-        model_tag,
-        &http_client,
-        &base_url,
-        &tg_attach_queue,
-        &rate_limiter,
-    )
-    .await;
+    stream_response(&deps, ctx, handle, model_tag).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Source-text sentinel tests for message_handler.rs.
+    //!
+    //! The handler requires Bot + AgentCore + ChannelSessionMap to run,
+    //! which is too heavy for unit tests. These sentinels pin the
+    //! structural contracts via include_str!.
+
+    fn source() -> &'static str {
+        include_str!("message_handler.rs")
+    }
+
+    #[test]
+    fn permission_check_before_any_processing() {
+        let src = source();
+        let allowed_pos = src.find("is_allowed(").expect("is_allowed call must exist");
+        let agent_pos = src
+            .find("get_or_create_session")
+            .expect("session creation must exist");
+        assert!(
+            allowed_pos < agent_pos,
+            "is_allowed must run BEFORE get_or_create_session (authz gate)"
+        );
+    }
+
+    #[test]
+    fn empty_messages_short_circuit() {
+        let src = source();
+        assert!(
+            src.contains("text_direct.is_none() && caption.is_none() && media_items.is_empty()"),
+            "empty-message short-circuit must exist"
+        );
+    }
+
+    #[test]
+    fn group_addressing_gate_exists() {
+        let src = source();
+        assert!(
+            src.contains("is_addressed_to_bot"),
+            "group addressing gate must exist for group-chat safety"
+        );
+    }
+
+    #[test]
+    fn command_routing_via_handle_command() {
+        let src = source();
+        assert!(
+            src.contains("handle_command("),
+            "slash commands must route through handle_command"
+        );
+    }
+
+    #[test]
+    fn media_extraction_before_agent_turn() {
+        let src = source();
+        let media_pos = src
+            .find("extract_media_items(")
+            .expect("media extraction must exist");
+        let session_pos = src
+            .find("get_or_create_session")
+            .expect("session creation must exist");
+        assert!(
+            media_pos < session_pos,
+            "media extraction must happen BEFORE session creation"
+        );
+    }
+
+    #[test]
+    fn stream_response_dispatched_via_bot_deps() {
+        // T3 contract: stream_response takes &BotDeps, not 10 individual args.
+        let src = source();
+        assert!(
+            src.contains("stream_response(&deps,"),
+            "stream_response must be called with &deps (T3 BotDeps pattern)"
+        );
+    }
+
+    #[test]
+    fn album_caption_coalescing() {
+        // Telegram only puts caption on first photo in album. The handler
+        // must search the whole batch for the first non-empty caption.
+        let src = source();
+        assert!(
+            src.contains("extra_album_msgs.iter()") && src.contains("caption"),
+            "album caption coalescing must search extra_album_msgs"
+        );
+    }
 }

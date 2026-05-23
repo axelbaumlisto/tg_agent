@@ -44,6 +44,7 @@ pub(crate) fn escape_html_min(s: &str) -> String {
 }
 
 /// Slugify a string for use as a research ID.
+#[cfg(test)] // B4: only used in tests after finalize_research_ui removal
 pub(crate) fn safe_slug(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_dash = false;

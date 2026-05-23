@@ -593,12 +593,7 @@ fn truncate_detail(s: &str) -> String {
     if s.len() <= MAX {
         s.to_string()
     } else {
-        // byte-safe truncation on char boundary
-        let mut end = MAX;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…", &s[..end])
+        format!("{}…", crate::util::head_truncate(s, MAX))
     }
 }
 

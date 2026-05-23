@@ -63,7 +63,12 @@ pub use dispatch::{is_due, plan_dispatches};
 /// Configuration knobs for [`ResearchScheduler`]. Defaults match the prod TG
 /// bot: scan every 30s, allow five runs at a time, time out individual runs
 /// at 10 minutes, alert after 3 consecutive failures.
-#[derive(Debug, Clone)]
+///
+/// **NOTE**: `Debug` is intentionally NOT derived because `dispatch_fn`
+/// (T6.3 — PLAN_RESEARCH_AGENT_FLOW_v1) wraps an opaque async closure that
+/// can't be Debug-printed. Manual impl below renders the closure as a
+/// presence/absence marker so logging is still useful.
+#[derive(Clone)]
 pub struct SchedulerConfig {
     /// Maximum interval between background scans even when no events arrive.
     pub tick_interval: Duration,
@@ -144,6 +149,42 @@ pub struct SchedulerConfig {
     /// scheduler with the same mechanism it uses for the polling
     /// loop. F2 of `PLAN_NEXT_SESSION.md`.
     pub liveness: Option<std::sync::Arc<naked_core::liveness::LivenessRegistry>>,
+    /// Optional synthetic-message dispatcher. T6.3 (PLAN_RESEARCH_AGENT_FLOW_v1):
+    /// when set AND `spec.chat_id` is configured, the scheduler injects a
+    /// synthetic message into the chat thread instead of calling
+    /// `run_research_verified_with_cancel` directly. This binds the
+    /// scheduler-launched run to a real chat session so the operator
+    /// can `/abort` it like any other turn (B57 mitigation).
+    ///
+    /// When `None` (default) OR when `spec.chat_id` is `None`, the
+    /// scheduler falls back to the legacy direct-run path (T6.4 fallback).
+    /// Wired by `wiring.rs` at boot.
+    pub dispatch_fn: Option<crate::synthetic::SyntheticDispatchFn>,
+}
+
+impl std::fmt::Debug for SchedulerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchedulerConfig")
+            .field("tick_interval", &self.tick_interval)
+            .field("max_concurrent_runs", &self.max_concurrent_runs)
+            .field("verify_by_default", &self.verify_by_default)
+            .field("max_verification_rounds", &self.max_verification_rounds)
+            .field("task_timeout", &self.task_timeout)
+            .field("max_retries_before_alert", &self.max_retries_before_alert)
+            .field("auto_pause_after_failures", &self.auto_pause_after_failures)
+            .field("max_resurrection_attempts", &self.max_resurrection_attempts)
+            .field("heartbeat_budget", &self.heartbeat_budget)
+            .field("resurrection_stagger", &self.resurrection_stagger)
+            .field("cancel_grace_period", &self.cancel_grace_period)
+            .field(
+                "inflight_terminal_retention",
+                &self.inflight_terminal_retention,
+            )
+            .field("inflight_purge_interval", &self.inflight_purge_interval)
+            .field("liveness", &self.liveness.is_some())
+            .field("dispatch_fn", &self.dispatch_fn.is_some())
+            .finish()
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -165,6 +206,7 @@ impl Default for SchedulerConfig {
             inflight_purge_interval: Duration::from_secs(60 * 60),
             clock: std::sync::Arc::new(RealClock),
             liveness: None,
+            dispatch_fn: None,
         }
     }
 }

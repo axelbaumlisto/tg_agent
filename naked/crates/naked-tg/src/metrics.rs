@@ -59,6 +59,55 @@ static MEDIA_TRANSCRIPTION_FAIL_RATE: AtomicU64 = AtomicU64::new(0);
 static MEDIA_TRANSCRIPTION_FAIL_PAYLOAD: AtomicU64 = AtomicU64::new(0);
 static MEDIA_TRANSCRIPTION_FAIL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
 static MEDIA_TRANSCRIPTION_FAIL_NETWORK: AtomicU64 = AtomicU64::new(0);
+
+// ── T11 (PLAN_RESEARCH_AGENT_FLOW_v1) ───────────────────────
+// Research-cancel propagation latency. Tracks the time from
+// `callbacks::handle_callback("r:stop:<id>")` receipt (or equivalent
+// /abort command) to the moment the agent's tool loop actually exits.
+//
+// The 2026-05-16 incident (B56 PARALLEL-CANCEL-MECHANISMS) had
+// effective propagation time of **infinity** — user pressed Stop
+// ×3 over 32s and tools kept running for ~3 min after. With the
+// unified `agent.abort(session_id)` path, propagation SHOULD be
+// under 3s (next iteration boundary).
+//
+// Three buckets keep cardinality low while making outliers visible:
+//   - under_3s   : nominal
+//   - 3s_to_30s  : slow but recovers (likely tool mid-network call)
+//   - over_30s   : alert-worthy (cancel got dropped somewhere)
+//
+// Sum + count expose the running average too (~1.2-1.5s expected).
+static RESEARCH_CANCEL_PROPAGATION_UNDER_3S: AtomicU64 = AtomicU64::new(0);
+static RESEARCH_CANCEL_PROPAGATION_3S_TO_30S: AtomicU64 = AtomicU64::new(0);
+static RESEARCH_CANCEL_PROPAGATION_OVER_30S: AtomicU64 = AtomicU64::new(0);
+static RESEARCH_CANCEL_PROPAGATION_SUM_MS: AtomicU64 = AtomicU64::new(0);
+static RESEARCH_CANCEL_PROPAGATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record one cancel-propagation observation. `elapsed_ms` is the wall
+/// time between callback dispatch (or `/abort` command receipt) and the
+/// tool loop's exit signal.
+///
+/// Anti-foot: callers MUST measure with `std::time::Instant::elapsed`
+/// captured BEFORE invoking `agent.abort`, not after — we want the
+/// operator-visible latency, not internal token-cancel overhead.
+pub fn record_research_cancel_propagation(elapsed_ms: u64) {
+    RESEARCH_CANCEL_PROPAGATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    RESEARCH_CANCEL_PROPAGATION_SUM_MS.fetch_add(elapsed_ms, Ordering::Relaxed);
+    if elapsed_ms < 3_000 {
+        RESEARCH_CANCEL_PROPAGATION_UNDER_3S.fetch_add(1, Ordering::Relaxed);
+    } else if elapsed_ms < 30_000 {
+        RESEARCH_CANCEL_PROPAGATION_3S_TO_30S.fetch_add(1, Ordering::Relaxed);
+    } else {
+        RESEARCH_CANCEL_PROPAGATION_OVER_30S.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            elapsed_ms,
+            "research cancel propagation > 30s — likely a B56-class regression \
+             (a tool loop missed its CancellationToken check). See \
+             postmortems/2026-05-16-research-split-brain.md."
+        );
+    }
+    tracing::info!(elapsed_ms, "metrics: research cancel propagated");
+}
 static MEDIA_TRANSCRIPTION_FAIL_OTHER: AtomicU64 = AtomicU64::new(0);
 
 /// Public bump for transcription outcome. `outcome` is "ok" or "fail";
@@ -144,6 +193,16 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         transcription_fail_network: MEDIA_TRANSCRIPTION_FAIL_NETWORK.load(Ordering::Relaxed),
         transcription_fail_other: MEDIA_TRANSCRIPTION_FAIL_OTHER.load(Ordering::Relaxed),
         redaction_applied: REDACTION_APPLIED.load(Ordering::Relaxed),
+        research_cancel_propagation_under_3s: RESEARCH_CANCEL_PROPAGATION_UNDER_3S
+            .load(Ordering::Relaxed),
+        research_cancel_propagation_3s_to_30s: RESEARCH_CANCEL_PROPAGATION_3S_TO_30S
+            .load(Ordering::Relaxed),
+        research_cancel_propagation_over_30s: RESEARCH_CANCEL_PROPAGATION_OVER_30S
+            .load(Ordering::Relaxed),
+        research_cancel_propagation_sum_ms: RESEARCH_CANCEL_PROPAGATION_SUM_MS
+            .load(Ordering::Relaxed),
+        research_cancel_propagation_count: RESEARCH_CANCEL_PROPAGATION_COUNT
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -166,6 +225,12 @@ pub struct MediaRoutingSnapshot {
     pub transcription_fail_other: u64,
     /// B45 wire-up: outgoing-msg credential redactions count.
     pub redaction_applied: u64,
+    // T11 PLAN_RESEARCH_AGENT_FLOW_v1: cancel propagation latency.
+    pub research_cancel_propagation_under_3s: u64,
+    pub research_cancel_propagation_3s_to_30s: u64,
+    pub research_cancel_propagation_over_30s: u64,
+    pub research_cancel_propagation_sum_ms: u64,
+    pub research_cancel_propagation_count: u64,
 }
 
 impl MediaRoutingSnapshot {
@@ -342,6 +407,17 @@ impl MediaRoutingSnapshot {
              # HELP naked_tg_redaction_applied_total (B45) Outgoing TG messages where scan_and_redact modified payload.\n\
              # TYPE naked_tg_redaction_applied_total counter\n\
              naked_tg_redaction_applied_total {redaction_applied}\n\
+             # HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n\
+             # TYPE naked_tg_research_cancel_propagation_total counter\n\
+             naked_tg_research_cancel_propagation_total{{bucket=\"under_3s\"}} {cancel_u3s}\n\
+             naked_tg_research_cancel_propagation_total{{bucket=\"3s_to_30s\"}} {cancel_3s_30s}\n\
+             naked_tg_research_cancel_propagation_total{{bucket=\"over_30s\"}} {cancel_o30s}\n\
+             # HELP naked_tg_research_cancel_propagation_sum_ms (T11) Sum of cancel propagation latencies in ms.\n\
+             # TYPE naked_tg_research_cancel_propagation_sum_ms counter\n\
+             naked_tg_research_cancel_propagation_sum_ms {cancel_sum_ms}\n\
+             # HELP naked_tg_research_cancel_propagation_count (T11) Total cancel observations recorded.\n\
+             # TYPE naked_tg_research_cancel_propagation_count counter\n\
+             naked_tg_research_cancel_propagation_count {cancel_count}\n\
              {model_health_body}",
             native = self.native_route_chosen,
             oversize = self.native_route_downgraded_oversize,
@@ -377,6 +453,11 @@ impl MediaRoutingSnapshot {
             tr_network = self.transcription_fail_network,
             tr_other = self.transcription_fail_other,
             redaction_applied = self.redaction_applied,
+            cancel_u3s = self.research_cancel_propagation_under_3s,
+            cancel_3s_30s = self.research_cancel_propagation_3s_to_30s,
+            cancel_o30s = self.research_cancel_propagation_over_30s,
+            cancel_sum_ms = self.research_cancel_propagation_sum_ms,
+            cancel_count = self.research_cancel_propagation_count,
             model_health_body = model_health_body,
         )
     }
@@ -732,5 +813,96 @@ mod tests {
                 &body[body.len().saturating_sub(400)..]
             );
         }
+    }
+
+    /// T11 (PLAN_RESEARCH_AGENT_FLOW_v1): cancel-propagation metric
+    /// buckets are present in /metrics output. Three buckets keep
+    /// cardinality low while flagging outliers (B56-class regressions
+    /// would show up as `bucket="over_30s"` count > 0).
+    #[test]
+    fn research_cancel_propagation_renders_to_prometheus() {
+        let snap = MediaRoutingSnapshot::default();
+        let body = snap.render_prometheus();
+        assert!(
+            body.contains("naked_tg_research_cancel_propagation_total"),
+            "propagation counter must be in /metrics"
+        );
+        assert!(
+            body.contains("bucket=\"under_3s\""),
+            "under_3s bucket must be exposed"
+        );
+        assert!(
+            body.contains("bucket=\"over_30s\""),
+            "over_30s bucket must be exposed (alert-worthy regressions)"
+        );
+        assert!(
+            body.contains("naked_tg_research_cancel_propagation_sum_ms"),
+            "sum_ms gauge must be exposed for avg latency calc"
+        );
+    }
+
+    /// B3 (PLAN_RESEARCH_FLOW_CLOSURE_v1): both cancel paths (the r:stop
+    /// inline button AND the /abort command) must record the
+    /// propagation metric. Source-text sentinel so a refactor that
+    /// drops one path surfaces here loudly instead of silently leaving
+    /// the metric blind to half the cancels.
+    #[test]
+    fn both_cancel_paths_record_propagation_metric() {
+        // The r:stop callback path lives in callbacks.rs.
+        let callbacks_src = include_str!("callbacks.rs");
+        assert!(
+            callbacks_src.contains("record_research_cancel_propagation"),
+            "r:stop callback must record cancel propagation (T11 wiring)"
+        );
+        // The /abort command path lives in commands/session.rs.
+        let session_src = include_str!("commands/session.rs");
+        assert!(
+            session_src.contains("record_research_cancel_propagation"),
+            "cmd_abort must record cancel propagation (B3 closure)"
+        );
+        // Both paths must take the timestamp BEFORE the abort call so
+        // the elapsed includes the actual abort work, not zero.
+        assert!(
+            session_src.contains("cancel_started = std::time::Instant::now"),
+            "cmd_abort must capture Instant BEFORE agent.abort"
+        );
+    }
+
+    /// T11: record_research_cancel_propagation classifies into correct bucket.
+    /// Note: this test mutates global atomics so it must NOT run in
+    /// parallel with `prometheus_render` (which reads the same statics).
+    /// In practice cargo test default jobs > 1, but the buckets are
+    /// monotonic counters so multiple writers/readers just race on
+    /// strictly-increasing counts — no torn writes, no false negatives.
+    #[test]
+    fn record_research_cancel_propagation_classifies_buckets() {
+        let before_u3s = RESEARCH_CANCEL_PROPAGATION_UNDER_3S.load(Ordering::Relaxed);
+        let before_3s_30s = RESEARCH_CANCEL_PROPAGATION_3S_TO_30S.load(Ordering::Relaxed);
+        let before_o30s = RESEARCH_CANCEL_PROPAGATION_OVER_30S.load(Ordering::Relaxed);
+        let before_count = RESEARCH_CANCEL_PROPAGATION_COUNT.load(Ordering::Relaxed);
+
+        record_research_cancel_propagation(1_500); // under_3s
+        record_research_cancel_propagation(5_000); // 3s_to_30s
+        record_research_cancel_propagation(45_000); // over_30s
+
+        let after_u3s = RESEARCH_CANCEL_PROPAGATION_UNDER_3S.load(Ordering::Relaxed);
+        let after_3s_30s = RESEARCH_CANCEL_PROPAGATION_3S_TO_30S.load(Ordering::Relaxed);
+        let after_o30s = RESEARCH_CANCEL_PROPAGATION_OVER_30S.load(Ordering::Relaxed);
+        let after_count = RESEARCH_CANCEL_PROPAGATION_COUNT.load(Ordering::Relaxed);
+
+        assert!(after_u3s > before_u3s, "1500ms must bump under_3s bucket");
+        assert!(
+            after_3s_30s > before_3s_30s,
+            "5000ms must bump 3s_to_30s bucket"
+        );
+        assert!(
+            after_o30s > before_o30s,
+            "45000ms must bump over_30s bucket (alert-worthy)"
+        );
+        assert_eq!(
+            after_count - before_count,
+            3,
+            "all 3 observations must increment count"
+        );
     }
 }

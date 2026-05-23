@@ -67,6 +67,7 @@ pub mod schema_migration;
 pub mod stream_filter;
 pub mod token_tracker;
 pub mod types;
+pub mod util;
 
 #[cfg(test)]
 mod core_tests {

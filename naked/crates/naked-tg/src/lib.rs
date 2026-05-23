@@ -20,14 +20,18 @@ pub mod model_switch;
 pub mod persona;
 pub mod rate_limit;
 pub mod render;
+// T4 (PLAN_v13_SOLID_AUDIT): 0 binary consumers after B4 removal.
+#[cfg(test)]
 pub mod research_html;
 pub mod scheduler;
 pub mod supervised;
 pub use scheduler as research_scheduler;
 pub mod guarded;
 pub mod markup;
+#[cfg(test)]
 pub mod research_ui;
 pub mod scheduler_lock;
 pub mod skill;
+pub mod synthetic;
 pub mod tg_attach;
 pub mod watchdog;

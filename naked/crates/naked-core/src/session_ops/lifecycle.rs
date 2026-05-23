@@ -53,11 +53,11 @@ impl AgentCore {
         if path.exists() {
             match SessionConfig::from_file(&path) {
                 Ok(sc) => {
-                    tracing::info!("loaded per-session config for {}", &session_id[..8]);
+                    tracing::info!("loaded per-session config for {}", &session_id[..8]); // REGISTRY-WAIVE: B48 — session ID is ASCII hex
                     sc
                 }
                 Err(e) => {
-                    tracing::warn!("bad session config.json for {}: {e}", &session_id[..8]);
+                    tracing::warn!("bad session config.json for {}: {e}", &session_id[..8]); // REGISTRY-WAIVE: B48 — session ID is ASCII hex
                     SessionConfig::default()
                 }
             }

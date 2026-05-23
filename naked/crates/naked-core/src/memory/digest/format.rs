@@ -55,7 +55,7 @@ fn build_summary_prompt(
         ));
     }
     if s.len() > max_chars {
-        s.truncate(max_chars);
+        s.truncate(s.floor_char_boundary(max_chars));
     }
     s
 }

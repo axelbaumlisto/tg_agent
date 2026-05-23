@@ -10,6 +10,7 @@
 //! user-requested behaviour (Q4).
 
 use super::*;
+use naked_core::util::head_truncate;
 
 /// Map a tool name to its `<pre><code class="language-X">` tag.
 ///
@@ -108,10 +109,7 @@ impl CompositeView {
                     let preview = output.lines().take(5).collect::<Vec<_>>().join("\n");
                     let body_cap = tool_result_budget.max(200);
                     let body = tail_trim(&preview, body_cap);
-                    Some(format!(
-                        "<pre><code>❌ {}</code></pre>",
-                        escape_html(&body)
-                    ))
+                    Some(format!("<pre><code>❌ {}</code></pre>", escape_html(&body)))
                 }
             }
             TurnEvent::SubAgentReference { agent_id } => self.sub_agents.get(agent_id).map(|sa| {
@@ -152,11 +150,7 @@ impl CompositeView {
     /// `for_streaming = true` strips `<code>` `class="..."` attributes
     /// because Telegram's `editMessageText` rejects them. `false` keeps
     /// language tags for the final `sendMessage` path.
-    fn render_chrono_blocks(
-        &self,
-        for_streaming: bool,
-        tool_result_budget: usize,
-    ) -> Vec<String> {
+    fn render_chrono_blocks(&self, for_streaming: bool, tool_result_budget: usize) -> Vec<String> {
         let mut blocks: Vec<String> = Vec::with_capacity(self.events.len() / 2 + 4);
         let mut i = 0;
         while i < self.events.len() {
@@ -331,7 +325,11 @@ impl CompositeView {
                     .into_iter()
                     .rev()
                 {
-                    let trimmed = if line.len() > 80 { &line[..80] } else { line };
+                    let trimmed = if line.len() > 80 {
+                        head_truncate(line, 80)
+                    } else {
+                        line
+                    };
                     tail_blocks.push(format!("  <code>{}</code>", escape_html(trimmed)));
                 }
             }
@@ -688,4 +686,115 @@ hr {{
     );
 
     doc.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Pure helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn tool_language_tag_known_tools() {
+        assert_eq!(tool_language_tag("bash"), "bash");
+        assert_eq!(tool_language_tag("python"), "python");
+        assert_eq!(tool_language_tag("python3"), "python");
+        assert_eq!(tool_language_tag("shell"), "bash");
+    }
+
+    #[test]
+    fn tool_language_tag_unknown_defaults_to_bash() {
+        assert_eq!(tool_language_tag("read"), "bash");
+        assert_eq!(tool_language_tag("web_search"), "bash");
+        assert_eq!(tool_language_tag(""), "bash");
+    }
+
+    #[test]
+    fn tail_trim_within_budget() {
+        let s = "hello world";
+        assert_eq!(tail_trim(s, 100), "hello world");
+        assert_eq!(tail_trim(s, 11), "hello world"); // exact fit
+    }
+
+    #[test]
+    fn tail_trim_over_budget() {
+        let s = "hello world";
+        let t = tail_trim(s, 6);
+        assert!(t.starts_with('…'), "truncated should start with ellipsis");
+        assert!(t.len() <= 8, "should fit budget approximately");
+    }
+
+    #[test]
+    fn tail_trim_multibyte_safe() {
+        // B48 regression guard: ensure we don't panic on multi-byte chars.
+        let s = "привет мир 💭 hello";
+        let t = tail_trim(s, 10);
+        assert!(t.starts_with('…'));
+    }
+
+    // ── join_with_head_truncate ──────────────────────────────────────
+
+    #[test]
+    fn join_head_truncate_fits() {
+        let blocks = vec!["alpha".to_string(), "beta".to_string()];
+        let (joined, dropped) = CompositeView::join_with_head_truncate(&blocks, 1000);
+        assert_eq!(dropped, 0);
+        assert!(joined.contains("alpha"));
+        assert!(joined.contains("beta"));
+    }
+
+    #[test]
+    fn join_head_truncate_drops_oldest() {
+        let blocks: Vec<String> = (0..20).map(|i| format!("block-{i} padding")).collect();
+        let (joined, dropped) = CompositeView::join_with_head_truncate(&blocks, 100);
+        assert!(dropped > 0, "should drop oldest blocks to fit");
+        // Newest block should survive
+        assert!(
+            joined.contains("block-19"),
+            "newest should survive: {joined}"
+        );
+    }
+
+    // ── CompositeView rendering ─────────────────────────────────────
+
+    fn make_view() -> CompositeView {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut v = CompositeView::new("test-model".into(), counter);
+        v.phase = "idle";
+        v
+    }
+
+    #[test]
+    fn render_live_contains_model() {
+        let view = make_view();
+        let html = view.render_live();
+        assert!(html.contains("idle"), "phase should appear: {html}");
+    }
+
+    #[test]
+    fn render_final_empty_view() {
+        let view = make_view();
+        let html = view.render_final();
+        // Empty view should not panic and should produce valid-ish HTML
+        assert!(!html.is_empty());
+    }
+
+    #[test]
+    fn render_summary_truncates_long_text() {
+        let mut view = make_view();
+        view.response_text = "a".repeat(5000);
+        let summary = view.render_summary(100);
+        // Should be truncated + contain "Full response attached"
+        assert!(summary.contains('…'), "should truncate");
+        assert!(summary.contains("Full response attached"));
+    }
+
+    #[test]
+    fn render_html_document_not_empty() {
+        let view = make_view();
+        let bytes = render_html_document(&view);
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("test-model") || html.contains("<!DOCTYPE"));
+    }
 }

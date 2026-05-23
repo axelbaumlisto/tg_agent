@@ -68,7 +68,7 @@ pub(crate) async fn cmd_sessions(
             format!("📄 page {page}/{total_pages} ({total} sessions total)"),
         );
         let text = list.join("\n");
-        send_long_text(bot, *ctx, &text).await?;
+        crate::shared::safe_send(bot, ctx, text, None).await?;
     }
     Ok(())
 }
@@ -83,7 +83,16 @@ pub(crate) async fn cmd_abort(
     let chat_id = ctx.chat_id.0;
     let tid = ctx.raw_thread_id();
     if let Some(sid) = channel_map.get(chat_id, tid).await {
+        // B3 (PLAN_RESEARCH_FLOW_CLOSURE_v1): measure cancel propagation
+        // latency identically to the r:stop callback path so /abort
+        // observability matches the inline button. `record_*` classifies
+        // into under_3s/3s_to_30s/over_30s buckets; B56-class regressions
+        // surface as bucket="over_30s" count > 0 regardless of which
+        // path the operator used.
+        let cancel_started = std::time::Instant::now();
         agent.abort(&sid).await;
+        let elapsed_ms = cancel_started.elapsed().as_millis() as u64;
+        crate::metrics::record_research_cancel_propagation(elapsed_ms);
         reply_text(bot, ctx, "Aborted.").await?;
     } else {
         reply_text(bot, ctx, "No active session.").await?;

@@ -531,7 +531,7 @@ fn short_slug(topic: &str) -> String {
 pub(crate) fn new_research_id(topic: &str) -> String {
     let slug = short_slug(topic);
     let uuid = uuid::Uuid::new_v4().simple().to_string();
-    format!("{slug}-{}", &uuid[..4])
+    format!("{slug}-{}", &uuid[..4]) // REGISTRY-WAIVE: B48 — UUID hex is ASCII
 }
 
 #[cfg(test)]

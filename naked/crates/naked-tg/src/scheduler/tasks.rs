@@ -50,18 +50,57 @@ pub(crate) async fn spawn_task(
             tracing::warn!(spec = %id_for_task, "failed to persist Running inflight: {e:#}");
         }
 
+        // T6.3 (PLAN_RESEARCH_AGENT_FLOW_v1): synthetic-dispatch path.
+        // When wiring.rs has installed `dispatch_fn` AND the spec has
+        // a chat_id, route through the operator's chat session instead
+        // of spawning an orphan research-channel session. This makes
+        // `/abort` in the operator's chat actually cancel the run
+        // (B57 mitigation).
+        let synthetic_mode = config_clone.dispatch_fn.is_some() && spec_for_task.chat_id.is_some();
+
         tracing::info!(
             spec = %id_for_task,
             attempt = attempt,
             attempt_id = %attempt_id_for_task,
             verify = config_clone.verify_by_default,
+            synthetic = synthetic_mode,
             "scheduler launching research run"
         );
         // Keep the full RunReport so we can tell a `Cancelled`
         // stop reason apart from a real success — the scheduler
         // treats cancellation as a *failure* (it always means the
         // sweep timeout fired), not as a normal completion.
-        let result: Result<(String, StopReason), _> = if config_clone.verify_by_default {
+        let result: Result<(String, StopReason), _> = if let Some(dispatch) =
+            config_clone.dispatch_fn.as_ref().cloned()
+            && let Some(chat_id) = spec_for_task.chat_id
+        {
+            // Synthetic dispatch: build the message, hand off to closure.
+            // Closure drives streaming + Abort button; we just wait for
+            // it to return (or for the sweep cancel to fire).
+            // REGISTRY-WAIVE: synthetic_mode flag above mirrors this
+            // condition; if-let is the lint-friendly form.
+            let _ = synthetic_mode; // already logged above
+            let thread_id = spec_for_task.thread_id;
+            let synth = crate::synthetic::SyntheticMessage::from_scheduler_spec(
+                &id_for_task,
+                chat_id,
+                thread_id,
+            );
+            // Dispatch returns when the spawned turn completes (or is
+            // aborted). We don't have a run_id surfaced from synthetic
+            // path yet — use the attempt_id as a placeholder so the
+            // ledger has SOMETHING. Real run_id is recorded inside the
+            // agent's session.
+            let dispatch_fut = (dispatch)(synth);
+            tokio::select! {
+                _ = dispatch_fut => {
+                    Ok((attempt_id_for_task.clone(), StopReason::AgentIdle))
+                }
+                _ = cancel_for_task.cancelled() => {
+                    Ok((attempt_id_for_task.clone(), StopReason::Cancelled))
+                }
+            }
+        } else if !synthetic_mode && config_clone.verify_by_default {
             core_clone
                 .clone()
                 .run_research_verified_with_cancel(
@@ -452,4 +491,84 @@ pub(crate) async fn lookup_last_run_on_disk(
 ) -> Option<DateTime<Utc>> {
     let runs = store.list_runs(spec_id, Some(1)).await.ok()?;
     runs.first().map(|r| r.finished_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_thresholds(alert: u32, auto_pause: u32) -> SchedulerConfig {
+        SchedulerConfig {
+            max_retries_before_alert: alert,
+            auto_pause_after_failures: auto_pause,
+            ..SchedulerConfig::default()
+        }
+    }
+
+    // ── evaluate_outcome ─────────────────────────────────────────────
+
+    #[test]
+    fn evaluate_outcome_below_all_thresholds() {
+        let cfg = cfg_with_thresholds(3, 10);
+        assert!(matches!(
+            evaluate_outcome(1, false, &cfg),
+            FailurePolicy::Quiet
+        ));
+        assert!(matches!(
+            evaluate_outcome(2, false, &cfg),
+            FailurePolicy::Quiet
+        ));
+    }
+
+    #[test]
+    fn evaluate_outcome_at_alert_threshold() {
+        let cfg = cfg_with_thresholds(3, 10);
+        assert!(matches!(
+            evaluate_outcome(3, false, &cfg),
+            FailurePolicy::AlertOnce { count: 3 }
+        ));
+    }
+
+    #[test]
+    fn evaluate_outcome_above_alert_already_alerted() {
+        let cfg = cfg_with_thresholds(3, 10);
+        // Already alerted → Quiet, not AlertOnce again
+        assert!(matches!(
+            evaluate_outcome(5, true, &cfg),
+            FailurePolicy::Quiet
+        ));
+    }
+
+    #[test]
+    fn evaluate_outcome_at_auto_pause() {
+        let cfg = cfg_with_thresholds(3, 5);
+        assert!(matches!(
+            evaluate_outcome(5, true, &cfg),
+            FailurePolicy::AutoPause { count: 5 }
+        ));
+        assert!(matches!(
+            evaluate_outcome(5, false, &cfg),
+            FailurePolicy::AutoPause { count: 5 }
+        ));
+    }
+
+    #[test]
+    fn evaluate_outcome_zero_thresholds_means_disabled() {
+        let cfg = cfg_with_thresholds(0, 0);
+        // With both thresholds disabled, always Quiet
+        assert!(matches!(
+            evaluate_outcome(100, false, &cfg),
+            FailurePolicy::Quiet
+        ));
+    }
+
+    #[test]
+    fn evaluate_outcome_auto_pause_takes_priority_over_alert() {
+        // When both thresholds fire on same count, auto_pause wins
+        let cfg = cfg_with_thresholds(3, 3);
+        assert!(matches!(
+            evaluate_outcome(3, false, &cfg),
+            FailurePolicy::AutoPause { count: 3 }
+        ));
+    }
 }

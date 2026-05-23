@@ -8,6 +8,20 @@ use super::*;
 
 // ── Media extraction & dispatch ─────────────────────────────────────────
 
+/// Shared context for media processing (kills 2× too_many_arguments).
+pub(crate) struct MediaCtx<'a> {
+    pub bot_token: &'a str,
+    pub config: &'a Config,
+    pub http: Arc<reqwest::Client>,
+    pub base_url: Arc<String>,
+    pub user_caption: Option<&'a str>,
+    #[allow(dead_code)] // reserved for future per-message metrics
+    pub msg_id: i32,
+    pub route_images_natively: bool,
+    pub native_cap_bytes: u64,
+    pub active_model: &'a str,
+}
+
 /// A single media attachment that we're willing to download and process.
 ///
 /// A Telegram message never contains more than one media "kind" at a time
@@ -214,37 +228,11 @@ pub struct NativeImage {
 /// Process one or more media items → produce the user-facing "media block"
 /// that gets prepended to the agent prompt. Errors degrade to `[⚠ … error: …]`
 /// and a path-only fallback whenever we've managed to save the file.
-// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn process_media_items(
-    items: &[MediaItem],
-    bot_token: &str,
-    config: &Config,
-    http: Arc<reqwest::Client>,
-    base_url: Arc<String>,
-    user_caption: Option<&str>,
-    msg_id: i32,
-    route_images_natively: bool,
-    native_cap_bytes: u64,
-    active_model: &str,
-) -> MediaProcessed {
+pub(crate) async fn process_media_items(items: &[MediaItem], ctx: &MediaCtx<'_>) -> MediaProcessed {
     let mut text_blocks: Vec<String> = Vec::with_capacity(items.len());
     let mut native_images: Vec<NativeImage> = Vec::new();
     for item in items {
-        match process_one_media(
-            item,
-            bot_token,
-            config,
-            http.clone(),
-            base_url.clone(),
-            user_caption,
-            msg_id,
-            route_images_natively,
-            native_cap_bytes,
-            active_model,
-        )
-        .await
-        {
+        match process_one_media(item, ctx).await {
             Ok(out) => {
                 text_blocks.push(out.text);
                 native_images.extend(out.native_images);
@@ -321,20 +309,18 @@ pub(crate) fn decide_native_route(
     route_images_natively && static_image && !too_big
 }
 
-// REGISTRY-WAIVE: too_many_arguments — refactor-defer, signature complexity acceptable
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_one_media(
     item: &MediaItem,
-    bot_token: &str,
-    config: &Config,
-    http: Arc<reqwest::Client>,
-    base_url: Arc<String>,
-    user_caption: Option<&str>,
-    _msg_id: i32,
-    route_images_natively: bool,
-    native_cap_bytes: u64,
-    active_model: &str,
+    ctx: &MediaCtx<'_>,
 ) -> anyhow::Result<MediaProcessed> {
+    let bot_token = ctx.bot_token;
+    let config = ctx.config;
+    let http = ctx.http.clone();
+    let base_url = ctx.base_url.clone();
+    let user_caption = ctx.user_caption;
+    let route_images_natively = ctx.route_images_natively;
+    let native_cap_bytes = ctx.native_cap_bytes;
+    let active_model = ctx.active_model;
     use media::MediaKind;
     let pre_model_for_err = active_model.to_string();
 
@@ -612,9 +598,12 @@ pub(crate) async fn send_text(
     thread_id: Option<ThreadId>,
     text: &str,
 ) -> Result<(), teloxide::RequestError> {
-    bot.send_message(chat_id, text)
-        .maybe_thread(thread_id)
-        .await?;
+    let ctx = crate::shared::ChatCtx {
+        chat_id,
+        thread_id,
+        reply_to: None,
+    };
+    crate::shared::safe_send(bot, &ctx, text.to_string(), None).await?;
     Ok(())
 }
 

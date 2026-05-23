@@ -124,9 +124,8 @@ impl AgentCore {
             .await
     }
 
-    pub async fn cancel_research_run(&self, run_id: &str) -> bool {
-        self.research_svc.cancel_research_run(run_id).await
-    }
+    // B4 (PLAN_RESEARCH_FLOW_CLOSURE_v1): cancel_research_run removed.
+    // All callers now use AgentCore::abort(session_id) (INV-CANCEL-1).
 
     pub fn research_run_permits(&self) -> Arc<tokio::sync::Semaphore> {
         self.research_svc.research_run_permits()

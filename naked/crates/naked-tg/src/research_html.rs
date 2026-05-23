@@ -1,5 +1,9 @@
 //! Self-contained HTML rendering for research reports.
 //!
+//! **Status (B4, PLAN_RESEARCH_FLOW_CLOSURE_v1)**: no binary consumer
+//! after `finalize_research_ui` removal. Retained for potential future
+//! direct-export or MCP-served report use cases.
+//!
 //! Telegram opens `.html` document attachments in its in-app browser,
 //! which gives us a free "open the full report on any device"
 //! affordance without standing up a separate web UI. The rendered

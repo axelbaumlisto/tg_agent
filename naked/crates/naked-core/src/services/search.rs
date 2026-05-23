@@ -152,7 +152,28 @@ mod tests {
 
     #[test]
     fn search_state_builds_with_empty_keys() {
+        // Verify construction doesn't panic. Pool size may be >0
+        // because EnvKeyProvider / FilesystemKeyProvider discover
+        // real keys from the host environment (DDG instances, .env,
+        // secrets JSON). The legacy_exa_keys slice is just ONE of
+        // several providers.
         let state = SearchState::from_config(&[]);
-        assert_eq!(state.exa_key_pool.size(), 0);
+        // Smoke: the state is usable (host_policy constructed, pools alive).
+        let _ = state.exa_key_pool.size();
+        let _ = state.tavily_key_pool.size();
+        let _ = state.serpapi_key_pool.size();
+    }
+
+    #[test]
+    fn search_state_builds_with_some_keys() {
+        let keys = vec!["test-key-1".to_string(), "test-key-2".to_string()];
+        let state = SearchState::from_config(&keys);
+        // Legacy keys are merged INTO the exa pool alongside env/fs keys.
+        // At minimum, the 2 we passed must be present.
+        assert!(
+            state.exa_key_pool.size() >= 2,
+            "exa pool must contain at least the legacy keys: got {}",
+            state.exa_key_pool.size()
+        );
     }
 }

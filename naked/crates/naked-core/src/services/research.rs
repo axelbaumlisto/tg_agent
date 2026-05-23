@@ -254,14 +254,9 @@ impl ResearchService {
         self.state.run_events.snapshot(run_id, limit).await
     }
 
-    pub async fn cancel_research_run(&self, run_id: &str) -> bool {
-        if let Some(token) = self.state.cancels.read().await.get(run_id).cloned() {
-            token.cancel();
-            true
-        } else {
-            false
-        }
-    }
+    // B4 (PLAN_RESEARCH_FLOW_CLOSURE_v1): cancel_research_run removed.
+    // Was deprecated T3.4; all callers use AgentCore::abort(session_id)
+    // via ChannelSessionMap now (INV-CANCEL-1, B56).
 
     pub fn research_run_permits(&self) -> Arc<tokio::sync::Semaphore> {
         self.state.run_semaphore.clone()
@@ -402,10 +397,8 @@ mod tests {
         assert!(svc.load_research(&spec.id).await.is_err());
     }
 
-    #[tokio::test]
-    async fn cancel_run_returns_false_for_unknown() {
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = make_service(tmp.path(), true);
-        assert!(!svc.cancel_research_run("nonexistent").await);
-    }
+    // B4 (PLAN_RESEARCH_FLOW_CLOSURE_v1): cancel_run_returns_false_for_unknown
+    // and cancel_research_run_carries_deprecated_attribute removed together
+    // with the function itself.  INV-CANCEL-1 coverage is now in
+    // callbacks.rs::stop_callback_has_no_legacy_cancel_fallback.
 }

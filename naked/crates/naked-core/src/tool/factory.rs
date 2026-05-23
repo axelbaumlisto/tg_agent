@@ -162,6 +162,14 @@ pub(crate) fn research_tools(
     ];
 
     if let Some(weak) = self_ref.read().expect("self_ref lock").clone() {
+        // T2.5 (PLAN_RESEARCH_AGENT_FLOW_v1): research_run tool lets the LLM
+        // trigger a research spec run inline in the current agent turn, sharing
+        // the parent cancel token. Registered here so it's visible in the agent's
+        // tool list alongside research_save, research_launch, etc.
+        tools.push(Box::new(crate::tool::research_run::ResearchRunTool::new(
+            weak.clone(),
+        )));
+
         // Upcast Weak<AgentCore> → Weak<dyn ResearchRunner> for ISP
         let runner_weak: std::sync::Weak<dyn crate::research::ResearchRunner> = weak;
         tools.push(Box::new(ResearchLaunchTool::new(runner_weak.clone())));
@@ -226,4 +234,39 @@ pub(crate) async fn extra_tools(
     factories: &RwLock<crate::ExtraToolFactories>,
 ) -> Vec<Box<dyn Tool>> {
     factories.read().await.iter().map(|f| f()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestCore;
+
+    #[test]
+    fn tool_factory_advertises_research_run() {
+        let tc = TestCore::build();
+        let core = &tc.core;
+        let config = core.config();
+        let tools = research_tools(&config, &core.research, &core.self_ref);
+        let names: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "research_run"),
+            "research_run tool must appear in research_tools(); got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn research_run_tool_appears_before_research_launch() {
+        let tc = TestCore::build();
+        let config = tc.core.config();
+        let tools = research_tools(&config, &tc.core.research, &tc.core.self_ref);
+        let names: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
+        let run_pos = names.iter().position(|n| n == "research_run");
+        let launch_pos = names.iter().position(|n| n == "research_launch");
+        assert!(run_pos.is_some(), "research_run must be in the list");
+        assert!(launch_pos.is_some(), "research_launch must be in the list");
+        assert!(
+            run_pos < launch_pos,
+            "research_run should appear before research_launch; order: {names:?}"
+        );
+    }
 }
