@@ -21,7 +21,7 @@ pub(crate) async fn send_stream_placeholder(
     ctx: &ChatCtx,
 ) -> Option<teloxide::types::MessageId> {
     match bot
-        .send_message(ctx.chat_id, "⏳")
+        .send_message(ctx.chat_id, "⏳ thinking…")
         .maybe_thread(ctx.thread_id)
         .maybe_reply_to(ctx.reply_to)
         .reply_markup(streaming_control_kb())
@@ -37,8 +37,8 @@ pub(crate) async fn send_stream_placeholder(
 
 pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
     teloxide::types::InlineKeyboardMarkup::new(vec![vec![
-        teloxide::types::InlineKeyboardButton::callback("⏹ Стоп", "stream:abort"),
-        teloxide::types::InlineKeyboardButton::callback("⏩ Send now", "stream:sendnow"),
+        teloxide::types::InlineKeyboardButton::callback("⏹ Stop", "stream:abort"),
+        teloxide::types::InlineKeyboardButton::callback("⏩ Send", "stream:sendnow"),
     ]])
 }
 
