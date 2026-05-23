@@ -9,6 +9,31 @@
 use super::super::fmt_utils::{format_age, format_interval};
 use super::super::*;
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use tokio::sync::RwLock;
+
+/// Per-chat mapping of index (1-based) → spec ID, updated on each `/research list`.
+/// Allows `/research show 3` instead of copying the full ID.
+static LIST_INDEX: LazyLock<RwLock<HashMap<i64, Vec<String>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// If `tail` is a decimal number, resolve it to a spec ID from the last
+/// `/research list` for this chat. Otherwise return the original string.
+async fn resolve_spec_ref(chat_id: i64, tail: &str) -> String {
+    if let Ok(n) = tail.parse::<usize>()
+        && n >= 1
+    {
+        let map = LIST_INDEX.read().await;
+        if let Some(ids) = map.get(&chat_id)
+            && let Some(id) = ids.get(n - 1)
+        {
+            return id.clone();
+        }
+    }
+    tail.to_string()
+}
+
 // Dead-code marker — the legacy orchestration layer (heartbeat waterfall,
 // stop/restart keyboards, ResearchOutcome enum, finalize_research_ui) is gone.
 // All research runs go through synthetic_dispatch::dispatch_for_chat.
@@ -38,34 +63,26 @@ pub(crate) async fn handle_research_cmd(
     let rest = text[cmd_word.len()..].trim();
     let mut parts = rest.splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("").to_string();
-    let tail = parts.next().unwrap_or("").trim().to_string();
+    let raw_tail = parts.next().unwrap_or("").trim().to_string();
+    // Resolve numeric refs: "/research show 3" → spec ID from last list.
+    let tail = resolve_spec_ref(ctx.chat_id.0, &raw_tail).await;
 
     let reply = match sub.as_str() {
         "" | "help" => "\
-/research new <topic>          create a new research spec
-/research ls | list             list specs with schedule + last-run metrics
-/research show <id>             show spec summary + recent findings
-/research state <id>            deep scheduler state — inflight ledger, failure streak, recent runs
-/research fresh <id>            show only findings from the latest run
-/research run <id>              launch a one-off run (background, gatekeeper-verified by default)
-/research metrics <id>          detailed metrics for the latest run (gatekeeper rounds, etc.)
-/research ask <id> <question>   ask the LLM a question grounded in the known findings
-/research pause <id>            pause scheduled runs
-/research resume <id>           resume scheduled runs
-/research reset <id>            clear failure streak + pause_reason and resume (rearm after fixing the cause)
-/research stop <id>             alias for pause
-/research rm | delete <id>      delete all data for a spec
-/research schedule <id> on <interval>   schedule periodic runs (e.g. 30m, 1h, 1d, or seconds)
-/research schedule <id> off              clear schedule
-/research schedule <id> status           show current schedule
-/research delta <id>            show findings from the latest run only
-/research <свободный текст>     (soft-fallback) создаст spec и сразу запустит прогон
+/research list                  нумерованный список
+/research show <N|id>           spec + находки
+/research run <N|id>            запустить прогон
+/research ask <N|id> <вопрос>   спросить по находкам
+/research pause <N|id>          пауза
+/research resume <N|id>         снять паузу
+/research reset <N|id>          сбросить ошибки + resume
+/research rm <N|id>             удалить
+/research schedule <N|id> on <30m|1h|1d>
+/research schedule <N|id> off
+/research new <тема>            новый spec
+/research <свободный текст>     создаст spec + запустит
 
-Tip: you can also just talk to me — \"расскажи как идёт исследование X\", \
-\"исправь расписание X на каждый час\", \"добавь источник Y в X\" — \
-the LLM has tools for all of this. А ещё свободный текст без слэша \
-(\"исследуй помещения в Дананге, до $3000, на апрель 2026\") поднимает \
-research-skill через LLM."
+<N> — номер из /research list"
             .to_string(),
         "new" => {
             if tail.is_empty() {
@@ -95,70 +112,24 @@ research-skill через LLM."
             Ok(list) if list.is_empty() => "No research specs defined.".to_string(),
             Ok(list) => {
                 let store = agent.research_store();
+                let mut ids: Vec<String> = Vec::with_capacity(list.len());
                 let mut out = String::from("🔬 research specs:\n");
-                for s in list {
+                for (i, s) in list.iter().enumerate() {
+                    let n = i + 1;
                     let total = store.count_findings(&s.id).await.unwrap_or(0);
-                    let runs = store.list_runs(&s.id, Some(20)).await.unwrap_or_default();
-                    let last = runs
-                        .iter()
-                        .find(|r| r.verification_rounds.is_some())
-                        .or_else(|| runs.first());
-                    let inflight = store.load_inflight(&s.id).await.ok().flatten();
                     let status = if s.paused { "⏸" } else { "▶" };
-                    let schedule = match s.interval_seconds {
-                        Some(secs) => format_interval(secs),
-                        None => "manual".to_string(),
+                    let short_topic: String = s.topic.chars().take(50).collect();
+                    let ellip = if s.topic.chars().count() > 50 {
+                        "…"
+                    } else {
+                        ""
                     };
-                    let short_topic: String = s.topic.chars().take(60).collect();
-                    let ellip = if s.topic.chars().count() > 60 { "…" } else { "" };
-                    out.push_str(&format!(
-                        "{status} `{}`\n   {short_topic}{ellip}\n   schedule: {} · findings: {}",
-                        s.id, schedule, total
-                    ));
-                    if s.paused
-                        && let Some(reason) = s.pause_reason.as_deref()
-                        && !reason.is_empty()
-                    {
-                        let short: String = reason.chars().take(120).collect();
-                        out.push_str(&format!("\n   ⏸ {short}"));
-                    }
-                    if let Some(r) = last {
-                        let age = (chrono::Utc::now() - r.finished_at).num_seconds().max(0) as u64;
-                        out.push_str(&format!(
-                            " · last: {} ago (+{} new",
-                            format_age(age),
-                            r.new_findings,
-                        ));
-                        if let Some(rounds) = r.verification_rounds {
-                            out.push_str(&format!(
-                                ", {rounds} rd, removed={}, replaced={}",
-                                r.dead_removed.unwrap_or(0),
-                                r.replacements_found.unwrap_or(0),
-                            ));
-                        }
-                        out.push(')');
-                    }
-                    if let Some(infl) = inflight {
-                        let icon = match infl.state {
-                            naked_core::research::RunState::Scheduled => "🟡",
-                            naked_core::research::RunState::Running => "🔵",
-                            naked_core::research::RunState::Completed => "✅",
-                            naked_core::research::RunState::Failed => "❌",
-                        };
-                        out.push_str(&format!(
-                            "\n   state: {icon} {} (attempt {})",
-                            infl.state.ru_label(),
-                            infl.attempt,
-                        ));
-                        if let Some(err) = infl.error.as_deref()
-                            && !err.is_empty()
-                        {
-                            let short: String = err.chars().take(80).collect();
-                            out.push_str(&format!(" · err: {short}"));
-                        }
-                    }
-                    out.push('\n');
+                    out.push_str(&format!("{status} {n}. {short_topic}{ellip} ({total})\n"));
+                    ids.push(s.id.clone());
                 }
+                out.push_str("\n`/research show|run|pause|rm <N>`");
+                // Store index for numeric refs.
+                LIST_INDEX.write().await.insert(ctx.chat_id.0, ids);
                 out
             }
             Err(e) => format!("error: {e}"),
@@ -225,8 +196,9 @@ research-skill через LLM."
             }
         }
         "ask" => {
-            let mut ap = tail.splitn(2, char::is_whitespace);
-            let id = ap.next().unwrap_or("").to_string();
+            let mut ap = raw_tail.splitn(2, char::is_whitespace);
+            let raw_id = ap.next().unwrap_or("").to_string();
+            let id = resolve_spec_ref(ctx.chat_id.0, &raw_id).await;
             let question = ap.next().unwrap_or("").trim().to_string();
             if id.is_empty() || question.is_empty() {
                 "Usage: /research ask <id> <question>".to_string()
@@ -284,8 +256,10 @@ research-skill через LLM."
             // In-process scheduler — no systemd. Stores `interval_seconds` on
             // the spec; the scheduler thread picks the change up via
             // SchedulerHook::notify and reschedules immediately.
-            let mut sp = tail.splitn(3, char::is_whitespace);
-            let id = sp.next().unwrap_or("").trim();
+            let mut sp = raw_tail.splitn(3, char::is_whitespace);
+            let raw_id = sp.next().unwrap_or("").trim();
+            let id_resolved = resolve_spec_ref(ctx.chat_id.0, raw_id).await;
+            let id = id_resolved.as_str();
             let action = sp.next().unwrap_or("").trim();
             let arg = sp.next().unwrap_or("").trim();
 
@@ -308,7 +282,11 @@ research-skill через LLM."
                         }
                     }
                     "" | "on" | "enable" => {
-                        let secs = if arg.is_empty() { Some(3600) } else { parse_interval(arg) };
+                        let secs = if arg.is_empty() {
+                            Some(3600)
+                        } else {
+                            parse_interval(arg)
+                        };
                         schedule_research_on(agent, id, secs, arg).await
                     }
                     "status" => match agent.load_research(id).await {
@@ -360,9 +338,7 @@ research-skill через LLM."
                         "🚀 создал `{}` — запускаю фоновый прогон…\nтема: {}",
                         spec_id, spec.topic
                     );
-                    let _ = crate::shared::safe_send(
-                        bot, ctx, header, None,
-                    ).await;
+                    let _ = crate::shared::safe_send(bot, ctx, header, None).await;
                     match naked_tg::synthetic::dispatch_for_chat(
                         agent,
                         channel_map,
@@ -373,9 +349,7 @@ research-skill через LLM."
                     .await
                     {
                         Ok((sid, _handle)) => {
-                            format!(
-                                "\u{1f52c} dispatched `{spec_id}` (session {sid})"
-                            )
+                            format!("\u{1f52c} dispatched `{spec_id}` (session {sid})")
                         }
                         Err(e) => format!("dispatch error: {e}"),
                     }
@@ -605,20 +579,20 @@ mod tests {
     }
 
     #[test]
-    fn help_documents_list_alias() {
+    fn help_documents_list_command() {
         let src = source();
         assert!(
-            src.contains("/research ls | list"),
-            "help text must show both ls and list to operators"
+            src.contains("/research list"),
+            "help text must mention /research list"
         );
     }
 
     #[test]
-    fn help_documents_delete_alias() {
+    fn help_documents_rm_command() {
         let src = source();
         assert!(
-            src.contains("/research rm | delete"),
-            "help text must show both rm and delete to operators"
+            src.contains("/research rm"),
+            "help text must mention /research rm"
         );
     }
 
