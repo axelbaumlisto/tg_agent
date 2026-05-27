@@ -22,6 +22,7 @@ mod commands;
 mod fmt_utils;
 mod media_dispatch;
 mod message_handler;
+mod session_control;
 #[path = "streaming_mod/mod.rs"]
 mod streaming;
 

@@ -5,14 +5,12 @@
 //! that the event loop in [`crate::runtime`] can use directly.
 
 use std::sync::Arc;
-use std::time::Duration;
-
 use teloxide::prelude::*;
 
 use naked_core::AgentCore;
 use naked_core::config::Config;
 
-use crate::shared::{RATE_LIMITER, memory_scheduler, research_scheduler};
+use crate::shared::{RATE_LIMITER, memory_scheduler};
 use naked_tg::channel_map::ChannelSessionMap;
 
 /// All state produced by [`build`] and consumed by the event loop.
@@ -41,8 +39,14 @@ pub(crate) struct WiredBot {
     pub(crate) liveness: Arc<naked_core::liveness::LivenessRegistry>,
 }
 
+pub(crate) mod channel_state;
+pub(crate) mod context_hooks;
 pub(crate) mod health;
 pub(crate) mod invariants;
+pub(crate) mod quality;
+pub(crate) mod research_scheduler;
+pub(crate) mod scheduler_lock;
+pub(crate) mod telegram;
 
 use health::{
     VisionShapeOutcome, audit_all_providers, boot_caps_invariant_sweep,
@@ -76,39 +80,7 @@ pub(crate) async fn build() -> WiredBot {
         });
     }
 
-    // PLAN_QUALITY_v1 wiring (T2/T5/T6): install pluggable managers.
-    // Each is opt-in via config / disk presence; missing = silent
-    // off-path (zero overhead).
-    {
-        // T2 LSP manager. ENABLED by default (post-edit compiler
-        // feedback is the biggest quality multiplier in
-        // PLAN_QUALITY_v1). Lazy: LSP servers spawn on first edit
-        // per language. Operators who want to disable can set
-        // NAKED_LSP_DISABLED=1.
-        let lsp_cfg = naked_core::lsp::LspConfig::default();
-        tracing::info!(
-            lsp_enabled = lsp_cfg.enabled,
-            lsp_warn_included = lsp_cfg.include_warnings,
-            lsp_max_diagnostics = lsp_cfg.max_diagnostics_per_file,
-            "PLAN_QUALITY_v1 LSP manager configured"
-        );
-        let lsp = std::sync::Arc::new(naked_core::lsp::LspManager::new(lsp_cfg));
-        agent.set_lsp(lsp);
-
-        // T6 lifecycle hooks: load ~/.naked/hooks.json if present.
-        // Empty file / missing path = no hooks installed (silent).
-        let hooks = std::sync::Arc::new(naked_core::lifecycle_hooks::LifecycleHookRunner::new());
-        hooks.load_default().await;
-        agent.set_lifecycle_hooks(hooks);
-
-        // T5 permission ruleset: load ~/.naked/permissions.json if
-        // present. Empty file / missing path = empty ruleset = every
-        // tool falls through to the existing UI prompt (Ask).
-        let ruleset = naked_core::permissions::Store::load();
-        let permissions = std::sync::Arc::new(tokio::sync::RwLock::new(ruleset));
-        agent.set_permissions(permissions);
-        tracing::info!("PLAN_QUALITY_v1 wiring installed: lsp + hooks + permissions");
-    }
+    quality::install_quality_managers(&agent).await;
 
     // BUG_REGISTRY D-BOOT-CONFIG-SYMLINK (B41 regression guard).
     // Asserts that `naked/naked.json` is a symlink pointing at
@@ -225,47 +197,7 @@ pub(crate) async fn build() -> WiredBot {
             .await;
     }
 
-    // Cross-process advisory lock guarding `<NAKED_HOME>/research/`.
-    // Acquired BEFORE we wire the scheduler so a second `naked-tg`
-    // instance pointed at the same NAKED_HOME aborts immediately
-    // instead of corrupting `inflight.json` and `runs.jsonl` via
-    // append races. Held by binding to `_scheduler_lock` so it lives
-    // for the lifetime of the bot process; drop on exit releases it.
-    // We keep an `Option` so test or future tooling can run without a
-    // research subsystem at all.
-    let _scheduler_lock: Option<naked_tg::scheduler_lock::SchedulerLock> = if config
-        .research
-        .enabled
-    {
-        let research_root = config
-            .research
-            .storage_dir
-            .clone()
-            .unwrap_or_else(naked_core::research::research_root);
-        match naked_tg::scheduler_lock::SchedulerLock::try_acquire(&research_root) {
-            Ok(lock) => Some(lock),
-            Err(naked_tg::scheduler_lock::LockError::Held { path, existing_pid }) => {
-                tracing::error!(
-                    lock = %path.display(),
-                    holder_pid = ?existing_pid,
-                    "research scheduler lock is held by another naked-tg process; \
-                     refusing to start the scheduler to avoid corrupting state. \
-                     Stop the other instance or point NAKED_HOME at a different \
-                     directory."
-                );
-                None
-            }
-            Err(naked_tg::scheduler_lock::LockError::Io(e)) => {
-                tracing::error!(
-                    "failed to acquire scheduler lock under {}: {e}; refusing to start scheduler",
-                    research_root.display()
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let _scheduler_lock = scheduler_lock::acquire_scheduler_lock(&config);
 
     // F2 of PLAN_NEXT_SESSION: shared liveness registry — the
     // polling loop and the scheduler both beat into it, the watchdog
@@ -308,295 +240,34 @@ pub(crate) async fn build() -> WiredBot {
 
     let mcp_failures = agent.init_mcp().await;
 
-    // B6: Register built-in context hook — inject short git status.
-    // Helps the model know if there are uncommitted changes.
-    agent
-        .hooks()
-        .on_context(std::sync::Arc::new(
-            |msgs: &mut Vec<naked_core::types::ConversationMessage>| {
-                // Only inject if the first message is a system prompt
-                // and we're in a git repo (workspace is set in system prompt).
-                if msgs.is_empty() {
-                    return;
-                }
-                // Quick check with timeout — skip if git is slow or not a repo
-                let output = std::process::Command::new("git")
-                    .args(["diff", "--stat", "HEAD"])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .output();
-                if let Ok(out) = output {
-                    let stat = String::from_utf8_lossy(&out.stdout);
-                    let stat = stat.trim();
-                    if !stat.is_empty() && stat.len() < 500 {
-                        msgs.push(naked_core::types::ConversationMessage::user(format!(
-                            "[git diff --stat]\n{stat}"
-                        )));
-                    }
-                }
-            },
-        ))
-        .await;
+    context_hooks::install_builtin_context_hooks(&agent).await;
 
     let restored = agent.restore_sessions().await.unwrap_or_default();
     if !restored.is_empty() {
         tracing::info!("Restored {} session(s)", restored.len());
     }
 
-    // Reconstruct the naked home dir (same formula as bootstrap.rs).
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let naked_dir = std::path::PathBuf::from(&home).join(".naked");
+    let channel_map = channel_state::restore_channel_state(&agent).await;
 
-    // Open the durable channel-map snapshot. On any failure we fall
-    // back to an in-memory map so the bot still starts; restoration via
-    // session-meta below remains the authoritative recovery path.
-    let channel_map = match ChannelSessionMap::open(&naked_dir).await {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            tracing::warn!("channel_map snapshot open failed ({e:#}); using in-memory only");
-            Arc::new(ChannelSessionMap::new())
-        }
-    };
-
-    // Rebuild channel→session mapping from persisted metadata. This is
-    // the authoritative path — the JSONL snapshot above is a cache that
-    // gets refreshed below once the in-memory state is fully populated.
-    let mappings = agent.channel_session_mappings().await;
-    let restored_links = channel_map.restore_from(&mappings).await;
-    if restored_links > 0 {
-        tracing::info!("Restored {restored_links} channel→session link(s)");
-    }
-
-    // Restore yolo + allow_list from persisted session configs
-    for (channel_id, session_id) in &mappings {
-        let sc = agent.load_session_config_pub(session_id);
-        let parts: Vec<&str> = channel_id.splitn(3, ':').collect();
-        if parts.len() == 3
-            && parts[0] == "tg"
-            && let (Ok(cid), Ok(raw_tid)) = (parts[1].parse::<i64>(), parts[2].parse::<i64>())
-        {
-            let tid = if raw_tid == 0 {
-                None
-            } else {
-                Some(raw_tid as i32)
-            };
-            if let Some(enabled_at) = sc.yolo_enabled_at {
-                channel_map.enable_yolo_at(cid, tid, enabled_at).await;
-                if channel_map.is_yolo(cid, tid).await {
-                    let remaining_h = channel_map.yolo_remaining_secs(cid, tid).await / 3600;
-                    tracing::info!(
-                        cid,
-                        ?tid,
-                        remaining_h,
-                        "restored yolo for session {} ({remaining_h}h left)",
-                        &session_id[..8] // REGISTRY-WAIVE: B48 — session ID is ASCII hex
-                    );
-                } else {
-                    tracing::info!(cid, ?tid, "yolo expired for session {}", &session_id[..8]); // REGISTRY-WAIVE: B48 — session ID is ASCII hex
-                }
-            }
-            if let Some(tools) = &sc.allow_list {
-                for tool in tools {
-                    channel_map.allow_add(cid, tid, tool).await;
-                }
-                if !tools.is_empty() {
-                    tracing::info!(
-                        cid,
-                        ?tid,
-                        n = tools.len(),
-                        "restored allow-list for session {}",
-                        &session_id[..8] // REGISTRY-WAIVE: B48 — session ID is ASCII hex
-                    );
-                }
-            }
-        }
-    }
-
-    // Refresh the durable snapshot to reflect everything we just
-    // restored.
-    if let Err(e) = channel_map.flush().await {
-        tracing::warn!("channel_map: initial flush failed: {e:#}");
-    }
-
-    // Periodic snapshot writer: cheap atomic temp+rename every 30s.
-    {
-        let cm = channel_map.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-            tick.tick().await; // skip the immediate first tick
-            loop {
-                tick.tick().await;
-                if let Err(e) = cm.flush().await {
-                    tracing::warn!("channel_map: periodic flush failed: {e:#}");
-                }
-            }
-        });
-    }
-
-    let bot_token = config
-        .telegram
-        .telegram_bot_token
-        .clone()
-        .or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok())
-        .expect("telegram_bot_token must be set in config or TELEGRAM_BOT_TOKEN env var");
-
-    let bot = Bot::new(&bot_token);
-
-    register_commands(&bot).await;
-
-    tracing::info!(
-        "Starting Telegram bot ({}/{})",
-        config.default_provider,
-        config.default_model
-    );
-
-    // Manual polling loop client — avoids teloxide's Dispatcher/Polling
-    // which conflicts with stale getUpdates connections from other processes.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .expect("reqwest client");
-    let base = format!("https://api.telegram.org/bot{bot_token}");
-    let http_client: Arc<reqwest::Client> = Arc::new(client.clone());
-    let base_url: Arc<String> = Arc::new(base.clone());
-    let bot_token_arc: Arc<String> = Arc::new(bot_token.clone());
-
-    // Resolve our own bot identity (id + @username) so the group-chat
-    // gate can tell "this message is for us" apart from "humans
-    // chatting with each other while the bot lurks". Privacy mode is
-    // OFF for this bot (`can_read_all_group_messages: true`), which
-    // means Telegram delivers every group message — without this
-    // identity-aware filter the bot would respond to all of them.
-    let bot_identity: Arc<naked_tg::bot_identity::BotIdentity> = match client
-        .get(format!("{base}/getMe"))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-    {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(v) => {
-                let id = v
-                    .get("result")
-                    .and_then(|r| r.get("id"))
-                    .and_then(|i| i.as_u64())
-                    .unwrap_or(0);
-                let username = v
-                    .get("result")
-                    .and_then(|r| r.get("username"))
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if id == 0 || username.is_empty() {
-                    tracing::warn!(
-                        "getMe returned malformed payload — group-chat addressing filter \
-                         will refuse every group message. Check the bot token."
-                    );
-                }
-                tracing::info!(bot_id = id, %username, "bot identity resolved via getMe");
-                Arc::new(naked_tg::bot_identity::BotIdentity { id, username })
-            }
-            Err(e) => {
-                tracing::error!(
-                    "getMe parse error: {e} — using zero identity (group filter will reject everything)"
-                );
-                Arc::new(naked_tg::bot_identity::BotIdentity {
-                    id: 0,
-                    username: String::new(),
-                })
-            }
-        },
-        Err(e) => {
-            tracing::error!(
-                "getMe request failed: {e} — using zero identity (group filter will reject everything)"
-            );
-            Arc::new(naked_tg::bot_identity::BotIdentity {
-                id: 0,
-                username: String::new(),
-            })
-        }
-    };
+    let telegram = telegram::boot_telegram_client(&config).await;
+    let bot = telegram.bot;
+    let bot_token_arc = telegram.bot_token;
+    let bot_identity = telegram.bot_identity;
+    let http_client = telegram.http_client;
+    let base_url = telegram.base_url;
 
     // Startup janitor: nuke old media artifacts outside the retention window.
     crate::media::sweep_old_artifacts(&config.workspace, config.tg_media.artifact_retention_days);
 
-    // Drop any pending updates + delete webhook on startup
-    let _ = client
-        .post(format!("{base}/deleteWebhook"))
-        .json(&serde_json::json!({"drop_pending_updates": true}))
-        .send()
-        .await;
-    tracing::info!("Webhook cleared, starting polling loop");
+    telegram::clear_webhook(&http_client, &base_url).await;
 
-    // T2.6 (PLAN_RESEARCH_AGENT_FLOW_v1): build the synthetic-message
-    // dispatch closure now that Bot + channel_map + agent are all in
-    // scope. The scheduler will call this when a spec is due AND has
-    // `chat_id` configured — the synthetic message lands in the
-    // operator's chat thread, gets a normal session via channel_map,
-    // and streams through the same pipeline as user-typed messages.
-    // The standard ⏹ Abort button is attached automatically; `/abort`
-    // command works the same way (B57 mitigation).
-    let mut research_scheduler_handle: Option<
-        Arc<crate::shared::research_scheduler::ResearchScheduler>,
-    > = None;
-    if config.research.enabled && _scheduler_lock.is_some() {
-        // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): the dispatch closure is
-        // now a thin shim over `synthetic::dispatch_for_chat` so the
-        // scheduler path AND the operator `/research run X` path share
-        // the same flow. The session-creation policy lives in synthetic.rs.
-        let dispatch_fn: naked_tg::synthetic::SyntheticDispatchFn = {
-            let agent = agent.clone();
-            let channel_map = channel_map.clone();
-            std::sync::Arc::new(move |msg: naked_tg::synthetic::SyntheticMessage| {
-                let agent = agent.clone();
-                let channel_map = channel_map.clone();
-                Box::pin(async move {
-                    let spec_id_owned =
-                        msg.source.spec_id().map(str::to_string).unwrap_or_default();
-                    match naked_tg::synthetic::dispatch_for_chat(
-                        &agent,
-                        &channel_map,
-                        msg.chat_id,
-                        msg.thread_id,
-                        &spec_id_owned,
-                    )
-                    .await
-                    {
-                        Ok((sid, _handle)) => {
-                            tracing::info!(
-                                session_id = %sid,
-                                spec_id = %spec_id_owned,
-                                "synthetic dispatch: turn submitted via wiring closure"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                spec_id = %spec_id_owned,
-                                error = %e,
-                                "synthetic dispatch failed; scheduler will retry next tick"
-                            );
-                        }
-                    }
-                })
-            })
-        };
-        let scheduler_cfg = research_scheduler::SchedulerConfig {
-            verify_by_default: config.research.verify_by_default,
-            max_verification_rounds: config.research.gatekeeper.max_rounds,
-            max_concurrent_runs: config.research.max_concurrent_runs.max(1),
-            task_timeout: std::time::Duration::from_secs(config.research.task_timeout_seconds),
-            max_retries_before_alert: config.research.max_retries_before_alert,
-            liveness: Some(liveness.clone()),
-            dispatch_fn: Some(dispatch_fn),
-            ..Default::default()
-        };
-        let (sched_arc, hook) =
-            research_scheduler::ResearchScheduler::start(Arc::downgrade(&agent), scheduler_cfg);
-        research_scheduler_handle = Some(sched_arc);
-        agent.set_scheduler_hook(hook);
-        tracing::info!(
-            "research scheduler online (synthetic dispatch wired; T2.6 PLAN_RESEARCH_AGENT_FLOW_v1)"
-        );
-    }
+    let research_scheduler_handle = research_scheduler::start_research_scheduler(
+        &agent,
+        &config,
+        &channel_map,
+        &liveness,
+        _scheduler_lock.is_some(),
+    );
 
     let rate_limiter = RATE_LIMITER.clone();
 
@@ -616,36 +287,6 @@ pub(crate) async fn build() -> WiredBot {
         _scheduler_lock,
         _memory_scheduler,
         liveness,
-    }
-}
-
-/// Register bot commands with Telegram so the slash-menu is populated.
-async fn register_commands(bot: &Bot) {
-    use teloxide::types::BotCommand;
-    let commands = vec![
-        BotCommand::new("status", "Session status, usage, cost"),
-        BotCommand::new("compact", "Compact session history"),
-        BotCommand::new("new", "Start a new session"),
-        BotCommand::new("sessions", "List active sessions"),
-        BotCommand::new("stop", "Cancel running task"),
-        BotCommand::new("abort", "Cancel running task (alias)"),
-        BotCommand::new("provider", "Switch provider"),
-        BotCommand::new("model", "Switch model"),
-        BotCommand::new("skills", "List loaded skills"),
-        BotCommand::new("mcp", "List MCP servers"),
-        BotCommand::new("refresh", "Reload skills & MCP"),
-        BotCommand::new("reasoning", "Set thinking/reasoning level"),
-        BotCommand::new("yolo", "Auto-approve ALL tools in this topic"),
-        BotCommand::new("allow", "Manage tool allow-list for this topic"),
-        BotCommand::new("memory", "Memory: rules / dreams / drafts / stats"),
-        BotCommand::new("research", "Run, list, pause or resume research"),
-        BotCommand::new("health", "Provider health & key status"),
-        BotCommand::new("commit", "Git commit modified files"),
-        BotCommand::new("remote", "Switch to SSH remote host"),
-        BotCommand::new("help", "Show all commands"),
-    ];
-    if let Err(e) = bot.set_my_commands(commands).await {
-        tracing::warn!("Failed to set bot commands: {e}");
     }
 }
 

@@ -848,8 +848,8 @@ mod tests {
     /// the metric blind to half the cancels.
     #[test]
     fn both_cancel_paths_record_propagation_metric() {
-        // The r:stop callback path lives in callbacks.rs.
-        let callbacks_src = include_str!("callbacks.rs");
+        // The r:stop callback path lives in callbacks/research.rs.
+        let callbacks_src = include_str!("callbacks/research.rs");
         assert!(
             callbacks_src.contains("record_research_cancel_propagation"),
             "r:stop callback must record cancel propagation (T11 wiring)"
