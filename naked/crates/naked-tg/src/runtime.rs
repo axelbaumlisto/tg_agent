@@ -233,6 +233,23 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
         std::sync::atomic::AtomicBool::new(config.telegram.tg_sender_attribution),
     );
 
+    // Single BotDeps construction — cloned into every handler arm (DRY).
+    let shared_deps = BotDeps {
+        bot: bot.clone(),
+        agent: agent.clone(),
+        channel_map: channel_map.clone(),
+        config: config.clone(),
+        pending_perms: pending_perms.clone(),
+        http_client: http_client.clone(),
+        base_url: base_url.clone(),
+        rate_limiter: rate_limiter.clone(),
+        attribution_flag: attribution_flag.clone(),
+        bot_token: bot_token.clone(),
+        bot_identity: bot_identity.clone(),
+        tg_attach_queue: tg_attach_queue.clone(),
+        research_scheduler: research_scheduler.clone(),
+    };
+
     let mut offset: i64 = 0;
 
     // Use the pre-computed base URL and token as borrowed slices.
@@ -330,21 +347,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                 // One cheap clone-bag covers both the album-flush callback
                 // and the sync dispatch path below. Replaces the 11-line
                 // manual plumbing this function used to carry.
-                let deps = BotDeps {
-                    bot: bot.clone(),
-                    agent: agent.clone(),
-                    channel_map: channel_map.clone(),
-                    config: config.clone(),
-                    pending_perms: pending_perms.clone(),
-                    http_client: http_client.clone(),
-                    base_url: base_url.clone(),
-                    rate_limiter: rate_limiter.clone(),
-                    attribution_flag: attribution_flag.clone(),
-                    bot_token: bot_token.clone(),
-                    bot_identity: bot_identity.clone(),
-                    tg_attach_queue: tg_attach_queue.clone(),
-                    research_scheduler: research_scheduler.clone(),
-                };
+                let deps = shared_deps.clone();
                 let permit = task_tracker.clone();
                 let album = album_buffer.clone();
                 let task_tracker_for_flush = task_tracker.clone();
@@ -427,21 +430,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                         msg_id,
                         "Dispatching edited_message as new message"
                     );
-                    let deps = BotDeps {
-                        bot: bot.clone(),
-                        agent: agent.clone(),
-                        channel_map: channel_map.clone(),
-                        config: config.clone(),
-                        pending_perms: pending_perms.clone(),
-                        http_client: http_client.clone(),
-                        base_url: base_url.clone(),
-                        rate_limiter: rate_limiter.clone(),
-                        attribution_flag: attribution_flag.clone(),
-                        bot_token: bot_token.clone(),
-                        bot_identity: bot_identity.clone(),
-                        tg_attach_queue: tg_attach_queue.clone(),
-                        research_scheduler: research_scheduler.clone(),
-                    };
+                    let deps = shared_deps.clone();
                     let permit = task_tracker.clone();
                     let guard_chat = msg.chat.id;
                     let guard_thread = msg.thread_id;
@@ -468,21 +457,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                         continue;
                     }
                 };
-                let cb_deps = crate::message_handler::BotDeps {
-                    bot: bot.clone(),
-                    agent: agent.clone(),
-                    channel_map: channel_map.clone(),
-                    config: config.clone(),
-                    pending_perms: pending_perms.clone(),
-                    http_client: http_client.clone(),
-                    base_url: base_url.clone(),
-                    rate_limiter: rate_limiter.clone(),
-                    attribution_flag: attribution_flag.clone(),
-                    bot_token: bot_token.clone(),
-                    bot_identity: bot_identity.clone(),
-                    tg_attach_queue: tg_attach_queue.clone(),
-                    research_scheduler: research_scheduler.clone(),
-                };
+                let cb_deps = shared_deps.clone();
                 let cb_pending = pending_perms.clone();
                 let permit = task_tracker.clone();
                 let cb_chat = q.message.as_ref().map(|m| m.chat().id).unwrap_or(ChatId(0));

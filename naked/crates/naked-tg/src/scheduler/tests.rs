@@ -1636,3 +1636,27 @@ fn resurrection_respects_slot_limit() {
         2
     );
 }
+
+// ── OperatorContext stamps on Inflight ──────────────────────────────────
+
+#[test]
+fn operator_context_struct_fields() {
+    let op = tasks::OperatorContext {
+        chat_id: 12345,
+        thread_id: Some(678),
+        session_id: "sess-op".into(),
+        prompt: "run spec=foo".into(),
+    };
+    assert_eq!(op.chat_id, 12345);
+    assert_eq!(op.thread_id, Some(678));
+    assert_eq!(op.session_id, "sess-op");
+    assert_eq!(op.prompt, "run spec=foo");
+}
+
+// ── cancel_task ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cancel_task_returns_false_for_unknown() {
+    let sched = ResearchScheduler::start(std::sync::Weak::new(), SchedulerConfig::default()).0;
+    assert!(!sched.cancel_task("nonexistent").await);
+}

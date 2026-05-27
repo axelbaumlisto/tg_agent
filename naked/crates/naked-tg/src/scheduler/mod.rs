@@ -523,27 +523,34 @@ impl ResearchScheduler {
             }
         }
 
-        // spawn_task creates its own Inflight::scheduled() — we let
-        // it do the initial write, then patch operator context on top
-        // so the fields survive resurrection.
-        tasks::spawn_task(&core, &self.state, &self.notifier, &self.config, &spec, 1).await;
-
-        // Patch operator context onto the inflight that spawn_task wrote.
-        let attempt_id = if let Ok(Some(mut infl)) = store.load_inflight(&spec.id).await {
-            let aid = infl.attempt_id.clone();
-            infl.chat_id = Some(chat_id);
-            infl.thread_id = thread_id;
-            infl.session_id = Some(session_id);
-            infl.prompt = Some(prompt);
-            if let Err(e) = store.save_inflight(&spec.id, &infl).await {
-                tracing::warn!(spec = %spec.id, "dispatch_immediate: patch inflight: {e:#}");
-            }
-            aid
-        } else {
-            "unknown".into()
+        // Single write: spawn_task stamps operator context on
+        // Inflight before the first save_inflight call.
+        let op = tasks::OperatorContext {
+            chat_id,
+            thread_id,
+            session_id,
+            prompt,
         };
+        tasks::spawn_task(
+            &core,
+            &self.state,
+            &self.notifier,
+            &self.config,
+            &spec,
+            1,
+            Some(op),
+        )
+        .await;
 
-        self.poke(); // wake sweep so heartbeat starts immediately
+        let attempt_id = store
+            .load_inflight(&spec.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.attempt_id)
+            .unwrap_or_else(|| "unknown".into());
+
+        self.poke();
         Ok(attempt_id)
     }
 }

@@ -79,7 +79,6 @@ pub(crate) async fn handle_command(
             };
             research::handle_research_cmd(
                 deps,
-                config,
                 &ctx,
                 effective_text,
                 if cmd_word == "/tasks" {

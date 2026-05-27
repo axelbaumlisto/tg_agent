@@ -1,5 +1,15 @@
 use super::*;
 
+/// Operator context for `/research run`-triggered dispatches.
+/// When present, these fields are stamped onto the Inflight record
+/// so the scheduler can stream results back to the right chat.
+pub(crate) struct OperatorContext {
+    pub chat_id: i64,
+    pub thread_id: Option<i32>,
+    pub session_id: String,
+    pub prompt: String,
+}
+
 /// Spawn the worker for one scheduling attempt. Owns the on-disk
 /// state-machine: writes `Scheduled` before spawn, has the worker
 /// flip to `Running`, and finalises to `Completed` / `Failed` from
@@ -14,6 +24,7 @@ pub(crate) async fn spawn_task(
     config: &SchedulerConfig,
     spec: &ResearchSpec,
     attempt: u32,
+    operator: Option<OperatorContext>,
 ) {
     let store = core.research_store();
     let timeout = spec
@@ -25,6 +36,12 @@ pub(crate) async fn spawn_task(
     // Phase 1: persist `Scheduled` so we survive a crash *before*
     // the worker future actually starts running.
     let mut infl = Inflight::scheduled(spec.id.clone(), attempt);
+    if let Some(op) = &operator {
+        infl.chat_id = Some(op.chat_id);
+        infl.thread_id = op.thread_id;
+        infl.session_id = Some(op.session_id.clone());
+        infl.prompt = Some(op.prompt.clone());
+    }
     let attempt_id = infl.attempt_id.clone();
     if let Err(e) = store.save_inflight(&spec.id, &infl).await {
         tracing::warn!(spec = %spec.id, "failed to persist Scheduled inflight: {e:#}");

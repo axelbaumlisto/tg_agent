@@ -310,7 +310,7 @@ pub(crate) async fn drain_resurrection_queue(
             attempt,
             "draining resurrection-tagged inflight under concurrency cap"
         );
-        spawn_task(core, state, notifier, config, &spec, attempt).await;
+        spawn_task(core, state, notifier, config, &spec, attempt, None).await;
         consumed += 1;
         if config.resurrection_stagger > Duration::ZERO {
             sleep(config.resurrection_stagger).await;

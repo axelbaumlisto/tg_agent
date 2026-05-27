@@ -149,7 +149,7 @@ pub(crate) async fn scan_and_dispatch(
         // Pre-set last_run so other planning passes wait one full cycle.
         state.lock().await.last_runs.insert(spec.id.clone(), now);
 
-        spawn_task(core, state, notifier, config, &spec, 1).await;
+        spawn_task(core, state, notifier, config, &spec, 1, None).await;
     }
     Ok(())
 }

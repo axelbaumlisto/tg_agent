@@ -72,7 +72,6 @@ async fn resolve_spec_ref(chat_id: i64, tail: &str) -> String {
 ///      yet" reply — systemd timer templating is deferred to v6.
 pub(crate) async fn handle_research_cmd(
     deps: &crate::message_handler::BotDeps,
-    config: &Config,
     ctx: &ChatCtx,
     text: &str,
     cmd_word: &str,
@@ -80,6 +79,7 @@ pub(crate) async fn handle_research_cmd(
     let bot = &deps.bot;
     let agent = &deps.agent;
     let channel_map = &deps.channel_map;
+    let config = &deps.config;
     if !config.research.enabled {
         reply_text(bot, ctx, "Research subsystem is disabled in config.").await?;
         return Ok(());
