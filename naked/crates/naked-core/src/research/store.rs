@@ -115,6 +115,11 @@ pub trait InflightStore: Send + Sync {
     async fn list_nonterminal_inflight(&self) -> Result<Vec<Inflight>> {
         Ok(Vec::new())
     }
+    /// All inflight records (terminal + non-terminal). Used by `/bg list`.
+    async fn list_all_inflight(&self) -> Result<Vec<Inflight>> {
+        // Default: only nonterminal (backwards-compat).
+        self.list_nonterminal_inflight().await
+    }
     async fn purge_terminal_inflight(
         &self,
         _now: chrono::DateTime<chrono::Utc>,

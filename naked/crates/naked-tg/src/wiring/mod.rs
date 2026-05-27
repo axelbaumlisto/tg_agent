@@ -29,6 +29,8 @@ pub(crate) struct WiredBot {
     pub(crate) mcp_failures: Vec<naked_core::mcp::client::McpConnectFailure>,
     pub(crate) rate_limiter: naked_tg::rate_limit::RateLimiter,
     // Kept alive for the lifetime of the process:
+    pub(crate) research_scheduler:
+        Option<Arc<crate::shared::research_scheduler::ResearchScheduler>>,
     pub(crate) _scheduler_lock: Option<naked_tg::scheduler_lock::SchedulerLock>,
     pub(crate) _memory_scheduler: naked_tg::memory_scheduler::MemoryScheduler,
     /// Shared liveness registry. The polling loop and the research
@@ -535,6 +537,9 @@ pub(crate) async fn build() -> WiredBot {
     // and streams through the same pipeline as user-typed messages.
     // The standard ⏹ Abort button is attached automatically; `/abort`
     // command works the same way (B57 mitigation).
+    let mut research_scheduler_handle: Option<
+        Arc<crate::shared::research_scheduler::ResearchScheduler>,
+    > = None;
     if config.research.enabled && _scheduler_lock.is_some() {
         // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): the dispatch closure is
         // now a thin shim over `synthetic::dispatch_for_chat` so the
@@ -586,8 +591,9 @@ pub(crate) async fn build() -> WiredBot {
             dispatch_fn: Some(dispatch_fn),
             ..Default::default()
         };
-        let (_scheduler, hook) =
+        let (sched_arc, hook) =
             research_scheduler::ResearchScheduler::start(Arc::downgrade(&agent), scheduler_cfg);
+        research_scheduler_handle = Some(sched_arc);
         agent.set_scheduler_hook(hook);
         tracing::info!(
             "research scheduler online (synthetic dispatch wired; T2.6 PLAN_RESEARCH_AGENT_FLOW_v1)"
@@ -608,6 +614,7 @@ pub(crate) async fn build() -> WiredBot {
         tg_attach_queue,
         mcp_failures,
         rate_limiter,
+        research_scheduler: research_scheduler_handle,
         _scheduler_lock,
         _memory_scheduler,
         liveness,

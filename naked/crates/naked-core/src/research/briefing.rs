@@ -42,7 +42,7 @@ pub fn short(cfg: &ResearchConfig) -> String {
            never fire. Schedule changes take effect on the next tick \
            because [tools] notify the scheduler immediately.\n\
          - **Concurrency**: at most {max_concurrent} run(s) at a time across \
-           the whole process — manual `/research run`, the `research_launch` \
+           the whole process — manual `/research run`, the `research_run` \
            tool, and the scheduler share one semaphore. If a run is in \
            flight, others queue.\n\
          - **Verification**: `verify_by_default = {verify}`; when on, every \
@@ -144,7 +144,7 @@ pub fn full(cfg: &ResearchConfig) -> String {
          - `research_metrics` — detailed metrics for one spec (recommended \
            for any 'how is X going / what's its schedule' question)\n\
          - `research_findings` — list saved findings for a spec\n\
-         - `research_launch` — kick off a one-off run (uses verification \
+         - `research_run` — kick off a one-off run (uses verification \
            by default if `verify_by_default = true`)\n\
          - `research_update_spec` — partial mutation (topic / sources / \
            schedule / provider / model / paused). Sources can be appended \
@@ -249,7 +249,7 @@ mod tests {
             "research_list_specs",
             "research_metrics",
             "research_findings",
-            "research_launch",
+            "research_run",
             "research_update_spec",
             "research_set_schedule",
             "research_pause",

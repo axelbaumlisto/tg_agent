@@ -135,7 +135,7 @@ impl Tool for ResearchRunTool {
                 },
                 "required": ["spec_id"]
             }),
-            permission: Permission::WorkspaceWrite,
+            permission: Permission::ReadOnly,
         }
     }
 
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn tool_spec_permission_is_workspace_write() {
-        assert_eq!(dead_tool().spec().permission, Permission::WorkspaceWrite);
+        assert_eq!(dead_tool().spec().permission, Permission::ReadOnly);
     }
 
     #[tokio::test]

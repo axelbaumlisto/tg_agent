@@ -93,7 +93,7 @@ pub struct ResearchConfig {
     #[serde(default = "default_true")]
     pub notify_on_new_findings: bool,
     /// Run gatekeeper verification automatically for runs launched from
-    /// Telegram (`/research run`) and the `research_launch` agent tool.
+    /// Telegram (`/research run`) and the `research_run` agent tool.
     /// Uses `gatekeeper.max_rounds` for the round budget.
     /// CLI `naked research run --verify` is unaffected (always explicit).
     /// Default: `true`.
@@ -120,7 +120,7 @@ pub struct ResearchConfig {
     pub gatekeeper: GatekeeperConfig,
     /// Maximum number of research runs that may execute concurrently in this
     /// process. Applies to every entry point — manual `/research run`, the
-    /// `research_launch` LLM tool, and the in-process scheduler. Default
+    /// `research_run` LLM tool, and the in-process scheduler. Default
     /// `5`: the scheduler subsystem treats this as the parallelism budget
     /// for at-time / cron / interval triggered runs. Set to `1` if your
     /// runs share a singleton (e.g. a single Playwright browser).

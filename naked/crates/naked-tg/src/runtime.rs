@@ -35,6 +35,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
         tg_attach_queue,
         mcp_failures,
         rate_limiter,
+        research_scheduler,
         _scheduler_lock,
         _memory_scheduler,
         liveness,
@@ -231,6 +232,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
     let attribution_flag: Arc<std::sync::atomic::AtomicBool> = Arc::new(
         std::sync::atomic::AtomicBool::new(config.telegram.tg_sender_attribution),
     );
+
     let mut offset: i64 = 0;
 
     // Use the pre-computed base URL and token as borrowed slices.
@@ -341,6 +343,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                     bot_token: bot_token.clone(),
                     bot_identity: bot_identity.clone(),
                     tg_attach_queue: tg_attach_queue.clone(),
+                    research_scheduler: research_scheduler.clone(),
                 };
                 let permit = task_tracker.clone();
                 let album = album_buffer.clone();
@@ -437,6 +440,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                         bot_token: bot_token.clone(),
                         bot_identity: bot_identity.clone(),
                         tg_attach_queue: tg_attach_queue.clone(),
+                        research_scheduler: research_scheduler.clone(),
                     };
                     let permit = task_tracker.clone();
                     let guard_chat = msg.chat.id;
@@ -464,13 +468,23 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                         continue;
                     }
                 };
-                let bot = bot.clone();
-                let pending_perms = pending_perms.clone();
-                let agent = agent.clone();
-                let channel_map = channel_map.clone();
-                let config = config.clone();
+                let cb_deps = crate::message_handler::BotDeps {
+                    bot: bot.clone(),
+                    agent: agent.clone(),
+                    channel_map: channel_map.clone(),
+                    config: config.clone(),
+                    pending_perms: pending_perms.clone(),
+                    http_client: http_client.clone(),
+                    base_url: base_url.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                    attribution_flag: attribution_flag.clone(),
+                    bot_token: bot_token.clone(),
+                    bot_identity: bot_identity.clone(),
+                    tg_attach_queue: tg_attach_queue.clone(),
+                    research_scheduler: research_scheduler.clone(),
+                };
+                let cb_pending = pending_perms.clone();
                 let permit = task_tracker.clone();
-                // Callback chat_id: from the message the button was on.
                 let cb_chat = q.message.as_ref().map(|m| m.chat().id).unwrap_or(ChatId(0));
                 let cb_thread = q.message.as_ref().and_then(|m| match m {
                     teloxide::types::MaybeInaccessibleMessage::Regular(msg) => msg.thread_id,
@@ -483,9 +497,7 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
                     "callback",
                     async move {
                         let _permit = permit.acquire().await;
-                        if let Err(e) =
-                            handle_callback(bot, q, pending_perms, agent, channel_map, config).await
-                        {
+                        if let Err(e) = handle_callback(cb_deps, q, cb_pending).await {
                             tracing::error!("handle_callback error: {e}");
                         }
                     },

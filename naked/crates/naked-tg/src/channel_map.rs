@@ -303,30 +303,23 @@ impl ChannelSessionMap {
 
     /// Returns true if `tool_name` should be auto-approved for this topic.
     /// Tools that are always safe to auto-approve (read-only, no side effects).
-    const SAFE_TOOLS: &'static [&'static str] = &[
-        "read_file",
-        "web_search",
-        "glob_search",
-        "grep_search",
-        "agent_status",
-    ];
-
+    /// Check if a tool should be auto-approved for this chat.
+    ///
+    /// SOLID/KISS: Permission level is the single source of truth.
+    /// ReadOnly tools are auto-approved by the core policy (never reach here).
+    /// WorkspaceWrite/Dangerous tools reach here and need yolo or allow_list.
     pub async fn should_auto_approve(
         &self,
         chat_id: i64,
         thread_id: Option<i32>,
-        tool_name: &str,
+        _tool_name: &str,
     ) -> bool {
-        // A4: Read-only tools always auto-approve.
-        if Self::SAFE_TOOLS.contains(&tool_name) {
-            return true;
-        }
         if self.is_yolo(chat_id, thread_id).await {
             return true;
         }
         let key = make_key(chat_id, thread_id);
         if let Some(tools) = self.allow_list.read().await.get(&key) {
-            return tools.contains(tool_name);
+            return tools.contains(_tool_name);
         }
         false
     }
@@ -442,12 +435,11 @@ mod tests {
     #[tokio::test]
     async fn allow_list_basics() {
         let map = ChannelSessionMap::new();
-        // bash is NOT safe — needs explicit allow or yolo
+        // Without yolo or allow_list, nothing auto-approves.
+        // (ReadOnly tools like read_file never reach should_auto_approve —
+        // core policy executes them directly without PermissionRequest.)
         assert!(!map.should_auto_approve(1, Some(2), "bash").await);
-        // A4: read_file IS safe — always auto-approved
-        assert!(map.should_auto_approve(1, Some(2), "read_file").await);
-        assert!(map.should_auto_approve(1, Some(2), "web_search").await);
-        assert!(map.should_auto_approve(1, Some(2), "grep_search").await);
+        assert!(!map.should_auto_approve(1, Some(2), "write_file").await);
 
         map.allow_add(1, Some(2), "bash").await;
 
@@ -460,8 +452,6 @@ mod tests {
 
         map.allow_remove(1, Some(2), "bash").await;
         assert!(!map.should_auto_approve(1, Some(2), "bash").await);
-        // read_file still auto-approved (safe tool)
-        assert!(map.should_auto_approve(1, Some(2), "read_file").await);
     }
 
     #[tokio::test]

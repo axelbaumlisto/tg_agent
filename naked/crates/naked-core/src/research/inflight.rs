@@ -102,6 +102,23 @@ pub struct Inflight {
     /// attempt to the corresponding `runs.jsonl` row.
     #[serde(default)]
     pub run_id: Option<String>,
+    // ── Operator context (T1 PLAN_BG_UNIFY_v2) ─────────────────────
+    // Present when an operator (or `/research run`) triggered the run.
+    // Absent for scheduler-only (cron/interval) dispatches.
+    // All `#[serde(default)]` for backward-compat with existing files.
+    /// Telegram chat to stream results into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<i64>,
+    /// Telegram thread (topic) inside the chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i32>,
+    /// naked-core session id for `send_prompt` / `stream_response`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The prompt sent to the LLM (for resurrect replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+
     /// `true` when this `Scheduled` record was re-queued by
     /// `resurrect_at_boot` after a process crash. The scheduler's
     /// dispatch loop drains these entries first (still under the
@@ -132,6 +149,10 @@ impl Inflight {
             error: None,
             attempt,
             run_id: None,
+            chat_id: None,
+            thread_id: None,
+            session_id: None,
+            prompt: None,
             scheduled_after_resurrection: false,
         }
     }
@@ -309,6 +330,39 @@ mod tests {
         }"#;
         let infl: Inflight = serde_json::from_str(raw).unwrap();
         assert!(!infl.scheduled_after_resurrection);
+    }
+
+    #[test]
+    fn operator_context_fields_backward_compat() {
+        // Old records without chat_id/thread_id/session_id/prompt
+        // must deserialize cleanly with None defaults.
+        let raw = r#"{
+          "spec_id": "old",
+          "attempt_id": "aabb1122",
+          "state": "running",
+          "scheduled_at": "2026-04-01T00:00:00Z",
+          "attempt": 1
+        }"#;
+        let infl: Inflight = serde_json::from_str(raw).unwrap();
+        assert!(infl.chat_id.is_none());
+        assert!(infl.thread_id.is_none());
+        assert!(infl.session_id.is_none());
+        assert!(infl.prompt.is_none());
+    }
+
+    #[test]
+    fn operator_context_fields_round_trip() {
+        let mut i = Inflight::scheduled("s1", 1);
+        i.chat_id = Some(123456);
+        i.thread_id = Some(789);
+        i.session_id = Some("sess-abc".into());
+        i.prompt = Some("Run research spec_id=foo".into());
+        let json = serde_json::to_string(&i).unwrap();
+        let back: Inflight = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.chat_id, Some(123456));
+        assert_eq!(back.thread_id, Some(789));
+        assert_eq!(back.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(back.prompt.as_deref(), Some("Run research spec_id=foo"));
     }
 
     #[test]

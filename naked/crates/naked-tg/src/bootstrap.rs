@@ -83,6 +83,16 @@ pub(crate) async fn run() {
     // No-op otherwise; production only opts in explicitly.
     crate::metrics::serve_prometheus_if_enabled();
 
+    // Tell systemd we're alive BEFORE the heavy build phase
+    // (MCP connect, provider audit, session loading can take 10-30s).
+    // The event loop sends a second READY=1 after build (idempotent).
+    #[cfg(target_os = "linux")]
+    if let Some(wd) = naked_tg::watchdog::SystemdWatchdog::detect_from_env() {
+        use naked_tg::watchdog::WatchdogNotifier as _;
+        wd.notify_ready().await;
+        tracing::info!("sd_notify READY=1 sent (pre-build)");
+    }
+
     // Build the DI graph, then hand off to the event loop.
     let wired = crate::wiring::build().await;
     crate::runtime::run_event_loop(wired).await;

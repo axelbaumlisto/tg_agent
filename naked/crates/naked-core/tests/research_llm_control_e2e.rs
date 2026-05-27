@@ -33,9 +33,9 @@ use naked_core::history::ConversationHistory;
 use naked_core::loop_::{AgentLoop, LoopConfig};
 use naked_core::provider::{ChatRequest, Provider};
 use naked_core::research::{
-    ResearchCreateTool, ResearchFindingsTool, ResearchLaunchTool, ResearchListSpecsTool,
-    ResearchMetricsTool, ResearchPauseTool, ResearchResumeTool, ResearchSetScheduleTool,
-    ResearchSetTargetTool, ResearchSpec, ResearchUpdateSpecTool,
+    ResearchCreateTool, ResearchFindingsTool, ResearchListSpecsTool, ResearchMetricsTool,
+    ResearchPauseTool, ResearchResumeTool, ResearchSetScheduleTool, ResearchSetTargetTool,
+    ResearchSpec, ResearchUpdateSpecTool,
 };
 use naked_core::tool::Tool;
 use naked_core::tool::registry::ToolRegistry;
@@ -167,7 +167,6 @@ async fn setup() -> Option<TestSetup> {
         Box::new(ResearchMetricsTool::new(store.clone())),
         Box::new(ResearchFindingsTool::new(store.clone())),
         Box::new(ResearchSetTargetTool::new(store.clone(), research_ctx)),
-        Box::new(ResearchLaunchTool::new(weak.clone())),
         Box::new(ResearchUpdateSpecTool::new(weak.clone())),
         Box::new(ResearchSetScheduleTool::new(weak.clone())),
         Box::new(ResearchPauseTool::new(weak.clone())),
@@ -463,7 +462,6 @@ async fn setup_from_existing(existing: &Arc<AgentCore>) -> Option<TestSetup> {
         Box::new(ResearchMetricsTool::new(store.clone())),
         Box::new(ResearchFindingsTool::new(store.clone())),
         Box::new(ResearchSetTargetTool::new(store.clone(), research_ctx)),
-        Box::new(ResearchLaunchTool::new(weak.clone())),
         Box::new(ResearchUpdateSpecTool::new(weak.clone())),
         Box::new(ResearchSetScheduleTool::new(weak.clone())),
         Box::new(ResearchPauseTool::new(weak.clone())),

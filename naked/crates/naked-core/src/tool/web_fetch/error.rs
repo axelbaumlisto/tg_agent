@@ -9,6 +9,9 @@ pub enum BlockKind {
     /// catch-all so future patterns can be added without another enum
     /// rename.
     AntiBotWall,
+    /// JS-rendered shell: HTTP 200 + large body but <2% visible text.
+    /// Typical of React/Next.js SPAs (chotot, FB Marketplace).
+    JsShell,
 }
 
 /// Heuristic detector for "the HTTP response looks fine but the body is
@@ -44,6 +47,21 @@ pub fn detect_block(status: u16, body: &str) -> Option<BlockKind> {
         && generic_walls.iter().any(|s| lower_small.contains(s))
     {
         return Some(BlockKind::AntiBotWall);
+    }
+    // JS-rendered shell: 200 OK, body is large but contains almost no
+    // readable text — just <script> / <noscript> / JSON state blobs.
+    // chotot.com, Facebook Marketplace, and many React/Next.js SPAs
+    // return this pattern.
+    if status == 200 && body.len() > 10_000 {
+        let visible_text_len = body
+            .split('<')
+            .filter_map(|seg| seg.split_once('>'))
+            .map(|(_, text)| text.trim().len())
+            .sum::<usize>();
+        // If visible text is <2% of total body → JS shell.
+        if visible_text_len * 50 < body.len() {
+            return Some(BlockKind::JsShell);
+        }
     }
     None
 }

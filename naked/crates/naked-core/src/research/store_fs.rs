@@ -507,6 +507,15 @@ impl InflightStore for FsResearchStore {
     }
 
     async fn list_nonterminal_inflight(&self) -> Result<Vec<Inflight>> {
+        Ok(self
+            .list_all_inflight()
+            .await?
+            .into_iter()
+            .filter(|i| !i.state.is_terminal())
+            .collect())
+    }
+
+    async fn list_all_inflight(&self) -> Result<Vec<Inflight>> {
         let mut out = Vec::new();
         if !self.root.exists() {
             return Ok(out);
@@ -525,8 +534,7 @@ impl InflightStore for FsResearchStore {
                 continue;
             };
             match serde_json::from_str::<Inflight>(&data) {
-                Ok(v) if !v.state.is_terminal() => out.push(v),
-                Ok(_) => {}
+                Ok(v) => out.push(v),
                 Err(e) => tracing::warn!(
                     path = %inflight_path.display(),
                     "ignoring malformed inflight.json: {e}"

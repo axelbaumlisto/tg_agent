@@ -172,7 +172,8 @@ pub(crate) fn research_tools(
 
         // Upcast Weak<AgentCore> → Weak<dyn ResearchRunner> for ISP
         let runner_weak: std::sync::Weak<dyn crate::research::ResearchRunner> = weak;
-        tools.push(Box::new(ResearchLaunchTool::new(runner_weak.clone())));
+        // research_launch removed (PLAN_UNIFIED_TURN_v1) — research_run
+        // covers the same functionality with streaming + abort support.
         tools.push(Box::new(ResearchUpdateSpecTool::new(runner_weak.clone())));
         tools.push(Box::new(ResearchSetScheduleTool::new(runner_weak.clone())));
         tools.push(Box::new(ResearchPauseTool::new(runner_weak.clone())));
@@ -256,18 +257,20 @@ mod tests {
     }
 
     #[test]
-    fn research_run_tool_appears_before_research_launch() {
+    fn research_launch_removed() {
+        // PLAN_UNIFIED_TURN_v1: research_launch was removed — research_run
+        // is the only way to execute a research spec from the LLM.
         let tc = TestCore::build();
         let config = tc.core.config();
         let tools = research_tools(&config, &tc.core.research, &tc.core.self_ref);
         let names: Vec<String> = tools.iter().map(|t| t.spec().name.clone()).collect();
-        let run_pos = names.iter().position(|n| n == "research_run");
-        let launch_pos = names.iter().position(|n| n == "research_launch");
-        assert!(run_pos.is_some(), "research_run must be in the list");
-        assert!(launch_pos.is_some(), "research_launch must be in the list");
         assert!(
-            run_pos < launch_pos,
-            "research_run should appear before research_launch; order: {names:?}"
+            names.iter().any(|n| n == "research_run"),
+            "research_run must be in the list"
+        );
+        assert!(
+            !names.iter().any(|n| n == "research_launch"),
+            "research_launch must NOT be in the list (removed)"
         );
     }
 }

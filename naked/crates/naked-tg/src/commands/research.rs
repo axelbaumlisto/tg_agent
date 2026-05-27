@@ -24,11 +24,34 @@ async fn resolve_spec_ref(chat_id: i64, tail: &str) -> String {
     if let Ok(n) = tail.parse::<usize>()
         && n >= 1
     {
+        // Try cached LIST_INDEX first (populated by /research ls).
         let map = LIST_INDEX.read().await;
         if let Some(ids) = map.get(&chat_id)
             && let Some(id) = ids.get(n - 1)
         {
             return id.clone();
+        }
+        drop(map);
+        // Fallback: scan research dir directly so `/research run 2`
+        // works even without a prior `/research ls` in this session.
+        let research_dir = naked_core::research::store::research_root();
+        if research_dir.is_dir() {
+            let mut ids: Vec<String> = std::fs::read_dir(&research_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.ok()?.path();
+                    if p.join("spec.json").exists() {
+                        Some(p.file_name()?.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ids.sort();
+            if let Some(id) = ids.get(n - 1) {
+                return id.clone();
+            }
         }
     }
     tail.to_string()
@@ -48,14 +71,15 @@ async fn resolve_spec_ref(chat_id: i64, tail: &str) -> String {
 ///   2. `schedule <id> <cron>` is stubbed with an explicit "not implemented
 ///      yet" reply — systemd timer templating is deferred to v6.
 pub(crate) async fn handle_research_cmd(
-    bot: &Bot,
-    agent: &Arc<AgentCore>,
-    channel_map: &Arc<ChannelSessionMap>,
+    deps: &crate::message_handler::BotDeps,
     config: &Config,
     ctx: &ChatCtx,
     text: &str,
     cmd_word: &str,
 ) -> Result<(), teloxide::RequestError> {
+    let bot = &deps.bot;
+    let agent = &deps.agent;
+    let channel_map = &deps.channel_map;
     if !config.research.enabled {
         reply_text(bot, ctx, "Research subsystem is disabled in config.").await?;
         return Ok(());
@@ -124,7 +148,19 @@ pub(crate) async fn handle_research_cmd(
                     } else {
                         ""
                     };
-                    out.push_str(&format!("{status} {n}. {short_topic}{ellip} ({total})\n"));
+                    let last_run = store
+                        .list_runs(&s.id, Some(1))
+                        .await
+                        .ok()
+                        .and_then(|r| r.first().map(|r| r.finished_at))
+                        .map(|dt| {
+                            let age = (chrono::Utc::now() - dt).num_seconds().max(0) as u64;
+                            format_age(age)
+                        })
+                        .unwrap_or_else(|| "—".into());
+                    out.push_str(&format!(
+                        "{status} {n}. {short_topic}{ellip} ({total}) · {last_run}\n"
+                    ));
                     ids.push(s.id.clone());
                 }
                 out.push_str("\n`/research show|run|pause|rm <N>`");
@@ -171,28 +207,12 @@ pub(crate) async fn handle_research_cmd(
             format_research_show(agent, &tail, sub == "fresh" || sub == "delta").await
         }
         "run" => {
-            // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): inject a synthetic prompt
-            // into the current chat session.  The agent's normal turn loop
-            // interprets it as a `research_run(spec_id=X)` tool call.  The
-            // standard ⭕ Abort button + `/abort` work identically to any
-            // other turn — INV-CANCEL-1 satisfied.
+            // PLAN_BG_UNIFY_v2 T3: dispatch through scheduler for
+            // heartbeat, timeout, resurrect, and concurrency cap.
             if tail.is_empty() {
                 "Usage: /research run <id>".to_string()
             } else {
-                match naked_tg::synthetic::dispatch_for_chat(
-                    agent,
-                    channel_map,
-                    ctx.chat_id.0,
-                    ctx.raw_thread_id(),
-                    &tail,
-                )
-                .await
-                {
-                    Ok((sid, _handle)) => {
-                        format!("\u{1f52c} research run `{tail}` dispatched (session {sid})")
-                    }
-                    Err(e) => format!("error dispatching research run: {e}"),
-                }
+                dispatch_research(deps, ctx, agent, channel_map, config, &tail).await
             }
         }
         "ask" => {
@@ -339,20 +359,7 @@ pub(crate) async fn handle_research_cmd(
                         spec_id, spec.topic
                     );
                     let _ = crate::shared::safe_send(bot, ctx, header, None).await;
-                    match naked_tg::synthetic::dispatch_for_chat(
-                        agent,
-                        channel_map,
-                        ctx.chat_id.0,
-                        ctx.raw_thread_id(),
-                        &spec_id,
-                    )
-                    .await
-                    {
-                        Ok((sid, _handle)) => {
-                            format!("\u{1f52c} dispatched `{spec_id}` (session {sid})")
-                        }
-                        Err(e) => format!("dispatch error: {e}"),
-                    }
+                    dispatch_research(deps, ctx, agent, channel_map, config, &spec_id).await
                 }
                 Err(e) => format!(
                     "не смог создать research spec из `{other} {tail}`: {e}\n\
@@ -375,18 +382,40 @@ pub(crate) async fn handle_research_cmd(
     Ok(())
 }
 
-/// `/memory ...` — operator surface over the daily-digest memory subsystem.
-///
-/// Resolves the workspace from the active session for this chat/topic so
-/// project-scoped queries hit the same `MEMORY.md` the agent sees.
-/// Falls back to `config.workspace` if no session is bound yet.
-///
-/// Subcommands:
-///   - `ls` / `list`            — durable rules (MEMORY.md) for the project scope.
-///   - `dreams`                 — last 7 entries of the digest audit log.
-///   - `drafts`                 — today's draft buffer (pre-promotion).
-///   - `stats`                  — counters (rules, drafts, promoted/rejected 7d).
-///   - `help` / empty           — usage hint.
+/// DRY helper — session + yolo + dispatch_immediate.
+async fn dispatch_research(
+    deps: &crate::message_handler::BotDeps,
+    ctx: &crate::shared::ChatCtx,
+    agent: &std::sync::Arc<naked_core::AgentCore>,
+    channel_map: &std::sync::Arc<naked_tg::channel_map::ChannelSessionMap>,
+    config: &naked_core::config::Config,
+    spec_id: &str,
+) -> String {
+    let Some(sched) = &deps.research_scheduler else {
+        return "Research scheduler not running".into();
+    };
+    let session_id = super::get_or_create_session(*ctx, agent, channel_map, config).await;
+    channel_map
+        .enable_yolo(ctx.chat_id.0, ctx.raw_thread_id())
+        .await;
+    let prompt = format!(
+        "Run research spec_id={spec_id}. Call research_run(spec_id=\"{spec_id}\") directly."
+    );
+    match sched
+        .dispatch_immediate(
+            spec_id,
+            ctx.chat_id.0,
+            ctx.raw_thread_id(),
+            session_id,
+            prompt,
+        )
+        .await
+    {
+        Ok(attempt_id) => format!("\u{1f52c} research `{spec_id}` dispatched ({attempt_id})"),
+        Err(e) => format!("dispatch error: {e}"),
+    }
+}
+
 async fn schedule_research_on(
     agent: &Arc<AgentCore>,
     id: &str,
@@ -606,29 +635,24 @@ mod tests {
         );
     }
 
-    // ---- B1 closure sentinel tests (replaced T2.6 sentinels) ----
+    // ---- PLAN_UNIFIED_TURN_v1 sentinel tests ----
 
     #[test]
-    fn run_subcommand_uses_synthetic_dispatch() {
-        // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): the 'run' arm must use
-        // `dispatch_for_chat` (the unified synthetic path), NOT the
-        // legacy function.
+    fn run_subcommand_uses_scheduler_dispatch() {
+        // PLAN_BG_UNIFY_v2: /research run must dispatch through scheduler.
         let src = source();
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
         assert!(
-            src.contains("synthetic_dispatch::dispatch_for_chat"),
-            "'run' arm must route through synthetic_dispatch::dispatch_for_chat"
+            prod.contains("dispatch_research("),
+            "'run' arm must use dispatch_research helper (DRY)"
         );
-        // Ensure the legacy function is not CALLED anywhere in the
-        // non-test portion.  We search for the call-site pattern
-        // (trailing `(`) rather than the bare name, because comments
-        // and this test itself legitimately mention it.
-        let call_pattern = "launch_research_run_with_ui(";
-        let first_test_marker = "#[cfg(test)]";
-        let prod_code = src.split(first_test_marker).next().unwrap_or("");
         assert!(
-            !prod_code.contains(call_pattern),
-            "Legacy function call must not appear in production code \
-             after B1 closure — all paths go through synthetic dispatch."
+            prod.contains("dispatch_immediate("),
+            "dispatch_research must call scheduler.dispatch_immediate"
+        );
+        assert!(
+            !prod.contains("BgGuard"),
+            "must NOT use BgGuard (replaced by scheduler Inflight)"
         );
     }
 }

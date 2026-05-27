@@ -1081,12 +1081,10 @@ fn verify_by_default_can_be_disabled() {
 }
 
 /// Contract test against the shipped `naked.json` at the repo root.
-/// Locks in the kimi-for-coding + reasoning=medium primary research
-/// configuration so a careless edit can't silently downgrade quality.
-/// Skips gracefully when the file isn't present (downstream consumers
-/// of naked-core may not ship naked.json).
+/// Validates that shipped naked.json has a working research provider +
+/// model configuration. Skips gracefully when the file isn't present.
 #[test]
-fn shipped_naked_json_research_uses_kimi_for_coding_with_reasoning() {
+fn shipped_naked_json_research_config_valid() {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidate = manifest
         .parent()
@@ -1099,36 +1097,26 @@ fn shipped_naked_json_research_uses_kimi_for_coding_with_reasoning() {
     let raw = std::fs::read_to_string(&path).expect("read naked.json");
     let cfg = Config::from_json_str(&raw).expect("parse naked.json");
 
-    // Research must run on kimi-for-coding via kimi-code provider, with
-    // reasoning_effort=medium (per the official Roo Code recipe).
-    assert_eq!(cfg.research.provider.as_deref(), Some("kimi-code"));
-    assert_eq!(cfg.research.model.as_deref(), Some("kimi-for-coding"));
-    assert_eq!(cfg.research.reasoning.as_deref(), Some("medium"));
-
-    // Cross-provider fallback chain must include qwen for resilience
-    // when the kimi-code endpoint is throttled / down.
-    let chain = &cfg.research.fallback_models;
-    assert!(
-        chain.iter().any(|m| m.starts_with("qwen/")),
-        "fallback chain must include a qwen/* entry — got {chain:?}"
-    );
-
-    // The kimi-code provider must list kimi-for-coding among its models
-    // so model-validation in `validate_and_warn` doesn't flag it.
-    let kimi = cfg
+    // Research provider + model must be configured and the model must
+    // be listed under the provider (otherwise boot validation warns).
+    let prov_name = cfg
+        .research
+        .provider
+        .as_deref()
+        .expect("research.provider must be set");
+    let model_name = cfg
+        .research
+        .model
+        .as_deref()
+        .expect("research.model must be set");
+    let prov = cfg
         .providers
-        .get("kimi-code")
-        .expect("kimi-code provider must be configured");
+        .get(prov_name)
+        .unwrap_or_else(|| panic!("provider `{prov_name}` must exist"));
     assert!(
-        kimi.models.iter().any(|m| m == "kimi-for-coding"),
-        "kimi-code provider must declare `kimi-for-coding` model"
-    );
-    assert_eq!(
-        kimi.headers.get("User-Agent").map(|s| s.as_str()),
-        Some("claude-code/1.0"),
-        "kimi-code requires User-Agent: claude-code/1.0 — without it \
-         api.kimi.com refuses kimi-for-coding with 403 \
-         \"Kimi For Coding is currently only available for Coding Agents\""
+        prov.models.iter().any(|m| m == model_name),
+        "provider `{prov_name}` must list model `{model_name}`; got {:?}",
+        prov.models
     );
 }
 

@@ -27,13 +27,14 @@ pub(crate) const SEND_NOW_NUDGE_TEXT: &str =
 // ── Callback handler (permissions) ──────────────────────────────────────────
 
 pub(crate) async fn handle_callback(
-    bot: Bot,
+    deps: crate::message_handler::BotDeps,
     q: CallbackQuery,
     pending_perms: PendingPermissions,
-    agent: Arc<AgentCore>,
-    channel_map: Arc<ChannelSessionMap>,
-    config: Config,
 ) -> Result<(), teloxide::RequestError> {
+    let bot = deps.bot.clone();
+    let agent = deps.agent.clone();
+    let channel_map = deps.channel_map.clone();
+    let config = deps.config.clone();
     let data = match &q.data {
         Some(d) => d.clone(),
         None => return Ok(()),
@@ -351,35 +352,43 @@ pub(crate) async fn handle_callback(
                     bot.answer_callback_query(q.id.clone())
                         .text("Restarting…")
                         .await?;
-                    // B1 (PLAN_RESEARCH_FLOW_CLOSURE_v1): restart goes
-                    // through the unified synthetic dispatch path.
-                    match naked_tg::synthetic::dispatch_for_chat(
-                        &agent,
-                        &channel_map,
-                        chat_id.0,
-                        thread_id.map(|teloxide::types::ThreadId(mid)| mid.0),
-                        &spec_id,
-                    )
-                    .await
-                    {
-                        Ok((sid, _handle)) => {
-                            let _ = bot
-                                .send_message(
-                                    chat_id,
-                                    format!("\u{1f52c} restarted `{spec_id}` (session {sid})"),
+                    // PLAN_UNIFIED_TURN_v1 T4: restart goes through normal
+                    // send_prompt → stream_response so operator sees progress.
+                    let cb_ctx = ChatCtx {
+                        chat_id,
+                        thread_id,
+                        reply_to: None,
+                    };
+                    let tid_raw = thread_id.map(|teloxide::types::ThreadId(mid)| mid.0);
+                    let session_id = if let Some(sid) = channel_map.get(chat_id.0, tid_raw).await {
+                        sid
+                    } else {
+                        let ws = std::path::PathBuf::from(
+                            std::env::var("NAKED_WORKSPACE").unwrap_or_else(|_| ".".into()),
+                        );
+                        let sid = agent.create_session_with_channel(&ws, "telegram").await;
+                        channel_map.set(chat_id.0, tid_raw, sid.clone()).await;
+                        sid
+                    };
+                    let prompt = format!("/research run {spec_id}");
+                    match agent.send_prompt(&session_id, &prompt).await {
+                        Ok(handle) => {
+                            let pm = agent.session_provider_model(&session_id).await;
+                            let deps_clone = deps.clone();
+                            tokio::spawn(async move {
+                                crate::streaming::stream_response(
+                                    &deps_clone,
+                                    cb_ctx,
+                                    handle,
+                                    format!("{}/{}", pm.0, pm.1),
                                 )
-                                .maybe_thread(thread_id)
                                 .await;
+                            });
                         }
                         Err(e) => {
-                            let err_ctx = ChatCtx {
-                                chat_id,
-                                thread_id,
-                                reply_to: None,
-                            };
                             let _ = crate::shared::safe_send(
                                 &bot,
-                                &err_ctx,
+                                &cb_ctx,
                                 format!("restart error: {e}"),
                                 None,
                             )

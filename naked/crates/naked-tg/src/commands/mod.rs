@@ -78,9 +78,7 @@ pub(crate) async fn handle_command(
                 text
             };
             research::handle_research_cmd(
-                bot,
-                agent,
-                channel_map,
+                deps,
                 config,
                 &ctx,
                 effective_text,
@@ -101,12 +99,119 @@ pub(crate) async fn handle_command(
         "/remote" => {
             ops::cmd_remote(bot, agent, channel_map, config, &ctx, text, pending_perms).await?
         }
+        "/bg" => {
+            cmd_bg(deps, &ctx, text).await?;
+        }
         _ => {
             return Ok(false);
         }
     }
 
     Ok(true)
+}
+
+/// `/bg` — background research management (thin wrapper over scheduler inflight).
+async fn cmd_bg(
+    deps: &crate::message_handler::BotDeps,
+    ctx: &ChatCtx,
+    text: &str,
+) -> Result<(), teloxide::RequestError> {
+    let rest = text.strip_prefix("/bg").unwrap_or("").trim();
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
+
+    let store = deps.agent.research_store();
+
+    match sub {
+        "" | "list" | "ls" => {
+            use naked_core::research::RunState;
+            let all = match store.list_all_inflight().await {
+                Ok(v) => v,
+                Err(e) => {
+                    reply_text(&deps.bot, ctx, format!("error: {e}")).await?;
+                    return Ok(());
+                }
+            };
+            if all.is_empty() {
+                reply_text(&deps.bot, ctx, "No inflight research tasks.").await?;
+            } else {
+                let mut out = String::from("\u{1f4cb} Research tasks:\n");
+                for infl in &all {
+                    let icon = match infl.state {
+                        RunState::Running => "\u{1f7e2}",
+                        RunState::Scheduled => "\u{23f3}",
+                        RunState::Completed => "\u{2705}",
+                        RunState::Failed => "\u{274c}",
+                    };
+                    let age = (chrono::Utc::now() - infl.scheduled_at)
+                        .num_seconds()
+                        .max(0) as u64;
+                    let age_str = crate::fmt_utils::format_age(age);
+                    let short_spec: String = infl.spec_id.chars().take(40).collect();
+                    out.push_str(&format!(
+                        "{icon} `{}` spec={short_spec} att={} {age_str}\n",
+                        infl.attempt_id, infl.attempt
+                    ));
+                }
+                out.push_str("\n`/bg abort <spec>` | `/bg clean`");
+                reply_text(&deps.bot, ctx, out).await?;
+            }
+        }
+        "abort" | "kill" => {
+            if arg.is_empty() {
+                reply_text(&deps.bot, ctx, "Usage: /bg abort <spec_id>").await?;
+            } else if let Some(sched) = &deps.research_scheduler {
+                let cancelled = sched.cancel_task(arg).await;
+                // Mark inflight as Failed so it won't be resurrected.
+                if let Ok(Some(mut infl)) = store.load_inflight(arg).await
+                    && !infl.state.is_terminal()
+                {
+                    infl.mark_failed("aborted by /bg abort");
+                    let _ = store.save_inflight(arg, &infl).await;
+                }
+                let msg = if cancelled {
+                    format!("\u{23f9} Aborted {arg}")
+                } else {
+                    format!("\u{23f9} Marked failed (was not in running map): {arg}")
+                };
+                reply_text(&deps.bot, ctx, msg).await?;
+            } else {
+                reply_text(&deps.bot, ctx, "Scheduler not running").await?;
+            }
+        }
+        "clean" => {
+            let all = match store.list_all_inflight().await {
+                Ok(v) => v,
+                Err(e) => {
+                    reply_text(&deps.bot, ctx, format!("error: {e}")).await?;
+                    return Ok(());
+                }
+            };
+            let mut cleaned = 0;
+            for infl in &all {
+                if infl.state.is_terminal() {
+                    let _ = store.clear_inflight(&infl.spec_id).await;
+                    cleaned += 1;
+                }
+            }
+            reply_text(
+                &deps.bot,
+                ctx,
+                format!("Cleaned {cleaned} terminal inflight(s)."),
+            )
+            .await?;
+        }
+        _ => {
+            reply_text(
+                &deps.bot,
+                ctx,
+                "/bg list — show tasks\n/bg abort <spec> — stop\n/bg clean — remove completed/failed",
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn get_or_create_session(

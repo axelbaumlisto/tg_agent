@@ -30,7 +30,7 @@ impl Tool for ResearchPauseTool {
             name: "research_pause".into(),
             description: "Pause a research spec — the background scheduler \
                           will stop launching it on its interval. Manual runs \
-                          via /research run or research_launch still work."
+                          via /research run or research_run still work."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -323,7 +323,7 @@ impl Tool for ResearchSetTargetTool {
                 },
                 "required": ["spec_id"]
             }),
-            permission: Permission::WorkspaceWrite,
+            permission: Permission::ReadOnly,
         }
     }
 

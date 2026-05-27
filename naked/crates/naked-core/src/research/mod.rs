@@ -39,8 +39,8 @@ pub use coordinator::{
 };
 pub use inflight::{Inflight, RunState};
 pub use ops_tool::{
-    ResearchCreateTool, ResearchFindingsTool, ResearchLaunchTool, ResearchListSpecsTool,
-    ResearchMetricsTool, ResearchUpdateSpecTool,
+    ResearchCreateTool, ResearchFindingsTool, ResearchListSpecsTool, ResearchMetricsTool,
+    ResearchUpdateSpecTool,
 };
 pub use ops_tool_extra::{
     ResearchHelpTool, ResearchPauseTool, ResearchResumeTool, ResearchSetScheduleTool,

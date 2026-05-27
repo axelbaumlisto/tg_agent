@@ -474,7 +474,7 @@ impl AgentCore {
     }
 
     /// Must be called once after wrapping in `Arc` so orchestration tools can
-    /// obtain a reference back to the core (e.g. `research_launch`).
+    /// obtain a reference back to the core (e.g. `research_run`).
     pub fn init_self_ref(self: &Arc<Self>) {
         *write_or_recover(&self.self_ref) = Some(Arc::downgrade(self));
     }

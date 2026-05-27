@@ -189,7 +189,7 @@ impl Tool for ResearchUpdateSpecTool {
                 },
                 "required": ["spec_id"]
             }),
-            permission: Permission::WorkspaceWrite,
+            permission: Permission::ReadOnly,
         }
     }
 

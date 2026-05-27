@@ -20,6 +20,12 @@ pub(crate) async fn send_stream_placeholder(
     bot: &Bot,
     ctx: &ChatCtx,
 ) -> Option<teloxide::types::MessageId> {
+    // Retry with exponential backoff: 2s, 5s, 10s.
+    // Network blips to Telegram DC are transient (10-30s); without
+    // retry the entire agent turn result is silently dropped.
+    const DELAYS: [u64; 3] = [2, 5, 10];
+    let mut last_err;
+    // First attempt (immediate)
     match bot
         .send_message(ctx.chat_id, "⏳ thinking…")
         .maybe_thread(ctx.thread_id)
@@ -27,12 +33,34 @@ pub(crate) async fn send_stream_placeholder(
         .reply_markup(streaming_control_kb())
         .await
     {
-        Ok(m) => Some(m.id),
+        Ok(m) => return Some(m.id),
         Err(e) => {
-            tracing::error!("Failed to send placeholder: {e}");
-            None
+            last_err = format!("{e}");
+            tracing::warn!("placeholder send failed, will retry: {e}");
         }
     }
+    // Retries
+    for delay in DELAYS {
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        match bot
+            .send_message(ctx.chat_id, "⏳ thinking…")
+            .maybe_thread(ctx.thread_id)
+            .maybe_reply_to(ctx.reply_to)
+            .reply_markup(streaming_control_kb())
+            .await
+        {
+            Ok(m) => {
+                tracing::info!("placeholder sent after {delay}s retry");
+                return Some(m.id);
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+                tracing::warn!("placeholder retry after {delay}s failed: {e}");
+            }
+        }
+    }
+    tracing::error!("Failed to send placeholder after all retries: {last_err}");
+    None
 }
 
 pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
@@ -142,7 +170,9 @@ pub(crate) async fn stream_response(
     // Fixed-interval ticker for streaming flushes.
     // The actual rate limiting happens inside RATE_LIMITER.edit() — the
     // ticker just decides when to ATTEMPT a flush.
-    let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(2_400));
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(
+        naked_tg::rate_limit::MIN_GAP_MS,
+    ));
     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_interval.tick().await; // consume first immediate tick
 

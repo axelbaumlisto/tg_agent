@@ -208,6 +208,7 @@ impl Tool for WebFetchTool {
             let kind_label = match kind {
                 BlockKind::Cloudflare => "Cloudflare challenge",
                 BlockKind::AntiBotWall => "anti-bot wall",
+                BlockKind::JsShell => "JS-rendered shell (no visible text)",
             };
             let cascade_summary = if cascade_notes.is_empty() {
                 "no fallback attempted".to_string()

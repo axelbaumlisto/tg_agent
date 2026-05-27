@@ -33,7 +33,7 @@ impl Tool for ResearchCreateTool {
         ToolSpec {
             name: "research_create".into(),
             description: "Create a new research spec for a given topic. Returns the spec id \
-                          which can be passed to research_launch (deep background run) or \
+                          which can be passed to research_run (deep background run) or \
                           research_set_target (inline research in the current chat)."
                 .into(),
             parameters: json!({
@@ -53,7 +53,7 @@ impl Tool for ResearchCreateTool {
                 },
                 "required": ["topic"]
             }),
-            permission: Permission::WorkspaceWrite,
+            permission: Permission::ReadOnly,
         }
     }
 
@@ -98,7 +98,7 @@ impl Tool for ResearchCreateTool {
                     "id": spec.id,
                     "topic": spec.topic,
                     "sources": sources,
-                    "hint": "Use research_launch to start a deep background run, or \
+                    "hint": "Use research_run to start a deep background run, or \
                              research_set_target to research inline in this chat."
                 })
                 .to_string(),

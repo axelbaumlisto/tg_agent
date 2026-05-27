@@ -9,6 +9,9 @@ use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::copilot::CopilotProvider;
 use crate::provider::openai_compat::OpenAiCompatProvider;
 use crate::provider::resilient::ResilientProvider;
+use crate::provider::timeout::{
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_INTER_CHUNK_TIMEOUT, TimeoutProvider,
+};
 
 /// Registry of provider factories — add new provider types here.
 ///
@@ -58,7 +61,7 @@ pub fn create_provider(name: &str, resolved: ResolvedProvider) -> Box<dyn Provid
             model_aliases: resolved.model_aliases,
             capabilities: HashMap::new(),
         };
-        return create_single_provider(name, cfg);
+        return wrap_with_timeout(create_single_provider(name, cfg));
     }
 
     let providers: Vec<Box<dyn Provider>> = resolved
@@ -89,7 +92,18 @@ pub fn create_provider(name: &str, resolved: ResolvedProvider) -> Box<dyn Provid
         "Provider '{name}': {} keys configured for rotation",
         providers.len()
     );
-    Box::new(ResilientProvider::new(providers))
+    wrap_with_timeout(Box::new(ResilientProvider::new(providers)))
+}
+
+/// Wrap any provider in [`TimeoutProvider`] for connect + inter-chunk
+/// deadlock protection. Every provider MUST go through this before
+/// being returned to the caller.
+fn wrap_with_timeout(inner: Box<dyn Provider>) -> Box<dyn Provider> {
+    Box::new(TimeoutProvider::new(
+        inner,
+        DEFAULT_CONNECT_TIMEOUT,
+        DEFAULT_INTER_CHUNK_TIMEOUT,
+    ))
 }
 
 /// Build a provider (possibly resilient with fallbacks) from config.
@@ -110,9 +124,11 @@ pub fn build_provider_from_config(config: &Config) -> Result<Box<dyn Provider>> 
     }
 
     if providers.len() == 1 {
-        Ok(providers.remove(0))
+        Ok(wrap_with_timeout(providers.remove(0)))
     } else {
-        Ok(Box::new(ResilientProvider::new(providers)))
+        Ok(wrap_with_timeout(Box::new(ResilientProvider::new(
+            providers,
+        ))))
     }
 }
 

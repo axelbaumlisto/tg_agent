@@ -353,6 +353,9 @@ pub struct ResearchScheduler {
     notify: Arc<Notify>,
     shutdown: Arc<Notify>,
     config: SchedulerConfig,
+    core: Weak<AgentCore>,
+    state: Arc<Mutex<SchedulerState>>,
+    notifier: Arc<dyn TaskNotifier>,
 }
 
 #[allow(dead_code)]
@@ -396,6 +399,9 @@ impl ResearchScheduler {
             notify: notify.clone(),
             shutdown: shutdown.clone(),
             config: config.clone(),
+            core: core.clone(),
+            state: state.clone(),
+            notifier: notifier.clone(),
         });
 
         let hook: Arc<dyn SchedulerHook> = Arc::new(ResearchSchedulerHook {
@@ -473,6 +479,72 @@ impl ResearchScheduler {
     /// Stop the loop gracefully. Idempotent.
     pub fn shutdown(&self) {
         self.shutdown.notify_waiters();
+    }
+
+    /// Cancel a running task by spec_id. Issues cooperative cancel,
+    /// then hard abort. Returns true if the task was found and cancelled.
+    pub async fn cancel_task(&self, spec_id: &str) -> bool {
+        let mut s = self.state.lock().await;
+        if let Some(handle) = s.running.remove(spec_id) {
+            handle.cancel.cancel();
+            handle.handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Operator-triggered dispatch: create an `Inflight` with chat
+    /// context and hand it to `spawn_task` immediately (no cron wait).
+    /// Returns the attempt_id on success.
+    pub async fn dispatch_immediate(
+        &self,
+        spec_id: &str,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        session_id: String,
+        prompt: String,
+    ) -> Result<String, String> {
+        let core = self.core.upgrade().ok_or("agent core dropped")?;
+        let store = core.research_store();
+        let spec = store
+            .load_spec(spec_id)
+            .await
+            .map_err(|e| format!("spec not found: {e}"))?;
+
+        // Check concurrency cap.
+        {
+            let s = self.state.lock().await;
+            if s.running.len() >= self.config.max_concurrent_runs {
+                return Err(format!(
+                    "concurrency cap ({}) reached — try later",
+                    self.config.max_concurrent_runs
+                ));
+            }
+        }
+
+        // spawn_task creates its own Inflight::scheduled() — we let
+        // it do the initial write, then patch operator context on top
+        // so the fields survive resurrection.
+        tasks::spawn_task(&core, &self.state, &self.notifier, &self.config, &spec, 1).await;
+
+        // Patch operator context onto the inflight that spawn_task wrote.
+        let attempt_id = if let Ok(Some(mut infl)) = store.load_inflight(&spec.id).await {
+            let aid = infl.attempt_id.clone();
+            infl.chat_id = Some(chat_id);
+            infl.thread_id = thread_id;
+            infl.session_id = Some(session_id);
+            infl.prompt = Some(prompt);
+            if let Err(e) = store.save_inflight(&spec.id, &infl).await {
+                tracing::warn!(spec = %spec.id, "dispatch_immediate: patch inflight: {e:#}");
+            }
+            aid
+        } else {
+            "unknown".into()
+        };
+
+        self.poke(); // wake sweep so heartbeat starts immediately
+        Ok(attempt_id)
     }
 }
 

@@ -6,6 +6,7 @@ const FILE_THRESHOLD: usize = MAX_TG_MSG * 2;
 const SUMMARY_CHARS: usize = 500;
 
 /// Edit with retry: if rate-limited, waits the indicated duration and retries.
+#[allow(dead_code)] // available for non-critical edits that can tolerate drops
 pub(crate) async fn edit_with_retry(
     bot: &Bot,
     chat_id: ChatId,
@@ -13,16 +14,53 @@ pub(crate) async fn edit_with_retry(
     text: &str,
     parse_html: bool,
 ) -> bool {
+    _edit_impl(bot, chat_id, msg_id, text, parse_html, false).await
+}
+
+/// Like edit_with_retry but never drops — waits through rate limits.
+pub(crate) async fn edit_must_deliver(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: MessageId,
+    text: &str,
+    parse_html: bool,
+) -> bool {
+    _edit_impl(bot, chat_id, msg_id, text, parse_html, true).await
+}
+
+async fn _edit_impl(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg_id: MessageId,
+    text: &str,
+    parse_html: bool,
+    must_deliver: bool,
+) -> bool {
     let rl = &*RATE_LIMITER;
     if parse_html {
-        if rl.edit_html(bot, chat_id, msg_id, text).await {
+        let ok = if must_deliver {
+            rl.edit_must_deliver(bot, chat_id, msg_id, text, true).await
+        } else {
+            rl.edit_html(bot, chat_id, msg_id, text).await
+        };
+        if ok {
             return true;
         }
         // HTML failed — try plain text
         let plain = strip_html_tags(text);
-        return rl.edit_plain(bot, chat_id, msg_id, &plain).await;
+        return if must_deliver {
+            rl.edit_must_deliver(bot, chat_id, msg_id, &plain, false)
+                .await
+        } else {
+            rl.edit_plain(bot, chat_id, msg_id, &plain).await
+        };
     }
-    rl.edit_plain(bot, chat_id, msg_id, text).await
+    if must_deliver {
+        rl.edit_must_deliver(bot, chat_id, msg_id, text, false)
+            .await
+    } else {
+        rl.edit_plain(bot, chat_id, msg_id, text).await
+    }
 }
 
 pub(crate) async fn send_final(
@@ -69,7 +107,7 @@ pub(crate) async fn send_final(
 
     // Short: fits in one message
     if html.len() <= MAX_TG_MSG {
-        edit_with_retry(&bot, chat_id, msg_id, html, true).await;
+        edit_must_deliver(&bot, chat_id, msg_id, html, true).await;
         if dropped > 0 {
             // Inline was head-truncated — attach full timeline.
             let html_doc = render_html_document(view);
@@ -92,7 +130,7 @@ pub(crate) async fn send_final(
     if html.len() <= FILE_THRESHOLD {
         let chunks = split_html(html, MAX_TG_MSG - 100);
         if let Some(first) = chunks.first() {
-            edit_with_retry(&bot, chat_id, msg_id, first, true).await;
+            edit_must_deliver(&bot, chat_id, msg_id, first, true).await;
         }
         for chunk in chunks.iter().skip(1) {
             let res = bot
@@ -117,7 +155,7 @@ pub(crate) async fn send_final(
     }
 
     let summary = view.render_summary(SUMMARY_CHARS);
-    edit_with_retry(&bot, chat_id, msg_id, &summary, true).await;
+    edit_must_deliver(&bot, chat_id, msg_id, &summary, true).await;
 
     let html_doc = render_html_document(view);
     let input_file = teloxide::types::InputFile::memory(html_doc).file_name("response.html");

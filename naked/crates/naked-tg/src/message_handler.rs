@@ -18,6 +18,8 @@ pub(crate) struct BotDeps {
     pub bot_token: Arc<String>,
     pub bot_identity: Arc<naked_tg::bot_identity::BotIdentity>,
     pub tg_attach_queue: naked_tg::tg_attach::AttachmentQueue,
+    pub research_scheduler:
+        Option<std::sync::Arc<crate::shared::research_scheduler::ResearchScheduler>>,
 }
 
 impl BotDeps {

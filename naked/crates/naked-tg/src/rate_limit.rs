@@ -16,10 +16,11 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode};
 use tokio::sync::Mutex;
 
-/// TG allows ~30 edits/min/chat. We budget 25 to stay safe.
-const BUDGET: u32 = 25;
-/// 60s / 25 = 2.4s minimum gap between edits to the same chat.
-const MIN_GAP: Duration = Duration::from_millis(2_400);
+/// TG undocumented limit ~20 edits/min/chat. Single source of truth.
+pub const BUDGET: u32 = 18;
+/// Derived: 60s / BUDGET ≈ 3.3s minimum gap between edits.
+pub const MIN_GAP_MS: u64 = 60_000 / BUDGET as u64;
+pub const MIN_GAP: Duration = Duration::from_millis(MIN_GAP_MS);
 /// Hard ceiling — even under backoff, never wait longer than this.
 const MAX_GAP: Duration = Duration::from_secs(120);
 
@@ -205,6 +206,59 @@ impl RateLimiter {
         text: &str,
     ) -> bool {
         self.edit(bot, chat_id, msg_id, text, false).await
+    }
+
+    /// Like [`edit`] but **never drops** — waits as long as needed.
+    /// Use for send_final where losing the message is unacceptable.
+    pub async fn edit_must_deliver(
+        &self,
+        bot: &Bot,
+        chat_id: ChatId,
+        msg_id: MessageId,
+        text: &str,
+        html: bool,
+    ) -> bool {
+        for attempt in 0..5 {
+            let wait = {
+                let mut state = self.inner.lock().await;
+                let cs = state.chats.entry(chat_id.0).or_insert_with(ChatState::new);
+                cs.time_until_allowed()
+            };
+            if wait > Duration::ZERO {
+                tracing::info!(
+                    chat = chat_id.0,
+                    attempt,
+                    wait_ms = wait.as_millis() as u64,
+                    "edit_must_deliver: waiting for rate limit"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            let result = if html {
+                bot.edit_message_text(chat_id, msg_id, text)
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await
+            } else {
+                bot.edit_message_text(chat_id, msg_id, text).await
+            };
+            let mut state = self.inner.lock().await;
+            let cs = state.chats.entry(chat_id.0).or_insert_with(ChatState::new);
+            match result {
+                Ok(_) => {
+                    cs.record_edit();
+                    return true;
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if let Some(secs) = parse_retry_after(&err_str) {
+                        cs.record_429(secs);
+                    } else {
+                        cs.record_edit();
+                        return false; // non-retryable error
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Current interval for a streaming ticker (used by streaming_mod).

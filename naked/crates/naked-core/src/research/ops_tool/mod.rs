@@ -17,4 +17,5 @@ pub mod runner;
 
 pub use create::{ResearchCreateTool, ResearchListSpecsTool};
 pub use metrics::{ResearchFindingsTool, ResearchMetricsTool};
-pub use runner::{ResearchLaunchTool, ResearchUpdateSpecTool};
+pub use runner::ResearchUpdateSpecTool;
+// ResearchLaunchTool removed (PLAN_UNIFIED_TURN_v1) — use research_run instead.

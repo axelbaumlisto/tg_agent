@@ -47,7 +47,7 @@ impl Tool for ResearchSaveTool {
                 },
                 "required": ["url"]
             }),
-            permission: Permission::WorkspaceWrite,
+            permission: Permission::ReadOnly,
         }
     }
 
@@ -263,7 +263,7 @@ impl Tool for ResearchSaveCursorTool {
                 },
                 "required": ["cursor"]
             }),
-            permission: Permission::WorkspaceWrite,
+            permission: Permission::ReadOnly,
         }
     }
 
