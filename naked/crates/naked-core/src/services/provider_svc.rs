@@ -53,7 +53,7 @@ impl ProviderService {
         let built: Arc<dyn Provider> = if let Some(pc) = self.config.providers.get(name)
             && let Ok(resolved) = pc.resolved()
         {
-            Arc::from(crate::create_provider(name, resolved))
+            Arc::from(crate::create_provider_chain(&self.config, name, resolved))
         } else {
             tracing::warn!("session requests provider '{name}' not in catalog, using default");
             return self.default.clone();
@@ -209,5 +209,42 @@ mod tests {
         let resolver: &dyn ProviderResolver = &svc;
         let p = resolver.resolve_provider("").await;
         assert_eq!(p.name(), "default");
+    }
+
+    #[tokio::test]
+    async fn resolve_non_default_inherits_global_fallback_chain() {
+        let mut cfg = Config {
+            default_provider: "qwen".into(),
+            fallback: vec!["deepseek-direct/deepseek-v4-flash".into()],
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "fireworks".into(),
+            crate::config::ProviderConfig {
+                api_key: "fw-test".into(),
+                models: vec!["accounts/fireworks/models/deepseek-v4-pro".into()],
+                ..Default::default()
+            },
+        );
+        cfg.providers.insert(
+            "deepseek-direct".into(),
+            crate::config::ProviderConfig {
+                api_key: "ds-test".into(),
+                models: vec!["deepseek-v4-flash".into()],
+                ..Default::default()
+            },
+        );
+        let svc = ProviderService::new(
+            Arc::new(MockProvider {
+                name: "qwen".into(),
+            }),
+            Arc::new(ModelHealth::new(Default::default())),
+            Arc::new(cfg),
+        );
+
+        let p = svc.resolve("fireworks").await;
+
+        assert_eq!(p.name(), "fireworks");
+        assert_eq!(p.total_key_count(), 2);
     }
 }

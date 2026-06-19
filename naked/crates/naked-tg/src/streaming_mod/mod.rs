@@ -9,7 +9,7 @@ pub(crate) use delta::render_html_document;
 pub(crate) use flush::{ask_permission, flush_live, send_final};
 pub(crate) use handlers::ViewAction;
 pub(crate) use helpers::*;
-pub(crate) use pipeline::stream_response;
+pub(crate) use pipeline::{register_turn_routing, stream_response};
 
 #[allow(unused_imports)]
 use super::*;
@@ -78,8 +78,6 @@ pub(crate) struct CompositeView {
     active_tool: Option<String>,
     /// Last few lines of stdout/stderr from the running tool.
     tool_output: Option<String>,
-    /// Live count of messages queued while this turn is active.
-    queue_counter: Arc<std::sync::atomic::AtomicUsize>,
     /// Set when a provider error occurs — used to show retry buttons after final.
     pub(crate) had_provider_error: bool,
     /// PLAN_TG_INTERLEAVED_v1 Q4: count of events dropped by the
@@ -92,7 +90,7 @@ pub(crate) struct CompositeView {
 const SPINNER: &[&str] = &["⏳", "⌛", "⏳", "⌛"];
 
 impl CompositeView {
-    fn new(model_tag: String, queue_counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    fn new(model_tag: String) -> Self {
         Self {
             thinking: String::new(),
             in_thinking: false,
@@ -110,7 +108,6 @@ impl CompositeView {
             tick: 0,
             phase: "thinking",
             started_at: std::time::Instant::now(),
-            queue_counter,
             had_provider_error: false,
             last_dropped_events: std::sync::atomic::AtomicUsize::new(0),
         }

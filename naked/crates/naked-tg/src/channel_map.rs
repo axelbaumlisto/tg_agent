@@ -21,6 +21,13 @@ pub fn format_tg_channel_id(chat_id: i64, thread_id: Option<i32>) -> String {
     format!("tg:{}:{}", chat_id, thread_id.unwrap_or(0))
 }
 
+fn is_safe_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "web_search" | "glob_search" | "grep_search" | "agent_status"
+    )
+}
+
 fn parse_tg_channel_id(s: &str) -> Option<ChannelKey> {
     let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() == 3 && parts[0] == "tg" {
@@ -41,6 +48,7 @@ fn parse_tg_channel_id(s: &str) -> Option<ChannelKey> {
 ///  3. Otherwise ask the user
 pub struct ChannelSessionMap {
     map: RwLock<HashMap<ChannelKey, String>>,
+    session_locks: RwLock<HashMap<ChannelKey, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Value = unix timestamp (secs) when yolo was enabled.
     yolo: RwLock<HashMap<ChannelKey, i64>>,
     allow_list: RwLock<HashMap<ChannelKey, HashSet<String>>>,
@@ -62,6 +70,7 @@ impl ChannelSessionMap {
     pub fn new() -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
+            session_locks: RwLock::new(HashMap::new()),
             yolo: RwLock::new(HashMap::new()),
             allow_list: RwLock::new(HashMap::new()),
             snapshot_path: RwLock::new(None),
@@ -210,6 +219,43 @@ impl ChannelSessionMap {
             .cloned()
     }
 
+    pub async fn get_or_insert_with<F, Fut>(
+        &self,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        create: F,
+    ) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
+        let key = make_key(chat_id, thread_id);
+        if let Some(existing) = self.map.read().await.get(&key).cloned() {
+            return existing;
+        }
+
+        let lock = self.session_lock_for(key).await;
+        let _guard = lock.lock().await;
+        if let Some(existing) = self.map.read().await.get(&key).cloned() {
+            return existing;
+        }
+
+        let session_id = create().await;
+        self.map.write().await.insert(key, session_id.clone());
+        session_id
+    }
+
+    async fn session_lock_for(&self, key: ChannelKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        if let Some(existing) = self.session_locks.read().await.get(&key).cloned() {
+            return existing;
+        }
+        let mut locks = self.session_locks.write().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// All (chat_id, thread_id, session_id) entries.
     pub async fn all_entries(&self) -> Vec<(i64, i64, String)> {
         self.map
@@ -314,6 +360,9 @@ impl ChannelSessionMap {
         thread_id: Option<i32>,
         _tool_name: &str,
     ) -> bool {
+        if is_safe_tool(_tool_name) {
+            return true;
+        }
         if self.is_yolo(chat_id, thread_id).await {
             return true;
         }
@@ -400,6 +449,40 @@ mod tests {
         assert_eq!(map.get(2, None).await.as_deref(), Some("s2"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_or_insert_with_is_atomic_for_one_key() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let map = Arc::new(ChannelSessionMap::new());
+        let creates = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(16));
+        let mut tasks = Vec::new();
+
+        for _ in 0..16 {
+            let map = map.clone();
+            let creates = creates.clone();
+            let start = start.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                map.get_or_insert_with(9, Some(3), || async {
+                    let n = creates.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    format!("session-{n}")
+                })
+                .await
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for task in tasks {
+            ids.push(task.await.expect("task panicked"));
+        }
+        assert!(ids.iter().all(|id| id == "session-0"));
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn topics_are_separate_sessions() {
         let map = ChannelSessionMap::new();
@@ -435,9 +518,8 @@ mod tests {
     #[tokio::test]
     async fn allow_list_basics() {
         let map = ChannelSessionMap::new();
-        // Without yolo or allow_list, nothing auto-approves.
-        // (ReadOnly tools like read_file never reach should_auto_approve —
-        // core policy executes them directly without PermissionRequest.)
+        // Without yolo or allow_list, only read-only safe tools auto-approve.
+        assert!(map.should_auto_approve(1, Some(2), "read_file").await);
         assert!(!map.should_auto_approve(1, Some(2), "bash").await);
         assert!(!map.should_auto_approve(1, Some(2), "write_file").await);
 
@@ -467,6 +549,7 @@ mod tests {
     #[tokio::test]
     async fn should_auto_approve_checks_both() {
         let map = ChannelSessionMap::new();
+        assert!(map.should_auto_approve(1, None, "web_search").await);
         assert!(!map.should_auto_approve(1, None, "bash").await);
 
         map.allow_add(1, None, "bash").await;

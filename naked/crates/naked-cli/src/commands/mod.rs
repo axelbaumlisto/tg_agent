@@ -4,6 +4,7 @@ pub(crate) mod agent;
 pub(crate) mod chat;
 pub(crate) mod copilot;
 pub(crate) mod memory;
+pub(crate) mod prune_dead_keys;
 pub(crate) mod skills;
 pub(crate) mod tg;
 pub(crate) mod vacuum;
@@ -41,6 +42,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
         }
         "copilot-login" => return copilot::copilot_login_cmd().await,
         "memory" => return memory::memory_cmd(&args[2..]).await,
+        "prune-dead-keys" => return prune_dead_keys::prune_dead_keys_cmd(&args[2..]),
         "vacuum-sessions" => return vacuum::vacuum_sessions_cmd(&args[2..]).await,
         "research" => return crate::research::research_cmd(&args[2..]).await,
         "agent" => return agent::agent_cmd(&args[2..]).await,
@@ -61,6 +63,7 @@ fn print_usage() {
     println!("  agent             Role-based agent execution and batch runs");
     println!("  copilot-login     GitHub Copilot OAuth device login");
     println!("  memory            Persistent memory management");
+    println!("  prune-dead-keys   Offline prune of dead provider keys (dry-run by default)");
     println!("  research          Research subsystem operator commands");
     println!("  skills            Inspect the skill registry");
     println!("  tg                Telegram subsystem helpers (off-bot; mocks + diagnostics)");

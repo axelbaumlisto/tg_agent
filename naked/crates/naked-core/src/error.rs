@@ -17,6 +17,9 @@ pub enum AgentError {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
+    #[error("session busy: {0}")]
+    SessionBusy(String),
+
     #[error("config error: {0}")]
     Config(String),
 

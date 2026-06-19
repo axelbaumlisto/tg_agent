@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod audit_targets;
 pub mod copilot;
 pub mod dead_key_persist; // B46 PLAN_PROVIDER_HEALTH_v1
 pub mod error;
@@ -9,7 +10,10 @@ pub mod timeout;
 
 pub use timeout::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_INTER_CHUNK_TIMEOUT, TimeoutProvider};
 
-pub use factory::{build_provider_from_config, create_provider};
+pub use audit_targets::{
+    DedupAuditPlan, DedupAuditTarget, KeyFingerprint, dedup_audit_targets, key_fingerprint,
+};
+pub use factory::{build_provider_from_config, create_provider, create_provider_chain};
 
 use std::pin::Pin;
 

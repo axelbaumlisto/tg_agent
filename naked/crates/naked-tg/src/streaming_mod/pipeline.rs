@@ -70,6 +70,17 @@ pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
     ]])
 }
 
+pub(crate) async fn register_turn_routing(ctx: ChatCtx, handle: &AgentHandle) {
+    let chat_id_raw = ctx.chat_id.0;
+    let tid = ctx.raw_thread_id();
+    let chat_key = (chat_id_raw, tid);
+
+    STEER_SENDERS
+        .write()
+        .await
+        .insert(chat_key, handle.steer.clone());
+}
+
 /// T3 (PLAN_v13_SOLID_AUDIT): takes `&BotDeps` for shared infra
 /// instead of 7 individual args.  Turn-specific params remain separate.
 pub(crate) async fn stream_response(
@@ -94,11 +105,13 @@ pub(crate) async fn stream_response(
     let tid = ctx.raw_thread_id();
     let chat_key_for_steer = (chat_id_raw, tid);
 
-    // Store steer sender so message_handler can reach us.
-    STEER_SENDERS
-        .write()
-        .await
-        .insert(chat_key_for_steer, steer);
+    // Idempotent fallback for non-message callers (e.g. research callbacks).
+    if !STEER_SENDERS.read().await.contains_key(&chat_key_for_steer) {
+        STEER_SENDERS
+            .write()
+            .await
+            .insert(chat_key_for_steer, steer);
+    }
 
     tracing::debug!(
         chat_id = chat_id_raw,
@@ -152,14 +165,7 @@ pub(crate) async fn stream_response(
         .await
         .insert(chat_key, model_switch.clone());
 
-    // Register queue counter (reset to 0 for this turn).
-    let queue_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    QUEUE_COUNTS
-        .write()
-        .await
-        .insert(chat_key, queue_counter.clone());
-
-    let mut view = CompositeView::new(model_tag, queue_counter);
+    let mut view = CompositeView::new(model_tag);
     let mut dirty = false;
     let mut last_sent = String::new();
     let mut html_broken = false;
@@ -445,34 +451,55 @@ pub(crate) async fn stream_response(
         }
     }
 
-    // If the agent task died without sending Idle (panic/crash),
-    // notify the user so they know something broke.
-    if !got_idle {
-        tracing::error!(
-            chat = ctx.chat_id.0,
-            "agent task died without Idle — likely panicked"
-        );
-        let _ = bot
-            .send_message(
-                ctx.chat_id,
-                "🔴 Внутренняя ошибка — задача аварийно завершилась. Попробуйте ещё раз.",
-            )
-            .maybe_thread(ctx.thread_id)
+    notify_if_agent_died_without_idle(&bot, ctx, got_idle).await;
+    typing_cancel.cancel();
+    cleanup_stream_registries(&bot, chat_key, chat_key_for_steer).await;
+
+    if aborted_for_switch {
+        // Don't send final — the turn was interrupted. Edit placeholder to
+        // indicate switch in progress.
+        RATE_LIMITER
+            .edit_plain(&bot, ctx.chat_id, placeholder, "⚡ Switching model…")
             .await;
+        return;
     }
 
-    typing_cancel.cancel();
+    let final_html = view.render_final();
+    send_final(bot.clone(), ctx, placeholder, &final_html, &view).await;
+    send_provider_error_card_if_needed(&bot, ctx, &view).await;
+    deliver_queued_attachments(http_client, base_url, ctx, tg_attach_queue).await;
+}
 
-    // Deregister model-switch state, queue counter, and steer sender.
+async fn notify_if_agent_died_without_idle(bot: &Bot, ctx: ChatCtx, got_idle: bool) {
+    // If the agent task died without sending Idle (panic/crash), notify the user
+    // so they know something broke.
+    if got_idle {
+        return;
+    }
+    tracing::error!(
+        chat = ctx.chat_id.0,
+        "agent task died without Idle — likely panicked"
+    );
+    let _ = bot
+        .send_message(
+            ctx.chat_id,
+            "🔴 Внутренняя ошибка — задача аварийно завершилась. Попробуйте ещё раз.",
+        )
+        .maybe_thread(ctx.thread_id)
+        .await;
+}
+
+async fn cleanup_stream_registries(
+    bot: &Bot,
+    chat_key: (i64, Option<i32>),
+    chat_key_for_steer: (i64, Option<i32>),
+) {
+    let (chat_id_raw, tid) = chat_key;
     MODEL_SWITCHES.write().await.remove(&chat_key);
-    QUEUE_COUNTS.write().await.remove(&chat_key);
     STEER_SENDERS.write().await.remove(&chat_key_for_steer);
-    // PLAN_MEDIA_UX_v1 M4 / B02: clear the [⏹ Стоп] [⏩ Send now]
-    // inline keyboard from the placeholder (which now ALSO holds
-    // the final text). editMessageReplyMarkup without
-    // `.reply_markup()` sends empty markup, removing buttons but
-    // leaving the text intact. NOT delete_message — that would
-    // wipe the final assistant reply.
+
+    // PLAN_MEDIA_UX_v1 M4 / B02: clear the [⏹ Стоп] [⏩ Send now] inline
+    // keyboard from the placeholder (which now ALSO holds the final text).
     if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
         .write()
         .await
@@ -485,100 +512,105 @@ pub(crate) async fn stream_response(
             "control card clear failed (likely already cleared): {e}"
         );
     }
-    // S6 cleanup: any ack ids still parked for this chat/thread are
-    // unreachable now (turn ended without an Idle-time SteerReceived
-    // for them). Best-effort delete — prevents the temp
-    // "Принято" message from sticking around forever.
-    {
-        let stale: Vec<(teloxide::types::ChatId, teloxide::types::MessageId)> = {
-            let mut acks = crate::shared::STEER_ACK_IDS.write().await;
-            let keys: Vec<_> = acks
-                .keys()
-                .filter(|(c, t, _)| *c == chat_id_raw && *t == tid)
-                .cloned()
-                .collect();
-            keys.into_iter().filter_map(|k| acks.remove(&k)).collect()
-        };
-        for (chat, ack_id) in stale {
-            if let Err(e) = bot.delete_message(chat, ack_id).await {
-                tracing::debug!(
-                    chat = chat.0,
-                    msg = ack_id.0,
-                    "end-of-turn steer ack cleanup failed: {e}"
-                );
-            }
+    cleanup_stale_steer_acks(bot, chat_id_raw, tid).await;
+}
+
+async fn cleanup_stale_steer_acks(bot: &Bot, chat_id_raw: i64, tid: Option<i32>) {
+    // S6 cleanup: any ack ids still parked for this chat/thread are unreachable
+    // now (turn ended without an Idle-time SteerReceived for them). Best-effort
+    // delete — prevents the temp "Принято" message from sticking around forever.
+    let stale: Vec<(teloxide::types::ChatId, teloxide::types::MessageId)> = {
+        let mut acks = crate::shared::STEER_ACK_IDS.write().await;
+        let keys: Vec<_> = acks
+            .keys()
+            .filter(|(c, t, _)| *c == chat_id_raw && *t == tid)
+            .cloned()
+            .collect();
+        keys.into_iter().filter_map(|k| acks.remove(&k)).collect()
+    };
+    for (chat, ack_id) in stale {
+        if let Err(e) = bot.delete_message(chat, ack_id).await {
+            tracing::debug!(
+                chat = chat.0,
+                msg = ack_id.0,
+                "end-of-turn steer ack cleanup failed: {e}"
+            );
         }
     }
+}
 
-    if aborted_for_switch {
-        // Don't send final — the turn was interrupted.
-        // Edit placeholder to indicate switch in progress.
-        RATE_LIMITER
-            .edit_plain(&bot, ctx.chat_id, placeholder, "⚡ Switching model…")
-            .await;
+async fn send_provider_error_card_if_needed(bot: &Bot, ctx: ChatCtx, view: &CompositeView) {
+    if !view.had_provider_error {
         return;
     }
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("🔄 Retry", "err:retry".to_string()),
+        InlineKeyboardButton::callback("🔀 Switch model", "err:switch".to_string()),
+    ]]);
+    let _ = bot
+        .send_message(
+            ctx.chat_id,
+            "⚠️ Ответ содержит ошибку провайдера. Повторить?",
+        )
+        .maybe_thread(ctx.thread_id)
+        .reply_markup(keyboard)
+        .await;
+}
 
-    let final_html = view.render_final();
-    send_final(bot.clone(), ctx, placeholder, &final_html, &view).await;
-
-    // ── A3: Send error card with retry button if provider failed ────
-    if view.had_provider_error {
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("🔄 Retry", "err:retry".to_string()),
-            InlineKeyboardButton::callback("🔀 Switch model", "err:switch".to_string()),
-        ]]);
-        let _ = bot
-            .send_message(
-                ctx.chat_id,
-                "⚠️ Ответ содержит ошибку провайдера. Повторить?",
-            )
-            .maybe_thread(ctx.thread_id)
-            .reply_markup(keyboard)
-            .await;
-    }
-
-    // Deliver any files queued by telegram_attach tool.
+async fn deliver_queued_attachments(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    ctx: ChatCtx,
+    tg_attach_queue: &naked_tg::tg_attach::AttachmentQueue,
+) {
     let attachments: Vec<naked_tg::tg_attach::StagedAttachment> =
         tg_attach_queue.lock().await.drain(..).collect();
     for att in attachments {
-        let method = if naked_tg::tg_attach::is_image_path(&att.path) {
-            "sendPhoto"
-        } else {
-            "sendDocument"
-        };
-        let field = if method == "sendPhoto" {
-            "photo"
-        } else {
-            "document"
-        };
-        let mut form = reqwest::multipart::Form::new().text("chat_id", ctx.chat_id.0.to_string());
-        if let Some(tid) = ctx.thread_id {
-            form = form.text("message_thread_id", tid.0.0.to_string());
-        }
-        let form = form.file(field, &att.path).await;
-        match form {
-            Ok(form) => {
-                let url = format!("{base_url}/{method}");
-                match http_client.post(&url).multipart(form).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        tracing::info!(file = %att.file_name, "telegram_attach delivered");
-                    }
-                    Ok(resp) => {
-                        tracing::warn!(
-                            file = %att.file_name,
-                            status = %resp.status(),
-                            "telegram_attach delivery failed"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(file = %att.file_name, error = %e, "telegram_attach send error");
-                    }
+        deliver_one_attachment(http_client, base_url, ctx, att).await;
+    }
+}
+
+async fn deliver_one_attachment(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    ctx: ChatCtx,
+    att: naked_tg::tg_attach::StagedAttachment,
+) {
+    let method = if naked_tg::tg_attach::is_image_path(&att.path) {
+        "sendPhoto"
+    } else {
+        "sendDocument"
+    };
+    let field = if method == "sendPhoto" {
+        "photo"
+    } else {
+        "document"
+    };
+    let mut form = reqwest::multipart::Form::new().text("chat_id", ctx.chat_id.0.to_string());
+    if let Some(tid) = ctx.thread_id {
+        form = form.text("message_thread_id", tid.0.0.to_string());
+    }
+    match form.file(field, &att.path).await {
+        Ok(form) => {
+            let url = format!("{base_url}/{method}");
+            match http_client.post(&url).multipart(form).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!(file = %att.file_name, "telegram_attach delivered");
+                }
+                Ok(resp) => {
+                    tracing::warn!(
+                        file = %att.file_name,
+                        status = %resp.status(),
+                        "telegram_attach delivery failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(file = %att.file_name, error = %e, "telegram_attach send error");
                 }
             }
-            Err(e) => {
-                tracing::warn!(file = %att.file_name, error = %e, "telegram_attach form build failed");
-            }
+        }
+        Err(e) => {
+            tracing::warn!(file = %att.file_name, error = %e, "telegram_attach form build failed");
         }
     }
 }

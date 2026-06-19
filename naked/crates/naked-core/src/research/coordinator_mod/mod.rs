@@ -117,7 +117,16 @@ impl ResearchCoordinator {
         if spec.paused {
             tracing::info!(spec = %spec_id, "skipping paused research");
             return self
-                .write_record(&spec, &run_id, 0, StopReason::Paused, started, "-", "-")
+                .write_record(briefing_ops::WriteRecordArgs {
+                    spec: &spec,
+                    run_id: &run_id,
+                    new_findings: 0,
+                    reason: StopReason::Paused,
+                    started,
+                    provider: "-",
+                    model: "-",
+                    verification: None,
+                })
                 .await;
         }
 
@@ -146,7 +155,16 @@ impl ResearchCoordinator {
                 Err(e) => {
                     tracing::error!(spec = %spec_id, "research runner failed to start: {e}");
                     return self
-                        .write_record(&spec, &run_id, 0, StopReason::Error, started, "-", "-")
+                        .write_record(briefing_ops::WriteRecordArgs {
+                            spec: &spec,
+                            run_id: &run_id,
+                            new_findings: 0,
+                            reason: StopReason::Error,
+                            started,
+                            provider: "-",
+                            model: "-",
+                            verification: None,
+                        })
                         .await;
                 }
             };
@@ -178,15 +196,16 @@ impl ResearchCoordinator {
         }
 
         let report = self
-            .write_record(
-                &spec,
-                &run_id,
+            .write_record(briefing_ops::WriteRecordArgs {
+                spec: &spec,
+                run_id: &run_id,
                 new_findings,
-                stop_reason,
+                reason: stop_reason,
                 started,
-                &provider,
-                &model,
-            )
+                provider: &provider,
+                model: &model,
+                verification: None,
+            })
             .await;
 
         // Agent runner owns the ephemeral session — ask it to tidy up after

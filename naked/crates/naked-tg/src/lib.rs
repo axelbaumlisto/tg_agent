@@ -17,6 +17,7 @@ pub mod media_helpers;
 pub mod memory_scheduler;
 pub mod model_glob;
 pub mod model_switch;
+pub mod per_chat_locks;
 pub mod persona;
 pub mod rate_limit;
 pub mod render;

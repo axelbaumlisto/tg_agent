@@ -9,10 +9,7 @@ mod tests {
     // ── render_thinking_block ───────────────────────────────────────────
 
     fn view_with_response_and_thinking(response: &str, thinking: &str) -> CompositeView {
-        let mut v = CompositeView::new(
-            "test-model".into(),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        );
+        let mut v = CompositeView::new("test-model".into());
         v.response_text = response.to_string();
         v.thinking = thinking.to_string();
         v

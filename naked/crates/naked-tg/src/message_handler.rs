@@ -20,6 +20,7 @@ pub(crate) struct BotDeps {
     pub tg_attach_queue: naked_tg::tg_attach::AttachmentQueue,
     pub research_scheduler:
         Option<std::sync::Arc<crate::shared::research_scheduler::ResearchScheduler>>,
+    pub per_chat_locks: Arc<crate::per_chat_locks::PerChatLocks>,
 }
 
 impl BotDeps {
@@ -77,25 +78,11 @@ pub(crate) async fn handle_message(
     let ctx = ChatCtx::from_msg(&msg);
     let chat_id_raw = ctx.chat_id.0;
 
-    // Pass-1: classify incoming content. Either `msg.text()`, or a caption on
-    // top of media, or pure media — or literally nothing (service messages).
-    let text_direct = msg.text().map(str::to_string).filter(|s| !s.is_empty());
-    // Album captions: Telegram only attaches the caption to the **first**
-    // photo in the group; for any subsequent message its `.caption()` is
-    // empty. Search the whole batch for the first non-empty caption so the
-    // user's intent isn't dropped just because the first part happened to
-    // be processed without a caption.
-    let caption = std::iter::once(&msg)
-        .chain(extra_album_msgs.iter())
-        .find_map(|m| {
-            m.caption()
-                .map(str::to_string)
-                .filter(|s| !s.trim().is_empty())
-        });
-    let mut media_items = extract_media_items(&msg);
-    for em in &extra_album_msgs {
-        media_items.extend(extract_media_items(em));
-    }
+    let IncomingContent {
+        text_direct,
+        caption,
+        mut media_items,
+    } = collect_incoming_content(&msg, &extra_album_msgs);
 
     // Replying to a message with media == "look at THIS". Pull the
     // attachments from the reply target into the current turn so the
@@ -212,48 +199,30 @@ pub(crate) async fn handle_message(
         );
     }
 
-    // Pass-2: if there's media, acknowledge and process it (download + transform).
-    let media_processed = if !media_items.is_empty() {
-        let _ = send_text(
-            bot,
-            ctx.chat_id,
-            ctx.thread_id,
-            "\u{1F4E5} processing media\u{2026}",
-        )
-        .await;
-        let media_ctx = crate::media_dispatch::MediaCtx {
+    let media_processed = process_media_if_any(
+        bot,
+        ctx,
+        &media_items,
+        &caption,
+        MediaProcessEnv {
             bot_token,
             config,
-            http: http_client.clone(),
-            base_url: base_url.clone(),
-            user_caption: caption.as_deref(),
+            http_client,
+            base_url,
             msg_id: msg.id.0,
             route_images_natively,
             native_cap_bytes,
             active_model: &pre_model,
-        };
-        Some(process_media_items(&media_items, &media_ctx).await)
-    } else {
-        None
-    };
+        },
+    )
+    .await;
 
     // Pass-3: merge media_block + text into a single user prompt.
     let (media_text, native_images) = match media_processed {
         Some(m) => (Some(m.text), m.native_images),
         None => (None, Vec::new()),
     };
-    let base_text = {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(block) = media_text {
-            parts.push(block);
-        }
-        if let Some(t) = text_direct.as_ref() {
-            parts.push(t.clone());
-        } else if let Some(c) = caption.as_ref() {
-            parts.push(c.clone());
-        }
-        parts.join("\n\n")
-    };
+    let base_text = build_base_text(media_text, text_direct.as_ref(), caption.as_ref());
     if base_text.trim().is_empty() && native_images.is_empty() {
         return Ok(());
     }
@@ -275,22 +244,7 @@ pub(crate) async fn handle_message(
     // Compose the final text for the agent: optional reply quote + optional
     // `@sender:` attribution prefix (groups only). Commands skip composition
     // so `/clear`, `/new`, etc. still work when sent as a reply.
-    let text = if base_text.starts_with('/') {
-        base_text.clone()
-    } else {
-        let quote = extract_reply_context(&msg);
-        let attr_enabled = attribution_flag.load(std::sync::atomic::Ordering::Relaxed);
-        let need_attr = attr_enabled && in_group;
-        let attributed = if need_attr {
-            format!("{sender}: {base_text}")
-        } else {
-            base_text.clone()
-        };
-        match quote {
-            Some(q) => format!("{q}\n\n{attributed}"),
-            None => attributed,
-        }
-    };
+    let text = compose_agent_text(&msg, &base_text, attribution_flag, in_group, &sender);
 
     if text.starts_with('/') {
         // Persona chats with `allow_slash_commands=false` are pure
@@ -316,125 +270,168 @@ pub(crate) async fn handle_message(
         // Unrecognized /command — fall through to agent as regular message
     }
 
+    let multimodal_blocks = build_multimodal_blocks(&native_images, &text, config);
+
+    let key = crate::per_chat_locks::ChatThreadKey::new(ctx.chat_id.0, ctx.raw_thread_id());
+    let guard = deps.per_chat_locks.lock(key).await;
+    if guard.waited() {
+        crate::metrics::record_concurrent_same_key_turn_wait();
+    }
+
+    // Short per-(chat,thread) critical section: session-create plus the
+    // new-turn-vs-steer/queue decision and registration. The guard is dropped
+    // before the multi-minute stream is awaited below, so a same-chat follow-up
+    // can acquire it quickly and route into steer/queue instead of blocking
+    // behind the active turn.
+    let dispatch = prepare_agent_dispatch(
+        &deps,
+        ctx,
+        &msg,
+        existing_session_id,
+        text,
+        multimodal_blocks,
+        (pre_prov, pre_model),
+    )
+    .await?;
+    drop(guard);
+
+    match dispatch {
+        PreparedDispatch::StartTurn(turn) => {
+            stream_response(&deps, ctx, turn.handle, turn.model_tag).await;
+        }
+        PreparedDispatch::SteerAck { msg_id, key } => {
+            send_steer_ack(bot, ctx, msg_id, key).await?;
+        }
+        PreparedDispatch::Busy => {
+            crate::shared::safe_send(bot, &ctx, crate::ux_text::BUSY_ACK.to_string(), None).await?;
+        }
+        PreparedDispatch::Error { message } => {
+            crate::shared::safe_send(bot, &ctx, message, None).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_multimodal_blocks(
+    native_images: &[crate::media_dispatch::NativeImage],
+    text: &str,
+    config: &Config,
+) -> Option<Vec<naked_core::types::ContentBlock>> {
+    // Block ordering: images FIRST, text LAST. Anthropic's vision docs
+    // recommend placing image blocks before text for best response quality.
+    if native_images.is_empty() {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    for img in native_images {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&img.bytes);
+        blocks.push(naked_core::types::ContentBlock::Image {
+            mime: img.mime.clone(),
+            data_base64: b64,
+            detail: config.tg_media.image_detail,
+        });
+    }
+    if !text.is_empty() {
+        blocks.push(naked_core::types::ContentBlock::Text {
+            text: text.to_string(),
+        });
+    }
+    Some(blocks)
+}
+
+enum PreparedDispatch {
+    StartTurn(PreparedTurn),
+    SteerAck {
+        msg_id: i32,
+        key: (i64, Option<i32>),
+    },
+    Busy,
+    Error {
+        message: String,
+    },
+}
+
+struct PreparedTurn {
+    handle: AgentHandle,
+    model_tag: String,
+}
+
+fn should_count_session_busy_ack(steer_succeeded: bool) -> bool {
+    !steer_succeeded
+}
+
+fn session_busy_dispatch(
+    key: (i64, Option<i32>),
+    msg_id: i32,
+    steer_succeeded: bool,
+) -> PreparedDispatch {
+    if steer_succeeded {
+        PreparedDispatch::SteerAck { msg_id, key }
+    } else {
+        if should_count_session_busy_ack(steer_succeeded) {
+            crate::metrics::record_session_busy_ack();
+        }
+        PreparedDispatch::Busy
+    }
+}
+
+async fn prepare_agent_dispatch(
+    deps: &BotDeps,
+    ctx: ChatCtx,
+    msg: &Message,
+    existing_session_id: Option<String>,
+    text: String,
+    multimodal_blocks: Option<Vec<naked_core::types::ContentBlock>>,
+    provider_model: (String, String),
+) -> Result<PreparedDispatch, teloxide::RequestError> {
+    let agent = &deps.agent;
+    let channel_map = &deps.channel_map;
+    let config = &deps.config;
+
     // Now we know the message is going to the agent — only now do we create
-    // a session if one didn't exist yet.
+    // a session if one didn't exist yet. This runs under the per-chat short
+    // lock, and ChannelSessionMap also protects the first-create path.
     let session_id = match existing_session_id {
         Some(sid) => sid,
         None => get_or_create_session(ctx, agent, channel_map, config).await,
     };
 
-    // Build optional native-multimodal blocks. When present, these go through
-    // `send_prompt_multimodal` / `queue_message_multimodal`; otherwise we fall
-    // back to the text-only entry points.
-    //
-    // Block ordering: images FIRST, text LAST. Anthropic's vision docs
-    // explicitly recommend placing image blocks before text for best response
-    // quality; OpenAI-compatible vision models accept either order. See
-    // https://docs.anthropic.com/en/docs/build-with-claude/vision
-    let multimodal_blocks: Option<Vec<naked_core::types::ContentBlock>> =
-        if !native_images.is_empty() {
-            let mut blocks: Vec<naked_core::types::ContentBlock> = Vec::new();
-            for img in &native_images {
-                use base64::Engine as _;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&img.bytes);
-                blocks.push(naked_core::types::ContentBlock::Image {
-                    mime: img.mime.clone(),
-                    data_base64: b64,
-                    detail: config.tg_media.image_detail,
-                });
-            }
-            if !text.is_empty() {
-                blocks.push(naked_core::types::ContentBlock::Text { text: text.clone() });
-            }
-            Some(blocks)
-        } else {
-            None
-        };
-
     if agent.is_session_active(&session_id).await {
-        let key = (ctx.chat_id.0, ctx.raw_thread_id());
-
-        // Try to steer the active turn (inject message into running loop).
-        let steered = {
-            let map = STEER_SENDERS.read().await;
-            if let Some(steer_tx) = map.get(&key) {
-                let steer_msg = naked_core::types::SteerMessage {
-                    msg_id: msg.id.0,
-                    text: text.clone(),
-                    is_edit: false,
-                };
-                steer_tx.try_send(steer_msg).is_ok()
-            } else {
-                false
-            }
-        };
-
-        if steered {
-            // S6: track the ack message id so the streaming pipeline
-            // can delete it once the steer is actually delivered
-            // (AgentEvent::SteerReceived). Without this the user is
-            // left with a permanent "Принято — доставлю" hanging
-            // in the chat even after the model already replied.
-            let ack = bot
-                .send_message(
-                    ctx.chat_id,
-                    "\u{21a9}\u{fe0f} Принято \u{2014} доставлю между шагами",
-                )
-                .maybe_thread(ctx.thread_id)
-                .maybe_reply_to(ctx.reply_to)
-                .await?;
-            crate::shared::STEER_ACK_IDS
-                .write()
-                .await
-                .insert((key.0, key.1, msg.id.0), (ctx.chat_id, ack.id));
-        } else {
-            // Steer channel not available — fall back to queue.
-            match multimodal_blocks {
-                Some(blocks) => agent.queue_message_multimodal(&session_id, blocks).await,
-                None => agent.queue_message(&session_id, &text).await,
-            }
-            // Increment queued message counter for status preview.
-            {
-                let map = QUEUE_COUNTS.read().await;
-                if let Some(counter) = map.get(&key) {
-                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            let qcount = {
-                let map = QUEUE_COUNTS.read().await;
-                map.get(&key)
-                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(0)
-            };
-            let note = if qcount > 0 {
-                format!("⏳ +{qcount} in queue")
-            } else {
-                "⏳ Queued".into()
-            };
-            bot.send_message(ctx.chat_id, note)
-                .maybe_thread(ctx.thread_id)
-                .maybe_reply_to(ctx.reply_to)
-                .await?;
-        }
-        return Ok(());
+        return prepare_active_session_message(ctx, msg, text).await;
     }
 
-    // Reuse the (provider, model) we resolved earlier for the multimodal
-    // routing decision — for both existing and freshly-created sessions the
-    // result is identical, so calling `session_provider_model` again would be
-    // a redundant lock acquisition.
-    let (prov, model) = (pre_prov, pre_model);
+    start_new_agent_turn(
+        deps,
+        ctx,
+        msg,
+        &session_id,
+        text,
+        multimodal_blocks,
+        provider_model,
+    )
+    .await
+}
+
+async fn start_new_agent_turn(
+    deps: &BotDeps,
+    ctx: ChatCtx,
+    msg: &Message,
+    session_id: &str,
+    text: String,
+    multimodal_blocks: Option<Vec<naked_core::types::ContentBlock>>,
+    provider_model: (String, String),
+) -> Result<PreparedDispatch, teloxide::RequestError> {
+    let agent = &deps.agent;
+    let (prov, model) = provider_model;
     let model_tag = format!("{prov}/{model}");
 
-    // Record the current author for this turn so the memory tool can resolve
-    // `scope=user` without extra parameters. Use the raw numeric id (stable
-    // across username changes).
     let sender_id = msg.from.as_ref().map(|u| u.id.0.to_string());
-    agent.set_session_sender(&session_id, sender_id).await;
+    agent.set_session_sender(session_id, sender_id).await;
 
-    // Expand @-mentions: @src/main.rs → inject file content.
     let workspace = agent
-        .session_workspace(&session_id)
+        .session_workspace(session_id)
         .await
         .unwrap_or_default();
     let (text, mention_ctx) = naked_core::mentions::expand_mentions(&text, &workspace).await;
@@ -447,21 +444,191 @@ pub(crate) async fn handle_message(
     let send_result = match multimodal_blocks {
         Some(blocks) => {
             agent
-                .send_prompt_multimodal(&session_id, blocks, text.clone())
+                .send_prompt_multimodal(session_id, blocks, text.clone())
                 .await
         }
-        None => agent.send_prompt(&session_id, &text).await,
+        None => agent.send_prompt(session_id, &text).await,
     };
     let handle = match send_result {
         Ok(h) => h,
         Err(e) => {
-            crate::shared::safe_send(bot, &ctx, format!("Error: {e}"), None).await?;
-            return Ok(());
+            if matches!(&e, naked_core::error::AgentError::SessionBusy(_)) {
+                let key = (ctx.chat_id.0, ctx.raw_thread_id());
+                let steered = try_steer_active_turn(key, msg.id.0, &text).await;
+                return Ok(session_busy_dispatch(key, msg.id.0, steered));
+            }
+            return Ok(PreparedDispatch::Error {
+                message: format!("Error: {e}"),
+            });
         }
     };
 
-    stream_response(&deps, ctx, handle, model_tag).await;
+    crate::streaming::register_turn_routing(ctx, &handle).await;
+    Ok(PreparedDispatch::StartTurn(PreparedTurn {
+        handle,
+        model_tag,
+    }))
+}
 
+struct IncomingContent {
+    text_direct: Option<String>,
+    caption: Option<String>,
+    media_items: Vec<crate::media_dispatch::MediaItem>,
+}
+
+fn collect_incoming_content(msg: &Message, extra_album_msgs: &[Message]) -> IncomingContent {
+    // Pass-1: classify incoming content. Either `msg.text()`, or a caption on
+    // top of media, or pure media — or literally nothing (service messages).
+    let text_direct = msg.text().map(str::to_string).filter(|s| !s.is_empty());
+    // Album captions: Telegram only attaches the caption to the **first** photo
+    // in the group; for any subsequent message its `.caption()` is empty.
+    let caption = std::iter::once(msg)
+        .chain(extra_album_msgs.iter())
+        .find_map(|m| {
+            m.caption()
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+        });
+    let mut media_items = extract_media_items(msg);
+    for em in extra_album_msgs {
+        media_items.extend(extract_media_items(em));
+    }
+    IncomingContent {
+        text_direct,
+        caption,
+        media_items,
+    }
+}
+
+struct MediaProcessEnv<'a> {
+    bot_token: &'a str,
+    config: &'a Config,
+    http_client: &'a Arc<reqwest::Client>,
+    base_url: &'a Arc<String>,
+    msg_id: i32,
+    route_images_natively: bool,
+    native_cap_bytes: u64,
+    active_model: &'a str,
+}
+
+async fn process_media_if_any(
+    bot: &Bot,
+    ctx: ChatCtx,
+    media_items: &[crate::media_dispatch::MediaItem],
+    caption: &Option<String>,
+    env: MediaProcessEnv<'_>,
+) -> Option<crate::media_dispatch::MediaProcessed> {
+    if media_items.is_empty() {
+        return None;
+    }
+    let _ = send_text(
+        bot,
+        ctx.chat_id,
+        ctx.thread_id,
+        "\u{1F4E5} processing media\u{2026}",
+    )
+    .await;
+    let media_ctx = crate::media_dispatch::MediaCtx {
+        bot_token: env.bot_token,
+        config: env.config,
+        http: env.http_client.clone(),
+        base_url: env.base_url.clone(),
+        user_caption: caption.as_deref(),
+        msg_id: env.msg_id,
+        route_images_natively: env.route_images_natively,
+        native_cap_bytes: env.native_cap_bytes,
+        active_model: env.active_model,
+    };
+    Some(process_media_items(media_items, &media_ctx).await)
+}
+
+fn build_base_text(
+    media_text: Option<String>,
+    text_direct: Option<&String>,
+    caption: Option<&String>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(block) = media_text {
+        parts.push(block);
+    }
+    if let Some(t) = text_direct {
+        parts.push(t.clone());
+    } else if let Some(c) = caption {
+        parts.push(c.clone());
+    }
+    parts.join("\n\n")
+}
+
+fn compose_agent_text(
+    msg: &Message,
+    base_text: &str,
+    attribution_flag: &Arc<std::sync::atomic::AtomicBool>,
+    in_group: bool,
+    sender: &str,
+) -> String {
+    if base_text.starts_with('/') {
+        return base_text.to_string();
+    }
+    let quote = extract_reply_context(msg);
+    let attr_enabled = attribution_flag.load(std::sync::atomic::Ordering::Relaxed);
+    let need_attr = attr_enabled && in_group;
+    let attributed = if need_attr {
+        format!("{sender}: {base_text}")
+    } else {
+        base_text.to_string()
+    };
+    match quote {
+        Some(q) => format!("{q}\n\n{attributed}"),
+        None => attributed,
+    }
+}
+
+async fn prepare_active_session_message(
+    ctx: ChatCtx,
+    msg: &Message,
+    text: String,
+) -> Result<PreparedDispatch, teloxide::RequestError> {
+    let key = (ctx.chat_id.0, ctx.raw_thread_id());
+    let steered = try_steer_active_turn(key, msg.id.0, &text).await;
+    Ok(session_busy_dispatch(key, msg.id.0, steered))
+}
+
+async fn try_steer_active_turn(key: (i64, Option<i32>), msg_id: i32, text: &str) -> bool {
+    let map = STEER_SENDERS.read().await;
+    if let Some(steer_tx) = map.get(&key) {
+        let steer_msg = naked_core::types::SteerMessage {
+            msg_id,
+            text: text.to_string(),
+            is_edit: false,
+        };
+        steer_try_send(steer_tx, steer_msg)
+    } else {
+        false
+    }
+}
+
+fn steer_try_send(
+    steer_tx: &tokio::sync::mpsc::Sender<naked_core::types::SteerMessage>,
+    steer_msg: naked_core::types::SteerMessage,
+) -> bool {
+    steer_tx.try_send(steer_msg).is_ok()
+}
+
+async fn send_steer_ack(
+    bot: &Bot,
+    ctx: ChatCtx,
+    msg_id: i32,
+    key: (i64, Option<i32>),
+) -> Result<(), teloxide::RequestError> {
+    let ack = bot
+        .send_message(ctx.chat_id, crate::ux_text::STEER_ACK)
+        .maybe_thread(ctx.thread_id)
+        .maybe_reply_to(ctx.reply_to)
+        .await?;
+    crate::shared::STEER_ACK_IDS
+        .write()
+        .await
+        .insert((key.0, key.1, msg_id), (ctx.chat_id, ack.id));
     Ok(())
 }
 
@@ -551,5 +718,278 @@ mod tests {
             src.contains("extra_album_msgs.iter()") && src.contains("caption"),
             "album caption coalescing must search extra_album_msgs"
         );
+    }
+
+    #[test]
+    fn session_busy_ack_counter_bumps_once_per_busy_ack() {
+        assert!(super::should_count_session_busy_ack(false));
+        assert!(!super::should_count_session_busy_ack(true));
+
+        let key = (42, Some(7));
+        let msg_id = 1001;
+        let before = crate::metrics::snapshot().session_busy_ack;
+        let busy = super::session_busy_dispatch(key, msg_id, false);
+        let after_busy = crate::metrics::snapshot().session_busy_ack;
+        assert_eq!(after_busy, before + 1);
+        assert!(matches!(busy, super::PreparedDispatch::Busy));
+
+        let steered = super::session_busy_dispatch(key, msg_id, true);
+        let after_steer = crate::metrics::snapshot().session_busy_ack;
+        assert_eq!(after_steer, after_busy);
+        assert!(matches!(
+            steered,
+            super::PreparedDispatch::SteerAck {
+                msg_id: actual_msg_id,
+                key: actual_key,
+            } if actual_msg_id == msg_id && actual_key == key
+        ));
+    }
+
+    #[test]
+    fn ux_text_busy_ack_is_honest_and_busy_arm_uses_constant() {
+        let busy_ack = crate::ux_text::BUSY_ACK;
+        assert!(
+            busy_ack.contains("не принято"),
+            "BUSY_ACK must explicitly say the message was not accepted"
+        );
+        for forbidden in ["очеред", "queued", "queue", "сохран", "saved"] {
+            assert!(
+                !busy_ack.to_lowercase().contains(forbidden),
+                "BUSY_ACK must not imply queueing/saving via {forbidden:?}: {busy_ack}"
+            );
+        }
+
+        let src = source();
+        let dispatch_match = src
+            .split("match dispatch")
+            .nth(1)
+            .and_then(|tail| tail.split("fn build_multimodal_blocks").next())
+            .expect("dispatch match body must be findable");
+        assert!(
+            dispatch_match.contains("crate::ux_text::BUSY_ACK"),
+            "Busy dispatch arm must use the central BUSY_ACK constant"
+        );
+        assert!(
+            dispatch_match.contains("send_steer_ack(bot, ctx, msg_id, key)"),
+            "SteerAck dispatch arm should stay delegated to send_steer_ack"
+        );
+
+        let steer_ack_fn = src
+            .split("async fn send_steer_ack")
+            .nth(1)
+            .and_then(|tail| tail.split("#[cfg(test)]").next())
+            .expect("send_steer_ack body must be findable");
+        assert!(
+            steer_ack_fn.contains("crate::ux_text::STEER_ACK"),
+            "send_steer_ack must use the central STEER_ACK constant"
+        );
+    }
+
+    #[test]
+    fn active_session_busy_dispatch_steers_or_soft_busy_without_queueing() {
+        let key = (42, Some(7));
+        let msg_id = 1001;
+
+        let steered = super::session_busy_dispatch(key, msg_id, true);
+        assert!(matches!(
+            steered,
+            super::PreparedDispatch::SteerAck {
+                msg_id: actual_msg_id,
+                key: actual_key,
+            } if actual_msg_id == msg_id && actual_key == key
+        ));
+        assert!(
+            !matches!(steered, super::PreparedDispatch::Error { ref message } if message.starts_with("Error:")),
+            "SessionBusy with steer available must not render as Error:"
+        );
+
+        let busy = super::session_busy_dispatch(key, msg_id, false);
+        assert!(matches!(busy, super::PreparedDispatch::Busy));
+        assert!(
+            !matches!(busy, super::PreparedDispatch::Error { ref message } if message.starts_with("Error:")),
+            "SessionBusy without steer sender must be a soft Busy ack, not Error:"
+        );
+
+        let src = source();
+        let active_fn = src
+            .split("async fn prepare_active_session_message")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn try_steer_active_turn").next())
+            .expect("prepare_active_session_message body must be findable");
+        assert!(
+            !contains_queue_call(active_fn),
+            "active-session no-steer path must steer-or-Busy, never append to live Session.history"
+        );
+        assert!(
+            active_fn.contains("session_busy_dispatch(key, msg.id.0, steered)"),
+            "active-session path must reuse the steer-or-Busy decision helper"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_session_busy_full_steer_channel_returns_busy() {
+        let key = (-9_876_543_210, Some(31_415));
+        let msg_id = 2002;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(naked_core::types::SteerMessage {
+            msg_id: 1,
+            text: "fills the channel".to_string(),
+            is_edit: false,
+        })
+        .expect("first steer send should fill the bounded channel");
+        let steered = super::steer_try_send(
+            &tx,
+            naked_core::types::SteerMessage {
+                msg_id,
+                text: "follow-up while full".to_string(),
+                is_edit: false,
+            },
+        );
+
+        assert!(!steered, "full steer channel must be treated as no-steer");
+        assert!(matches!(
+            super::session_busy_dispatch(key, msg_id, steered),
+            super::PreparedDispatch::Busy
+        ));
+    }
+
+    #[test]
+    fn queue_message_call_sites_are_classified_with_rationale() {
+        use std::path::{Path, PathBuf};
+
+        #[derive(Debug)]
+        struct Allow<'a> {
+            file: &'a str,
+            needle: String,
+            rationale: &'a str,
+        }
+
+        let q = "queue_message";
+        let allowlist = [
+            Allow {
+                file: "src/callbacks/model.rs",
+                needle: format!("agent.{q}(sid, &continuation).await;"),
+                rationale: "B3c: model-switch continuation after abort; intentional post-abort delivery, shares §R4 risk and is tracked/allowlisted.",
+            },
+            Allow {
+                file: "src/runtime.rs",
+                needle: format!(".{q}(\n                    &sid,"),
+                rationale: "B3d: thumbs-down advisory correction note; best-effort non-user-authored content, shares §R4 risk and is tracked/allowlisted.",
+            },
+            Allow {
+                file: "../naked-core/src/test_support.rs",
+                needle: format!("tc.core.{q}(&sid, \"hello\").await;"),
+                rationale: "test-only helper smoke test; not a production live-history append path.",
+            },
+        ];
+        assert!(
+            allowlist.iter().all(|entry| !entry.rationale.is_empty()),
+            "every queue-message allowlist entry must carry an explicit rationale"
+        );
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let roots = [
+            (manifest.join("src"), "src"),
+            (manifest.join("../naked-core/src"), "../naked-core/src"),
+        ];
+        let mut actual = Vec::new();
+        for (root, rel_root) in roots {
+            collect_queue_message_calls(&root, rel_root, &mut actual);
+        }
+        actual.sort();
+
+        for entry in &allowlist {
+            let path = manifest.join(entry.file);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            assert!(
+                src.contains(&entry.needle),
+                "allowlisted queue_message site missing or changed in {} ({})",
+                entry.file,
+                entry.rationale
+            );
+        }
+
+        let allowed_files: std::collections::BTreeSet<_> = allowlist
+            .iter()
+            .map(|entry| entry.file.to_string())
+            .collect();
+        let unclassified: Vec<_> = actual
+            .iter()
+            .filter(|site| !allowed_files.contains(site.file.as_str()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "unclassified queue_message* call site(s): {unclassified:#?}; add an explicit allowlist+rationale or remove the live-history append"
+        );
+        assert!(
+            actual
+                .iter()
+                .all(|site| site.file != "src/message_handler.rs"),
+            "message_handler.rs must not call queue_message* on active no-steer paths"
+        );
+        assert_eq!(
+            actual.len(),
+            allowlist.len(),
+            "queue_message* call-site inventory changed: actual={actual:#?} allowlist={allowlist:#?}"
+        );
+
+        fn collect_queue_message_calls(root: &Path, rel_root: &str, out: &mut Vec<Site>) {
+            for entry in std::fs::read_dir(root)
+                .unwrap_or_else(|err| panic!("failed to read dir {}: {err}", root.display()))
+            {
+                let path = entry.expect("dir entry must be readable").path();
+                if path.is_dir() {
+                    let child_rel_root = format!(
+                        "{rel_root}/{}",
+                        path.file_name()
+                            .expect("directory must have a file name")
+                            .to_string_lossy()
+                    );
+                    collect_queue_message_calls(&path, &child_rel_root, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let src = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+                    let rel = format!(
+                        "{rel_root}/{}",
+                        path.file_name()
+                            .expect("source file must have a file name")
+                            .to_string_lossy()
+                    );
+                    for token in [short_queue_call_token(), multimodal_queue_call_token()] {
+                        for (idx, line) in src.lines().enumerate() {
+                            if line.contains(&token) {
+                                out.push(Site {
+                                    file: rel.clone(),
+                                    line: idx + 1,
+                                    call: token.clone(),
+                                    text: line.trim().to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct Site {
+        file: String,
+        line: usize,
+        call: String,
+        text: String,
+    }
+
+    fn short_queue_call_token() -> String {
+        format!(".{}(", "queue_message")
+    }
+
+    fn multimodal_queue_call_token() -> String {
+        format!(".{}(", "queue_message_multimodal")
+    }
+
+    fn contains_queue_call(src: &str) -> bool {
+        src.contains(&short_queue_call_token()) || src.contains(&multimodal_queue_call_token())
     }
 }

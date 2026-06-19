@@ -55,6 +55,36 @@ fn production_config_parses_without_error() {
     );
 }
 
+/// B63 / AB-5: every chat fallback provider must exist in `providers`.
+/// Option-B boot audit enumerates configured providers' own keys; a dangling
+/// fallback name would otherwise be invisible to the de-duplicated audit.
+#[test]
+fn production_fallback_provider_names_exist() {
+    let Some(path) = locate_prod_config() else {
+        eprintln!("skipped: no prod naked.json reachable");
+        return;
+    };
+    let cfg = Config::from_json_file(&path).expect("parse");
+
+    let missing: Vec<String> = cfg
+        .fallback_providers()
+        .into_iter()
+        .filter_map(|(provider, model)| {
+            if cfg.providers.contains_key(&provider) {
+                None
+            } else {
+                Some(format!("{provider}/{model}"))
+            }
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "config.fallback[] references provider(s) absent from config.providers: {}",
+        missing.join(", ")
+    );
+}
+
 /// INV-1 + INV-2: every model in the production config whose
 /// `capabilities[model].supports_vision = Some(true)` MUST be routable
 /// through `is_vision_capable_with_provider`. Closes a class of

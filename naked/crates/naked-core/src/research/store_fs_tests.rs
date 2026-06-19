@@ -1,7 +1,10 @@
 use super::*;
 use crate::research::spec::{Finding, ResearchSpec, RunRecord, dedup_hash};
 use chrono::Utc;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::sync::Barrier;
 
 fn make_spec(id: &str, topic: &str) -> ResearchSpec {
     // REGISTRY-WAIVE: exhaustive test struct ctor — pre-2026-05-13 baseline; new tests must use ..Default::default()
@@ -47,6 +50,137 @@ fn make_finding(spec_id: &str, url: &str) -> Finding {
         content_hash: String::new(),
         seen_at: Utc::now(),
     }
+}
+
+fn assert_findings_file_all_valid(path: &std::path::Path) -> Vec<Finding> {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("failed to read findings file {}: {e}", path.display()));
+    let content = String::from_utf8(bytes)
+        .unwrap_or_else(|e| panic!("findings file {} is not utf-8: {e}", path.display()));
+    let mut findings = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        findings.push(serde_json::from_str::<Finding>(line).unwrap_or_else(|e| {
+            panic!(
+                "invalid findings.jsonl row {} in {}: {e}",
+                idx + 1,
+                path.display()
+            )
+        }));
+    }
+    findings
+}
+
+fn corrupt_backups(dir: &Path) -> Vec<PathBuf> {
+    let mut backups = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("failed to read research dir {}: {e}", dir.display()))
+        .map(|entry| entry.expect("read_dir entry ok").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("findings.jsonl.corrupt-"))
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
+}
+
+fn mixed_corrupt_findings_bytes(valid: &[Finding], bad_suffix: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(serde_json::to_string(&valid[0]).unwrap().as_bytes());
+    bytes.extend_from_slice(b"\n{\"torn\":");
+    bytes.extend_from_slice(bad_suffix.as_bytes());
+    bytes.extend_from_slice(b"\n");
+    bytes.extend_from_slice(serde_json::to_string(&valid[1]).unwrap().as_bytes());
+    bytes.extend_from_slice(b"\nnot-json-at-all\n");
+    bytes.extend_from_slice(serde_json::to_string(&valid[2]).unwrap().as_bytes());
+    bytes.extend_from_slice(b"\n");
+    bytes
+}
+
+#[tokio::test]
+async fn mixed_corrupt_findings_self_heals_once() {
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("id-heal", "t");
+    store.create_spec(&spec).await.unwrap();
+    let research_dir = tmp.path().join("id-heal");
+    let findings_path = research_dir.join("findings.jsonl");
+
+    let valid = vec![
+        make_finding("id-heal", "https://x.com/a"),
+        make_finding("id-heal", "https://x.com/b"),
+        make_finding("id-heal", "https://x.com/c"),
+    ];
+    let original = mixed_corrupt_findings_bytes(&valid, "42");
+    std::fs::write(&findings_path, &original).unwrap();
+
+    let listed = store.list_findings("id-heal", None).await.unwrap();
+    assert_eq!(
+        listed, valid,
+        "read must return only valid findings in order"
+    );
+    assert_eq!(
+        assert_findings_file_all_valid(&findings_path),
+        valid,
+        "healed findings file must be 100% valid JSONL"
+    );
+
+    let backups = corrupt_backups(&research_dir);
+    assert_eq!(backups.len(), 1, "first corrupt read creates one backup");
+    assert_eq!(
+        std::fs::read(&backups[0]).unwrap(),
+        original,
+        "backup must be byte-for-byte original including torn rows"
+    );
+
+    let second = store.list_findings("id-heal", None).await.unwrap();
+    assert_eq!(second, valid);
+    assert_eq!(
+        corrupt_backups(&research_dir),
+        backups,
+        "second clean read must not create another backup or re-heal"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_findings_backups_use_unique_names_across_repeated_heals() {
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("id-heal-unique", "t");
+    store.create_spec(&spec).await.unwrap();
+    let research_dir = tmp.path().join("id-heal-unique");
+    let findings_path = research_dir.join("findings.jsonl");
+    let valid = vec![
+        make_finding("id-heal-unique", "https://x.com/a"),
+        make_finding("id-heal-unique", "https://x.com/b"),
+        make_finding("id-heal-unique", "https://x.com/c"),
+    ];
+
+    let first_original = mixed_corrupt_findings_bytes(&valid, "first");
+    std::fs::write(&findings_path, &first_original).unwrap();
+    store.list_findings("id-heal-unique", None).await.unwrap();
+
+    let second_original = mixed_corrupt_findings_bytes(&valid, "second");
+    std::fs::write(&findings_path, &second_original).unwrap();
+    store.list_findings("id-heal-unique", None).await.unwrap();
+
+    let backups = corrupt_backups(&research_dir);
+    assert_eq!(backups.len(), 2, "two corrupt generations need two backups");
+    assert_ne!(
+        backups[0].file_name().unwrap(),
+        backups[1].file_name().unwrap(),
+        "backup suffix must be unique, not seconds-only"
+    );
+    let backup_bytes = backups
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    assert!(backup_bytes.contains(&first_original));
+    assert!(backup_bytes.contains(&second_original));
 }
 
 #[tokio::test]
@@ -193,6 +327,254 @@ async fn dedup_survives_reopen() {
     let store2 = FsResearchStore::new(tmp.path().to_path_buf());
     let dup = make_finding("id-3", "https://x.com/ad/99?utm_source=later");
     assert!(!store2.try_append_finding(&dup).await.unwrap());
+}
+
+#[tokio::test]
+async fn concurrent_upsert_keeps_file_valid() {
+    let tmp = tempdir().unwrap();
+    let store = Arc::new(FsResearchStore::new(tmp.path().to_path_buf()));
+    let spec = make_spec("id-concurrent", "t");
+    store.create_spec(&spec).await.unwrap();
+
+    for idx in 0..8 {
+        let f = make_finding("id-concurrent", &format!("https://x.com/existing/{idx}"));
+        assert!(!store.upsert_finding(&f).await.unwrap());
+    }
+    for idx in 0..8 {
+        let f = make_finding("id-concurrent", &format!("https://x.com/remove/{idx}"));
+        assert!(!store.upsert_finding(&f).await.unwrap());
+    }
+
+    reset_findings_write_critical_section_probe("id-concurrent");
+
+    let gate = Arc::new(Barrier::new(33));
+    let mut handles = Vec::new();
+
+    for idx in 0..32 {
+        let store = store.clone();
+        let gate = gate.clone();
+        handles.push(tokio::spawn(async move {
+            gate.wait().await;
+            match idx % 4 {
+                0 => {
+                    let f = make_finding("id-concurrent", &format!("https://x.com/new/{idx}"));
+                    store.upsert_finding(&f).await.map(|_| ())
+                }
+                1 => {
+                    let mut f = make_finding(
+                        "id-concurrent",
+                        &format!("https://x.com/existing/{}", idx / 4),
+                    );
+                    f.title = Some(format!("updated {idx}"));
+                    store.upsert_finding(&f).await.map(|_| ())
+                }
+                2 => {
+                    let hashes = [dedup_hash(&format!("https://x.com/remove/{}", idx / 4))]
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    store
+                        .remove_findings_by_hash("id-concurrent", &hashes)
+                        .await
+                        .map(|_| ())
+                }
+                _ => {
+                    let f = make_finding("id-concurrent", &format!("https://x.com/try/{idx}"));
+                    store.try_append_finding(&f).await.map(|_| ())
+                }
+            }
+        }));
+    }
+
+    gate.wait().await;
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        findings_write_critical_section_max_observed(),
+        1,
+        "per-id findings file mutex must keep max concurrent write critical sections at 1"
+    );
+    disable_findings_write_critical_section_probe();
+
+    let path = tmp.path().join("id-concurrent").join("findings.jsonl");
+    let findings = assert_findings_file_all_valid(&path);
+    let hashes = findings
+        .iter()
+        .map(|f| f.dedup_hash.clone())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        findings.len(),
+        hashes.len(),
+        "raw file must not contain duplicate dedup hashes"
+    );
+
+    let expected_hashes = (0..8)
+        .map(|idx| dedup_hash(&format!("https://x.com/existing/{idx}")))
+        .chain(
+            (0..32)
+                .step_by(4)
+                .map(|idx| dedup_hash(&format!("https://x.com/new/{idx}"))),
+        )
+        .chain(
+            (3..32)
+                .step_by(4)
+                .map(|idx| dedup_hash(&format!("https://x.com/try/{idx}"))),
+        )
+        .collect::<HashSet<_>>();
+    assert_eq!(hashes, expected_hashes);
+    assert_eq!(
+        store.count_findings("id-concurrent").await.unwrap(),
+        findings.len() as u32
+    );
+}
+
+#[tokio::test]
+async fn findings_file_lock_wait_counter_bumps_on_contention() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let tmp = tempdir().unwrap();
+    let store = Arc::new(FsResearchStore::new(tmp.path().to_path_buf()));
+    let spec = make_spec("id-lock-wait", "t");
+    store.create_spec(&spec).await.unwrap();
+
+    let file_lock = store.write_guard("id-lock-wait").await;
+    let held = file_lock.lock().await;
+    let before = crate::types::RESEARCH_STORE_FILE_LOCK_WAIT_COUNT.load(Ordering::Relaxed);
+
+    let contender_store = store.clone();
+    let mut contender = tokio::spawn(async move {
+        let finding = make_finding("id-lock-wait", "https://x.com/contention");
+        contender_store.try_append_finding(&finding).await
+    });
+
+    // Deterministic behavioural proof: while this test holds the per-id mutex,
+    // the contender must not complete. It is therefore parked on the same mutex
+    // after `lock_file_guard` synchronously missed `try_lock` and bumped the
+    // counter. The counter assertion below is only the metric-wiring check.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut contender)
+            .await
+            .is_err(),
+        "contending findings mutator completed while the file lock was still held"
+    );
+
+    drop(held);
+    assert!(contender.await.unwrap().unwrap());
+
+    let after = crate::types::RESEARCH_STORE_FILE_LOCK_WAIT_COUNT.load(Ordering::Relaxed);
+    let expected_after = before + 1;
+    assert!(
+        after >= expected_after,
+        "contending findings mutator must bump file-lock wait counter before acquiring lock; before={before}, after={after}"
+    );
+}
+
+#[test]
+fn findings_write_calls_are_guarded_by_file_mutex() {
+    let source = include_str!("store_fs.rs");
+    let finding_impl = source
+        .split("impl FindingStore for FsResearchStore")
+        .nth(1)
+        .expect("FindingStore impl exists")
+        .split("impl RunStore for FsResearchStore")
+        .next()
+        .expect("RunStore impl follows FindingStore impl");
+
+    // Heuristic sentinel for B59: a findings write site is any method block
+    // that mentions `findings.jsonl` and calls append_jsonl/atomic_write. Count
+    // all such call sites in store_fs.rs and require every one to live in one
+    // of the guarded findings mutators, with write_guard acquired before the
+    // first write call. This fails if a future method writes findings.jsonl
+    // outside the guarded mutators.
+    let mut guarded_write_calls = 0usize;
+    for mutator in [
+        "async fn try_append_finding",
+        "async fn upsert_finding",
+        "async fn remove_findings_by_hash",
+    ] {
+        let block = function_block(finding_impl, mutator)
+            .unwrap_or_else(|| panic!("missing mutator {mutator}"));
+        let guard_pos = block
+            .find("let _file_guard = Self::lock_file_guard(&file_lock).await")
+            .unwrap_or_else(|| panic!("{mutator} must hold the per-id file mutex"));
+        let first_write_pos = first_findings_write_call(block)
+            .unwrap_or_else(|| panic!("{mutator} must contain a findings write call"));
+        assert!(
+            block[..guard_pos].contains("let file_lock = self.write_guard"),
+            "{mutator} must clone the per-id file mutex before locking it"
+        );
+        assert!(
+            guard_pos < first_write_pos,
+            "{mutator} must acquire the per-id file mutex before writing findings.jsonl"
+        );
+        guarded_write_calls += count_findings_write_calls(block);
+    }
+
+    let all_findings_write_calls = count_findings_file_write_calls(source);
+    assert_eq!(
+        all_findings_write_calls, guarded_write_calls,
+        "all findings.jsonl append_jsonl/atomic_write call sites must be inside guarded findings mutators"
+    );
+}
+
+fn function_block<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    function_block_at(source, source.find(signature)?)
+}
+
+fn function_block_at(source: &str, start: usize) -> Option<&str> {
+    let after_signature = &source[start..];
+    let open_rel = after_signature.find('{')?;
+    let body_start = start + open_rel;
+    let mut depth = 0usize;
+    for (rel, ch) in source[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&source[start..body_start + rel + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn first_findings_write_call(source: &str) -> Option<usize> {
+    [".append_jsonl(", ".atomic_write("]
+        .into_iter()
+        .filter_map(|needle| source.find(needle))
+        .min()
+}
+
+fn count_findings_write_calls(source: &str) -> usize {
+    [".append_jsonl(", ".atomic_write("]
+        .into_iter()
+        .map(|needle| source.matches(needle).count())
+        .sum()
+}
+
+fn count_findings_file_write_calls(source: &str) -> usize {
+    method_blocks(source)
+        .into_iter()
+        .filter(|block| block.contains("\"findings.jsonl\""))
+        .map(count_findings_write_calls)
+        .sum()
+}
+
+fn method_blocks(source: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut offset = 0usize;
+    while let Some(rel) = source[offset..].find("\n    async fn ") {
+        let start = offset + rel + 1;
+        if let Some(block) = function_block_at(source, start) {
+            blocks.push(block);
+        }
+        offset = start + "    async fn ".len();
+    }
+    blocks
 }
 
 #[tokio::test]

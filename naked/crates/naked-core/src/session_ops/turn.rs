@@ -15,7 +15,18 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+static DISPATCH_AGENT_LOOP_RUN_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl AgentCore {
+    async fn mark_session_idle_after_dispatch_reject(&self, session_id: &str) {
+        if let Some(session) = self.ss.sessions.write().await.get_mut(session_id) {
+            session.state = SessionState::Idle;
+        }
+        let _ = self.ss.store.mark_idle(session_id).await;
+    }
+
     /// Connect any extra MCP servers needed by a session (additive over global).
     async fn session_mcp_servers(
         &self,
@@ -207,6 +218,24 @@ impl AgentCore {
         session_id: &str,
         push: UserPush,
     ) -> Result<AgentHandle> {
+        {
+            let mut sessions = self.ss.sessions.write().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
+            if session.state == SessionState::Active {
+                crate::types::SESSION_DOUBLE_TURN_REJECTED_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // PLAN_RESEARCH_STORE_ATOMIC_v1 §R4 option (c): reject
+                // with a typed busy error instead of queueing onto live
+                // Session.history. Existing queue_message paths append
+                // there directly and can be overwritten when
+                // persist_turn_result installs the loop-private history.
+                return Err(AgentError::SessionBusy(session_id.to_string()));
+            }
+            session.state = SessionState::Active;
+        }
+
         let (tx, rx) = mpsc::channel(64);
         let (perm_tx, perm_rx) = mpsc::channel::<PermissionResponse>(4);
         let (steer_tx, steer_rx) = mpsc::channel::<crate::types::SteerMessage>(16);
@@ -215,12 +244,27 @@ impl AgentCore {
         let effective = self.config().merge_session(&sc);
 
         // Phase 1: setup session, push message, gather compaction data
-        let setup = self.setup_turn(session_id, push, &effective).await?;
+        let setup = match self.setup_turn(session_id, push, &effective).await {
+            Ok(setup) => setup,
+            Err(e) => {
+                self.mark_session_idle_after_dispatch_reject(session_id)
+                    .await;
+                return Err(e);
+            }
+        };
 
         // Phase 2: LLM compaction + prepare history & loop config
-        let mut spawn_data = self
+        let mut spawn_data = match self
             .compact_and_prepare(session_id, &setup, &effective, &tx)
-            .await?;
+            .await
+        {
+            Ok(spawn_data) => spawn_data,
+            Err(e) => {
+                self.mark_session_idle_after_dispatch_reject(session_id)
+                    .await;
+                return Err(e);
+            }
+        };
 
         // Validate model before making API calls
         if let Some(err_msg) =
@@ -228,9 +272,8 @@ impl AgentCore {
         {
             let _ = tx.send(AgentEvent::Error(err_msg)).await;
             let _ = tx.send(AgentEvent::Idle).await;
-            if let Some(s) = self.ss.sessions.write().await.get_mut(session_id) {
-                s.state = SessionState::Idle;
-            }
+            self.mark_session_idle_after_dispatch_reject(session_id)
+                .await;
             return Ok(AgentHandle {
                 events: rx,
                 permissions: perm_tx,
@@ -282,6 +325,9 @@ impl AgentCore {
 
         tokio::spawn(
             async move {
+                #[cfg(test)]
+                DISPATCH_AGENT_LOOP_RUN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 let result = agent_loop
                     .run(
                         &mut spawn_data.history,
@@ -367,5 +413,223 @@ impl crate::services::ToolBuilder for AgentCore {
     ) -> crate::tool::registry::ToolRegistry {
         self.build_tool_registry_for(session_id, effective, provider, model, workspace)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DISPATCH_AGENT_LOOP_RUN_COUNT;
+    use crate::AgentCore;
+    use crate::config::Config;
+    use crate::error::{AgentError, Result};
+    use crate::provider::{ChatRequest, Provider};
+    use crate::session::SessionState;
+    use crate::types::{AgentEvent, ModelInfo, SESSION_DOUBLE_TURN_REJECTED_COUNT, StreamChunk};
+    use async_trait::async_trait;
+    use futures_util::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::{Barrier, Notify, Semaphore};
+
+    static DISPATCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct BlockingProvider {
+        stream_calls: std::sync::atomic::AtomicU64,
+        started: Notify,
+        release: Semaphore,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                stream_calls: std::sync::atomic::AtomicU64::new(0),
+                started: Notify::new(),
+                release: Semaphore::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for BlockingProvider {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                provider: "blocking".into(),
+                model_id: "blocking-model".into(),
+                display_name: "Blocking".into(),
+            }]
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            self.started.notify_one();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("release semaphore open");
+            permit.forget();
+            Ok(Box::pin(futures_util::stream::iter([
+                StreamChunk::Text("ok".into()),
+                StreamChunk::Done,
+            ])))
+        }
+    }
+
+    fn blocking_core(provider: Arc<BlockingProvider>) -> (tempfile::TempDir, Arc<AgentCore>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let memory = crate::config::MemoryConfig {
+            daily_enabled: false,
+            ..Default::default()
+        };
+        let config = Config {
+            workspace,
+            session_dir: tmp.path().join("sessions"),
+            research: crate::config::ResearchConfig {
+                storage_dir: Some(tmp.path().join("research")),
+                ..Default::default()
+            },
+            default_provider: "blocking".into(),
+            default_model: "blocking-model".into(),
+            memory,
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.workspace).expect("workspace dir");
+
+        let core = Arc::new(AgentCore::new(config, Box::new(ProviderArc(provider))));
+        core.init_self_ref();
+        (tmp, core)
+    }
+
+    struct ProviderArc(Arc<BlockingProvider>);
+
+    #[async_trait]
+    impl Provider for ProviderArc {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            self.0.models()
+        }
+
+        async fn stream_chat(
+            &self,
+            request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            self.0.stream_chat(request).await
+        }
+    }
+
+    async fn drain_until_idle(mut events: tokio::sync::mpsc::Receiver<AgentEvent>) {
+        while let Some(event) = events.recv().await {
+            if matches!(event, AgentEvent::Idle) {
+                break;
+            }
+        }
+    }
+
+    async fn wait_for_stream_calls(provider: &BlockingProvider, expected: u64) {
+        while provider.stream_calls.load(Ordering::Relaxed) < expected {
+            provider.started.notified().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_session_rejects_second_and_runs_one_agent_loop() {
+        let _guard = DISPATCH_TEST_LOCK.lock().await;
+        let provider = BlockingProvider::new();
+        let (_tmp, core) = blocking_core(provider.clone());
+        let workspace = core.config().workspace.clone();
+        let sid = core.create_session(&workspace).await;
+        let baseline_rejected = SESSION_DOUBLE_TURN_REJECTED_COUNT.load(Ordering::Relaxed);
+        DISPATCH_AGENT_LOOP_RUN_COUNT.store(0, Ordering::Relaxed);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn_dispatch = |prompt: &'static str| {
+            let core = core.clone();
+            let sid = sid.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                core.send_prompt(&sid, prompt).await
+            })
+        };
+
+        let first = spawn_dispatch("one");
+        let second = spawn_dispatch("two");
+
+        let (first_result, second_result) = tokio::join!(first, second);
+        let results = [
+            first_result.expect("first task join"),
+            second_result.expect("second task join"),
+        ];
+
+        let ok_count = results.iter().filter(|result| result.is_ok()).count();
+        let busy_count = results
+            .iter()
+            .filter(|result| matches!(result, Err(AgentError::SessionBusy(busy)) if busy == &sid))
+            .count();
+
+        assert_eq!(ok_count, 1);
+        assert_eq!(busy_count, 1);
+        wait_for_stream_calls(&provider, 1).await;
+        assert_eq!(
+            SESSION_DOUBLE_TURN_REJECTED_COUNT.load(Ordering::Relaxed),
+            baseline_rejected + 1
+        );
+        assert_eq!(DISPATCH_AGENT_LOOP_RUN_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 1);
+
+        provider.release.add_permits(1);
+        let started_handle = results
+            .into_iter()
+            .find_map(std::result::Result::ok)
+            .expect("one turn starts");
+        drain_until_idle(started_handle.events).await;
+        assert_eq!(DISPATCH_AGENT_LOOP_RUN_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn sequential_same_session_turn_after_idle_starts_normally() {
+        let _guard = DISPATCH_TEST_LOCK.lock().await;
+        let provider = BlockingProvider::new();
+        let (_tmp, core) = blocking_core(provider.clone());
+        let workspace = core.config().workspace.clone();
+        let sid = core.create_session(&workspace).await;
+        DISPATCH_AGENT_LOOP_RUN_COUNT.store(0, Ordering::Relaxed);
+
+        let first = core
+            .send_prompt(&sid, "one")
+            .await
+            .expect("first turn starts");
+        wait_for_stream_calls(&provider, 1).await;
+        provider.release.add_permits(1);
+        drain_until_idle(first.events).await;
+        assert!(!core.is_session_active(&sid).await);
+
+        let second = core
+            .send_prompt(&sid, "two")
+            .await
+            .expect("second turn starts");
+        wait_for_stream_calls(&provider, 2).await;
+        provider.release.add_permits(1);
+        drain_until_idle(second.events).await;
+
+        let sessions = core.ss.sessions.read().await;
+        assert_eq!(
+            sessions.get(&sid).map(|s| &s.state),
+            Some(&SessionState::Idle)
+        );
+        assert_eq!(DISPATCH_AGENT_LOOP_RUN_COUNT.load(Ordering::Relaxed), 2);
     }
 }

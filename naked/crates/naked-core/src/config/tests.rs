@@ -1341,6 +1341,19 @@ fn telegram_config_defaults() {
     assert!(tc.telegram_bot_token.is_none());
     assert!(tc.allowed_chat_ids.is_empty());
     assert!(!tc.tg_sender_attribution); // derive(Default) gives false; serde default gives true
+    assert_eq!(tc.coalesce_text_ms, 0);
+}
+
+#[test]
+fn telegram_config_coalesce_text_ms_defaults_and_roundtrips() {
+    let absent: TelegramConfig = serde_json::from_str(r#"{}"#).unwrap();
+    assert_eq!(absent.coalesce_text_ms, 0);
+
+    let present: TelegramConfig = serde_json::from_str(r#"{"coalesce_text_ms":250}"#).unwrap();
+    assert_eq!(present.coalesce_text_ms, 250);
+    let json = serde_json::to_string(&present).unwrap();
+    let reparsed: TelegramConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(reparsed.coalesce_text_ms, 250);
 }
 
 #[test]
@@ -1349,12 +1362,14 @@ fn telegram_config_serde_roundtrip() {
         telegram_bot_token: Some("test-token".into()),
         allowed_chat_ids: vec![123, 456],
         tg_sender_attribution: false,
+        coalesce_text_ms: 0,
     };
     let json = serde_json::to_string(&tc).unwrap();
     let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.telegram_bot_token, Some("test-token".into()));
     assert_eq!(parsed.allowed_chat_ids, vec![123, 456]);
     assert!(!parsed.tg_sender_attribution);
+    assert_eq!(parsed.coalesce_text_ms, 0);
 }
 
 #[test]
@@ -1369,6 +1384,15 @@ fn config_with_flatten_telegram_parses() {
     assert_eq!(config.telegram.telegram_bot_token, Some("bot123".into()));
     assert_eq!(config.telegram.allowed_chat_ids, vec![100]);
     assert!(!config.telegram.tg_sender_attribution);
+}
+
+#[test]
+fn coalesce_text_ms_parses_at_root_not_nested() {
+    let root: Config = serde_json::from_str(r#"{"coalesce_text_ms":1200}"#).unwrap();
+    assert_eq!(root.telegram.coalesce_text_ms, 1200);
+
+    let nested: Config = serde_json::from_str(r#"{"telegram":{"coalesce_text_ms":1200}}"#).unwrap();
+    assert_eq!(nested.telegram.coalesce_text_ms, 0);
 }
 
 #[test]

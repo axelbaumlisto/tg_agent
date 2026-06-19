@@ -129,6 +129,11 @@ impl ResilientProvider {
             }
         });
         let outcomes = join_all(probes).await;
+        let provider_name = self
+            .providers
+            .first()
+            .map(|p| p.name().to_string())
+            .unwrap_or_else(|| "<unknown>".into());
         let mut bl = self.blacklist.lock().await;
         let mut alive = 0usize;
         let mut dead = 0usize;
@@ -138,19 +143,20 @@ impl ResilientProvider {
                 continue;
             }
             dead += 1;
-            if let Some((permanent, _msg)) = err
+            if let Some((permanent, msg)) = err
                 && *permanent
             {
                 bl.insert(*idx, permanent_blacklist_until());
                 crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    provider = %provider_name,
+                    key_index = *idx,
+                    error = %msg,
+                    "provider key permanently blacklisted during boot audit"
+                );
             }
         }
-        let provider_name = self
-            .providers
-            .first()
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|| "<unknown>".into());
         tracing::info!(
             provider = %provider_name,
             alive = alive,

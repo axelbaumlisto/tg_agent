@@ -9,6 +9,7 @@
 mod album;
 mod media;
 mod metrics;
+mod per_chat_locks;
 
 // ── Shared types / statics / helpers ──────────────────────────────────────
 // All items in `shared` are pub(crate); re-exporting them here lets every
@@ -25,6 +26,7 @@ mod message_handler;
 mod session_control;
 #[path = "streaming_mod/mod.rs"]
 mod streaming;
+mod ux_text;
 
 // ── Re-export child-module items consumed by grandchild modules ───────────
 // These allow `use super::*;` in grandchild modules (commands/*, streaming_mod/*)

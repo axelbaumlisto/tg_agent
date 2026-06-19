@@ -37,6 +37,27 @@ static RATE_LIMIT_DELAYED: AtomicU64 = AtomicU64::new(0);
 /// `api_key=` / `Bearer X` / `Authorization:` token into the assistant turn.
 static REDACTION_APPLIED: AtomicU64 = AtomicU64::new(0);
 
+/// B61/TB2: same (chat,thread) dispatches that observed per-key lock contention.
+static CONCURRENT_SAME_KEY_TURNS: AtomicU64 = AtomicU64::new(0);
+
+/// B60 / FOLLOWUP F4: text bursts merged into one user turn.
+static TEXT_COALESCED: AtomicU64 = AtomicU64::new(0);
+
+/// B62 / Q4: SessionBusy follow-ups that could not be steered and got a soft Busy ack.
+static SESSION_BUSY_ACK: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_concurrent_same_key_turn_wait() {
+    CONCURRENT_SAME_KEY_TURNS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_text_coalesced() {
+    TEXT_COALESCED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_session_busy_ack() {
+    SESSION_BUSY_ACK.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_redaction_applied() {
     REDACTION_APPLIED.fetch_add(1, Ordering::Relaxed);
 }
@@ -193,6 +214,9 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         transcription_fail_network: MEDIA_TRANSCRIPTION_FAIL_NETWORK.load(Ordering::Relaxed),
         transcription_fail_other: MEDIA_TRANSCRIPTION_FAIL_OTHER.load(Ordering::Relaxed),
         redaction_applied: REDACTION_APPLIED.load(Ordering::Relaxed),
+        concurrent_same_key_turns: CONCURRENT_SAME_KEY_TURNS.load(Ordering::Relaxed),
+        text_coalesced: TEXT_COALESCED.load(Ordering::Relaxed),
+        session_busy_ack: SESSION_BUSY_ACK.load(Ordering::Relaxed),
         research_cancel_propagation_under_3s: RESEARCH_CANCEL_PROPAGATION_UNDER_3S
             .load(Ordering::Relaxed),
         research_cancel_propagation_3s_to_30s: RESEARCH_CANCEL_PROPAGATION_3S_TO_30S
@@ -225,12 +249,50 @@ pub struct MediaRoutingSnapshot {
     pub transcription_fail_other: u64,
     /// B45 wire-up: outgoing-msg credential redactions count.
     pub redaction_applied: u64,
+    /// B61/TB2: same-key dispatches that had to wait on the per-chat lock.
+    pub concurrent_same_key_turns: u64,
+    /// B60/F4: text bursts merged into one turn.
+    pub text_coalesced: u64,
+    /// B62/Q4: SessionBusy follow-ups that got a soft Busy ack.
+    pub session_busy_ack: u64,
     // T11 PLAN_RESEARCH_AGENT_FLOW_v1: cancel propagation latency.
     pub research_cancel_propagation_under_3s: u64,
     pub research_cancel_propagation_3s_to_30s: u64,
     pub research_cancel_propagation_over_30s: u64,
     pub research_cancel_propagation_sum_ms: u64,
     pub research_cancel_propagation_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PrometheusInputs {
+    media: MediaRoutingSnapshot,
+    sentinel_leaks: u64,
+    empty_retries: u64,
+    turn_ok: u64,
+    turn_err: u64,
+    steer_delivered: u64,
+    steer_soft_interrupted: u64,
+    steer_drained_on_abort: u64,
+    supervisor_restart: u64,
+    snapshot_capture: u64,
+    lsp_emitted: u64,
+    permission_match: u64,
+    hook_fire: u64,
+    subagent_resolve: u64,
+    provider_perm_blacklist: u64,
+    crash_notified: u64,
+    vision_mismatch: u64,
+    cfg_ext_write: u64,
+    ip_hallucin: u64,
+    research_store_corrupt_rows: u64,
+    research_store_files_healed: u64,
+    research_store_heal_failed: u64,
+    research_store_file_lock_wait: u64,
+    concurrent_same_key_turns: u64,
+    text_coalesced: u64,
+    session_busy_ack: u64,
+    memory_pollution: u64,
+    model_health_body: String,
 }
 
 impl MediaRoutingSnapshot {
@@ -254,41 +316,6 @@ impl MediaRoutingSnapshot {
     /// `/metrics` HTTP by [`serve_prometheus_if_enabled`].
     pub fn render_prometheus(&self) -> String {
         use std::sync::atomic::Ordering;
-        let sentinel_leaks = naked_core::types::SENTINEL_LEAK_COUNT.load(Ordering::Relaxed);
-        let empty_retries = naked_core::types::EMPTY_CONTENT_RETRY_COUNT.load(Ordering::Relaxed);
-        let turn_ok = naked_core::types::TURN_COMPLETED_COUNT.load(Ordering::Relaxed);
-        let turn_err = naked_core::types::TURN_ERROR_COUNT.load(Ordering::Relaxed);
-        // F3: steer-pipeline + supervisor counters. Pin the recent
-        // steer/abort UX work so a regression on either drain path
-        // or the supervisor primitive shows up as a flat-zero series.
-        let steer_delivered = naked_core::types::STEER_DELIVERED_COUNT.load(Ordering::Relaxed);
-        let steer_soft_interrupted =
-            naked_core::types::STEER_SOFT_INTERRUPTED_COUNT.load(Ordering::Relaxed);
-        let steer_drained_on_abort =
-            naked_core::types::STEER_DRAINED_ON_ABORT_COUNT.load(Ordering::Relaxed);
-        // Note: `supervised` is in the lib crate (`naked_tg::`),
-        // not the bin crate's `crate::*` namespace.
-        let supervisor_restart =
-            naked_tg::supervised::SUPERVISOR_PANIC_RESTART_COUNT.load(Ordering::Relaxed);
-        // R5 of PLAN_RESILIENCE_v1: per-feature counters for the
-        // PLAN_QUALITY_v1 modules. All start at 0 and stay there
-        // unless the corresponding feature actually fires — a
-        // flat-zero rate is a real signal the module isn't active.
-        let snapshot_capture = naked_core::types::SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed);
-        let lsp_emitted = naked_core::types::LSP_DIAGNOSTIC_EMITTED_COUNT.load(Ordering::Relaxed);
-        let permission_match =
-            naked_core::types::PERMISSION_RULE_MATCH_COUNT.load(Ordering::Relaxed);
-        let hook_fire = naked_core::types::LIFECYCLE_HOOK_FIRE_COUNT.load(Ordering::Relaxed);
-        let subagent_resolve =
-            naked_core::types::SUBAGENT_ROLE_RESOLVE_COUNT.load(Ordering::Relaxed);
-        let provider_perm_blacklist =
-            naked_core::types::PROVIDER_PERMANENT_BLACKLIST_COUNT.load(Ordering::Relaxed);
-        let crash_notified =
-            naked_core::types::CRASH_RECOVERY_NOTIFIED_COUNT.load(Ordering::Relaxed);
-        let vision_mismatch =
-            naked_core::types::PROVIDER_VISION_CAP_MISMATCH_COUNT.load(Ordering::Relaxed);
-        let cfg_ext_write = naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT.load(Ordering::Relaxed);
-        let ip_hallucin = naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed);
         // Pollution sentinel from `naked-housekeep.timer`: 0 unless the
         // daily sweep found `research:*` lines in global MEMORY.md. Non-zero
         // means the research-leak fix regressed and operator should
@@ -316,8 +343,56 @@ impl MediaRoutingSnapshot {
                 + "/.naked/.metrics/model_health.prom",
         )
         .unwrap_or_default();
-        format!(
-            "# HELP naked_tg_native_route_chosen_total Photos sent via native path.\n\
+        let inputs = PrometheusInputs {
+            media: *self,
+            sentinel_leaks: naked_core::types::SENTINEL_LEAK_COUNT.load(Ordering::Relaxed),
+            empty_retries: naked_core::types::EMPTY_CONTENT_RETRY_COUNT.load(Ordering::Relaxed),
+            turn_ok: naked_core::types::TURN_COMPLETED_COUNT.load(Ordering::Relaxed),
+            turn_err: naked_core::types::TURN_ERROR_COUNT.load(Ordering::Relaxed),
+            steer_delivered: naked_core::types::STEER_DELIVERED_COUNT.load(Ordering::Relaxed),
+            steer_soft_interrupted: naked_core::types::STEER_SOFT_INTERRUPTED_COUNT
+                .load(Ordering::Relaxed),
+            steer_drained_on_abort: naked_core::types::STEER_DRAINED_ON_ABORT_COUNT
+                .load(Ordering::Relaxed),
+            supervisor_restart: naked_tg::supervised::SUPERVISOR_PANIC_RESTART_COUNT
+                .load(Ordering::Relaxed),
+            snapshot_capture: naked_core::types::SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed),
+            lsp_emitted: naked_core::types::LSP_DIAGNOSTIC_EMITTED_COUNT.load(Ordering::Relaxed),
+            permission_match: naked_core::types::PERMISSION_RULE_MATCH_COUNT
+                .load(Ordering::Relaxed),
+            hook_fire: naked_core::types::LIFECYCLE_HOOK_FIRE_COUNT.load(Ordering::Relaxed),
+            subagent_resolve: naked_core::types::SUBAGENT_ROLE_RESOLVE_COUNT
+                .load(Ordering::Relaxed),
+            provider_perm_blacklist: naked_core::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+                .load(Ordering::Relaxed),
+            crash_notified: naked_core::types::CRASH_RECOVERY_NOTIFIED_COUNT
+                .load(Ordering::Relaxed),
+            vision_mismatch: naked_core::types::PROVIDER_VISION_CAP_MISMATCH_COUNT
+                .load(Ordering::Relaxed),
+            cfg_ext_write: naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT.load(Ordering::Relaxed),
+            ip_hallucin: naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed),
+            research_store_corrupt_rows:
+                naked_core::types::RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT
+                    .load(Ordering::Relaxed),
+            research_store_files_healed: naked_core::types::RESEARCH_STORE_FILES_HEALED_COUNT
+                .load(Ordering::Relaxed),
+            research_store_heal_failed: naked_core::types::RESEARCH_STORE_HEAL_FAILED_COUNT
+                .load(Ordering::Relaxed),
+            research_store_file_lock_wait: naked_core::types::RESEARCH_STORE_FILE_LOCK_WAIT_COUNT
+                .load(Ordering::Relaxed),
+            concurrent_same_key_turns: self.concurrent_same_key_turns,
+            text_coalesced: self.text_coalesced,
+            session_busy_ack: self.session_busy_ack,
+            memory_pollution,
+            model_health_body,
+        };
+        render_prometheus_from(&inputs)
+    }
+}
+
+fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
+    format!(
+        "# HELP naked_tg_native_route_chosen_total Photos sent via native path.\n\
              # TYPE naked_tg_native_route_chosen_total counter\n\
              naked_tg_native_route_chosen_total {native}\n\
              # HELP naked_tg_native_route_downgraded_oversize_total Native batches with oversize hint.\n\
@@ -389,6 +464,18 @@ impl MediaRoutingSnapshot {
              # HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n\
              # TYPE naked_core_ip_token_hallucination_total counter\n\
              naked_core_ip_token_hallucination_total {ip_hallucin}\n\
+             # HELP naked_core_research_store_corrupt_rows_detected_total (B59) Invalid findings.jsonl rows detected by the research store healing path.\n\
+             # TYPE naked_core_research_store_corrupt_rows_detected_total counter\n\
+             naked_core_research_store_corrupt_rows_detected_total {research_store_corrupt_rows}\n\
+             # HELP naked_core_research_store_files_healed_total (B59) findings.jsonl files successfully healed after corrupt-row detection.\n\
+             # TYPE naked_core_research_store_files_healed_total counter\n\
+             naked_core_research_store_files_healed_total {research_store_files_healed}\n\
+             # HELP naked_core_research_store_heal_failed_total (B59) Research-store healing attempts that failed before replacing the live file.\n\
+             # TYPE naked_core_research_store_heal_failed_total counter\n\
+             naked_core_research_store_heal_failed_total {research_store_heal_failed}\n\
+             # HELP naked_core_research_store_file_lock_wait_total (B59) findings.jsonl write-lock acquisitions that had to wait on contention.\n\
+             # TYPE naked_core_research_store_file_lock_wait_total counter\n\
+             naked_core_research_store_file_lock_wait_total {research_store_file_lock_wait}\n\
              # HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n\
              # TYPE naked_memory_pollution_count gauge\n\
              naked_memory_pollution_count {memory_pollution}\n\
@@ -407,6 +494,15 @@ impl MediaRoutingSnapshot {
              # HELP naked_tg_redaction_applied_total (B45) Outgoing TG messages where scan_and_redact modified payload.\n\
              # TYPE naked_tg_redaction_applied_total counter\n\
              naked_tg_redaction_applied_total {redaction_applied}\n\
+             # HELP naked_tg_concurrent_same_key_turns_total (B61) Same (chat,thread) dispatches that waited on the per-key short-section lock.\n\
+             # TYPE naked_tg_concurrent_same_key_turns_total counter\n\
+             naked_tg_concurrent_same_key_turns_total {concurrent_same_key_turns}\n\
+             # HELP naked_tg_text_coalesced_total (B60) Text bursts merged (>=2 client-split messages joined into one turn).\n\
+             # TYPE naked_tg_text_coalesced_total counter\n\
+             naked_tg_text_coalesced_total {text_coalesced}\n\
+             # HELP naked_tg_session_busy_ack_total (B62) SessionBusy follow-ups that got a soft busy ack (no steer sender / full channel); measures the F1/B3 drop window.\n\
+             # TYPE naked_tg_session_busy_ack_total counter\n\
+             naked_tg_session_busy_ack_total {session_busy_ack}\n\
              # HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n\
              # TYPE naked_tg_research_cancel_propagation_total counter\n\
              naked_tg_research_cancel_propagation_total{{bucket=\"under_3s\"}} {cancel_u3s}\n\
@@ -419,48 +515,54 @@ impl MediaRoutingSnapshot {
              # TYPE naked_tg_research_cancel_propagation_count counter\n\
              naked_tg_research_cancel_propagation_count {cancel_count}\n\
              {model_health_body}",
-            native = self.native_route_chosen,
-            oversize = self.native_route_downgraded_oversize,
-            describer = self.describer_fallback,
-            leaks = sentinel_leaks,
-            rate_delayed = self.rate_limit_delayed,
-            empty_retries = empty_retries,
-            turn_ok = turn_ok,
-            turn_err = turn_err,
-            steer_delivered = steer_delivered,
-            steer_soft_interrupted = steer_soft_interrupted,
-            steer_drained_on_abort = steer_drained_on_abort,
-            supervisor_restart = supervisor_restart,
-            btn_abort = self.stream_button_click_abort,
-            btn_sendnow = self.stream_button_click_sendnow,
-            snapshot_capture = snapshot_capture,
-            lsp_emitted = lsp_emitted,
-            permission_match = permission_match,
-            hook_fire = hook_fire,
-            subagent_resolve = subagent_resolve,
-            provider_perm_blacklist = provider_perm_blacklist,
-            crash_notified = crash_notified,
-            vision_mismatch = vision_mismatch,
-            cfg_ext_write = cfg_ext_write,
-            ip_hallucin = ip_hallucin,
-            memory_pollution = memory_pollution,
-            tr_ok = self.transcription_ok,
-            tr_fail = self.transcription_fail,
-            tr_auth = self.transcription_fail_auth,
-            tr_rate = self.transcription_fail_rate,
-            tr_payload = self.transcription_fail_payload,
-            tr_timeout = self.transcription_fail_timeout,
-            tr_network = self.transcription_fail_network,
-            tr_other = self.transcription_fail_other,
-            redaction_applied = self.redaction_applied,
-            cancel_u3s = self.research_cancel_propagation_under_3s,
-            cancel_3s_30s = self.research_cancel_propagation_3s_to_30s,
-            cancel_o30s = self.research_cancel_propagation_over_30s,
-            cancel_sum_ms = self.research_cancel_propagation_sum_ms,
-            cancel_count = self.research_cancel_propagation_count,
-            model_health_body = model_health_body,
-        )
-    }
+        native = inputs.media.native_route_chosen,
+        oversize = inputs.media.native_route_downgraded_oversize,
+        describer = inputs.media.describer_fallback,
+        leaks = inputs.sentinel_leaks,
+        rate_delayed = inputs.media.rate_limit_delayed,
+        empty_retries = inputs.empty_retries,
+        turn_ok = inputs.turn_ok,
+        turn_err = inputs.turn_err,
+        steer_delivered = inputs.steer_delivered,
+        steer_soft_interrupted = inputs.steer_soft_interrupted,
+        steer_drained_on_abort = inputs.steer_drained_on_abort,
+        supervisor_restart = inputs.supervisor_restart,
+        btn_abort = inputs.media.stream_button_click_abort,
+        btn_sendnow = inputs.media.stream_button_click_sendnow,
+        snapshot_capture = inputs.snapshot_capture,
+        lsp_emitted = inputs.lsp_emitted,
+        permission_match = inputs.permission_match,
+        hook_fire = inputs.hook_fire,
+        subagent_resolve = inputs.subagent_resolve,
+        provider_perm_blacklist = inputs.provider_perm_blacklist,
+        crash_notified = inputs.crash_notified,
+        vision_mismatch = inputs.vision_mismatch,
+        cfg_ext_write = inputs.cfg_ext_write,
+        ip_hallucin = inputs.ip_hallucin,
+        research_store_corrupt_rows = inputs.research_store_corrupt_rows,
+        research_store_files_healed = inputs.research_store_files_healed,
+        research_store_heal_failed = inputs.research_store_heal_failed,
+        research_store_file_lock_wait = inputs.research_store_file_lock_wait,
+        memory_pollution = inputs.memory_pollution,
+        tr_ok = inputs.media.transcription_ok,
+        tr_fail = inputs.media.transcription_fail,
+        tr_auth = inputs.media.transcription_fail_auth,
+        tr_rate = inputs.media.transcription_fail_rate,
+        tr_payload = inputs.media.transcription_fail_payload,
+        tr_timeout = inputs.media.transcription_fail_timeout,
+        tr_network = inputs.media.transcription_fail_network,
+        tr_other = inputs.media.transcription_fail_other,
+        redaction_applied = inputs.media.redaction_applied,
+        concurrent_same_key_turns = inputs.concurrent_same_key_turns,
+        text_coalesced = inputs.text_coalesced,
+        session_busy_ack = inputs.session_busy_ack,
+        cancel_u3s = inputs.media.research_cancel_propagation_under_3s,
+        cancel_3s_30s = inputs.media.research_cancel_propagation_3s_to_30s,
+        cancel_o30s = inputs.media.research_cancel_propagation_over_30s,
+        cancel_sum_ms = inputs.media.research_cancel_propagation_sum_ms,
+        cancel_count = inputs.media.research_cancel_propagation_count,
+        model_health_body = inputs.model_health_body,
+    )
 }
 
 /// Build the HTTP response for a metrics request. Accepts only
@@ -545,6 +647,191 @@ mod tests {
     use super::*;
 
     #[test]
+    fn render_prometheus_from_golden() {
+        let inputs = PrometheusInputs {
+            media: MediaRoutingSnapshot {
+                native_route_chosen: 1,
+                native_route_downgraded_oversize: 2,
+                describer_fallback: 3,
+                rate_limit_delayed: 4,
+                stream_button_click_abort: 5,
+                stream_button_click_sendnow: 6,
+                transcription_ok: 7,
+                transcription_fail: 8,
+                transcription_fail_auth: 9,
+                transcription_fail_rate: 10,
+                transcription_fail_payload: 11,
+                transcription_fail_timeout: 12,
+                transcription_fail_network: 13,
+                transcription_fail_other: 14,
+                redaction_applied: 15,
+                concurrent_same_key_turns: 916,
+                text_coalesced: 917,
+                session_busy_ack: 918,
+                research_cancel_propagation_under_3s: 19,
+                research_cancel_propagation_3s_to_30s: 20,
+                research_cancel_propagation_over_30s: 21,
+                research_cancel_propagation_sum_ms: 22,
+                research_cancel_propagation_count: 23,
+            },
+            sentinel_leaks: 24,
+            empty_retries: 25,
+            turn_ok: 26,
+            turn_err: 27,
+            steer_delivered: 28,
+            steer_soft_interrupted: 29,
+            steer_drained_on_abort: 30,
+            supervisor_restart: 31,
+            snapshot_capture: 32,
+            lsp_emitted: 33,
+            permission_match: 34,
+            hook_fire: 35,
+            subagent_resolve: 36,
+            provider_perm_blacklist: 37,
+            crash_notified: 38,
+            vision_mismatch: 39,
+            cfg_ext_write: 40,
+            ip_hallucin: 41,
+            research_store_corrupt_rows: 42,
+            research_store_files_healed: 43,
+            research_store_heal_failed: 44,
+            research_store_file_lock_wait: 45,
+            concurrent_same_key_turns: 46,
+            text_coalesced: 47,
+            session_busy_ack: 48,
+            memory_pollution: 0,
+            model_health_body: "# model health\nnaked_model_health_probe 777\n".to_string(),
+        };
+        let expected = concat!(
+            "# HELP naked_tg_native_route_chosen_total Photos sent via native path.\n",
+            "# TYPE naked_tg_native_route_chosen_total counter\n",
+            "naked_tg_native_route_chosen_total 1\n",
+            "# HELP naked_tg_native_route_downgraded_oversize_total Native batches with oversize hint.\n",
+            "# TYPE naked_tg_native_route_downgraded_oversize_total counter\n",
+            "naked_tg_native_route_downgraded_oversize_total 2\n",
+            "# HELP naked_tg_describer_fallback_total Batches that fell back to the describer.\n",
+            "# TYPE naked_tg_describer_fallback_total counter\n",
+            "naked_tg_describer_fallback_total 3\n",
+            "# HELP naked_core_sentinel_leak_stripped_total Image-ref sentinels stripped before reaching an LLM.\n",
+            "# TYPE naked_core_sentinel_leak_stripped_total counter\n",
+            "naked_core_sentinel_leak_stripped_total 24\n",
+            "# HELP naked_tg_rate_limit_delayed_total TG sends that waited for the 60/min window to free up.\n",
+            "# TYPE naked_tg_rate_limit_delayed_total counter\n",
+            "naked_tg_rate_limit_delayed_total 4\n",
+            "# HELP naked_core_empty_content_retry_total Times the loop retried a turn after the provider closed the stream with no content (glm-5-turbo class).\n",
+            "# TYPE naked_core_empty_content_retry_total counter\n",
+            "naked_core_empty_content_retry_total 25\n",
+            "# HELP naked_core_turn_completed_total Agent turns that finished successfully.\n",
+            "# TYPE naked_core_turn_completed_total counter\n",
+            "naked_core_turn_completed_total 26\n",
+            "# HELP naked_core_turn_error_total Agent turns that ended with an error.\n",
+            "# TYPE naked_core_turn_error_total counter\n",
+            "naked_core_turn_error_total 27\n",
+            "# HELP naked_core_steer_delivered_total Steer messages successfully merged into history.\n",
+            "# TYPE naked_core_steer_delivered_total counter\n",
+            "naked_core_steer_delivered_total 28\n",
+            "# HELP naked_core_steer_soft_interrupted_total Times the LLM stream was soft-interrupted by a mid-stream steer (S2/S3 path).\n",
+            "# TYPE naked_core_steer_soft_interrupted_total counter\n",
+            "naked_core_steer_soft_interrupted_total 29\n",
+            "# HELP naked_core_steer_drained_on_abort_total Times the run-loop's drain-on-error rescued in-flight steers from a dying turn.\n",
+            "# TYPE naked_core_steer_drained_on_abort_total counter\n",
+            "naked_core_steer_drained_on_abort_total 30\n",
+            "# HELP naked_tg_supervisor_panic_restart_total Panic-triggered restarts inside spawn_supervised_with_opts.\n",
+            "# TYPE naked_tg_supervisor_panic_restart_total counter\n",
+            "naked_tg_supervisor_panic_restart_total 31\n",
+            "# HELP naked_tg_stream_button_click_abort_total Clicks of the [⏹ Стоп] inline button on the streaming control card.\n",
+            "# TYPE naked_tg_stream_button_click_abort_total counter\n",
+            "naked_tg_stream_button_click_abort_total 5\n",
+            "# HELP naked_tg_stream_button_click_sendnow_total Clicks of the [⏩ Send now] inline button on the streaming control card.\n",
+            "# TYPE naked_tg_stream_button_click_sendnow_total counter\n",
+            "naked_tg_stream_button_click_sendnow_total 6\n",
+            "# HELP naked_core_snapshot_capture_total Side-git pre-turn workspace snapshots captured by `dispatch_turn`.\n",
+            "# TYPE naked_core_snapshot_capture_total counter\n",
+            "naked_core_snapshot_capture_total 32\n",
+            "# HELP naked_core_lsp_diagnostic_emitted_total Non-empty LSP diagnostics blocks injected into history after edit tools.\n",
+            "# TYPE naked_core_lsp_diagnostic_emitted_total counter\n",
+            "naked_core_lsp_diagnostic_emitted_total 33\n",
+            "# HELP naked_core_permission_rule_match_total Non-`Ask` decisions from the pattern-based permission ruleset.\n",
+            "# TYPE naked_core_permission_rule_match_total counter\n",
+            "naked_core_permission_rule_match_total 34\n",
+            "# HELP naked_core_lifecycle_hook_fire_total Lifecycle hooks that actually matched and executed.\n",
+            "# TYPE naked_core_lifecycle_hook_fire_total counter\n",
+            "naked_core_lifecycle_hook_fire_total 35\n",
+            "# HELP naked_core_subagent_role_resolve_total Sub-agent calls whose `mode` parameter resolved to a canonical role.\n",
+            "# TYPE naked_core_subagent_role_resolve_total counter\n",
+            "naked_core_subagent_role_resolve_total 36\n",
+            "# HELP naked_core_provider_permanent_blacklist_total Provider keys permanently removed from rotation due to auth/payment errors.\n",
+            "# TYPE naked_core_provider_permanent_blacklist_total counter\n",
+            "naked_core_provider_permanent_blacklist_total 37\n",
+            "# HELP naked_core_crash_recovery_notified_total Users notified about interrupted sessions on bot boot.\n",
+            "# TYPE naked_core_crash_recovery_notified_total counter\n",
+            "naked_core_crash_recovery_notified_total 38\n",
+            "# HELP naked_core_provider_vision_capability_mismatch_total (B06) caps.supports_vision=true but API rejects image_url content shape.\n",
+            "# TYPE naked_core_provider_vision_capability_mismatch_total counter\n",
+            "naked_core_provider_vision_capability_mismatch_total 39\n",
+            "# HELP naked_core_config_external_write_total (B42) state/naked.json modified by external process detected by D-CONFIG-MTIME-WATCH.\n",
+            "# TYPE naked_core_config_external_write_total counter\n",
+            "naked_core_config_external_write_total 40\n",
+            "# HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n",
+            "# TYPE naked_core_ip_token_hallucination_total counter\n",
+            "naked_core_ip_token_hallucination_total 41\n",
+            "# HELP naked_core_research_store_corrupt_rows_detected_total (B59) Invalid findings.jsonl rows detected by the research store healing path.\n",
+            "# TYPE naked_core_research_store_corrupt_rows_detected_total counter\n",
+            "naked_core_research_store_corrupt_rows_detected_total 42\n",
+            "# HELP naked_core_research_store_files_healed_total (B59) findings.jsonl files successfully healed after corrupt-row detection.\n",
+            "# TYPE naked_core_research_store_files_healed_total counter\n",
+            "naked_core_research_store_files_healed_total 43\n",
+            "# HELP naked_core_research_store_heal_failed_total (B59) Research-store healing attempts that failed before replacing the live file.\n",
+            "# TYPE naked_core_research_store_heal_failed_total counter\n",
+            "naked_core_research_store_heal_failed_total 44\n",
+            "# HELP naked_core_research_store_file_lock_wait_total (B59) findings.jsonl write-lock acquisitions that had to wait on contention.\n",
+            "# TYPE naked_core_research_store_file_lock_wait_total counter\n",
+            "naked_core_research_store_file_lock_wait_total 45\n",
+            "# HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n",
+            "# TYPE naked_memory_pollution_count gauge\n",
+            "naked_memory_pollution_count 0\n",
+            "# HELP naked_tg_media_transcription_total Audio transcription outcomes (label `outcome`: ok or fail).\n",
+            "# TYPE naked_tg_media_transcription_total counter\n",
+            "naked_tg_media_transcription_total{outcome=\"ok\"} 7\n",
+            "naked_tg_media_transcription_total{outcome=\"fail\"} 8\n",
+            "# HELP naked_tg_media_transcription_failure_total Audio transcription failures by classified reason (cardinality-safe).\n",
+            "# TYPE naked_tg_media_transcription_failure_total counter\n",
+            "naked_tg_media_transcription_failure_total{reason=\"auth\"} 9\n",
+            "naked_tg_media_transcription_failure_total{reason=\"rate_limit\"} 10\n",
+            "naked_tg_media_transcription_failure_total{reason=\"payload\"} 11\n",
+            "naked_tg_media_transcription_failure_total{reason=\"timeout\"} 12\n",
+            "naked_tg_media_transcription_failure_total{reason=\"network\"} 13\n",
+            "naked_tg_media_transcription_failure_total{reason=\"other\"} 14\n",
+            "# HELP naked_tg_redaction_applied_total (B45) Outgoing TG messages where scan_and_redact modified payload.\n",
+            "# TYPE naked_tg_redaction_applied_total counter\n",
+            "naked_tg_redaction_applied_total 15\n",
+            "# HELP naked_tg_concurrent_same_key_turns_total (B61) Same (chat,thread) dispatches that waited on the per-key short-section lock.\n",
+            "# TYPE naked_tg_concurrent_same_key_turns_total counter\n",
+            "naked_tg_concurrent_same_key_turns_total 46\n",
+            "# HELP naked_tg_text_coalesced_total (B60) Text bursts merged (>=2 client-split messages joined into one turn).\n",
+            "# TYPE naked_tg_text_coalesced_total counter\n",
+            "naked_tg_text_coalesced_total 47\n",
+            "# HELP naked_tg_session_busy_ack_total (B62) SessionBusy follow-ups that got a soft busy ack (no steer sender / full channel); measures the F1/B3 drop window.\n",
+            "# TYPE naked_tg_session_busy_ack_total counter\n",
+            "naked_tg_session_busy_ack_total 48\n",
+            "# HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n",
+            "# TYPE naked_tg_research_cancel_propagation_total counter\n",
+            "naked_tg_research_cancel_propagation_total{bucket=\"under_3s\"} 19\n",
+            "naked_tg_research_cancel_propagation_total{bucket=\"3s_to_30s\"} 20\n",
+            "naked_tg_research_cancel_propagation_total{bucket=\"over_30s\"} 21\n",
+            "# HELP naked_tg_research_cancel_propagation_sum_ms (T11) Sum of cancel propagation latencies in ms.\n",
+            "# TYPE naked_tg_research_cancel_propagation_sum_ms counter\n",
+            "naked_tg_research_cancel_propagation_sum_ms 22\n",
+            "# HELP naked_tg_research_cancel_propagation_count (T11) Total cancel observations recorded.\n",
+            "# TYPE naked_tg_research_cancel_propagation_count counter\n",
+            "naked_tg_research_cancel_propagation_count 23\n",
+            "# model health\n",
+            "naked_model_health_probe 777\n",
+        );
+        assert_eq!(render_prometheus_from(&inputs), expected);
+    }
+
+    #[test]
     fn snapshot_is_monotonic_non_negative() {
         let s1 = snapshot();
         record_media_routing(true, false, false);
@@ -594,6 +881,46 @@ mod tests {
         assert!(p.contains("naked_tg_native_route_downgraded_oversize_total 2"));
         assert!(p.contains("naked_tg_describer_fallback_total 1"));
         assert!(p.contains("naked_core_sentinel_leak_stripped_total"));
+        assert!(p.contains("# HELP naked_tg_concurrent_same_key_turns_total"));
+        assert!(p.contains("# TYPE naked_tg_concurrent_same_key_turns_total counter"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_research_store_healing_counters() {
+        let p = snapshot().render_prometheus();
+        for metric in [
+            "naked_core_research_store_corrupt_rows_detected_total",
+            "naked_core_research_store_files_healed_total",
+            "naked_core_research_store_heal_failed_total",
+        ] {
+            assert!(
+                p.contains(metric),
+                "render_prometheus must expose `{metric}`; full body:\n{p}",
+            );
+            assert!(
+                p.contains(&format!("# TYPE {metric} counter")),
+                "missing TYPE for {metric}",
+            );
+        }
+    }
+
+    #[test]
+    fn render_prometheus_includes_text_coalesced_and_file_lock_wait_counters() {
+        let p = snapshot().render_prometheus();
+        for metric in [
+            "naked_tg_text_coalesced_total",
+            "naked_tg_session_busy_ack_total",
+            "naked_core_research_store_file_lock_wait_total",
+        ] {
+            assert!(
+                p.contains(metric),
+                "render_prometheus must expose `{metric}`; full body:\n{p}",
+            );
+            assert!(
+                p.contains(&format!("# TYPE {metric} counter")),
+                "missing TYPE for {metric}",
+            );
+        }
     }
 
     #[test]

@@ -1,35 +1,49 @@
 //! Filesystem-backed research store implementation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, MutexGuard, RwLock};
+
+#[cfg(test)]
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::inflight::Inflight;
 use super::spec::{Cursor, Finding, ResearchSpec, RunRecord};
 use super::store::*;
 use crate::error::{AgentError, Result};
+use crate::types::{
+    RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT, RESEARCH_STORE_FILE_LOCK_WAIT_COUNT,
+    RESEARCH_STORE_FILES_HEALED_COUNT, RESEARCH_STORE_HEAL_FAILED_COUNT,
+};
 
 /// Filesystem-backed research store. Holds a per-id mutex to serialize the
 /// read-modify-write dance on `findings.jsonl` (dedup set lookup, then append).
 pub struct FsResearchStore {
     root: PathBuf,
-    /// Coarse lock per research id. Kept as `Arc<RwLock<HashSet<hash>>>` so
-    /// lookups are cheap once warm and the set survives across append calls
-    /// for the duration of the process.
-    locks: RwLock<std::collections::HashMap<String, Arc<RwLock<HashSet<String>>>>>,
+    /// Per-id dedup caches. This map is never held across file I/O.
+    locks: RwLock<HashMap<String, Arc<RwLock<HashSet<String>>>>>,
+    /// Per-id file mutexes for `findings.jsonl` read→decide→append/rename sequences.
+    /// Separate from the dedup cache locks: the file mutex protects physical bytes,
+    /// while the dedup lock protects only the in-memory hash set.
+    write_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl FsResearchStore {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            locks: RwLock::new(std::collections::HashMap::new()),
+            locks: RwLock::new(HashMap::new()),
+            write_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -47,37 +61,69 @@ impl FsResearchStore {
         Ok(())
     }
 
-    /// Get (or lazily load) the dedup set for a research id. On first use we
-    /// scan `findings.jsonl` once — subsequent calls reuse the in-memory set.
-    async fn dedup_set(&self, id: &str) -> Result<Arc<RwLock<HashSet<String>>>> {
+    /// Clone (or lazily create) the per-id file mutex. The map guard is dropped
+    /// before returning; callers must not hold it across file I/O.
+    async fn write_guard(&self, id: &str) -> Arc<Mutex<()>> {
+        {
+            let guard = self.write_locks.read().await;
+            if let Some(lock) = guard.get(id) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.write_locks.write().await;
+        guard
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn lock_file_guard(file_lock: &Arc<Mutex<()>>) -> MutexGuard<'_, ()> {
+        match file_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                RESEARCH_STORE_FILE_LOCK_WAIT_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                file_lock.lock().await
+            }
+        }
+    }
+
+    /// Clone (or lazily create) the dedup set for a research id. This only
+    /// touches the in-memory map; cold file loading is done by callers while
+    /// already holding the per-id file mutex, preserving the lock order:
+    /// file mutex first, then short dedup-set updates, never map guard + I/O.
+    async fn dedup_set(&self, id: &str) -> Arc<RwLock<HashSet<String>>> {
         {
             let guard = self.locks.read().await;
             if let Some(set) = guard.get(id) {
-                return Ok(set.clone());
+                return set.clone();
             }
         }
         let mut guard = self.locks.write().await;
-        // Re-check after upgrading — another task may have installed it.
-        if let Some(set) = guard.get(id) {
-            return Ok(set.clone());
-        }
-        let mut set = HashSet::new();
-        let path = self.dir(id).join("findings.jsonl");
-        if path.exists() {
-            let content = fs::read_to_string(&path).await?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(f) = serde_json::from_str::<Finding>(line) {
-                    set.insert(f.dedup_hash);
-                }
+        guard
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(RwLock::new(HashSet::new())))
+            .clone()
+    }
+
+    async fn ensure_dedup_loaded_from_file(
+        &self,
+        id: &str,
+        set: &Arc<RwLock<HashSet<String>>>,
+    ) -> Result<()> {
+        {
+            let read = set.read().await;
+            if !read.is_empty() {
+                return Ok(());
             }
         }
-        let arc = Arc::new(RwLock::new(set));
-        guard.insert(id.to_string(), arc.clone());
-        Ok(arc)
+        let findings = self.read_findings_healing_locked(id, None).await?;
+        let loaded = findings.into_iter().map(|f| f.dedup_hash).collect();
+        let mut write = set.write().await;
+        if write.is_empty() {
+            *write = loaded;
+        }
+        Ok(())
     }
 
     async fn atomic_write(&self, path: &Path, content: &[u8]) -> Result<()> {
@@ -128,7 +174,7 @@ impl FsResearchStore {
             }
             match serde_json::from_str::<T>(line) {
                 Ok(v) => out.push(v),
-                Err(e) => tracing::warn!("research store: skipping malformed jsonl row: {e}"),
+                Err(e) => tracing::trace!("research store: skipping malformed jsonl row: {e}"),
             }
         }
         if let Some(n) = limit {
@@ -136,6 +182,238 @@ impl FsResearchStore {
             out = out.split_off(start);
         }
         Ok(out)
+    }
+
+    async fn read_findings_healing(&self, id: &str, limit: Option<usize>) -> Result<Vec<Finding>> {
+        let file_lock = self.write_guard(id).await;
+        let _file_guard = Self::lock_file_guard(&file_lock).await;
+        self.read_findings_healing_locked(id, limit).await
+    }
+
+    async fn read_findings_healing_locked(
+        &self,
+        id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Finding>> {
+        let path = self.dir(id).join("findings.jsonl");
+        let original = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let parsed = parse_findings_jsonl_bytes(&original);
+        if parsed.bad_rows > 0 {
+            RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT
+                .fetch_add(parsed.bad_rows as u64, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                research_id = %id,
+                bad_rows = parsed.bad_rows,
+                path = %path.display(),
+                "research store: corrupt findings.jsonl rows detected; self-healing"
+            );
+            if let Err(e) = self
+                .heal_findings_file(&path, &original, &parsed.cleaned_bytes)
+                .await
+            {
+                RESEARCH_STORE_HEAL_FAILED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+            RESEARCH_STORE_FILES_HEALED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut out = parsed.findings;
+        if let Some(n) = limit {
+            let start = out.len().saturating_sub(n);
+            out = out.split_off(start);
+        }
+        Ok(out)
+    }
+
+    async fn heal_findings_file(&self, path: &Path, original: &[u8], cleaned: &[u8]) -> Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            AgentError::Config(format!(
+                "findings path '{}' has no parent directory",
+                path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).await?;
+
+        let tmp = unique_sibling_path(path, "heal");
+        let mut tmp_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await?;
+        tmp_file.write_all(cleaned).await?;
+        tmp_file.flush().await?;
+        tmp_file.sync_data().await?;
+        drop(tmp_file);
+
+        let backup = unique_sibling_path(path, "corrupt");
+        let backup_result = async {
+            let mut backup_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup)
+                .await?;
+            backup_file.write_all(original).await?;
+            backup_file.flush().await?;
+            backup_file.sync_data().await?;
+            Result::<()>::Ok(())
+        }
+        .await;
+        if let Err(e) = backup_result {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+
+        fs::rename(&tmp, path).await?;
+        fsync_parent_dir_best_effort(parent);
+        Ok(())
+    }
+}
+
+struct ParsedFindingsJsonl {
+    findings: Vec<Finding>,
+    cleaned_bytes: Vec<u8>,
+    bad_rows: usize,
+}
+
+fn parse_findings_jsonl_bytes(original: &[u8]) -> ParsedFindingsJsonl {
+    let mut findings = Vec::new();
+    let mut cleaned_bytes = Vec::new();
+    let mut bad_rows = 0usize;
+    for raw_line in original.split(|b| *b == b'\n') {
+        let line = trim_ascii_whitespace(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        match std::str::from_utf8(line)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Finding>(s).ok())
+        {
+            Some(finding) => {
+                findings.push(finding);
+                cleaned_bytes.extend_from_slice(line);
+                cleaned_bytes.push(b'\n');
+            }
+            None => bad_rows += 1,
+        }
+    }
+    ParsedFindingsJsonl {
+        findings,
+        cleaned_bytes,
+        bad_rows,
+    }
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = bytes.split_first() {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+fn unique_sibling_path(path: &Path, kind: &str) -> PathBuf {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("findings.jsonl");
+    path.with_file_name(format!("{file_name}.{kind}-{now_nanos}-{pid}"))
+}
+
+#[cfg(unix)]
+fn fsync_parent_dir_best_effort(parent: &Path) {
+    let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir_best_effort(_parent: &Path) {}
+
+#[cfg(test)]
+static FINDINGS_WRITE_CRITICAL_SECTION_CURRENT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static FINDINGS_WRITE_CRITICAL_SECTION_MAX: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+fn findings_write_critical_section_probe_target() -> &'static std::sync::Mutex<Option<String>> {
+    static TARGET: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
+    TARGET.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn reset_findings_write_critical_section_probe(id: &str) {
+    *findings_write_critical_section_probe_target()
+        .lock()
+        .expect("findings write critical-section probe target mutex poisoned") =
+        Some(id.to_string());
+    FINDINGS_WRITE_CRITICAL_SECTION_CURRENT.store(0, Ordering::SeqCst);
+    FINDINGS_WRITE_CRITICAL_SECTION_MAX.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn disable_findings_write_critical_section_probe() {
+    *findings_write_critical_section_probe_target()
+        .lock()
+        .expect("findings write critical-section probe target mutex poisoned") = None;
+}
+
+#[cfg(test)]
+fn findings_write_critical_section_max_observed() -> usize {
+    FINDINGS_WRITE_CRITICAL_SECTION_MAX.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn findings_write_critical_section_probe(id: &str) -> FindingsWriteCriticalSectionProbe {
+    let active = findings_write_critical_section_probe_target()
+        .lock()
+        .expect("findings write critical-section probe target mutex poisoned")
+        .as_deref()
+        == Some(id);
+    if active {
+        let now = FINDINGS_WRITE_CRITICAL_SECTION_CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut max = FINDINGS_WRITE_CRITICAL_SECTION_MAX.load(Ordering::SeqCst);
+        while now > max {
+            match FINDINGS_WRITE_CRITICAL_SECTION_MAX.compare_exchange(
+                max,
+                now,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => max = observed,
+            }
+        }
+    }
+    FindingsWriteCriticalSectionProbe { active }
+}
+
+#[cfg(test)]
+struct FindingsWriteCriticalSectionProbe {
+    active: bool,
+}
+
+#[cfg(test)]
+impl Drop for FindingsWriteCriticalSectionProbe {
+    fn drop(&mut self) {
+        if self.active {
+            FINDINGS_WRITE_CRITICAL_SECTION_CURRENT.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -214,6 +492,10 @@ impl SpecStore for FsResearchStore {
             let mut guard = self.locks.write().await;
             guard.remove(id);
         }
+        {
+            let mut guard = self.write_locks.write().await;
+            guard.remove(id);
+        }
         Ok(())
     }
 }
@@ -222,7 +504,13 @@ impl SpecStore for FsResearchStore {
 impl FindingStore for FsResearchStore {
     async fn try_append_finding(&self, finding: &Finding) -> Result<bool> {
         self.ensure_dir(&finding.research_id).await?;
-        let set = self.dedup_set(&finding.research_id).await?;
+        let file_lock = self.write_guard(&finding.research_id).await;
+        let _file_guard = Self::lock_file_guard(&file_lock).await;
+        #[cfg(test)]
+        let _critical_section_probe = findings_write_critical_section_probe(&finding.research_id);
+        let set = self.dedup_set(&finding.research_id).await;
+        self.ensure_dedup_loaded_from_file(&finding.research_id, &set)
+            .await?;
         {
             let read = set.read().await;
             if read.contains(&finding.dedup_hash) {
@@ -292,36 +580,46 @@ impl FindingStore for FsResearchStore {
                 }
             }
         }
-        let mut write = set.write().await;
-        // Double-check after acquiring the write lock.
-        if !write.insert(finding.dedup_hash.clone()) {
-            return Ok(false);
+        {
+            let read = set.read().await;
+            // Double-check before writing; the file mutex prevents this from
+            // changing until we append and update the in-memory set below.
+            if read.contains(&finding.dedup_hash) {
+                return Ok(false);
+            }
         }
         self.append_jsonl(&path, finding).await?;
+        let mut write = set.write().await;
+        write.insert(finding.dedup_hash.clone());
         Ok(true)
     }
 
     async fn upsert_finding(&self, finding: &Finding) -> Result<bool> {
         self.ensure_dir(&finding.research_id).await?;
-        let set = self.dedup_set(&finding.research_id).await?;
+        let file_lock = self.write_guard(&finding.research_id).await;
+        let _file_guard = Self::lock_file_guard(&file_lock).await;
+        #[cfg(test)]
+        let _critical_section_probe = findings_write_critical_section_probe(&finding.research_id);
+        let set = self.dedup_set(&finding.research_id).await;
+        self.ensure_dedup_loaded_from_file(&finding.research_id, &set)
+            .await?;
         let guard = set.read().await;
         let existed = guard.contains(&finding.dedup_hash);
         drop(guard);
 
+        let path = self.dir(&finding.research_id).join("findings.jsonl");
         if !existed {
             // New finding — just append
+            self.append_jsonl(&path, finding).await?;
             let mut write = set.write().await;
             write.insert(finding.dedup_hash.clone());
-            drop(write);
-            let path = self.dir(&finding.research_id).join("findings.jsonl");
-            self.append_jsonl(&path, finding).await?;
             return Ok(false);
         }
 
         // Existing finding — rewrite the file, replacing the old entry
-        let path = self.dir(&finding.research_id).join("findings.jsonl");
         let content = fs::read_to_string(&path).await.unwrap_or_default();
         let mut lines = Vec::new();
+        let mut replaced = false;
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -336,9 +634,18 @@ impl FindingStore for FsResearchStore {
                     })
                 })?;
                 lines.push(new_line);
+                replaced = true;
                 continue;
             }
             lines.push(line.to_string());
+        }
+        if !replaced {
+            lines.push(serde_json::to_string(finding).map_err(|e| {
+                AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                    context: "finding".into(),
+                    source: e.to_string(),
+                })
+            })?);
         }
         let new_content = lines.join("\n") + if lines.is_empty() { "" } else { "\n" };
         self.atomic_write(&path, new_content.as_bytes()).await?;
@@ -346,27 +653,27 @@ impl FindingStore for FsResearchStore {
     }
 
     async fn list_findings(&self, id: &str, limit: Option<usize>) -> Result<Vec<Finding>> {
-        let path = self.dir(id).join("findings.jsonl");
-        self.read_jsonl(&path, limit).await
+        self.read_findings_healing(id, limit).await
     }
 
     async fn count_findings(&self, id: &str) -> Result<u32> {
-        let path = self.dir(id).join("findings.jsonl");
-        if !path.exists() {
-            return Ok(0);
-        }
-        let content = fs::read_to_string(&path).await?;
-        Ok(content.lines().filter(|l| !l.trim().is_empty()).count() as u32)
+        Ok(self.read_findings_healing(id, None).await?.len() as u32)
     }
 
     async fn remove_findings_by_hash(&self, id: &str, hashes: &HashSet<String>) -> Result<u32> {
         if hashes.is_empty() {
             return Ok(0);
         }
+        let file_lock = self.write_guard(id).await;
+        let _file_guard = Self::lock_file_guard(&file_lock).await;
+        #[cfg(test)]
+        let _critical_section_probe = findings_write_critical_section_probe(id);
         let path = self.dir(id).join("findings.jsonl");
         if !path.exists() {
             return Ok(0);
         }
+        let set = self.dedup_set(id).await;
+        self.ensure_dedup_loaded_from_file(id, &set).await?;
         let content = fs::read_to_string(&path).await?;
         let mut kept = Vec::new();
         let mut removed = 0u32;
@@ -385,8 +692,6 @@ impl FindingStore for FsResearchStore {
         if removed > 0 {
             let new_content = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
             self.atomic_write(&path, new_content.as_bytes()).await?;
-            // Rebuild dedup set
-            let set = self.dedup_set(id).await?;
             let mut guard = set.write().await;
             for h in hashes {
                 guard.remove(h);

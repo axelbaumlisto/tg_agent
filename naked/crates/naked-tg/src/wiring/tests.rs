@@ -1,6 +1,7 @@
 use crate::wiring::health::{
-    MultimodalDescriberHealth, VisionShapeOutcome, audit_all_providers, boot_caps_invariant_sweep,
-    check_multimodal_describer_health, classify_vision_probe_error,
+    BootAuditProbeStats, MultimodalDescriberHealth, VisionShapeOutcome, audit_all_providers,
+    audit_deduped_provider_targets, boot_caps_invariant_sweep, check_multimodal_describer_health,
+    classify_vision_probe_error,
 };
 use crate::wiring::invariants::{check_config_symlink_invariant, check_system_prompt_paths};
 use naked_core::config::{Config, ProviderConfig, VisionProviderCfg};
@@ -313,6 +314,95 @@ async fn audit_all_providers_calls_each_provider_once() {
         count.load(std::sync::atomic::Ordering::SeqCst),
         names.len(),
         "audit must call audit_keys_on_boot on every provider name"
+    );
+}
+
+#[tokio::test]
+async fn audit_deduped_provider_targets_probes_shared_key_once() {
+    let providers = vec![
+        (
+            "alpha".to_string(),
+            ProviderConfig {
+                provider_type: "openai_compat".into(),
+                api_key: "alpha-primary".into(),
+                api_keys: vec!["shared-fallback-key".into()],
+                models: vec!["m".into()],
+                ..Default::default()
+            },
+        ),
+        (
+            "beta".to_string(),
+            ProviderConfig {
+                provider_type: "openai_compat".into(),
+                api_key: "beta-primary".into(),
+                api_keys: vec!["shared-fallback-key".into()],
+                models: vec!["m".into()],
+                ..Default::default()
+            },
+        ),
+        (
+            "gamma".to_string(),
+            ProviderConfig {
+                provider_type: "openai_compat".into(),
+                api_key: "gamma-primary".into(),
+                api_keys: vec!["shared-fallback-key".into()],
+                models: vec!["m".into()],
+                ..Default::default()
+            },
+        ),
+    ];
+    let counters = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        naked_core::provider::KeyFingerprint,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    >::new()));
+    let counters_for_probe = counters.clone();
+
+    let summary = audit_deduped_provider_targets(providers, move |target| {
+        let counters = counters_for_probe.clone();
+        async move {
+            assert_eq!(
+                target.resolved.all_keys.len(),
+                target.selected_targets.len(),
+                "mock target should carry exactly the selected physical keys"
+            );
+            for key in &target.resolved.all_keys {
+                let fp = naked_core::provider::key_fingerprint(key).expect("fake key fingerprints");
+                let counter = {
+                    let mut counters = counters.lock().expect("counter mutex");
+                    counters
+                        .entry(fp)
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0))
+                        })
+                        .clone()
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            BootAuditProbeStats::default()
+        }
+    })
+    .await;
+
+    let shared_fp = naked_core::provider::key_fingerprint("shared-fallback-key").unwrap();
+    let counters = counters.lock().expect("counter mutex");
+    assert_eq!(summary.providers_seen, 3);
+    assert_eq!(summary.targets_probed, counters.len());
+    assert_eq!(summary.targets_skipped_dup, 2);
+    assert_eq!(
+        counters
+            .get(&shared_fp)
+            .expect("shared fingerprint should be probed")
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "shared physical key must be probed exactly once"
+    );
+    assert_eq!(
+        counters
+            .values()
+            .map(|counter| counter.load(std::sync::atomic::Ordering::SeqCst))
+            .sum::<usize>(),
+        4,
+        "total mock probes must equal distinct physical fingerprints"
     );
 }
 

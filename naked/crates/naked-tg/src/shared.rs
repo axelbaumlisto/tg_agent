@@ -382,10 +382,6 @@ pub(crate) type ModelSwitchMap =
     HashMap<(i64, Option<i32>), naked_tg::model_switch::SharedModelSwitch>;
 pub(crate) static MODEL_SWITCHES: LazyLock<tokio::sync::RwLock<ModelSwitchMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
-pub(crate) type QueueCountMap = HashMap<(i64, Option<i32>), Arc<std::sync::atomic::AtomicUsize>>;
-pub(crate) static QUEUE_COUNTS: LazyLock<tokio::sync::RwLock<QueueCountMap>> =
-    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
-
 /// Steer senders: (chat_id, thread_id) → Sender<SteerMessage>.
 /// Populated when a streaming turn starts, removed when it ends.
 pub(crate) type SteerSenderMap =

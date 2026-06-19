@@ -1,6 +1,7 @@
 //! Provider factory machinery.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 
 use crate::config::{Config, ResolvedProvider};
 use crate::error::Result;
@@ -12,6 +13,7 @@ use crate::provider::resilient::ResilientProvider;
 use crate::provider::timeout::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_INTER_CHUNK_TIMEOUT, TimeoutProvider,
 };
+use tokio_stream::Stream;
 
 /// Registry of provider factories — add new provider types here.
 ///
@@ -40,6 +42,53 @@ pub(super) fn create_single_provider(
         }
     }
     Box::new(OpenAiCompatProvider::new(name.to_string(), cfg))
+}
+
+/// Provider decorator used for fallback entries in `config.fallback[]`.
+///
+/// A provider fallback is a `(provider, model)` pair. The failed request's
+/// original model id usually belongs to the primary provider (for example
+/// `accounts/fireworks/models/deepseek-v4-pro`) and must not be sent to the
+/// fallback provider. This wrapper keeps the normal request body but rewrites
+/// only `ChatRequest.model` to the fallback entry's model before dispatch.
+struct ModelOverrideProvider {
+    inner: Box<dyn Provider>,
+    model: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for ModelOverrideProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        self.inner.models()
+    }
+
+    fn blacklisted_key_count(&self) -> usize {
+        self.inner.blacklisted_key_count()
+    }
+
+    fn total_key_count(&self) -> usize {
+        self.inner.total_key_count()
+    }
+
+    fn key_hint(&self) -> Option<String> {
+        self.inner.key_hint()
+    }
+
+    async fn audit_keys_on_boot(&self) {
+        self.inner.audit_keys_on_boot().await;
+    }
+
+    async fn stream_chat(
+        &self,
+        mut request: crate::provider::ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = crate::types::StreamChunk> + Send>>> {
+        request.model = self.model.clone();
+        self.inner.stream_chat(request).await
+    }
 }
 
 /// Create a Provider from a resolved config.
@@ -106,30 +155,49 @@ fn wrap_with_timeout(inner: Box<dyn Provider>) -> Box<dyn Provider> {
     ))
 }
 
-/// Build a provider (possibly resilient with fallbacks) from config.
-pub fn build_provider_from_config(config: &Config) -> Result<Box<dyn Provider>> {
-    let (primary_name, primary_resolved) = config.resolve_default_provider()?;
+/// Create a provider chain whose first entry is `primary_name`, followed by
+/// the global chat fallback chain from `config.fallback[]`.
+///
+/// Used both for the configured default provider and for a session-selected
+/// non-default provider. Without this, `/provider fireworks` bypasses the
+/// shared fallback chain entirely (B58).
+pub fn create_provider_chain(
+    config: &Config,
+    primary_name: &str,
+    primary_resolved: ResolvedProvider,
+) -> Box<dyn Provider> {
     let mut providers: Vec<Box<dyn Provider>> =
-        vec![create_provider(&primary_name, primary_resolved)];
+        vec![create_provider(primary_name, primary_resolved)];
 
-    for (fb_provider, _fb_model) in config.fallback_providers() {
+    for (fb_provider, fb_model) in config.fallback_providers() {
         if fb_provider == primary_name {
             continue;
         }
         if let Some(pc) = config.provider_config(&fb_provider)
             && let Ok(resolved) = pc.resolved()
         {
-            providers.push(create_provider(&fb_provider, resolved));
+            providers.push(Box::new(ModelOverrideProvider {
+                inner: create_provider(&fb_provider, resolved),
+                model: fb_model,
+            }));
         }
     }
 
     if providers.len() == 1 {
-        Ok(wrap_with_timeout(providers.remove(0)))
+        wrap_with_timeout(providers.remove(0))
     } else {
-        Ok(wrap_with_timeout(Box::new(ResilientProvider::new(
-            providers,
-        ))))
+        wrap_with_timeout(Box::new(ResilientProvider::new(providers)))
     }
+}
+
+/// Build a provider (possibly resilient with fallbacks) from config.
+pub fn build_provider_from_config(config: &Config) -> Result<Box<dyn Provider>> {
+    let (primary_name, primary_resolved) = config.resolve_default_provider()?;
+    Ok(create_provider_chain(
+        config,
+        &primary_name,
+        primary_resolved,
+    ))
 }
 
 #[cfg(test)]

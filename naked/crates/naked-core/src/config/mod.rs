@@ -3,6 +3,7 @@ mod memory;
 mod provider;
 mod research;
 mod validate;
+pub use loader::filter_dead_keys_from_json;
 pub use memory::*;
 mod media;
 pub use media::*;
@@ -30,6 +31,10 @@ pub struct TelegramConfig {
     /// chats.
     #[serde(default = "default_sender_attribution")]
     pub tg_sender_attribution: bool,
+    /// Debounce window for coalescing client-split plain-text bursts, in ms.
+    /// `0` disables text coalescing (safe default; operators opt in).
+    #[serde(default = "default_coalesce_text_ms")]
+    pub coalesce_text_ms: u64,
 }
 
 /// Top-level agent configuration. Loaded from JSON, env vars override.
@@ -204,6 +209,10 @@ impl ChatPersona {
 
 fn default_sender_attribution() -> bool {
     true
+}
+
+fn default_coalesce_text_ms() -> u64 {
+    0
 }
 
 fn default_enforce_model_capabilities() -> bool {

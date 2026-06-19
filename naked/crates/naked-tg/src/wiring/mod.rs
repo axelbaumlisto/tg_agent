@@ -49,8 +49,9 @@ pub(crate) mod scheduler_lock;
 pub(crate) mod telegram;
 
 use health::{
-    VisionShapeOutcome, audit_all_providers, boot_caps_invariant_sweep,
-    check_multimodal_describer_health, probe_vision_content_shape,
+    VisionShapeOutcome, audit_all_providers, audit_deduped_provider_targets,
+    boot_audit_dedup_enabled, boot_caps_invariant_sweep, check_multimodal_describer_health,
+    probe_deduped_target_with_created_provider, probe_vision_content_shape,
 };
 use invariants::{
     check_config_symlink_invariant, check_system_prompt_paths, populate_novnc_ip_allowlist,
@@ -64,10 +65,31 @@ pub(crate) async fn build() -> WiredBot {
     let agent = Arc::new(AgentCore::new(config.clone(), provider));
     agent.init_self_ref();
 
-    // R2 of PLAN_RESILIENCE_v1: fire-and-forget boot-time key audit
-    // for EVERY configured provider. See audit_all_providers below —
-    // extracted for testability (D-INV-AUDIT-ALL-PROVIDERS).
-    {
+    // R2 of PLAN_RESILIENCE_v1 + B63: fire-and-forget boot-time key audit
+    // for EVERY configured provider name, but in default mode probe each
+    // physical resolved credential once. The legacy per-name chain audit is
+    // kept behind NAKED_BOOT_AUDIT_DEDUP=0 for one-restart rollback.
+    if boot_audit_dedup_enabled() {
+        let provider_entries: Vec<(String, naked_core::config::ProviderConfig)> = config
+            .providers
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        tokio::spawn(async move {
+            let summary = audit_deduped_provider_targets(provider_entries, |target| async move {
+                probe_deduped_target_with_created_provider(target).await
+            })
+            .await;
+            tracing::info!(
+                providers_seen = summary.providers_seen,
+                targets_probed = summary.targets_probed,
+                targets_skipped_dup = summary.targets_skipped_dup,
+                known_dead = summary.known_dead,
+                inconclusive = summary.inconclusive,
+                "R2 boot-time provider audit complete for all configured providers"
+            );
+        });
+    } else {
         let agent_for_audit = agent.clone();
         let provider_names: Vec<String> = config.providers.keys().cloned().collect();
         tokio::spawn(async move {
@@ -76,7 +98,10 @@ pub(crate) async fn build() -> WiredBot {
                 async move { agent.provider_for(&name).await }
             })
             .await;
-            tracing::info!("R2 boot-time provider audit complete for all configured providers");
+            tracing::info!(
+                mode = "legacy",
+                "R2 boot-time provider audit complete for all configured providers"
+            );
         });
     }
 

@@ -49,6 +49,34 @@ pub static TURN_COMPLETED_COUNT: std::sync::atomic::AtomicU64 =
 /// unlabelled to keep the renderer dead-simple).
 pub static TURN_ERROR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// B62 / PLAN_RESEARCH_STORE_ATOMIC_v1 §R4: bumped each time
+/// `dispatch_turn` rejects a second concurrent turn for the same
+/// session before spawning an `AgentLoop`. Fixed unlabelled atomic so
+/// renderers can expose `naked_core_session_double_turn_rejected_total`.
+pub static SESSION_DOUBLE_TURN_REJECTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B59 / PLAN_RESEARCH_STORE_ATOMIC_v1 T4: malformed non-empty rows
+/// detected while parsing `research/*/findings.jsonl` in the healing
+/// read path. Incremented by bad row count, not per file.
+pub static RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B59 / PLAN_RESEARCH_STORE_ATOMIC_v1 T4: `findings.jsonl` files
+/// successfully rewritten from valid rows after a corrupt-row detection.
+pub static RESEARCH_STORE_FILES_HEALED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B59 / PLAN_RESEARCH_STORE_ATOMIC_v1 T4: healing attempts that aborted
+/// before replacing the live file (for example, backup creation failed).
+pub static RESEARCH_STORE_HEAL_FAILED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B59 / FOLLOWUP F4: findings file-mutex acquisitions that had to wait
+/// (contention on the per-research-id write lock).
+pub static RESEARCH_STORE_FILE_LOCK_WAIT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 // ── Steer-pipeline counters (PLAN_NEXT_SESSION 2026-05-10) ─────────
 //
 // Three counters that pin the new steer behaviour. Operators can

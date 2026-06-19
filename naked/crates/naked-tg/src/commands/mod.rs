@@ -225,22 +225,24 @@ pub(crate) async fn get_or_create_session(
         return sid;
     }
 
-    // Per-chat persona: when `naked.json` declares `chat_personas[<chat_id>]`,
-    // the new session is rooted in the persona's dedicated workspace instead
-    // of the global `config.workspace`. This is the single switch that gives
-    // each persona its own system prompt, project memory namespace,
-    // CLAUDE.md/AGENTS.md walk, and default `bash` cwd — without forking the
-    // bot process. See `naked-core::config::ChatPersona` for the contract.
-    let workspace = resolve_session_workspace(chat_id, config).await;
-
-    let session_id = agent
-        .create_session_with_channel(&workspace, "telegram")
+    let inserted = channel_map
+        .get_or_insert_with(chat_id, tid, || async {
+            // Per-chat persona: when `naked.json` declares `chat_personas[<chat_id>]`,
+            // the new session is rooted in the persona's dedicated workspace instead
+            // of the global `config.workspace`. This is the single switch that gives
+            // each persona its own system prompt, project memory namespace,
+            // CLAUDE.md/AGENTS.md walk, and default `bash` cwd — without forking the
+            // bot process. See `naked-core::config::ChatPersona` for the contract.
+            let workspace = resolve_session_workspace(chat_id, config).await;
+            agent
+                .create_session_with_channel(&workspace, "telegram")
+                .await
+        })
         .await;
-    channel_map.set(chat_id, tid, session_id.clone()).await;
 
     let channel_id = format_tg_channel_id(chat_id, tid);
-    agent.set_session_channel_id(&session_id, &channel_id).await;
-    session_id
+    agent.set_session_channel_id(&inserted, &channel_id).await;
+    inserted
 }
 
 /// Drop a Telegram slash command in a persona chat that opted out of the

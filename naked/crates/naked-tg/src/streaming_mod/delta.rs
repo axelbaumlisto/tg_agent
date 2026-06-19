@@ -274,14 +274,6 @@ impl CompositeView {
             String::new()
         };
         let elapsed = self.elapsed_label();
-        let queued = self
-            .queue_counter
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let queue_str = if queued > 0 {
-            format!(" · +{queued} queued")
-        } else {
-            String::new()
-        };
         let cap_str = if let Some(u) = &self.usage {
             let pressure =
                 naked_core::capacity::check_pressure(u.input_tokens, self.context_window);
@@ -296,10 +288,7 @@ impl CompositeView {
             String::new()
         };
 
-        let status = format!(
-            "{spin} <i>{} · {elapsed}{tokens}{queue_str}{cap_str}</i>",
-            self.phase
-        );
+        let status = format!("{spin} <i>{} · {elapsed}{tokens}{cap_str}</i>", self.phase);
 
         // Build "outside" blocks (active-tool spinner + sub-agent map
         // lines). These render AFTER chronology so they reflect
@@ -792,8 +781,7 @@ mod tests {
     // ── CompositeView rendering ─────────────────────────────────────
 
     fn make_view() -> CompositeView {
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut v = CompositeView::new("test-model".into(), counter);
+        let mut v = CompositeView::new("test-model".into());
         v.phase = "idle";
         v
     }

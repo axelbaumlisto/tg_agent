@@ -205,10 +205,7 @@ mod tests {
     use super::*;
 
     fn new_view() -> CompositeView {
-        CompositeView::new(
-            "test-model".into(),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        )
+        CompositeView::new("test-model".into())
     }
 
     #[test]

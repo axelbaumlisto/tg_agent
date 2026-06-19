@@ -191,15 +191,16 @@ impl ResearchCoordinator {
             );
 
             last_report = self
-                .write_record(
-                    &spec,
-                    &re_run_id,
-                    new_in_rerun,
-                    stop_reason,
+                .write_record(super::briefing_ops::WriteRecordArgs {
+                    spec: &spec,
+                    run_id: &re_run_id,
+                    new_findings: new_in_rerun,
+                    reason: stop_reason,
                     started,
-                    &provider,
-                    &model,
-                )
+                    provider: &provider,
+                    model: &model,
+                    verification: None,
+                })
                 .await?;
 
             self.runner.cleanup_research_session(&re_run_id).await;
@@ -224,16 +225,16 @@ impl ResearchCoordinator {
             remaining_issues: all_issues.len() as u32,
         };
         let summary_report = self
-            .write_record_with_verification(
-                &spec,
-                &summary_run_id,
-                0,
-                StopReason::AgentIdle,
-                verified_started,
-                &last_report.provider,
-                &last_report.model,
-                Some(verification),
-            )
+            .write_record(super::briefing_ops::WriteRecordArgs {
+                spec: &spec,
+                run_id: &summary_run_id,
+                new_findings: 0,
+                reason: StopReason::AgentIdle,
+                started: verified_started,
+                provider: &last_report.provider,
+                model: &last_report.model,
+                verification: Some(verification),
+            })
             .await
             .unwrap_or_else(|_| last_report.clone());
 

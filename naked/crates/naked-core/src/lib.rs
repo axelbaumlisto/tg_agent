@@ -137,7 +137,7 @@ use provider::Provider;
 // Re-export factory machinery moved to `provider/factory.rs` (T4 of
 // PLAN_CORE_HARDENING_v2): keeps `naked_core::create_provider` and
 // `naked_core::build_provider_from_config` working for embedders.
-pub use provider::factory::{build_provider_from_config, create_provider};
+pub use provider::factory::{build_provider_from_config, create_provider, create_provider_chain};
 use research::{FsResearchStore, ResearchStore};
 use session::jsonl_store::JsonlSessionStore;
 

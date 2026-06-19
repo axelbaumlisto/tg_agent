@@ -2,6 +2,220 @@
 //!
 //! Extracted from wiring.rs (T2, PLAN_v13_SOLID_AUDIT) for SRP.
 
+use std::collections::HashMap;
+
+use naked_core::config::{ProviderConfig, ResolvedProvider};
+use naked_core::error::AgentError;
+use naked_core::provider::{ChatRequest, DedupAuditTarget, Provider};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BootAuditProbeStats {
+    pub(crate) known_dead: usize,
+    pub(crate) inconclusive: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BootAuditSummary {
+    pub(crate) providers_seen: usize,
+    pub(crate) targets_probed: usize,
+    pub(crate) targets_skipped_dup: usize,
+    pub(crate) known_dead: usize,
+    pub(crate) inconclusive: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DedupedProviderAuditTarget {
+    pub(crate) provider_name: String,
+    pub(crate) resolved: ResolvedProvider,
+    pub(crate) selected_targets: Vec<DedupAuditTarget>,
+}
+
+fn resolved_subset_for_audit(
+    config: &ProviderConfig,
+    keys: Vec<String>,
+) -> Option<ResolvedProvider> {
+    let api_key = keys.first()?.clone();
+    Some(ResolvedProvider {
+        provider_type: config.provider_type.clone(),
+        api_key,
+        all_keys: keys,
+        base_url: config.base_url.clone(),
+        models: config.models.clone(),
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        headers: config.headers.clone(),
+        model_aliases: config.model_aliases.clone(),
+    })
+}
+
+fn build_deduped_provider_audit_targets(
+    providers: &[(String, ProviderConfig)],
+) -> (BootAuditSummary, Vec<DedupedProviderAuditTarget>) {
+    let key_inputs: Vec<(String, Vec<String>)> = providers
+        .iter()
+        .map(|(name, cfg)| (name.clone(), cfg.resolved_all_keys()))
+        .collect();
+    let plan = naked_core::provider::dedup_audit_targets(&key_inputs);
+
+    let mut by_provider: HashMap<String, Vec<DedupAuditTarget>> = HashMap::new();
+    for target in plan.targets.iter().cloned() {
+        by_provider
+            .entry(target.provider_name.clone())
+            .or_default()
+            .push(target);
+    }
+
+    let mut targets = Vec::new();
+    for (provider_name, cfg) in providers {
+        let Some(selected_targets) = by_provider.remove(provider_name) else {
+            continue;
+        };
+        let Some((_, resolved_keys)) = key_inputs.iter().find(|(name, _)| name == provider_name)
+        else {
+            continue;
+        };
+        let selected_keys: Vec<String> = selected_targets
+            .iter()
+            .filter_map(|target| resolved_keys.get(target.key_index).cloned())
+            .collect();
+        if let Some(resolved) = resolved_subset_for_audit(cfg, selected_keys) {
+            targets.push(DedupedProviderAuditTarget {
+                provider_name: provider_name.clone(),
+                resolved,
+                selected_targets,
+            });
+        }
+    }
+
+    let summary = BootAuditSummary {
+        providers_seen: plan.providers_seen,
+        targets_probed: plan.targets.len(),
+        targets_skipped_dup: plan.targets_skipped_dup,
+        known_dead: 0,
+        inconclusive: 0,
+    };
+    (summary, targets)
+}
+
+pub(crate) async fn audit_deduped_provider_targets<F, Fut>(
+    providers: Vec<(String, ProviderConfig)>,
+    probe: F,
+) -> BootAuditSummary
+where
+    F: Fn(DedupedProviderAuditTarget) -> Fut,
+    Fut: std::future::Future<Output = BootAuditProbeStats>,
+{
+    let (mut summary, targets) = build_deduped_provider_audit_targets(&providers);
+    for target in targets {
+        let stats = probe(target).await;
+        summary.known_dead += stats.known_dead;
+        summary.inconclusive += stats.inconclusive;
+    }
+    summary
+}
+
+pub(crate) async fn probe_deduped_target_with_created_provider(
+    target: DedupedProviderAuditTarget,
+) -> BootAuditProbeStats {
+    let original_key_index = target
+        .selected_targets
+        .first()
+        .map(|selected| selected.key_index)
+        .unwrap_or(0);
+    let provider = naked_core::create_provider(&target.provider_name, target.resolved);
+
+    if provider.total_key_count() > 1 {
+        provider.audit_keys_on_boot().await;
+        return BootAuditProbeStats {
+            known_dead: provider.blacklisted_key_count(),
+            inconclusive: 0,
+        };
+    }
+
+    let Some(probe_model) = provider
+        .models()
+        .first()
+        .map(|model| model.model_id.clone())
+    else {
+        tracing::debug!(
+            provider = %target.provider_name,
+            "audit_keys_on_boot: no model configured, skipping single-key probe"
+        );
+        return BootAuditProbeStats {
+            known_dead: 0,
+            inconclusive: 1,
+        };
+    };
+
+    let req = ChatRequest {
+        model: probe_model,
+        system: String::new(),
+        messages: vec![serde_json::json!({
+            "role": "user",
+            "content": "hi"
+        })],
+        tools: Vec::new(),
+        max_tokens: 1,
+        temperature: None,
+        reasoning: None,
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), provider.stream_chat(req)).await {
+        Ok(Ok(_stream)) => BootAuditProbeStats::default(),
+        Ok(Err(e)) => {
+            let permanent = matches!(
+                &e,
+                AgentError::ProviderTyped(pe) if pe.is_permanent_key_failure()
+            );
+            if permanent {
+                naked_core::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    key_index = original_key_index,
+                    error = %e,
+                    "provider key permanently blacklisted during boot audit"
+                );
+                BootAuditProbeStats {
+                    known_dead: 1,
+                    inconclusive: 0,
+                }
+            } else {
+                BootAuditProbeStats {
+                    known_dead: 0,
+                    inconclusive: 1,
+                }
+            }
+        }
+        Err(_) => BootAuditProbeStats {
+            known_dead: 0,
+            inconclusive: 1,
+        },
+    }
+}
+
+pub(crate) fn boot_audit_dedup_enabled() -> bool {
+    let disabled = |value: std::ffi::OsString| {
+        let value = value.to_string_lossy();
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "legacy"
+        )
+    };
+
+    if std::env::var_os("NAKED_BOOT_AUDIT_DEDUP").is_some_and(disabled) {
+        return false;
+    }
+    if std::env::var_os("NAKED_BOOT_AUDIT_DEDUP_MODE").is_some_and(|value| {
+        value
+            .to_string_lossy()
+            .trim()
+            .eq_ignore_ascii_case("legacy")
+    }) {
+        return false;
+    }
+    true
+}
+
 /// Must be called **after** tracing is initialised (in [`crate::bootstrap`]).
 /// BUG_REGISTRY D-INV-AUDIT-ALL-PROVIDERS: iterates every provider
 /// name, resolves it via the `resolve` closure, and calls
