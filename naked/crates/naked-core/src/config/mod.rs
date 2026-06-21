@@ -88,6 +88,10 @@ pub struct Config {
     /// Telegram bot settings (token, allowed chats, sender attribution).
     #[serde(flatten)]
     pub telegram: TelegramConfig,
+    /// CYCLE 2 rollout flag for run-id keyed multi-stream control plane.
+    /// Default false preserves the current single-run-per-thread behaviour.
+    #[serde(default)]
+    pub run_registry_multi_stream_enabled: bool,
     /// Exa.ai API keys for web search (round-robin rotation)
     #[serde(default)]
     pub exa_api_keys: Vec<String>,
@@ -290,6 +294,7 @@ impl Default for Config {
             agent_dirs: Vec::new(),
             session_dir: default_session_dir(),
             telegram: TelegramConfig::default(),
+            run_registry_multi_stream_enabled: false,
             exa_api_keys: Vec::new(),
             tg_media: TgMediaConfig::default(),
             research: ResearchConfig::default(),

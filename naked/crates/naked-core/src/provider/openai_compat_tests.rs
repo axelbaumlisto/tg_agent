@@ -440,3 +440,154 @@ fn provider_empty_models_list() {
     let models = provider.models();
     assert!(models.is_empty());
 }
+
+fn b71_request(model: &str, temperature: Option<f32>, reasoning: Option<&str>) -> ChatRequest {
+    // REGISTRY-WAIVE: B16 — ChatRequest has no Default derive; provider tests construct it exhaustively.
+    ChatRequest {
+        model: model.into(),
+        system: String::new(),
+        messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+        tools: Vec::new(),
+        max_tokens: 1024,
+        temperature,
+        reasoning: reasoning.map(str::to_string),
+    }
+}
+
+#[test]
+fn b71_openai_compat_airpx_reasoning_omits_temperature() {
+    let request = b71_request("claude-sonnet-4", Some(0.7), Some("medium"));
+    let body = build_openai_request_body(
+        &request,
+        request.max_tokens,
+        build_openai_messages(&request),
+        "claude-sonnet-4-6",
+        "https://airpx.cc/v1",
+        true,
+    );
+    assert_eq!(body["reasoning_effort"], serde_json::json!("medium"));
+    assert!(body.get("temperature").is_none());
+}
+
+#[test]
+fn b71_openai_compat_thinking_route_rejects_temperature_one_when_reasoning_off() {
+    let request = b71_request("claude-sonnet-4", Some(1.0), Some("off"));
+    let body = build_openai_request_body(
+        &request,
+        request.max_tokens,
+        build_openai_messages(&request),
+        "claude-sonnet-4-6",
+        "https://airpx.cc/v1",
+        true,
+    );
+    assert_eq!(body["reasoning_effort"], serde_json::json!("off"));
+    assert!(body.get("temperature").is_none());
+}
+
+#[test]
+fn b81_openai_compat_airpx_thinking_route_omits_temperature_zero_no_reasoning() {
+    // B81 live repro: the research inner-loop sends reasoning=None +
+    // temperature=Some(0.0) to the airpx fallback. airpx `claude-sonnet-4-6`
+    // is adaptive-mode (thinking on by default), so ANY explicit temperature
+    // != 1 is rejected with HTTP 400. The body must therefore omit it.
+    let request = b71_request("claude-sonnet-4", Some(0.0), None);
+    let body = build_openai_request_body(
+        &request,
+        request.max_tokens,
+        build_openai_messages(&request),
+        "claude-sonnet-4-6",
+        "https://airpx.cc/v1",
+        true,
+    );
+    assert!(
+        body.get("temperature").is_none(),
+        "B81: adaptive-mode thinking route must NOT receive an explicit \
+         temperature (even 0.0 with reasoning off); got {:?}",
+        body.get("temperature")
+    );
+}
+
+#[test]
+fn b71_openai_compat_plain_route_allows_temperature() {
+    let request = b71_request("gpt-4o", Some(0.7), None);
+    let body = build_openai_request_body(
+        &request,
+        request.max_tokens,
+        build_openai_messages(&request),
+        "gpt-4o",
+        "https://plain.example/v1",
+        false,
+    );
+    let temp = body["temperature"].as_f64().expect("temperature number");
+    assert!((temp - 0.7).abs() < 1e-6, "temperature={temp}");
+}
+
+async fn collect_openai_sse_chunks(body: &str) -> Vec<StreamChunk> {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/sse", server.uri()))
+        .send()
+        .await
+        .expect("mock SSE response must be reachable");
+
+    sse_stream_from_response(response).collect().await
+}
+
+#[tokio::test]
+async fn sse_stream_errors_when_closed_without_done() {
+    let chunks =
+        collect_openai_sse_chunks("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")
+            .await;
+
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Text(t) if t == "hello"))
+    );
+    assert!(chunks.iter().any(|chunk| matches!(
+        chunk,
+        StreamChunk::Error(msg) if msg == "SSE stream closed without [DONE] or content"
+    )));
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Done))
+    );
+}
+
+#[tokio::test]
+async fn sse_stream_done_marker_yields_done_without_error() {
+    let chunks = collect_openai_sse_chunks(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n",
+    )
+    .await;
+
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Text(t) if t == "hello"))
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Done))
+    );
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Error(_)))
+    );
+}

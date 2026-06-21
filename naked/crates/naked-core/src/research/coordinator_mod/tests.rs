@@ -330,6 +330,7 @@ impl AgentRunner for ScriptedRunner {
                 events: rx,
                 permissions: perm_tx,
                 steer: steer_tx,
+                abort: tokio_util::sync::CancellationToken::new(),
             },
             "test-provider".into(),
             "test-model".into(),
@@ -476,6 +477,7 @@ async fn drain_events_returns_cancelled_immediately_on_pre_cancelled_token() {
         events: ev_rx,
         permissions: _perm_tx,
         steer: steer_tx2,
+        abort: tokio_util::sync::CancellationToken::new(),
     };
     // Push some events; they must be ignored.
     ev_tx.send(AgentEvent::TextDelta("a".into())).await.unwrap();

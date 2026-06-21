@@ -8,6 +8,7 @@ pub(crate) enum CallbackAction<'a> {
     Command { name: &'a str },
     ModelPage { page: &'a str },
     Stream { action: &'a str },
+    StreamRun { action: &'a str, run_id: &'a str },
     Error { action: &'a str },
     Unknown,
 }
@@ -34,6 +35,10 @@ impl<'a> CallbackAction<'a> {
             "cmd" if parts.len() >= 2 => Self::Command { name: parts[1] },
             "mp" if parts.len() >= 2 => Self::ModelPage { page: parts[1] },
             "stream" if parts.len() >= 2 => Self::Stream { action: parts[1] },
+            "s" if parts.len() == 3 => Self::StreamRun {
+                action: parts[1],
+                run_id: parts[2],
+            },
             "err" if parts.len() >= 2 => Self::Error { action: parts[1] },
             _ => Self::Unknown,
         }
@@ -56,6 +61,45 @@ mod tests {
                 action: "stop",
                 spec_id: "da-nang-food",
             }
+        );
+    }
+
+    #[test]
+    fn callback_v2_prefix_parses_under_64_bytes() {
+        let data = "s:abort:attempt-1234567890abcdef";
+        assert!(data.len() <= 64);
+        assert_eq!(
+            CallbackAction::parse(data),
+            CallbackAction::StreamRun {
+                action: "abort",
+                run_id: "attempt-1234567890abcdef",
+            }
+        );
+        assert_eq!(
+            CallbackAction::parse("s:sendnow:run-1"),
+            CallbackAction::StreamRun {
+                action: "sendnow",
+                run_id: "run-1"
+            }
+        );
+    }
+
+    #[test]
+    fn callback_v2_prefix_revert_safe_and_legacy_expired() {
+        assert_eq!(
+            CallbackAction::parse("s:abort:run-1"),
+            CallbackAction::StreamRun {
+                action: "abort",
+                run_id: "run-1"
+            }
+        );
+        // Seeded-fail proof: the forbidden broken variant would be parsed by the
+        // old/legacy stream parser as action="abort" (with run_id silently
+        // ignored), causing a revert-time misfire. The chosen s:* prefix avoids
+        // that legacy parser entirely.
+        assert_eq!(
+            CallbackAction::parse("stream:abort:run-1"),
+            CallbackAction::Stream { action: "abort" }
         );
     }
 
@@ -84,9 +128,21 @@ mod tests {
     }
 
     #[test]
+    fn callback_allowed_chat_gate_before_registry_action() {
+        let src = include_str!("mod.rs");
+        let allowed_pos = src.find("is_allowed(").expect("callback allow gate");
+        let match_pos = src.find("match action").expect("callback action dispatch");
+        assert!(
+            allowed_pos < match_pos,
+            "allowed_chat_ids gate must run before callback action/registry dispatch"
+        );
+    }
+
+    #[test]
     fn malformed_callbacks_are_unknown() {
         assert_eq!(CallbackAction::parse(""), CallbackAction::Unknown);
         assert_eq!(CallbackAction::parse("r:stop"), CallbackAction::Unknown);
         assert_eq!(CallbackAction::parse("stream"), CallbackAction::Unknown);
+        assert_eq!(CallbackAction::parse("s:abort"), CallbackAction::Unknown);
     }
 }

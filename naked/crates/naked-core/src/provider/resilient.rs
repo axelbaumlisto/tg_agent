@@ -1,8 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures_util::StreamExt as FuturesStreamExt;
 use tokio::sync::Mutex;
 use tokio_stream::Stream;
 
@@ -18,6 +21,8 @@ use super::{ChatRequest, Provider};
 /// instant so the key is effectively removed from rotation for
 /// the lifetime of the process.
 const BLACKLIST_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const STREAM_FAILURE_PENDING: u8 = 0b1000_0000;
+const STREAM_FAILURE_COUNT_MASK: u8 = 0b0111_1111;
 
 /// Far-future cutoff used for permanently-blacklisted keys. ~100
 /// years from epoch — well beyond any plausible process lifetime
@@ -41,6 +46,12 @@ pub struct ResilientProvider {
     order: Mutex<VecDeque<usize>>,
     /// Indices blacklisted after terminal errors. Value = when to un-blacklist.
     blacklist: Mutex<HashMap<usize, Instant>>,
+    /// B67: per-index mid-stream failure tally, bumped by the returned
+    /// stream's wrapper (sync closure) and folded into `blacklist`/`order`
+    /// at the top of the next `stream_chat`. Uses `std::sync::Mutex`
+    /// because stream combinator closures are synchronous and cannot await
+    /// the existing tokio locks; the guard is never held across `.await`.
+    stream_failures: Arc<StdMutex<HashMap<usize, u8>>>,
 }
 
 impl ResilientProvider {
@@ -54,6 +65,7 @@ impl ResilientProvider {
             providers,
             order: Mutex::new(order),
             blacklist: Mutex::new(HashMap::new()),
+            stream_failures: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -70,6 +82,64 @@ impl ResilientProvider {
     pub async fn blacklisted_count(&self) -> usize {
         let bl = self.blacklist.lock().await;
         bl.values().filter(|&&exp| Instant::now() < exp).count()
+    }
+
+    async fn fold_stream_failures(&self) {
+        // B67: apply any mid-stream failures recorded by previously-returned
+        // streams. The sync mutex is held only long enough to drain the small
+        // tally map; tokio locks are acquired afterwards, never while holding
+        // the std mutex across `.await`.
+        let pending: Vec<(usize, u8)> = {
+            let mut failures = self.stream_failures.lock().expect("stream failure lock");
+            let pending: Vec<_> = failures
+                .iter()
+                .filter_map(|(&idx, &raw)| {
+                    (raw & STREAM_FAILURE_PENDING != 0)
+                        .then_some((idx, raw & STREAM_FAILURE_COUNT_MASK))
+                })
+                .collect();
+            for (idx, _) in &pending {
+                failures.remove(idx);
+            }
+            pending
+        };
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut carry = Vec::new();
+        {
+            let mut bl = self.blacklist.lock().await;
+            let mut order = self.order.lock().await;
+            let now = Instant::now();
+            for (idx, count) in pending {
+                if count >= 2 {
+                    bl.insert(idx, now + BLACKLIST_TTL);
+                    tracing::warn!(
+                        "Provider '{}' blacklisted after {} mid-stream failures",
+                        self.providers[idx].name(),
+                        count
+                    );
+                } else if let Some(p) = order.iter().position(|&i| i == idx) {
+                    order.remove(p);
+                    order.push_back(idx);
+                    carry.push((idx, count));
+                }
+            }
+        }
+
+        if !carry.is_empty() {
+            let mut failures = self.stream_failures.lock().expect("stream failure lock");
+            for (idx, count) in carry {
+                let raw = failures.get(&idx).copied().unwrap_or(0);
+                let pending_bit = raw & STREAM_FAILURE_PENDING;
+                let existing_count = raw & STREAM_FAILURE_COUNT_MASK;
+                let merged_count = existing_count
+                    .saturating_add(count)
+                    .min(STREAM_FAILURE_COUNT_MASK);
+                failures.insert(idx, pending_bit | merged_count);
+            }
+        }
     }
 
     /// Provider health summary for diagnostics.
@@ -240,6 +310,7 @@ impl Provider for ResilientProvider {
         &self,
         request: ChatRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        self.fold_stream_failures().await;
         let snapshot: Vec<usize> = { self.order.lock().await.iter().copied().collect() };
 
         // Expire old blacklist entries
@@ -282,21 +353,66 @@ impl Provider for ResilientProvider {
                             }
                         }
                     }
-                    return Ok(stream);
+                    let failures = self.stream_failures.clone();
+                    let saw_error = Arc::new(AtomicBool::new(false));
+                    let saw_content = Arc::new(AtomicBool::new(false));
+                    let wrapped = FuturesStreamExt::map(stream, move |chunk| {
+                        match &chunk {
+                            StreamChunk::Error(_) => {
+                                saw_error.store(true, Ordering::Relaxed);
+                                let mut failures = failures.lock().expect("stream failure lock");
+                                let entry = failures.entry(idx).or_insert(0);
+                                let count = (*entry & STREAM_FAILURE_COUNT_MASK)
+                                    .saturating_add(1)
+                                    .min(STREAM_FAILURE_COUNT_MASK);
+                                *entry = STREAM_FAILURE_PENDING | count;
+                            }
+                            StreamChunk::Text(_)
+                            | StreamChunk::Thinking(_)
+                            | StreamChunk::ToolUse { .. } => {
+                                saw_content.store(true, Ordering::Relaxed);
+                            }
+                            StreamChunk::Done => {
+                                if saw_content.load(Ordering::Relaxed)
+                                    && !saw_error.load(Ordering::Relaxed)
+                                {
+                                    let mut failures =
+                                        failures.lock().expect("stream failure lock");
+                                    if let Some(raw) = failures.get(&idx).copied()
+                                        && raw & STREAM_FAILURE_PENDING == 0
+                                    {
+                                        failures.remove(&idx);
+                                    }
+                                }
+                            }
+                            StreamChunk::Usage(_) => {}
+                        }
+                        chunk
+                    });
+                    return Ok(Box::pin(wrapped));
                 }
                 Err(e) => {
                     // Try to extract typed error; fall back to string classification
-                    let (key_dead, model_dead) = if let AgentError::ProviderTyped(ref pe) = e {
-                        (pe.is_key_dead(), pe.is_model_dead())
-                    } else {
-                        let err_str = e.to_string();
-                        let pe = super::error::ProviderError::from_llm_http(
-                            extract_status_from_error(&err_str),
-                            &err_str,
-                            &request.model,
-                        );
-                        (pe.is_key_dead(), pe.is_model_dead())
-                    };
+                    let (key_dead, model_dead, invalid_request) =
+                        if let AgentError::ProviderTyped(ref pe) = e {
+                            (
+                                pe.is_key_dead(),
+                                pe.is_model_dead(),
+                                matches!(pe, super::error::ProviderError::InvalidRequest { .. }),
+                            )
+                        } else {
+                            let err_str = e.to_string();
+                            let pe = super::error::ProviderError::from_llm_http(
+                                extract_status_from_error(&err_str),
+                                &err_str,
+                                &request.model,
+                            );
+                            (
+                                pe.is_key_dead(),
+                                pe.is_model_dead(),
+                                matches!(pe, super::error::ProviderError::InvalidRequest { .. }),
+                            )
+                        };
                     if key_dead {
                         // R1 of PLAN_RESILIENCE_v1: distinguish
                         // PERMANENT (auth/payment) from TRANSIENT
@@ -346,6 +462,13 @@ impl Provider for ResilientProvider {
                             provider.name(),
                         );
                         return Err(e);
+                    } else if invalid_request {
+                        crate::types::PROVIDER_INVALID_REQUEST_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            "Provider '{}' invalid request (likely config/request-shape bug): {e}, demoting without blacklist",
+                            provider.name()
+                        );
                     } else {
                         tracing::warn!("Provider '{}' error: {e}, demoting", provider.name());
                     }
@@ -391,6 +514,9 @@ fn extract_status_from_error(err: &str) -> u16 {
 mod tests {
     use super::*;
     use crate::error::AgentError;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_stream::StreamExt as TokioStreamExt;
 
     struct SuccessProvider {
         name: String,
@@ -416,6 +542,115 @@ mod tests {
                 StreamChunk::Text("ok".into()),
                 StreamChunk::Done,
             ])))
+        }
+    }
+
+    struct StreamErrorProvider {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Provider for StreamErrorProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                provider: self.name.clone(),
+                model_id: "test".into(),
+                display_name: "Test".into(),
+            }]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            Ok(Box::pin(tokio_stream::iter(vec![StreamChunk::Error(
+                format!("{} inter-chunk timeout", self.name),
+            )])))
+        }
+    }
+
+    struct FirstOkThenFailProvider {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for FirstOkThenFailProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                provider: self.name.clone(),
+                model_id: "test".into(),
+                display_name: "Test".into(),
+            }]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Box::pin(tokio_stream::iter(vec![StreamChunk::Error(
+                    format!("{} inter-chunk timeout", self.name),
+                )])))
+            } else {
+                Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::Other {
+                        status: 0,
+                        body: format!("{} failed", self.name),
+                    },
+                ))
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScriptedChunk {
+        Error,
+        ContentThenDone,
+    }
+
+    struct ScriptedStreamProvider {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        script: Vec<ScriptedChunk>,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedStreamProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                provider: self.name.clone(),
+                model_id: "test".into(),
+                display_name: "Test".into(),
+            }]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunk = self
+                .script
+                .get(call)
+                .copied()
+                .unwrap_or(ScriptedChunk::ContentThenDone);
+            let chunks = match chunk {
+                ScriptedChunk::Error => vec![StreamChunk::Error(format!(
+                    "{} inter-chunk timeout",
+                    self.name
+                ))],
+                ScriptedChunk::ContentThenDone => {
+                    vec![StreamChunk::Text("ok".into()), StreamChunk::Done]
+                }
+            };
+            Ok(Box::pin(tokio_stream::iter(chunks)))
         }
     }
 
@@ -522,6 +757,192 @@ mod tests {
             Box::new(SuccessProvider { name: "c".into() }),
         ]);
         assert_eq!(p.current_order().await, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn report_via_stream_demotes_failed_provider() {
+        let p = ResilientProvider::new(vec![
+            Box::new(StreamErrorProvider { name: "k0".into() }),
+            Box::new(SuccessProvider { name: "k1".into() }),
+        ]);
+
+        let mut stream = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut stream).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let mut next = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.current_order().await, vec![1, 0]);
+        assert!(matches!(
+            TokioStreamExt::next(&mut next).await,
+            Some(StreamChunk::Text(t)) if t == "ok"
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_stream_failures_blacklist_idx() {
+        let p = ResilientProvider::new(vec![
+            Box::new(StreamErrorProvider { name: "k0".into() }),
+            Box::new(FailProvider { name: "k1".into() }),
+        ]);
+
+        let mut first = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut first).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let mut second = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut second).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let result = p.stream_chat(test_request()).await;
+        assert!(result.is_err());
+        assert_eq!(p.blacklisted_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_streams_only_failed_idx_demoted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let p = ResilientProvider::new(vec![
+            Box::new(FirstOkThenFailProvider {
+                name: "k0".into(),
+                calls: calls.clone(),
+            }),
+            Box::new(SuccessProvider { name: "k1".into() }),
+        ]);
+
+        let mut failed_stream = p.stream_chat(test_request()).await.unwrap();
+        let _healthy_stream = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(
+            p.current_order().await,
+            vec![1, 0],
+            "opening the second stream should fall back to k1 and demote only k0"
+        );
+
+        assert!(matches!(
+            TokioStreamExt::next(&mut failed_stream).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let mut next = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(
+            p.current_order().await,
+            vec![1, 0],
+            "idx1 must remain preferred; the idx0 stream error must not be attributed to idx1"
+        );
+        assert_eq!(p.blacklisted_count().await, 0);
+        assert!(matches!(
+            TokioStreamExt::next(&mut next).await,
+            Some(StreamChunk::Text(t)) if t == "ok"
+        ));
+    }
+
+    #[tokio::test]
+    async fn single_provider_stream_failure_no_panic() {
+        let p = ResilientProvider::new(vec![Box::new(StreamErrorProvider {
+            name: "solo".into(),
+        })]);
+
+        let mut first = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut first).await,
+            Some(StreamChunk::Error(_))
+        ));
+        let mut second = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut second).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let result = p.stream_chat(test_request()).await;
+        assert!(result.is_err());
+        assert_eq!(p.blacklisted_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_failure_decays_on_successful_stream() {
+        let p = ResilientProvider::new(vec![Box::new(ScriptedStreamProvider {
+            name: "solo".into(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            script: vec![
+                ScriptedChunk::Error,
+                ScriptedChunk::ContentThenDone,
+                ScriptedChunk::Error,
+                ScriptedChunk::ContentThenDone,
+            ],
+        })]);
+
+        let mut first = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut first).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let mut success = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut success).await,
+            Some(StreamChunk::Text(t)) if t == "ok"
+        ));
+        assert!(matches!(
+            TokioStreamExt::next(&mut success).await,
+            Some(StreamChunk::Done)
+        ));
+        assert!(
+            !p.stream_failures
+                .lock()
+                .expect("stream failure lock")
+                .contains_key(&0),
+            "successful content+Done stream should clear stale count"
+        );
+
+        let mut second_failure = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut second_failure).await,
+            Some(StreamChunk::Error(_))
+        ));
+
+        let mut not_blacklisted = p.stream_chat(test_request()).await.unwrap();
+        assert_eq!(p.blacklisted_count().await, 0);
+        assert!(matches!(
+            TokioStreamExt::next(&mut not_blacklisted).await,
+            Some(StreamChunk::Text(t)) if t == "ok"
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_failure_not_erased_by_concurrent_success() {
+        let p = ResilientProvider::new(vec![Box::new(SuccessProvider {
+            name: "solo".into(),
+        })]);
+
+        let mut success = p.stream_chat(test_request()).await.unwrap();
+        assert!(matches!(
+            TokioStreamExt::next(&mut success).await,
+            Some(StreamChunk::Text(t)) if t == "ok"
+        ));
+
+        {
+            let mut failures = p.stream_failures.lock().expect("stream failure lock");
+            failures.insert(0, STREAM_FAILURE_PENDING | 1);
+        }
+
+        assert!(matches!(
+            TokioStreamExt::next(&mut success).await,
+            Some(StreamChunk::Done)
+        ));
+        assert_eq!(
+            p.stream_failures
+                .lock()
+                .expect("stream failure lock")
+                .get(&0)
+                .copied(),
+            Some(STREAM_FAILURE_PENDING | 1),
+            "successful stream must not erase a concurrent pending failure"
+        );
     }
 
     #[tokio::test]

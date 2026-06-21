@@ -55,6 +55,10 @@ pub enum ProviderError {
     /// context window. Triggers emergency compaction in the loop instead of
     /// a user-visible error.
     ContextWindowExceeded { message: String },
+    /// Provider rejected the request as invalid (HTTP 400 `invalid_request_error`).
+    /// This is observable as a likely config/request-shape bug but is not a
+    /// key-dead, model-dead, or transient-retry class.
+    InvalidRequest { status: u16, body: String },
     /// Serialization failure (JSON encode/decode).
     Serialize { context: String, source: String },
     /// MCP protocol error.
@@ -174,7 +178,8 @@ impl ProviderError {
 /// Classify a raw HTTP error body that does NOT fall into a known status-based
 /// bucket (i.e. the caller already handled 401/402/404/429/5xx). Returns
 /// [`ProviderError::ContextWindowExceeded`] when the body matches a known
-/// sentinel, otherwise [`ProviderError::Other`].
+/// sentinel, [`ProviderError::InvalidRequest`] for HTTP 400
+/// `invalid_request_error`, otherwise [`ProviderError::Other`].
 ///
 /// Used by [`ProviderError::from_llm_http`]'s fallback arm and by transport-
 /// layer adapters that wrap network errors directly (e.g. `anthropic.rs`,
@@ -185,12 +190,32 @@ pub fn classify_provider_body(status: u16, body: &str) -> ProviderError {
         ProviderError::ContextWindowExceeded {
             message: truncate(body, 512),
         }
+    } else if status == 400 && body_indicates_invalid_request_error(body, &lower) {
+        ProviderError::InvalidRequest {
+            status,
+            body: truncate(body, 512),
+        }
     } else {
         ProviderError::Other {
             status,
             body: truncate(body, 512),
         }
     }
+}
+
+fn body_indicates_invalid_request_error(body: &str, lower: &str) -> bool {
+    if lower.contains("invalid_request_error") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str())
+                .map(str::to_ascii_lowercase)
+        })
+        .is_some_and(|t| t == "invalid_request_error")
 }
 
 fn extract_retry_seconds(lower: &str) -> Option<u64> {
@@ -240,6 +265,9 @@ impl std::fmt::Display for ProviderError {
             }
             ProviderError::ContextWindowExceeded { message } => {
                 write!(f, "context window exceeded: {message}")
+            }
+            ProviderError::InvalidRequest { status, body } => {
+                write!(f, "invalid request ({status}): {body}")
             }
             ProviderError::Serialize { context, source } => {
                 write!(f, "serialize {context}: {source}")
@@ -405,6 +433,63 @@ mod tests {
     fn context_sentinel_non_match_stays_other() {
         let e = classify_provider_body(400, "invalid request body");
         assert!(matches!(e, ProviderError::Other { status: 400, .. }));
+    }
+
+    #[test]
+    fn invalid_request_error_400_is_observable_not_dead() {
+        let e = classify_provider_body(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"temperature bad"}}"#,
+        );
+        assert!(matches!(
+            e,
+            ProviderError::InvalidRequest { status: 400, .. }
+        ));
+        assert!(!e.is_key_dead());
+        assert!(!e.is_permanent_key_failure());
+        assert!(!e.is_model_dead());
+        assert!(!e.is_transient());
+    }
+
+    #[test]
+    fn invalid_request_error_substring_400_is_observable() {
+        let e = classify_provider_body(400, "upstream invalid_request_error: bad field");
+        assert!(matches!(
+            e,
+            ProviderError::InvalidRequest { status: 400, .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_request_error_non_400_stays_other() {
+        let e = classify_provider_body(422, "invalid_request_error: bad field");
+        assert!(matches!(e, ProviderError::Other { status: 422, .. }));
+    }
+
+    #[test]
+    fn context_sentinel_priority_over_invalid_request_error() {
+        let e = classify_provider_body(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        );
+        assert!(matches!(e, ProviderError::ContextWindowExceeded { .. }));
+    }
+
+    #[test]
+    fn from_llm_http_preserves_401_402_404_priority_over_invalid_request_error() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"model_not_found"}}"#;
+        assert!(matches!(
+            ProviderError::from_llm_http(401, body, "gpt-4"),
+            ProviderError::AuthFailed { status: 401, .. }
+        ));
+        assert!(matches!(
+            ProviderError::from_llm_http(402, body, "gpt-4"),
+            ProviderError::PaymentRequired { status: 402, .. }
+        ));
+        assert!(matches!(
+            ProviderError::from_llm_http(404, body, "gpt-4"),
+            ProviderError::ModelNotFound { .. }
+        ));
     }
 
     #[test]

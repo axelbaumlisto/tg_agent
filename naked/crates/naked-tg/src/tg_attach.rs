@@ -6,11 +6,33 @@
 //! Design: the tool itself does no I/O to Telegram — it only validates
 //! paths and stages them. Delivery is the caller's responsibility.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use serde_json::json;
 use tokio::sync::Mutex;
+
+static WORKSPACE_RUN_BINDINGS: LazyLock<Mutex<HashMap<PathBuf, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub async fn bind_workspace_run(workspace: PathBuf, run_id: String) {
+    WORKSPACE_RUN_BINDINGS
+        .lock()
+        .await
+        .insert(workspace, run_id);
+}
+
+pub async fn unbind_workspace_run(workspace: &Path, run_id: &str) {
+    let mut guard = WORKSPACE_RUN_BINDINGS.lock().await;
+    if guard.get(workspace).is_some_and(|id| id == run_id) {
+        guard.remove(workspace);
+    }
+}
+
+async fn run_id_for_cwd(cwd: &Path) -> Option<String> {
+    WORKSPACE_RUN_BINDINGS.lock().await.get(cwd).cloned()
+}
 
 use naked_core::tool::Tool;
 use naked_core::types::{Permission, ToolResult, ToolSpec};
@@ -23,6 +45,7 @@ pub type AttachmentQueue = Arc<Mutex<Vec<StagedAttachment>>>;
 pub struct StagedAttachment {
     pub path: PathBuf,
     pub file_name: String,
+    pub run_id: Option<String>,
 }
 
 /// Create a new shared attachment queue.
@@ -34,6 +57,7 @@ pub fn new_queue() -> AttachmentQueue {
 /// stages them for Telegram delivery.
 pub struct TelegramAttachTool {
     queue: AttachmentQueue,
+    run_id: Option<String>,
     max_attachments: usize,
     max_file_bytes: u64,
 }
@@ -42,8 +66,18 @@ impl TelegramAttachTool {
     pub fn new(queue: AttachmentQueue) -> Self {
         Self {
             queue,
+            run_id: None,
             max_attachments: 10,
             max_file_bytes: 50 * 1024 * 1024, // 50 MB (Telegram bot limit)
+        }
+    }
+
+    pub fn new_for_run(queue: AttachmentQueue, run_id: impl Into<String>) -> Self {
+        Self {
+            queue,
+            run_id: Some(run_id.into()),
+            max_attachments: 10,
+            max_file_bytes: 50 * 1024 * 1024,
         }
     }
 }
@@ -72,7 +106,7 @@ impl Tool for TelegramAttachTool {
         }
     }
 
-    async fn execute(&self, input: serde_json::Value, _cwd: &std::path::Path) -> ToolResult {
+    async fn execute(&self, input: serde_json::Value, cwd: &std::path::Path) -> ToolResult {
         let paths: Vec<String> = match input.get("paths").and_then(|v| {
             v.as_array().map(|arr| {
                 arr.iter()
@@ -89,6 +123,10 @@ impl Tool for TelegramAttachTool {
             }
         };
 
+        let run_id = match self.run_id.clone() {
+            Some(id) => Some(id),
+            None => run_id_for_cwd(cwd).await,
+        };
         let mut queue = self.queue.lock().await;
         let mut added = Vec::new();
         let mut errors = Vec::new();
@@ -135,6 +173,7 @@ impl Tool for TelegramAttachTool {
             queue.push(StagedAttachment {
                 path,
                 file_name: file_name.clone(),
+                run_id: run_id.clone(),
             });
             added.push(file_name);
         }
@@ -159,6 +198,23 @@ impl Tool for TelegramAttachTool {
             is_error: added.is_empty(),
         }
     }
+}
+
+pub async fn drain_for_run(queue: &AttachmentQueue, run_id: &str) -> Vec<StagedAttachment> {
+    let mut guard = queue.lock().await;
+    let mut selected = Vec::new();
+    let mut retained = Vec::new();
+    for att in guard.drain(..) {
+        if att.run_id.as_deref() == Some(run_id) || att.run_id.is_none() {
+            // Legacy/unscoped attachments are delivered to the finishing run for
+            // backwards compatibility. Run-scoped tools/tests prove B is retained.
+            selected.push(att);
+        } else {
+            retained.push(att);
+        }
+    }
+    *guard = retained;
+    selected
 }
 
 /// Guess whether a file should be sent as a photo (image) or document.
@@ -266,6 +322,40 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(queue.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attachments_finish_a_does_not_deliver_b() {
+        let tmp_a = tempfile::NamedTempFile::new().unwrap();
+        let tmp_b = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp_a.path(), "a").unwrap();
+        std::fs::write(tmp_b.path(), "b").unwrap();
+        let queue = new_queue();
+        let tool_a = TelegramAttachTool::new_for_run(queue.clone(), "run-a");
+        let tool_b = TelegramAttachTool::new_for_run(queue.clone(), "run-b");
+        tool_a
+            .execute(
+                json!({"paths": [tmp_a.path().to_str().unwrap()]}),
+                std::path::Path::new("/tmp"),
+            )
+            .await;
+        tool_b
+            .execute(
+                json!({"paths": [tmp_b.path().to_str().unwrap()]}),
+                std::path::Path::new("/tmp"),
+            )
+            .await;
+
+        let delivered_a = drain_for_run(&queue, "run-a").await;
+        assert_eq!(delivered_a.len(), 1);
+        assert_eq!(delivered_a[0].run_id.as_deref(), Some("run-a"));
+        let remaining = queue.lock().await;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "seeded-fail: global drain would remove B here"
+        );
+        assert_eq!(remaining[0].run_id.as_deref(), Some("run-b"));
     }
 
     #[tokio::test]

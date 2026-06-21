@@ -68,12 +68,19 @@ pub(crate) async fn spawn_task(
         }
 
         // T6.3 (PLAN_RESEARCH_AGENT_FLOW_v1): synthetic-dispatch path.
-        // When wiring.rs has installed `dispatch_fn` AND the spec has
-        // a chat_id, route through the operator's chat session instead
-        // of spawning an orphan research-channel session. This makes
-        // `/abort` in the operator's chat actually cancel the run
-        // (B57 mitigation).
-        let synthetic_mode = config_clone.dispatch_fn.is_some() && spec_for_task.chat_id.is_some();
+        // When wiring.rs has installed `dispatch_fn` AND the effective
+        // run origin has a chat_id, route through the operator's chat
+        // session instead of spawning an orphan research-channel session.
+        // B79: prefer attempt-scoped Inflight origin over the persisted spec
+        // so `/research run <id>` from chat streams a bubble even for old/CLI
+        // specs whose long-lived `ResearchSpec.chat_id` is null.
+        let (effective_chat_id, effective_thread_id) = effective_origin(
+            infl.chat_id,
+            infl.thread_id,
+            spec_for_task.chat_id,
+            spec_for_task.thread_id,
+        );
+        let synthetic_mode = config_clone.dispatch_fn.is_some() && effective_chat_id.is_some();
 
         tracing::info!(
             spec = %id_for_task,
@@ -83,37 +90,94 @@ pub(crate) async fn spawn_task(
             synthetic = synthetic_mode,
             "scheduler launching research run"
         );
+        let provider_name = research_provider_name(&core_clone, &spec_for_task);
+        let provider = core_clone.provider_for(&provider_name).await;
+        let blacklisted = provider.blacklisted_key_count();
+        let total = provider.total_key_count();
+
         // Keep the full RunReport so we can tell a `Cancelled`
         // stop reason apart from a real success — the scheduler
         // treats cancellation as a *failure* (it always means the
         // sweep timeout fired), not as a normal completion.
-        let result: Result<(String, StopReason), _> = if let Some(dispatch) =
-            config_clone.dispatch_fn.as_ref().cloned()
-            && let Some(chat_id) = spec_for_task.chat_id
+        let result: Result<(String, StopReason), _> = if should_skip_dispatch(blacklisted, total) {
+            record_scheduler_dispatch_skipped();
+            tracing::warn!(
+                spec = %id_for_task,
+                provider = %provider_name,
+                blacklisted,
+                total,
+                "all provider keys/providers blacklisted — skipping dispatch"
+            );
+            Err(naked_core::error::AgentError::Session(
+                "provider exhausted, dispatch skipped".into(),
+            ))
+        } else if let Some(dispatch) = config_clone.dispatch_fn.as_ref().cloned()
+            && let Some(chat_id) = effective_chat_id
         {
-            // Synthetic dispatch: build the message, hand off to closure.
-            // Closure drives streaming + Abort button; we just wait for
-            // it to return (or for the sweep cancel to fire).
+            // B64 fix: Synthetic dispatch now returns a structured result.
+            // The closure drains AgentHandle to completion and reports
+            // success/failure. We map that to scheduler ledger entries.
             // REGISTRY-WAIVE: synthetic_mode flag above mirrors this
-            // condition; if-let is the lint-friendly form.
+            // effective-origin condition; if-let is the lint-friendly form.
             let _ = synthetic_mode; // already logged above
-            let thread_id = spec_for_task.thread_id;
-            let synth = crate::synthetic::SyntheticMessage::from_scheduler_spec(
+            let thread_id = effective_thread_id;
+            let synth = crate::synthetic::SyntheticMessage::from_scheduler_spec_with_run_id(
                 &id_for_task,
                 chat_id,
                 thread_id,
+                Some(attempt_id_for_task.clone()),
             );
-            // Dispatch returns when the spawned turn completes (or is
-            // aborted). We don't have a run_id surfaced from synthetic
-            // path yet — use the attempt_id as a placeholder so the
-            // ledger has SOMETHING. Real run_id is recorded inside the
-            // agent's session.
-            let dispatch_fut = (dispatch)(synth);
+            // B64: session_id latch — the dispatch closure resolves
+            // the session_id inside its future; we need it in the
+            // cancel branch to abort the real agent turn.
+            // B64 + SESSION_FIX_v1: The dispatch closure now calls
+            // stream_response() which blocks for the entire turn (minutes).
+            // We pass `sid_latch` INTO the closure so it can publish the
+            // session-id immediately after dispatch_for_chat() — BEFORE
+            // the blocking stream. The cancel branch reads the latch to
+            // call agent.abort(sid) while the turn is still in progress.
+            let sid_latch: crate::synthetic::SessionIdLatch =
+                std::sync::Arc::new(tokio::sync::Mutex::new(None));
+            let dispatch_fut = (dispatch)(synth, sid_latch.clone());
             tokio::select! {
-                _ = dispatch_fut => {
-                    Ok((attempt_id_for_task.clone(), StopReason::AgentIdle))
+                result = dispatch_fut => {
+                    match result {
+                        Ok(outcome)
+                            if outcome.stop_reason == StopReason::AgentIdle
+                                && outcome.errors.is_empty() =>
+                        {
+                            Ok((attempt_id_for_task.clone(), StopReason::AgentIdle))
+                        }
+                        Ok(outcome) => {
+                            // Turn completed but with errors or abnormal stop.
+                            let detail = format!(
+                                "synthetic turn finished with {:?}, {} errors: {}",
+                                outcome.stop_reason,
+                                outcome.errors.len(),
+                                outcome.errors.join("; ")
+                            );
+                            Err(naked_core::error::AgentError::Session(detail))
+                        }
+                        Err(e) => {
+                            // Dispatch setup failed (SessionBusy, send_prompt error).
+                            Err(naked_core::error::AgentError::Session(
+                                format!("synthetic dispatch error: {e}"),
+                            ))
+                        }
+                    }
                 }
                 _ = cancel_for_task.cancelled() => {
+                    // B64 step 6: abort the real agent session if we
+                    // know its id (dispatch started but cancel fired
+                    // before the drain finished).
+                    if let Some(sid) = sid_latch.lock().await.as_deref() {
+                        tracing::warn!(
+                            spec = %id_for_task,
+                            session_id = %sid,
+                            "scheduler cancel: aborting synthetic session"
+                        );
+                        core_clone.abort(sid).await;
+                    }
                     Ok((attempt_id_for_task.clone(), StopReason::Cancelled))
                 }
             }
@@ -380,6 +444,35 @@ pub(crate) enum FailurePolicy {
 
 /// Pure decision over the failure counter. Easy to unit-test without
 /// touching tokio, the store, or the notifier.
+pub(crate) fn should_skip_dispatch(blacklisted: usize, total: usize) -> bool {
+    total > 0 && blacklisted >= total
+}
+
+fn effective_origin(
+    inflight_chat_id: Option<i64>,
+    inflight_thread_id: Option<i32>,
+    spec_chat_id: Option<i64>,
+    spec_thread_id: Option<i32>,
+) -> (Option<i64>, Option<i32>) {
+    (
+        inflight_chat_id.or(spec_chat_id),
+        inflight_thread_id.or(spec_thread_id),
+    )
+}
+
+fn record_scheduler_dispatch_skipped() {
+    naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn research_provider_name(core: &AgentCore, spec: &ResearchSpec) -> String {
+    let cfg = core.config();
+    spec.provider
+        .clone()
+        .or_else(|| cfg.research.provider.clone())
+        .unwrap_or_else(|| cfg.default_provider.clone())
+}
+
 pub(crate) fn evaluate_outcome(
     prev_count: u32,
     alerted: bool,
@@ -520,6 +613,59 @@ mod tests {
             auto_pause_after_failures: auto_pause,
             ..SchedulerConfig::default()
         }
+    }
+
+    // ── effective_origin ────────────────────────────────────────────
+
+    #[test]
+    fn effective_origin_prefers_inflight_chat_when_spec_missing() {
+        assert_eq!(
+            effective_origin(Some(42), Some(7), None, None),
+            (Some(42), Some(7))
+        );
+    }
+
+    #[test]
+    fn effective_origin_uses_spec_chat_for_scheduled_runs() {
+        assert_eq!(
+            effective_origin(None, None, Some(99), Some(11)),
+            (Some(99), Some(11))
+        );
+    }
+
+    #[test]
+    fn effective_origin_none_when_inflight_and_spec_missing() {
+        assert_eq!(effective_origin(None, None, None, None), (None, None));
+    }
+
+    #[test]
+    fn effective_origin_prefers_inflight_when_both_present() {
+        assert_eq!(
+            effective_origin(Some(42), Some(7), Some(99), Some(11)),
+            (Some(42), Some(7))
+        );
+    }
+
+    // ── should_skip_dispatch ─────────────────────────────────────────
+
+    #[test]
+    fn should_skip_dispatch_requires_nonzero_total_and_full_exhaustion() {
+        assert!(!should_skip_dispatch(0, 0));
+        assert!(!should_skip_dispatch(1, 3));
+        assert!(should_skip_dispatch(3, 3));
+        assert!(!should_skip_dispatch(0, 3));
+        assert!(should_skip_dispatch(4, 3));
+    }
+
+    #[test]
+    fn record_scheduler_dispatch_skipped_increments_counter() {
+        use std::sync::atomic::Ordering;
+
+        let before = naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT.load(Ordering::Relaxed);
+        assert!(should_skip_dispatch(3, 3));
+        record_scheduler_dispatch_skipped();
+        let after = naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT.load(Ordering::Relaxed);
+        assert_eq!(after - before, 1);
     }
 
     // ── evaluate_outcome ─────────────────────────────────────────────

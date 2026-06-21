@@ -32,6 +32,7 @@
 //! observability + key-pool reporting keeps working.
 
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -117,6 +118,7 @@ impl<P: Provider> Provider for TimeoutProvider<P> {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
+                crate::types::PROVIDER_CONNECT_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
                 let body = format!(
                     "{} connect timeout after {}s",
                     self.inner.name(),
@@ -138,10 +140,13 @@ impl<P: Provider> Provider for TimeoutProvider<P> {
         let budget = self.inter_chunk_timeout;
         let guarded = inner_stream.timeout(budget).map(move |item| match item {
             Ok(chunk) => chunk,
-            Err(_elapsed) => StreamChunk::Error(format!(
-                "{provider_label} inter-chunk timeout after {}s",
-                budget.as_secs(),
-            )),
+            Err(_elapsed) => {
+                crate::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+                StreamChunk::Error(format!(
+                    "{provider_label} inter-chunk timeout after {}s",
+                    budget.as_secs(),
+                ))
+            }
         });
         Ok(Box::pin(guarded))
     }
@@ -234,6 +239,7 @@ mod tests {
         };
         let wrapped =
             TimeoutProvider::new(provider, Duration::from_millis(50), Duration::from_secs(60));
+        let before = crate::types::PROVIDER_CONNECT_TIMEOUT_COUNT.load(Ordering::Relaxed);
         let started = std::time::Instant::now();
         let res = wrapped.stream_chat(make_request()).await;
         let elapsed = started.elapsed();
@@ -253,6 +259,8 @@ mod tests {
             }
             Ok(_) => panic!("connect timeout must surface as Err"),
         }
+        let after = crate::types::PROVIDER_CONNECT_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        assert_eq!(after - before, 1, "connect timeout counter delta");
     }
 
     #[tokio::test]
@@ -278,6 +286,7 @@ mod tests {
         let mut s = wrapped.stream_chat(make_request()).await.unwrap();
         let first = s.next().await.unwrap();
         assert!(matches!(first, StreamChunk::Text(t) if t == "partial"));
+        let before = crate::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT.load(Ordering::Relaxed);
         let started = std::time::Instant::now();
         let second = s.next().await.unwrap();
         let elapsed = started.elapsed();
@@ -294,6 +303,8 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "inter-chunk arm must fire near the budget, took {elapsed:?}"
         );
+        let after = crate::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        assert_eq!(after - before, 1, "inter-chunk timeout counter delta");
     }
 
     #[tokio::test]

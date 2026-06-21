@@ -717,6 +717,7 @@ pub fn resolve_auto_model(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_loop_config(
     max_iterations: usize,
+    max_wall: Option<std::time::Duration>,
     cwd: std::path::PathBuf,
     model: String,
     max_tokens: u32,
@@ -730,6 +731,7 @@ pub(crate) fn build_loop_config(
 ) -> crate::loop_::LoopConfig {
     crate::loop_::LoopConfig {
         max_iterations,
+        max_wall,
         cwd,
         model,
         max_tokens,

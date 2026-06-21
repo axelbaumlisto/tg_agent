@@ -338,6 +338,7 @@ fn default_config_empty() {
     assert!(cfg.providers.is_empty());
     assert!(cfg.default_provider.is_empty());
     assert_eq!(cfg.max_iterations, 0);
+    assert!(!cfg.run_registry_multi_stream_enabled);
 }
 
 #[test]
@@ -1393,6 +1394,17 @@ fn coalesce_text_ms_parses_at_root_not_nested() {
 
     let nested: Config = serde_json::from_str(r#"{"telegram":{"coalesce_text_ms":1200}}"#).unwrap();
     assert_eq!(nested.telegram.coalesce_text_ms, 0);
+}
+
+#[test]
+fn run_registry_multi_stream_enabled_parses_at_root_not_nested() {
+    let root: Config =
+        serde_json::from_str(r#"{"run_registry_multi_stream_enabled":true}"#).unwrap();
+    assert!(root.run_registry_multi_stream_enabled);
+
+    let nested: Config =
+        serde_json::from_str(r#"{"telegram":{"run_registry_multi_stream_enabled":true}}"#).unwrap();
+    assert!(!nested.run_registry_multi_stream_enabled);
 }
 
 #[test]

@@ -138,6 +138,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
         mut events,
         permissions,
         steer: _,
+        abort: _,
     } = handle;
 
     let spinning = Arc::new(AtomicBool::new(true));

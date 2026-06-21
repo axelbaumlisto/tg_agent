@@ -937,14 +937,96 @@ mod tests {
     // low-level `Bot`/`reqwest` layer — higher-level dispatch logic is
     // covered by the `album::tests` module.
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn unique_test_id() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(10_000);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
 
     /// Build a `Bot` pointing at the provided mock URL instead of
     /// `api.telegram.org`. Token is a throwaway.
     fn mock_bot(mock_url: &str) -> Bot {
         let url = reqwest::Url::parse(mock_url).unwrap();
         Bot::new("0:TEST_TOKEN").set_api_url(url)
+    }
+
+    struct NoopProvider;
+
+    fn test_config() -> naked_core::config::Config {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = naked_core::config::Config {
+            run_registry_multi_stream_enabled: true,
+            workspace: tmp.path().join("workspace"),
+            session_dir: tmp.path().join("sessions"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.workspace).unwrap();
+        std::fs::create_dir_all(&config.session_dir).unwrap();
+        std::mem::forget(tmp);
+        config
+    }
+
+    fn test_bot_deps(
+        bot: Bot,
+        config: naked_core::config::Config,
+        channel_map: std::sync::Arc<ChannelSessionMap>,
+        base_url: String,
+    ) -> crate::message_handler::BotDeps {
+        let agent = std::sync::Arc::new(naked_core::AgentCore::new(
+            config.clone(),
+            Box::new(NoopProvider),
+        ));
+        crate::message_handler::BotDeps {
+            bot,
+            agent,
+            channel_map,
+            config,
+            pending_perms: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            http_client: std::sync::Arc::new(reqwest::Client::new()),
+            base_url: std::sync::Arc::new(base_url),
+            rate_limiter: naked_tg::rate_limit::RateLimiter::new(),
+            attribution_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bot_token: std::sync::Arc::new("0:TEST_TOKEN".to_string()),
+            bot_identity: std::sync::Arc::new(naked_tg::bot_identity::BotIdentity {
+                id: 0,
+                username: "test_bot".to_string(),
+            }),
+            tg_attach_queue: naked_tg::tg_attach::new_queue(),
+            research_scheduler: None,
+            per_chat_locks: std::sync::Arc::new(crate::per_chat_locks::PerChatLocks::new()),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl naked_core::provider::Provider for NoopProvider {
+        fn name(&self) -> &str {
+            "noop"
+        }
+
+        fn models(&self) -> Vec<naked_core::types::ModelInfo> {
+            vec![naked_core::types::ModelInfo {
+                provider: "noop".to_string(),
+                model_id: "noop-model".to_string(),
+                display_name: "noop".to_string(),
+            }]
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: naked_core::provider::ChatRequest,
+        ) -> naked_core::error::Result<
+            std::pin::Pin<
+                Box<dyn tokio_stream::Stream<Item = naked_core::types::StreamChunk> + Send>,
+            >,
+        > {
+            Ok(Box::pin(tokio_stream::empty()))
+        }
     }
 
     // ─── BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard) ───
@@ -1074,6 +1156,514 @@ mod tests {
     /// two (the old `⏳` placeholder + `⏯️` control card pattern).
     /// Uses the same wiremock infra as send_text_hits_mock_server_with_sendmessage.
     #[tokio::test]
+    async fn single_run_behavior_b02_placeholder_guard_stays_green() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 1, "type": "private", "first_name": "u"},
+                    "text": "\u{23F3}"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let bot = mock_bot(&server.uri());
+        let ctx = crate::shared::ChatCtx {
+            chat_id: ChatId(1),
+            thread_id: None,
+            reply_to: None,
+        };
+        let _ = crate::streaming::pipeline::send_stream_placeholder(&bot, &ctx, "run-b02").await;
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "Step 2 must preserve B02 single-placeholder behavior; got {} requests",
+            received.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn mockbot_three_runs_same_thread_three_bubbles_fourth_rejected() {
+        use naked_core::types::SteerMessage;
+        use naked_tg::run_registry::{
+            ChatThreadKey, MULTI_RUN_THREAD_CAP, MessageKey, RegisterRunInput, RegisterRunOptions,
+            RunKind, RunOrigin,
+        };
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 901, "type": "private", "first_name": "u"},
+                    "text": "\u{23F3}"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let chat_id = 901_000 + unique as i64;
+        let bot = mock_bot(&server.uri());
+        let ctx = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_id),
+            thread_id: None,
+            reply_to: None,
+        };
+        let registry = &crate::shared::RUN_REGISTRY;
+        let thread = ChatThreadKey::new(chat_id, None);
+        for idx in 0..=MULTI_RUN_THREAD_CAP {
+            let _ = registry.remove_run(&format!("cap-l3-run-{unique}-{idx}"));
+        }
+
+        for idx in 0..MULTI_RUN_THREAD_CAP {
+            let run_id = format!("cap-l3-run-{unique}-{idx}");
+            let session_id = format!("cap-l3-sid-{unique}-{idx}");
+            let (steer, _rx) = mpsc::channel::<SteerMessage>(4);
+            registry
+                .register_run(
+                    RegisterRunInput {
+                        requested_run_id: Some(run_id.clone()),
+                        session_id,
+                        origin: RunOrigin::new(chat_id, None),
+                        kind: RunKind::ChatTurn,
+                        source_ref: None,
+                        steer,
+                        abort: CancellationToken::new(),
+                    },
+                    RegisterRunOptions::cap_three(),
+                )
+                .expect("first three runs are admitted with flag=true/cap=3");
+            let _ = crate::streaming::pipeline::send_stream_placeholder(&bot, &ctx, &run_id).await;
+            registry
+                .bind_message(&run_id, MessageKey::new(chat_id, 1000 + idx as i32))
+                .expect("each admitted run gets its own bound bubble");
+        }
+
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+        drop(events_tx);
+        let (perm_tx, _perm_rx) = tokio::sync::mpsc::channel(1);
+        let (steer_tx, _steer_rx) = tokio::sync::mpsc::channel(1);
+        let mut config = naked_core::config::Config {
+            run_registry_multi_stream_enabled: true,
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        config.workspace = tmp.path().join("workspace");
+        config.session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&config.workspace).unwrap();
+        std::fs::create_dir_all(&config.session_dir).unwrap();
+        let agent = std::sync::Arc::new(naked_core::AgentCore::new(
+            config.clone(),
+            Box::new(NoopProvider),
+        ));
+        let deps = crate::message_handler::BotDeps {
+            bot: bot.clone(),
+            agent,
+            channel_map: std::sync::Arc::new(ChannelSessionMap::new()),
+            config,
+            pending_perms: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            http_client: std::sync::Arc::new(reqwest::Client::new()),
+            base_url: std::sync::Arc::new(server.uri()),
+            rate_limiter: naked_tg::rate_limit::RateLimiter::new(),
+            attribution_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bot_token: std::sync::Arc::new("0:TEST_TOKEN".to_string()),
+            bot_identity: std::sync::Arc::new(naked_tg::bot_identity::BotIdentity {
+                id: 0,
+                username: "test_bot".to_string(),
+            }),
+            tg_attach_queue: naked_tg::tg_attach::new_queue(),
+            research_scheduler: None,
+            per_chat_locks: std::sync::Arc::new(crate::per_chat_locks::PerChatLocks::new()),
+        };
+        let _outcome = crate::streaming::pipeline::stream_response(
+            &deps,
+            ctx,
+            naked_core::types::AgentHandle {
+                events: events_rx,
+                permissions: perm_tx,
+                steer: steer_tx,
+                abort: CancellationToken::new(),
+            },
+            "test-model".to_string(),
+            crate::streaming::pipeline::StreamRunContext {
+                requested_run_id: Some(format!("cap-l3-run-{unique}-3")),
+                session_id: format!("cap-l3-sid-{unique}-3"),
+                kind: RunKind::ChatTurn,
+                source_ref: None,
+            },
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            4,
+            "4th rejected run must send exactly one friendly rejection and NO placeholder; got {} TG requests",
+            received.len()
+        );
+        let fourth_body = std::str::from_utf8(&received[3].body).unwrap_or("");
+        assert!(
+            fourth_body.contains("3 runs already active in this thread"),
+            "4th request must be the production friendly cap-reject message, body={fourth_body}"
+        );
+        assert!(
+            !fourth_body.contains("thinking") && !fourth_body.contains("reply_markup"),
+            "4th rejected run must not send a placeholder/control bubble, body={fourth_body}"
+        );
+        let summaries = registry.list_for_thread(thread);
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(
+            summaries
+                .iter()
+                .filter(|s| s.run_id.starts_with(&format!("cap-l3-run-{unique}-")))
+                .filter_map(|s| s.bubble_message_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "the 3 admitted runs must have 3 distinct bound bubble ids"
+        );
+        for idx in 0..=MULTI_RUN_THREAD_CAP {
+            let _ = registry.remove_run(&format!("cap-l3-run-{unique}-{idx}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn move_rehome_channel_session_map_set_b() {
+        use naked_core::types::SteerMessage;
+        use naked_tg::run_registry::{
+            MessageKey, RegisterRunInput, RegisterRunOptions, RunKind, RunOrigin,
+        };
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 77,
+                    "date": 0,
+                    "chat": {"id": 920, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let unique = unique_test_id();
+        let chat_a = 910_000 + unique as i64;
+        let chat_b = 920_000 + unique as i64;
+        let bot = mock_bot(&server.uri());
+        let channel_map = std::sync::Arc::new(ChannelSessionMap::new());
+        let deps = test_bot_deps(bot, test_config(), channel_map.clone(), server.uri());
+        let run_id = format!("move-map-run-{unique}");
+        let session_id = format!("move-map-sid-{unique}");
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+        let (steer, _rx) = mpsc::channel::<SteerMessage>(4);
+        crate::shared::RUN_REGISTRY
+            .register_run(
+                RegisterRunInput {
+                    requested_run_id: Some(run_id.clone()),
+                    session_id: session_id.clone(),
+                    origin: RunOrigin::new(chat_a, None),
+                    kind: RunKind::ChatTurn,
+                    source_ref: None,
+                    steer,
+                    abort: CancellationToken::new(),
+                },
+                RegisterRunOptions::cap_three(),
+            )
+            .unwrap();
+        crate::shared::RUN_REGISTRY
+            .bind_message(&run_id, MessageKey::new(chat_a, 42))
+            .unwrap();
+        let ctx_b = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_b),
+            thread_id: None,
+            reply_to: None,
+        };
+        crate::commands::research::move_live_run_here(&deps, &ctx_b, &format!("{run_id} here"))
+            .await
+            .unwrap();
+        assert_eq!(
+            channel_map.get(chat_b, None).await.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            crate::shared::RUN_REGISTRY
+                .primary_sink(&run_id)
+                .expect("new B bubble bound")
+                .chat_id,
+            chat_b
+        );
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+    }
+
+    #[tokio::test]
+    async fn move_cap_rejected_destination_bubble_has_no_live_controls() {
+        use naked_core::types::SteerMessage;
+        use naked_tg::run_registry::{
+            MessageKey, RegisterRunInput, RegisterRunOptions, RunKind, RunOrigin,
+        };
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 77,
+                    "date": 0,
+                    "chat": {"id": 1, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let chat_a = 930_000 + unique as i64;
+        let chat_b = 940_000 + unique as i64;
+        let run_id = format!("move-cap-reject-run-{unique}");
+        let session_id = format!("move-cap-reject-sid-{unique}");
+        let registry = &crate::shared::RUN_REGISTRY;
+        let all_run_ids: Vec<String> = std::iter::once(run_id.clone())
+            .chain((0..3).map(|idx| format!("move-cap-dest-{unique}-{idx}")))
+            .collect();
+        for id in &all_run_ids {
+            let _ = registry.remove_run(id);
+        }
+
+        let (steer, _rx) = mpsc::channel::<SteerMessage>(4);
+        registry
+            .register_run(
+                RegisterRunInput {
+                    requested_run_id: Some(run_id.clone()),
+                    session_id: session_id.clone(),
+                    origin: RunOrigin::new(chat_a, None),
+                    kind: RunKind::ChatTurn,
+                    source_ref: None,
+                    steer,
+                    abort: CancellationToken::new(),
+                },
+                RegisterRunOptions::cap_three(),
+            )
+            .unwrap();
+        registry
+            .bind_message(&run_id, MessageKey::new(chat_a, 42))
+            .unwrap();
+
+        for idx in 0..3 {
+            let dest_run_id = format!("move-cap-dest-{unique}-{idx}");
+            let dest_session_id = format!("move-cap-dest-sid-{unique}-{idx}");
+            let (steer, _rx) = mpsc::channel::<SteerMessage>(4);
+            registry
+                .register_run(
+                    RegisterRunInput {
+                        requested_run_id: Some(dest_run_id),
+                        session_id: dest_session_id,
+                        origin: RunOrigin::new(chat_b, None),
+                        kind: RunKind::ChatTurn,
+                        source_ref: None,
+                        steer,
+                        abort: CancellationToken::new(),
+                    },
+                    RegisterRunOptions::cap_three(),
+                )
+                .unwrap();
+        }
+
+        let bot = mock_bot(&server.uri());
+        let channel_map = std::sync::Arc::new(ChannelSessionMap::new());
+        let deps = test_bot_deps(bot, test_config(), channel_map, server.uri());
+        let ctx_b = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_b),
+            thread_id: None,
+            reply_to: None,
+        };
+        crate::commands::research::move_live_run_here(&deps, &ctx_b, &format!("{run_id} here"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry
+                .primary_sink(&run_id)
+                .expect("run remains at A")
+                .chat_id,
+            chat_a,
+            "cap-rejected move must leave the run at its old origin"
+        );
+        let received = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = received
+            .iter()
+            .map(|req| String::from_utf8_lossy(&req.body).to_string())
+            .collect();
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("destination already has")),
+            "must edit the markup-less destination message into friendly rejection; bodies={bodies:#?}"
+        );
+        assert!(
+            bodies.iter().all(|body| {
+                !body.contains("s:abort:")
+                    && !body.contains("s:sendnow:")
+                    && !body.contains("reply_markup")
+                    && !body.contains("inline_keyboard")
+            }),
+            "cap-rejected move must never expose live controls on the destination bubble; bodies={bodies:#?}"
+        );
+
+        for id in all_run_ids {
+            let _ = registry.remove_run(&id);
+        }
+    }
+
+    #[tokio::test]
+    async fn move_mockbot_freezes_a_and_continues_b() {
+        use naked_core::types::{AgentEvent, AgentHandle};
+        use naked_tg::run_registry::RunKind;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 910, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let chat_a = 910_000 + unique as i64;
+        let chat_b = 920_000 + unique as i64;
+        let run_id = format!("move-l3-run-{unique}");
+        let session_id = format!("move-l3-sid-{unique}");
+        let bot = mock_bot(&server.uri());
+        let channel_map = std::sync::Arc::new(ChannelSessionMap::new());
+        let config = test_config();
+        let deps = test_bot_deps(bot.clone(), config, channel_map, server.uri());
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (perm_tx, _perm_rx) = mpsc::channel(1);
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let ctx_a = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_a),
+            thread_id: None,
+            reply_to: None,
+        };
+        let run_id_for_stream = run_id.clone();
+        let session_id_for_stream = session_id.clone();
+        let stream_task = tokio::spawn(async move {
+            crate::streaming::pipeline::stream_response(
+                &deps,
+                ctx_a,
+                AgentHandle {
+                    events: events_rx,
+                    permissions: perm_tx,
+                    steer: steer_tx,
+                    abort: CancellationToken::new(),
+                },
+                "test-model".to_string(),
+                crate::streaming::pipeline::StreamRunContext {
+                    requested_run_id: Some(run_id_for_stream),
+                    session_id: session_id_for_stream,
+                    kind: RunKind::ChatTurn,
+                    source_ref: None,
+                },
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if crate::shared::RUN_REGISTRY
+                .primary_sink(&run_id)
+                .is_some_and(|sink| sink.chat_id == chat_a)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(crate::shared::RUN_REGISTRY.primary_sink(&run_id).is_some());
+
+        let move_bot = mock_bot(&server.uri());
+        let move_channel_map = std::sync::Arc::new(ChannelSessionMap::new());
+        let move_deps = test_bot_deps(move_bot, test_config(), move_channel_map, server.uri());
+        let ctx_b = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_b),
+            thread_id: None,
+            reply_to: None,
+        };
+        crate::commands::research::move_live_run_here(
+            &move_deps,
+            &ctx_b,
+            &format!("{run_id} here"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::shared::RUN_REGISTRY
+                .primary_sink(&run_id)
+                .expect("new B primary")
+                .chat_id,
+            chat_b
+        );
+
+        events_tx
+            .send(AgentEvent::TextDelta("after move proof".to_string()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(
+            naked_tg::rate_limit::MIN_GAP_MS + 250,
+        ))
+        .await;
+        events_tx.send(AgentEvent::Idle).await.unwrap();
+        let _ = stream_task.await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = received
+            .iter()
+            .map(|req| String::from_utf8_lossy(&req.body).to_string())
+            .collect();
+        assert!(
+            bodies.iter().any(|body| body.contains(&chat_a.to_string())
+                && body.contains(&format!("moved to chat {chat_b}"))),
+            "old A bubble must be frozen with moved note; bodies={bodies:#?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains(&chat_b.to_string()) && body.contains("after move proof")),
+            "new B bubble must receive subsequent stream edits/final; bodies={bodies:#?}"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains(&chat_a.to_string()) && body.contains("after move proof")),
+            "old A bubble must not receive post-move stream text; bodies={bodies:#?}"
+        );
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+    }
+
+    #[tokio::test]
     async fn stream_start_sends_exactly_one_message_with_inline_kbd() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1095,7 +1685,7 @@ mod tests {
             thread_id: None,
             reply_to: None,
         };
-        let _ = crate::streaming::pipeline::send_stream_placeholder(&bot, &ctx).await;
+        let _ = crate::streaming::pipeline::send_stream_placeholder(&bot, &ctx, "run-start").await;
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(
@@ -1113,6 +1703,284 @@ mod tests {
             body.contains("reply_markup") || body.contains("inline_keyboard"),
             "stream-start request must carry inline keyboard: body={body}"
         );
+        assert!(
+            body.contains("s:abort:run-start") && body.contains("s:sendnow:run-start"),
+            "new run-bound placeholder must emit s:* scoped callbacks immediately: body={body}"
+        );
+        assert!(
+            !body.contains("stream:abort") && !body.contains("stream:sendnow"),
+            "new run-bound placeholder must not emit legacy stream:* callbacks: body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_fanout_consumes_agent_events_once() {
+        use naked_core::types::{AgentEvent, AgentHandle};
+        use naked_tg::run_registry::RunKind;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::{RwLock, mpsc};
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 903, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = naked_core::config::Config {
+            run_registry_multi_stream_enabled: true,
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        config.workspace = tmp.path().join("workspace");
+        config.session_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&config.workspace).unwrap();
+        std::fs::create_dir_all(&config.session_dir).unwrap();
+        let agent = std::sync::Arc::new(naked_core::AgentCore::new(
+            config.clone(),
+            Box::new(NoopProvider),
+        ));
+        let bot = mock_bot(&server.uri());
+        let deps = crate::message_handler::BotDeps {
+            bot: bot.clone(),
+            agent,
+            channel_map: std::sync::Arc::new(ChannelSessionMap::new()),
+            config,
+            pending_perms: std::sync::Arc::new(RwLock::new(std::collections::HashMap::new())),
+            http_client: std::sync::Arc::new(reqwest::Client::new()),
+            base_url: std::sync::Arc::new(server.uri()),
+            rate_limiter: naked_tg::rate_limit::RateLimiter::new(),
+            attribution_flag: std::sync::Arc::new(AtomicBool::new(false)),
+            bot_token: std::sync::Arc::new("0:TEST_TOKEN".to_string()),
+            bot_identity: std::sync::Arc::new(naked_tg::bot_identity::BotIdentity {
+                id: 0,
+                username: "test_bot".to_string(),
+            }),
+            tg_attach_queue: naked_tg::tg_attach::new_queue(),
+            research_scheduler: None,
+            per_chat_locks: std::sync::Arc::new(crate::per_chat_locks::PerChatLocks::new()),
+        };
+
+        let unique = unique_test_id();
+        let chat_home = 903_000 + unique as i64;
+        let chat_mirror = 904_000 + unique as i64;
+        let run_id = format!("mirror-l3-run-{unique}");
+        let session_id = format!("mirror-l3-sid-{unique}");
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (perm_tx, _perm_rx) = mpsc::channel(1);
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let ctx_home = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_home),
+            thread_id: None,
+            reply_to: None,
+        };
+        let run_id_for_stream = run_id.clone();
+        let session_id_for_stream = session_id.clone();
+        let stream_task = tokio::spawn(async move {
+            crate::streaming::pipeline::stream_response(
+                &deps,
+                ctx_home,
+                AgentHandle {
+                    events: events_rx,
+                    permissions: perm_tx,
+                    steer: steer_tx,
+                    abort: CancellationToken::new(),
+                },
+                "test-model".to_string(),
+                crate::streaming::pipeline::StreamRunContext {
+                    requested_run_id: Some(run_id_for_stream),
+                    session_id: session_id_for_stream,
+                    kind: RunKind::ChatTurn,
+                    source_ref: None,
+                },
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if crate::shared::RUN_REGISTRY
+                .get_run(&run_id)
+                .and_then(|run| run.bubble_message_id)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            crate::shared::RUN_REGISTRY
+                .get_run(&run_id)
+                .and_then(|run| run.bubble_message_id)
+                .is_some(),
+            "home run must be registered and bound before adding mirror"
+        );
+
+        let ctx_mirror = crate::shared::ChatCtx {
+            chat_id: ChatId(chat_mirror),
+            thread_id: None,
+            reply_to: None,
+        };
+        crate::commands::research::send_live_run_snapshot(
+            &bot,
+            &ctx_mirror,
+            &crate::shared::RUN_REGISTRY,
+            &run_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(crate::shared::RUN_REGISTRY.mirror_sinks(&run_id).len(), 1);
+
+        events_tx
+            .send(AgentEvent::TextDelta("mirror fanout proof".to_string()))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(
+            naked_tg::rate_limit::MIN_GAP_MS + 250,
+        ))
+        .await;
+        events_tx.send(AgentEvent::Idle).await.unwrap();
+        let _ = stream_task.await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = received
+            .iter()
+            .map(|req| String::from_utf8_lossy(&req.body).to_string())
+            .collect();
+        let proof_edits = bodies
+            .iter()
+            .filter(|body| body.contains("mirror fanout proof"))
+            .count();
+        assert!(
+            proof_edits >= 2,
+            "home + mirror must both receive rendered edits/final text; bodies={bodies:#?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains(&chat_home.to_string())
+                    && body.contains("mirror fanout proof")),
+            "home bubble should receive fanout edit/final; bodies={bodies:#?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains(&chat_mirror.to_string())
+                    && body.contains("mirror fanout proof")),
+            "mirror bubble should receive fanout edit/final; bodies={bodies:#?}"
+        );
+
+        let pipeline_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/streaming_mod/pipeline.rs"
+        ))
+        .unwrap();
+        let fanout = pipeline_src
+            .split("async fn flush_live_to_all_sinks")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn send_final_to_all_sinks").next())
+            .expect("fanout helper source present");
+        assert_eq!(
+            fanout.matches("view.render_live()").count(),
+            1,
+            "fanout must render once then broadcast"
+        );
+        assert!(
+            !fanout.contains("stream_response(") && !fanout.contains("AgentHandle"),
+            "mirror fanout must not start a second stream_response / second AgentHandle consumer"
+        );
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+    }
+
+    #[tokio::test]
+    async fn attachments_mockbot_finish_a_sends_only_a_files() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 77,
+                    "date": 0,
+                    "chat": {"id": 902, "type": "private", "first_name": "u"},
+                    "document": {"file_id": "doc", "file_unique_id": "uniq", "file_name": "ok.txt"}
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let queue = naked_tg::tg_attach::new_queue();
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("run-a-l3-document.txt");
+        let path_b = dir.path().join("run-b-l3-document.txt");
+        std::fs::write(&path_a, "a-only").unwrap();
+        std::fs::write(&path_b, "b-must-not-send").unwrap();
+
+        let tool_a = naked_tg::tg_attach::TelegramAttachTool::new_for_run(queue.clone(), "run-a");
+        let tool_b = naked_tg::tg_attach::TelegramAttachTool::new_for_run(queue.clone(), "run-b");
+        let cwd = std::path::Path::new("/tmp");
+        let result_a = naked_core::tool::Tool::execute(
+            &tool_a,
+            serde_json::json!({"paths": [path_a.to_str().unwrap()]}),
+            cwd,
+        )
+        .await;
+        assert!(!result_a.is_error, "A stage failed: {}", result_a.output);
+        let result_b = naked_core::tool::Tool::execute(
+            &tool_b,
+            serde_json::json!({"paths": [path_b.to_str().unwrap()]}),
+            cwd,
+        )
+        .await;
+        assert!(!result_b.is_error, "B stage failed: {}", result_b.output);
+
+        let client = reqwest::Client::new();
+        let delivered_a = naked_tg::tg_attach::drain_for_run(&queue, "run-a").await;
+        assert_eq!(delivered_a.len(), 1, "run A drain selects only A");
+        for att in delivered_a {
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", "902")
+                .file("document", &att.path)
+                .await
+                .expect("multipart form");
+            client
+                .post(format!("{}/sendDocument", server.uri()))
+                .multipart(form)
+                .send()
+                .await
+                .expect("mock sendDocument");
+        }
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "finishing run A should deliver only A's queued attachment"
+        );
+        assert!(
+            received[0].url.path().ends_with("/sendDocument"),
+            "text file should use sendDocument: {}",
+            received[0].url.path()
+        );
+        let body = String::from_utf8_lossy(&received[0].body);
+        assert!(
+            body.contains("run-a-l3-document.txt"),
+            "multipart body should reference A file only: {body}"
+        );
+        assert!(
+            !body.contains("run-b-l3-document.txt") && !body.contains("b-must-not-send"),
+            "seeded-fail: a global drain would leak B's attachment into A finalize: {body}"
+        );
+        let remaining = queue.lock().await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].run_id.as_deref(), Some("run-b"));
     }
 
     #[tokio::test]
@@ -1338,8 +2206,8 @@ mod resilience_tests {
     // button layout. Full one-bubble assertion uses wiremock — see
     // resilience_tests::stream_start_sends_exactly_one_message_with_inline_kbd.
     #[test]
-    fn streaming_control_kb_has_two_buttons() {
-        let kb = crate::streaming::pipeline::streaming_control_kb();
+    fn streaming_control_kb_for_run_has_two_scoped_buttons() {
+        let kb = crate::streaming::pipeline::streaming_control_kb_for_run("run-kb");
         let rows = kb.inline_keyboard;
         assert_eq!(rows.len(), 1, "expected single row of buttons");
         let row = &rows[0];
@@ -1357,7 +2225,7 @@ mod resilience_tests {
             InlineKeyboardButtonKind::CallbackData(d) => d.as_str(),
             _ => panic!("button 1 must be CallbackData"),
         };
-        assert_eq!(cb0, "stream:abort");
-        assert_eq!(cb1, "stream:sendnow");
+        assert_eq!(cb0, "s:abort:run-kb");
+        assert_eq!(cb1, "s:sendnow:run-kb");
     }
 }

@@ -102,10 +102,12 @@ impl AgentRunner for ScriptedRunner {
         Ok((
             {
                 let (steer_tx, _) = tokio::sync::mpsc::channel(1);
+                // REGISTRY-WAIVE: B16 — AgentHandle owns mpsc Receiver/Sender channels; no Default is possible for this test fixture.
                 AgentHandle {
                     events: rx,
                     permissions: perm_tx,
                     steer: steer_tx,
+                    abort: tokio_util::sync::CancellationToken::new(),
                 }
             },
             "test-provider".into(),

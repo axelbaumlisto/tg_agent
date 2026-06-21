@@ -46,6 +46,15 @@ static TEXT_COALESCED: AtomicU64 = AtomicU64::new(0);
 /// B62 / Q4: SessionBusy follow-ups that could not be steered and got a soft Busy ack.
 static SESSION_BUSY_ACK: AtomicU64 = AtomicU64::new(0);
 
+/// B05: current boot-time config health for multimodal fallback.
+/// State gauge: 1 when the default model is not vision-capable AND no
+/// `tg_media.vision` describer fallback is configured, otherwise 0.
+static CONFIG_DESCRIBER_MISSING: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_config_describer_missing(missing: bool) {
+    CONFIG_DESCRIBER_MISSING.store(u64::from(missing), Ordering::Relaxed);
+}
+
 pub fn record_concurrent_same_key_turn_wait() {
     CONCURRENT_SAME_KEY_TURNS.fetch_add(1, Ordering::Relaxed);
 }
@@ -69,6 +78,12 @@ pub fn record_redaction_applied() {
 // means users frequently want to cut tool execution short.
 static STREAM_BUTTON_CLICK_ABORT: AtomicU64 = AtomicU64::new(0);
 static STREAM_BUTTON_CLICK_SENDNOW: AtomicU64 = AtomicU64::new(0);
+static RUN_REGISTRY_REGISTER: AtomicU64 = AtomicU64::new(0);
+static RUN_REGISTRY_REMOVE: AtomicU64 = AtomicU64::new(0);
+static RUN_REGISTRY_CAP_REJECT: AtomicU64 = AtomicU64::new(0);
+static RUN_REGISTRY_CALLBACK_EXPIRED: AtomicU64 = AtomicU64::new(0);
+static RUN_REGISTRY_CALLBACK_RESOLVED: AtomicU64 = AtomicU64::new(0);
+static RUN_REGISTRY_CALLBACK_DENIED: AtomicU64 = AtomicU64::new(0);
 
 // ── PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01 ────────────────────
 // Audio-transcription observability. Two outcome buckets + six
@@ -154,6 +169,30 @@ pub fn record_transcription(outcome: &str, reason: Option<&str>) {
     }
 }
 
+pub fn record_run_registry_register() {
+    RUN_REGISTRY_REGISTER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_run_registry_remove() {
+    RUN_REGISTRY_REMOVE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_run_registry_cap_reject() {
+    RUN_REGISTRY_CAP_REJECT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_run_registry_callback_expired() {
+    RUN_REGISTRY_CALLBACK_EXPIRED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_run_registry_callback_resolved() {
+    RUN_REGISTRY_CALLBACK_RESOLVED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_run_registry_callback_denied() {
+    RUN_REGISTRY_CALLBACK_DENIED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Bumped by [`crate::callbacks::handle_callback`] for every
 /// `stream:abort` / `stream:sendnow` button press. The two-bucket
 /// split (rather than one labelled counter) keeps the renderer
@@ -205,6 +244,12 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         rate_limit_delayed: RATE_LIMIT_DELAYED.load(Ordering::Relaxed),
         stream_button_click_abort: STREAM_BUTTON_CLICK_ABORT.load(Ordering::Relaxed),
         stream_button_click_sendnow: STREAM_BUTTON_CLICK_SENDNOW.load(Ordering::Relaxed),
+        run_registry_register: RUN_REGISTRY_REGISTER.load(Ordering::Relaxed),
+        run_registry_remove: RUN_REGISTRY_REMOVE.load(Ordering::Relaxed),
+        run_registry_cap_reject: RUN_REGISTRY_CAP_REJECT.load(Ordering::Relaxed),
+        run_registry_callback_expired: RUN_REGISTRY_CALLBACK_EXPIRED.load(Ordering::Relaxed),
+        run_registry_callback_resolved: RUN_REGISTRY_CALLBACK_RESOLVED.load(Ordering::Relaxed),
+        run_registry_callback_denied: RUN_REGISTRY_CALLBACK_DENIED.load(Ordering::Relaxed),
         transcription_ok: MEDIA_TRANSCRIPTION_OK.load(Ordering::Relaxed),
         transcription_fail: MEDIA_TRANSCRIPTION_FAIL.load(Ordering::Relaxed),
         transcription_fail_auth: MEDIA_TRANSCRIPTION_FAIL_AUTH.load(Ordering::Relaxed),
@@ -217,6 +262,7 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         concurrent_same_key_turns: CONCURRENT_SAME_KEY_TURNS.load(Ordering::Relaxed),
         text_coalesced: TEXT_COALESCED.load(Ordering::Relaxed),
         session_busy_ack: SESSION_BUSY_ACK.load(Ordering::Relaxed),
+        config_describer_missing: CONFIG_DESCRIBER_MISSING.load(Ordering::Relaxed),
         research_cancel_propagation_under_3s: RESEARCH_CANCEL_PROPAGATION_UNDER_3S
             .load(Ordering::Relaxed),
         research_cancel_propagation_3s_to_30s: RESEARCH_CANCEL_PROPAGATION_3S_TO_30S
@@ -238,6 +284,12 @@ pub struct MediaRoutingSnapshot {
     pub rate_limit_delayed: u64,
     pub stream_button_click_abort: u64,
     pub stream_button_click_sendnow: u64,
+    pub run_registry_register: u64,
+    pub run_registry_remove: u64,
+    pub run_registry_cap_reject: u64,
+    pub run_registry_callback_expired: u64,
+    pub run_registry_callback_resolved: u64,
+    pub run_registry_callback_denied: u64,
     // PLAN_MEDIA_UX_v1 M5 / BUG_REGISTRY B01
     pub transcription_ok: u64,
     pub transcription_fail: u64,
@@ -255,6 +307,8 @@ pub struct MediaRoutingSnapshot {
     pub text_coalesced: u64,
     /// B62/Q4: SessionBusy follow-ups that got a soft Busy ack.
     pub session_busy_ack: u64,
+    /// B05: 0/1 state gauge for missing multimodal describer fallback.
+    pub config_describer_missing: u64,
     // T11 PLAN_RESEARCH_AGENT_FLOW_v1: cancel propagation latency.
     pub research_cancel_propagation_under_3s: u64,
     pub research_cancel_propagation_3s_to_30s: u64,
@@ -282,6 +336,10 @@ struct PrometheusInputs {
     provider_perm_blacklist: u64,
     crash_notified: u64,
     vision_mismatch: u64,
+    provider_connect_timeout: u64,
+    provider_inter_chunk_timeout: u64,
+    provider_invalid_request: u64,
+    scheduler_dispatch_skipped: u64,
     cfg_ext_write: u64,
     ip_hallucin: u64,
     research_store_corrupt_rows: u64,
@@ -369,6 +427,14 @@ impl MediaRoutingSnapshot {
                 .load(Ordering::Relaxed),
             vision_mismatch: naked_core::types::PROVIDER_VISION_CAP_MISMATCH_COUNT
                 .load(Ordering::Relaxed),
+            provider_connect_timeout: naked_core::types::PROVIDER_CONNECT_TIMEOUT_COUNT
+                .load(Ordering::Relaxed),
+            provider_inter_chunk_timeout: naked_core::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT
+                .load(Ordering::Relaxed),
+            provider_invalid_request: naked_core::types::PROVIDER_INVALID_REQUEST_COUNT
+                .load(Ordering::Relaxed),
+            scheduler_dispatch_skipped: naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT
+                .load(Ordering::Relaxed),
             cfg_ext_write: naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT.load(Ordering::Relaxed),
             ip_hallucin: naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed),
             research_store_corrupt_rows:
@@ -434,6 +500,24 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_tg_stream_button_click_sendnow_total Clicks of the [⏩ Send now] inline button on the streaming control card.\n\
              # TYPE naked_tg_stream_button_click_sendnow_total counter\n\
              naked_tg_stream_button_click_sendnow_total {btn_sendnow}\n\
+             # HELP naked_tg_run_registry_register_total RunRegistry run registrations.\n\
+             # TYPE naked_tg_run_registry_register_total counter\n\
+             naked_tg_run_registry_register_total {run_reg}\n\
+             # HELP naked_tg_run_registry_remove_total RunRegistry run removals.\n\
+             # TYPE naked_tg_run_registry_remove_total counter\n\
+             naked_tg_run_registry_remove_total {run_remove}\n\
+             # HELP naked_tg_run_registry_cap_reject_total RunRegistry thread cap rejections.\n\
+             # TYPE naked_tg_run_registry_cap_reject_total counter\n\
+             naked_tg_run_registry_cap_reject_total {run_cap_reject}\n\
+             # HELP naked_tg_run_registry_callback_expired_total Expired legacy stream callbacks.\n\
+             # TYPE naked_tg_run_registry_callback_expired_total counter\n\
+             naked_tg_run_registry_callback_expired_total {run_cb_expired}\n\
+             # HELP naked_tg_run_registry_callback_resolved_total Stream callbacks resolved to a live run.\n\
+             # TYPE naked_tg_run_registry_callback_resolved_total counter\n\
+             naked_tg_run_registry_callback_resolved_total {run_cb_resolved}\n\
+             # HELP naked_tg_run_registry_callback_denied_total Stream callbacks denied by allowed_chat_ids.\n\
+             # TYPE naked_tg_run_registry_callback_denied_total counter\n\
+             naked_tg_run_registry_callback_denied_total {run_cb_denied}\n\
              # HELP naked_core_snapshot_capture_total Side-git pre-turn workspace snapshots captured by `dispatch_turn`.\n\
              # TYPE naked_core_snapshot_capture_total counter\n\
              naked_core_snapshot_capture_total {snapshot_capture}\n\
@@ -458,6 +542,16 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_core_provider_vision_capability_mismatch_total (B06) caps.supports_vision=true but API rejects image_url content shape.\n\
              # TYPE naked_core_provider_vision_capability_mismatch_total counter\n\
              naked_core_provider_vision_capability_mismatch_total {vision_mismatch}\n\
+             # HELP naked_core_provider_timeout_total (B68) Provider timeout events by timeout kind.\n\
+             # TYPE naked_core_provider_timeout_total counter\n\
+             naked_core_provider_timeout_total{{kind=\"connect\"}} {provider_connect_timeout}\n\
+             naked_core_provider_timeout_total{{kind=\"inter_chunk\"}} {provider_inter_chunk_timeout}\n\
+             # HELP naked_core_provider_invalid_request_total (B76) Provider HTTP 400 invalid_request_error responses (likely config/request-shape bugs).\n\
+             # TYPE naked_core_provider_invalid_request_total counter\n\
+             naked_core_provider_invalid_request_total {provider_invalid_request}\n\
+             # HELP naked_core_scheduler_dispatch_skipped_total (B75) Scheduler dispatches skipped because all provider keys/providers were blacklisted.\n\
+             # TYPE naked_core_scheduler_dispatch_skipped_total counter\n\
+             naked_core_scheduler_dispatch_skipped_total {scheduler_dispatch_skipped}\n\
              # HELP naked_core_config_external_write_total (B42) state/naked.json modified by external process detected by D-CONFIG-MTIME-WATCH.\n\
              # TYPE naked_core_config_external_write_total counter\n\
              naked_core_config_external_write_total {cfg_ext_write}\n\
@@ -503,6 +597,9 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_tg_session_busy_ack_total (B62) SessionBusy follow-ups that got a soft busy ack (no steer sender / full channel); measures the F1/B3 drop window.\n\
              # TYPE naked_tg_session_busy_ack_total counter\n\
              naked_tg_session_busy_ack_total {session_busy_ack}\n\
+             # HELP naked_tg_config_describer_missing (B05) Set to 1 when the default model is not vision-capable AND no tg_media.vision describer fallback is configured.\n\
+             # TYPE naked_tg_config_describer_missing gauge\n\
+             naked_tg_config_describer_missing {config_describer_missing}\n\
              # HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n\
              # TYPE naked_tg_research_cancel_propagation_total counter\n\
              naked_tg_research_cancel_propagation_total{{bucket=\"under_3s\"}} {cancel_u3s}\n\
@@ -529,6 +626,12 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         supervisor_restart = inputs.supervisor_restart,
         btn_abort = inputs.media.stream_button_click_abort,
         btn_sendnow = inputs.media.stream_button_click_sendnow,
+        run_reg = inputs.media.run_registry_register,
+        run_remove = inputs.media.run_registry_remove,
+        run_cap_reject = inputs.media.run_registry_cap_reject,
+        run_cb_expired = inputs.media.run_registry_callback_expired,
+        run_cb_resolved = inputs.media.run_registry_callback_resolved,
+        run_cb_denied = inputs.media.run_registry_callback_denied,
         snapshot_capture = inputs.snapshot_capture,
         lsp_emitted = inputs.lsp_emitted,
         permission_match = inputs.permission_match,
@@ -537,6 +640,10 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         provider_perm_blacklist = inputs.provider_perm_blacklist,
         crash_notified = inputs.crash_notified,
         vision_mismatch = inputs.vision_mismatch,
+        provider_connect_timeout = inputs.provider_connect_timeout,
+        provider_inter_chunk_timeout = inputs.provider_inter_chunk_timeout,
+        provider_invalid_request = inputs.provider_invalid_request,
+        scheduler_dispatch_skipped = inputs.scheduler_dispatch_skipped,
         cfg_ext_write = inputs.cfg_ext_write,
         ip_hallucin = inputs.ip_hallucin,
         research_store_corrupt_rows = inputs.research_store_corrupt_rows,
@@ -556,6 +663,7 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         concurrent_same_key_turns = inputs.concurrent_same_key_turns,
         text_coalesced = inputs.text_coalesced,
         session_busy_ack = inputs.session_busy_ack,
+        config_describer_missing = inputs.media.config_describer_missing,
         cancel_u3s = inputs.media.research_cancel_propagation_under_3s,
         cancel_3s_30s = inputs.media.research_cancel_propagation_3s_to_30s,
         cancel_o30s = inputs.media.research_cancel_propagation_over_30s,
@@ -656,6 +764,12 @@ mod tests {
                 rate_limit_delayed: 4,
                 stream_button_click_abort: 5,
                 stream_button_click_sendnow: 6,
+                run_registry_register: 61,
+                run_registry_remove: 62,
+                run_registry_cap_reject: 63,
+                run_registry_callback_expired: 64,
+                run_registry_callback_resolved: 65,
+                run_registry_callback_denied: 66,
                 transcription_ok: 7,
                 transcription_fail: 8,
                 transcription_fail_auth: 9,
@@ -668,6 +782,7 @@ mod tests {
                 concurrent_same_key_turns: 916,
                 text_coalesced: 917,
                 session_busy_ack: 918,
+                config_describer_missing: 1,
                 research_cancel_propagation_under_3s: 19,
                 research_cancel_propagation_3s_to_30s: 20,
                 research_cancel_propagation_over_30s: 21,
@@ -690,6 +805,10 @@ mod tests {
             provider_perm_blacklist: 37,
             crash_notified: 38,
             vision_mismatch: 39,
+            provider_connect_timeout: 390,
+            provider_inter_chunk_timeout: 391,
+            provider_invalid_request: 392,
+            scheduler_dispatch_skipped: 393,
             cfg_ext_write: 40,
             ip_hallucin: 41,
             research_store_corrupt_rows: 42,
@@ -745,6 +864,24 @@ mod tests {
             "# HELP naked_tg_stream_button_click_sendnow_total Clicks of the [⏩ Send now] inline button on the streaming control card.\n",
             "# TYPE naked_tg_stream_button_click_sendnow_total counter\n",
             "naked_tg_stream_button_click_sendnow_total 6\n",
+            "# HELP naked_tg_run_registry_register_total RunRegistry run registrations.\n",
+            "# TYPE naked_tg_run_registry_register_total counter\n",
+            "naked_tg_run_registry_register_total 61\n",
+            "# HELP naked_tg_run_registry_remove_total RunRegistry run removals.\n",
+            "# TYPE naked_tg_run_registry_remove_total counter\n",
+            "naked_tg_run_registry_remove_total 62\n",
+            "# HELP naked_tg_run_registry_cap_reject_total RunRegistry thread cap rejections.\n",
+            "# TYPE naked_tg_run_registry_cap_reject_total counter\n",
+            "naked_tg_run_registry_cap_reject_total 63\n",
+            "# HELP naked_tg_run_registry_callback_expired_total Expired legacy stream callbacks.\n",
+            "# TYPE naked_tg_run_registry_callback_expired_total counter\n",
+            "naked_tg_run_registry_callback_expired_total 64\n",
+            "# HELP naked_tg_run_registry_callback_resolved_total Stream callbacks resolved to a live run.\n",
+            "# TYPE naked_tg_run_registry_callback_resolved_total counter\n",
+            "naked_tg_run_registry_callback_resolved_total 65\n",
+            "# HELP naked_tg_run_registry_callback_denied_total Stream callbacks denied by allowed_chat_ids.\n",
+            "# TYPE naked_tg_run_registry_callback_denied_total counter\n",
+            "naked_tg_run_registry_callback_denied_total 66\n",
             "# HELP naked_core_snapshot_capture_total Side-git pre-turn workspace snapshots captured by `dispatch_turn`.\n",
             "# TYPE naked_core_snapshot_capture_total counter\n",
             "naked_core_snapshot_capture_total 32\n",
@@ -769,6 +906,16 @@ mod tests {
             "# HELP naked_core_provider_vision_capability_mismatch_total (B06) caps.supports_vision=true but API rejects image_url content shape.\n",
             "# TYPE naked_core_provider_vision_capability_mismatch_total counter\n",
             "naked_core_provider_vision_capability_mismatch_total 39\n",
+            "# HELP naked_core_provider_timeout_total (B68) Provider timeout events by timeout kind.\n",
+            "# TYPE naked_core_provider_timeout_total counter\n",
+            "naked_core_provider_timeout_total{kind=\"connect\"} 390\n",
+            "naked_core_provider_timeout_total{kind=\"inter_chunk\"} 391\n",
+            "# HELP naked_core_provider_invalid_request_total (B76) Provider HTTP 400 invalid_request_error responses (likely config/request-shape bugs).\n",
+            "# TYPE naked_core_provider_invalid_request_total counter\n",
+            "naked_core_provider_invalid_request_total 392\n",
+            "# HELP naked_core_scheduler_dispatch_skipped_total (B75) Scheduler dispatches skipped because all provider keys/providers were blacklisted.\n",
+            "# TYPE naked_core_scheduler_dispatch_skipped_total counter\n",
+            "naked_core_scheduler_dispatch_skipped_total 393\n",
             "# HELP naked_core_config_external_write_total (B42) state/naked.json modified by external process detected by D-CONFIG-MTIME-WATCH.\n",
             "# TYPE naked_core_config_external_write_total counter\n",
             "naked_core_config_external_write_total 40\n",
@@ -814,6 +961,9 @@ mod tests {
             "# HELP naked_tg_session_busy_ack_total (B62) SessionBusy follow-ups that got a soft busy ack (no steer sender / full channel); measures the F1/B3 drop window.\n",
             "# TYPE naked_tg_session_busy_ack_total counter\n",
             "naked_tg_session_busy_ack_total 48\n",
+            "# HELP naked_tg_config_describer_missing (B05) Set to 1 when the default model is not vision-capable AND no tg_media.vision describer fallback is configured.\n",
+            "# TYPE naked_tg_config_describer_missing gauge\n",
+            "naked_tg_config_describer_missing 1\n",
             "# HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n",
             "# TYPE naked_tg_research_cancel_propagation_total counter\n",
             "naked_tg_research_cancel_propagation_total{bucket=\"under_3s\"} 19\n",
@@ -829,6 +979,70 @@ mod tests {
             "naked_model_health_probe 777\n",
         );
         assert_eq!(render_prometheus_from(&inputs), expected);
+    }
+
+    #[test]
+    fn render_prometheus_includes_provider_timeout_labels() {
+        let inputs = PrometheusInputs {
+            provider_connect_timeout: 11,
+            provider_inter_chunk_timeout: 12,
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_core_provider_timeout_total"));
+        assert!(rendered.contains("# TYPE naked_core_provider_timeout_total counter"));
+        assert!(rendered.contains("naked_core_provider_timeout_total{kind=\"connect\"} 11"));
+        assert!(rendered.contains("naked_core_provider_timeout_total{kind=\"inter_chunk\"} 12"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_provider_invalid_request_counter() {
+        let inputs = PrometheusInputs {
+            provider_invalid_request: 13,
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_core_provider_invalid_request_total"));
+        assert!(rendered.contains("# TYPE naked_core_provider_invalid_request_total counter"));
+        assert!(rendered.contains("naked_core_provider_invalid_request_total 13"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_scheduler_dispatch_skipped_counter() {
+        let inputs = PrometheusInputs {
+            scheduler_dispatch_skipped: 14,
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_core_scheduler_dispatch_skipped_total"));
+        assert!(rendered.contains("# TYPE naked_core_scheduler_dispatch_skipped_total counter"));
+        assert!(rendered.contains("naked_core_scheduler_dispatch_skipped_total 14"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_config_describer_missing_gauge() {
+        let inputs = PrometheusInputs {
+            media: MediaRoutingSnapshot {
+                config_describer_missing: 1,
+                ..MediaRoutingSnapshot::default()
+            },
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_tg_config_describer_missing (B05)"));
+        assert!(rendered.contains("# TYPE naked_tg_config_describer_missing gauge"));
+        assert!(rendered.contains("naked_tg_config_describer_missing 1"));
+        assert!(!rendered.contains("naked_tg_config_describer_missing_total"));
+    }
+
+    #[test]
+    fn set_config_describer_missing_updates_snapshot_gauge_state() {
+        set_config_describer_missing(false);
+        assert_eq!(snapshot().config_describer_missing, 0);
+        set_config_describer_missing(true);
+        assert_eq!(snapshot().config_describer_missing, 1);
+        set_config_describer_missing(false);
+        assert_eq!(snapshot().config_describer_missing, 0);
     }
 
     #[test]
@@ -951,6 +1165,44 @@ mod tests {
                 "missing TYPE for {metric}",
             );
         }
+    }
+
+    #[test]
+    fn registry_metrics_render_and_bump() {
+        let before = snapshot();
+        record_run_registry_register();
+        record_run_registry_remove();
+        record_run_registry_cap_reject();
+        record_run_registry_callback_expired();
+        record_run_registry_callback_resolved();
+        record_run_registry_callback_denied();
+        let after = snapshot();
+        assert_eq!(
+            after.run_registry_register,
+            before.run_registry_register + 1
+        );
+        assert_eq!(after.run_registry_remove, before.run_registry_remove + 1);
+        assert_eq!(
+            after.run_registry_cap_reject,
+            before.run_registry_cap_reject + 1
+        );
+        assert_eq!(
+            after.run_registry_callback_expired,
+            before.run_registry_callback_expired + 1
+        );
+        assert_eq!(
+            after.run_registry_callback_resolved,
+            before.run_registry_callback_resolved + 1
+        );
+        assert_eq!(
+            after.run_registry_callback_denied,
+            before.run_registry_callback_denied + 1
+        );
+        let rendered = after.render_prometheus();
+        assert!(rendered.contains("naked_tg_run_registry_register_total"));
+        assert!(rendered.contains("naked_tg_run_registry_callback_expired_total"));
+        assert!(rendered.contains("naked_tg_run_registry_callback_resolved_total"));
+        assert!(rendered.contains("naked_tg_run_registry_callback_denied_total"));
     }
 
     #[test]

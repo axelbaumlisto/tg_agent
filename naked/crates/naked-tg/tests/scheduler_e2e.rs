@@ -327,7 +327,17 @@ async fn t_synthetic_mode_requires_dispatch_fn_and_chat_id() {
     // an actual dispatch in a unit test (would need Bot + BotDeps),
     // but we can verify the Option<SyntheticDispatchFn> field is
     // wired through.
-    let stub: SyntheticDispatchFn = Arc::new(|_msg: SyntheticMessage| Box::pin(async move {}));
+    let stub: SyntheticDispatchFn = Arc::new(
+        |_msg: SyntheticMessage, _latch: naked_tg::synthetic::SessionIdLatch| {
+            Box::pin(async move {
+                Ok(naked_tg::synthetic::SyntheticDispatchOutcome {
+                    session_id: "stub".into(),
+                    stop_reason: naked_core::research::StopReason::AgentIdle,
+                    errors: vec![],
+                })
+            })
+        },
+    );
     let cfg_with_dispatch = SchedulerConfig {
         dispatch_fn: Some(stub),
         ..SchedulerConfig::default()
@@ -338,19 +348,64 @@ async fn t_synthetic_mode_requires_dispatch_fn_and_chat_id() {
     );
 }
 
-/// T6.5 sentinel: synthetic_mode requires BOTH dispatch_fn AND chat_id.
-/// Source-text grep prevents accidental removal of the gating condition
-/// (tasks.rs synthetic_mode = dispatch_fn.is_some() && chat_id.is_some()).
+/// B64 test 7e: dispatch returning Err maps to scheduler failure path.
+/// Verifies the tasks.rs synthetic branch converts dispatch Err into
+/// AgentError::Session so the scheduler records Failed, not Completed.
+#[test]
+fn t_b64_dispatch_err_maps_to_session_error() {
+    let src = include_str!("../src/scheduler/tasks.rs");
+    // The synthetic dispatch Err branch must produce AgentError::Session.
+    assert!(
+        src.contains("synthetic dispatch error"),
+        "Err branch must format 'synthetic dispatch error' for scheduler failure path"
+    );
+    assert!(
+        src.contains("AgentError::Session"),
+        "synthetic dispatch errors must be AgentError::Session so scheduler records Failed"
+    );
+}
+
+/// B64 test 7f: dispatch returning Ok(Idle, no errors) maps to scheduler success.
+/// Verifies the tasks.rs synthetic branch produces StopReason::AgentIdle only
+/// when the outcome is clean.
+#[test]
+fn t_b64_clean_idle_maps_to_success() {
+    let src = include_str!("../src/scheduler/tasks.rs");
+    // Clean Idle with no errors → Ok with AgentIdle.
+    assert!(
+        src.contains("outcome.stop_reason == StopReason::AgentIdle")
+            && src.contains("outcome.errors.is_empty()"),
+        "only clean Idle with empty errors should map to scheduler success"
+    );
+    // Errors or abnormal stop → Err (failure).
+    assert!(
+        src.contains("synthetic turn finished with"),
+        "non-clean outcome must produce a detail message for failure path"
+    );
+}
+
+/// B64 test: scheduler cancel branch aborts the synthetic session.
+#[test]
+fn t_b64_cancel_aborts_session() {
+    let src = include_str!("../src/scheduler/tasks.rs");
+    assert!(
+        src.contains("core_clone.abort(sid)"),
+        "cancel branch must call AgentCore::abort on the synthetic session"
+    );
+}
+
+/// T6.5/B79 sentinel: synthetic_mode requires dispatch_fn AND an effective
+/// origin chat (operator/inflight chat wins, spec chat is cron fallback).
+/// Source-text grep prevents accidental removal of the effective-origin gate.
 #[test]
 fn t_synthetic_mode_gating_condition_locked() {
     let src = include_str!("../src/scheduler/tasks.rs");
     assert!(
         src.contains("synthetic_mode") && src.contains("dispatch_fn.is_some()"),
-        "scheduler tasks.rs must gate synthetic dispatch on both \
-         dispatch_fn.is_some() AND spec.chat_id.is_some() (T6.3 contract)"
+        "scheduler tasks.rs must gate synthetic dispatch on dispatch_fn.is_some() and an effective origin chat"
     );
     assert!(
-        src.contains("spec_for_task.chat_id.is_some()"),
-        "synthetic_mode requires spec.chat_id (T6.4 fallback gate)"
+        src.contains("effective_origin(") && src.contains("effective_chat_id.is_some()"),
+        "synthetic_mode requires effective_origin chat (B79: inflight/operator wins, spec is fallback)"
     );
 }

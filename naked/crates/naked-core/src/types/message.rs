@@ -177,6 +177,30 @@ pub static CRASH_RECOVERY_NOTIFIED_COUNT: std::sync::atomic::AtomicU64 =
 pub static PROVIDER_VISION_CAP_MISMATCH_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// B68: provider stream-open attempts that exceeded the connect-timeout
+/// budget in `TimeoutProvider::stream_chat`. Rendered as
+/// `naked_core_provider_timeout_total{kind="connect"}`.
+pub static PROVIDER_CONNECT_TIMEOUT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B68: provider streams that opened successfully but then exceeded the
+/// inter-chunk timeout budget before the next chunk arrived. Rendered as
+/// `naked_core_provider_timeout_total{kind="inter_chunk"}`.
+pub static PROVIDER_INTER_CHUNK_TIMEOUT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B76: upstream provider rejected the request as an HTTP 400
+/// `invalid_request_error` (likely config/request-shape bug). Rendered as
+/// `naked_core_provider_invalid_request_total`.
+pub static PROVIDER_INVALID_REQUEST_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B75: scheduler skipped dispatch because the resolved research provider
+/// chain reported every key/provider blacklisted. Rendered as
+/// `naked_core_scheduler_dispatch_skipped_total`.
+pub static SCHEDULER_DISPATCH_SKIPPED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// BUG_REGISTRY D-CONFIG-MTIME-WATCH (B42 detector): bumped each
 /// time the bot detects that `state/naked.json` was modified by an
 /// external process (mtime or sha256 differs from the boot snapshot).

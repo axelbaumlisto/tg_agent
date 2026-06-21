@@ -44,6 +44,10 @@ const EMPTY_CONTENT_BASE_DELAY_MS: u64 = 250;
 
 pub struct LoopConfig {
     pub max_iterations: usize,
+    /// Optional turn-level wall-clock budget checked only at iteration boundaries.
+    /// B73: cooperative deadline for research/synthetic turns; `None` preserves
+    /// existing behavior and does not interrupt a single long stream/tool mid-flight.
+    pub max_wall: Option<std::time::Duration>,
     pub cwd: std::path::PathBuf,
     pub model: String,
     pub max_tokens: u32,
@@ -98,6 +102,7 @@ impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: 0,
+            max_wall: None,
             cwd: std::env::current_dir().unwrap_or_default(),
             model: String::new(),
             max_tokens: 16384,

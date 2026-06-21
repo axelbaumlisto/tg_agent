@@ -112,13 +112,20 @@ async fn answer_model_select(
     agent: &Arc<AgentCore>,
     q: &CallbackQuery,
     sid: &str,
-    cb_ctx: ChatCtx,
+    _cb_ctx: ChatCtx,
     prov: &str,
     model: &str,
 ) -> Result<(), teloxide::RequestError> {
     // If agent is busy on this chat, trigger in-flight model switch:
     // abort current turn and re-dispatch with a continuation.
-    let chat_key = (cb_ctx.chat_id.0, cb_ctx.raw_thread_id());
+    let run_id_for_message = q.message.as_ref().and_then(|msg| {
+        crate::shared::RUN_REGISTRY
+            .resolve_message(naked_tg::run_registry::MessageKey::new(
+                msg.chat().id.0,
+                msg.id().0,
+            ))
+            .map(|run| run.run_id)
+    });
     if agent.is_session_active(sid).await {
         let reasoning = agent.session_reasoning(sid).await;
         let thinking_suffix = reasoning
@@ -138,7 +145,10 @@ async fn answer_model_select(
             },
         };
         let map = MODEL_SWITCHES.read().await;
-        if let Some(ms) = map.get(&chat_key) {
+        if let Some(ms) = run_id_for_message
+            .as_ref()
+            .and_then(|run_id| map.get(run_id))
+        {
             let continuation = naked_tg::model_switch::build_continuation(&switch);
             ms.lock().await.request(switch);
             agent.abort(sid).await;

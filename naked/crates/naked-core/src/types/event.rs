@@ -118,6 +118,7 @@ pub struct AgentHandle {
     pub events: tokio::sync::mpsc::Receiver<AgentEvent>,
     pub permissions: tokio::sync::mpsc::Sender<PermissionResponse>,
     pub steer: tokio::sync::mpsc::Sender<SteerMessage>,
+    pub abort: tokio_util::sync::CancellationToken,
 }
 
 // ---------------------------------------------------------------------------

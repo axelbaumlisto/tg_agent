@@ -180,6 +180,7 @@ impl Tool for SubAgentTool {
         let tools = self.build_tools(mode);
         let config = LoopConfig {
             max_iterations: SUB_AGENT_MAX_ITERATIONS,
+            max_wall: None,
             cwd: cwd.to_path_buf(),
             model: self.model.clone(),
             max_tokens: 8192,

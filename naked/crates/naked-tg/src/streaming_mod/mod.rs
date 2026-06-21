@@ -6,10 +6,12 @@ mod handlers;
 mod helpers;
 mod pipeline;
 pub(crate) use delta::render_html_document;
-pub(crate) use flush::{ask_permission, flush_live, send_final};
+pub(crate) use flush::{ask_permission, flush_live_html, send_final};
 pub(crate) use handlers::ViewAction;
 pub(crate) use helpers::*;
-pub(crate) use pipeline::{register_turn_routing, stream_response};
+pub(crate) use pipeline::{
+    StreamRunContext, register_turn_routing, stream_response, streaming_control_kb_for_run,
+};
 
 #[allow(unused_imports)]
 use super::*;

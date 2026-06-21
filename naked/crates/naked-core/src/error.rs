@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// B73: stable user-visible error text emitted before `AgentError::WallTimeout`.
+pub const WALL_TIMEOUT_MESSAGE: &str = "turn wall-clock budget exceeded";
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("provider error: {0}")]
@@ -31,6 +34,9 @@ pub enum AgentError {
 
     #[error("cancelled")]
     Cancelled,
+
+    #[error("{WALL_TIMEOUT_MESSAGE}")]
+    WallTimeout,
 
     #[error("max iterations ({0}) exceeded")]
     MaxIterations(usize),

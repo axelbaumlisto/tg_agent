@@ -274,10 +274,19 @@ impl AgentCore {
             let _ = tx.send(AgentEvent::Idle).await;
             self.mark_session_idle_after_dispatch_reject(session_id)
                 .await;
+            let cancel = self
+                .ss
+                .cancels
+                .read()
+                .await
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(CancellationToken::new);
             return Ok(AgentHandle {
                 events: rx,
                 permissions: perm_tx,
                 steer: steer_tx,
+                abort: cancel,
             });
         }
 
@@ -321,6 +330,7 @@ impl AgentCore {
             provider = %setup.provider_name,
             model = %setup.model,
         );
+        let abort = cancel.clone();
         use tracing::Instrument;
 
         tokio::spawn(
@@ -355,6 +365,7 @@ impl AgentCore {
             events: rx,
             permissions: perm_tx,
             steer: steer_tx,
+            abort,
         })
     }
 

@@ -209,6 +209,9 @@ impl Tool for ResearchRunTool {
         let cfg = core.config();
         let loop_config = LoopConfig {
             max_iterations: RESEARCH_RUN_MAX_ITERATIONS,
+            max_wall: Some(std::time::Duration::from_secs(
+                cfg.research.max_wall_seconds,
+            )),
             cwd: cwd.to_path_buf(),
             model: cfg.default_model.clone(),
             provider: cfg.default_provider.clone(),
@@ -253,13 +256,54 @@ impl Tool for ResearchRunTool {
 
         let agent = AgentLoop::new(Box::new(ArcProvider(provider_arc)), tools, loop_config);
 
-        let (event_tx, _event_rx) = mpsc::channel(256);
+        // B80a: the inner research loop emits AgentEvents into `event_tx`.
+        // This receiver MUST be drained continuously: the channel is
+        // bounded, so if nobody reads it the inner loop's `tx.send().await`
+        // parks forever once 256 events pile up (observed live: a
+        // chat-driven `research_run` deadlocked the inner loop and never
+        // returned, while the parent turn span at 100% CPU). We spawn a
+        // forwarder that drains every inner event and, best-effort,
+        // mirrors display-worthy ones to the parent `progress` channel as
+        // `SubAgentProgress` so the chat bubble shows the nested research
+        // live. `try_send` is used so a slow/full parent channel never
+        // re-introduces the deadlock — dropped mirror events are cosmetic.
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+        let progress_for_forward = progress.clone();
+        let spec_id_for_forward = spec_id.clone();
+        let forward_handle = tokio::spawn(async move {
+            use crate::types::SubAgentEvent;
+            while let Some(ev) = event_rx.recv().await {
+                let mapped = match ev {
+                    AgentEvent::ToolStart { name, input, .. } => Some(SubAgentEvent::ToolUse {
+                        name,
+                        input_preview: input.to_string().chars().take(120).collect(),
+                    }),
+                    AgentEvent::ToolEnd { name, state, .. } => {
+                        Some(SubAgentEvent::ToolDone { name, state })
+                    }
+                    AgentEvent::Error(e) => Some(SubAgentEvent::Error(e)),
+                    // Drained but not mirrored (deltas/usage/idle/etc.):
+                    // draining alone is what prevents the B80a deadlock.
+                    _ => None,
+                };
+                if let Some(event) = mapped {
+                    let _ = progress_for_forward.try_send(AgentEvent::SubAgentProgress {
+                        agent_id: spec_id_for_forward.clone(),
+                        event,
+                    });
+                }
+            }
+        });
+
         let run_result = agent
             .run(&mut history, event_tx, inner_cancel.clone(), None, None)
             .await;
 
-        // Stop the monitor.
+        // Stop the monitor + forwarder. The inner loop has returned, so
+        // `event_tx` is dropped; the forwarder will see the channel close
+        // and exit on its own, but abort() guarantees prompt teardown.
         monitor_handle.abort();
+        forward_handle.abort();
 
         let was_cancelled = inner_cancel.is_cancelled();
         let findings_saved = core.research.context.save_count();

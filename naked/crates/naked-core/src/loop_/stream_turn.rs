@@ -22,6 +22,9 @@ pub(super) struct TurnStreamOutcome {
     /// True when the stream produced no content at all (no text, no tools, no thinking).
     /// The outer loop decides whether to retry via the empty-content-attempts budget.
     pub(super) empty: bool,
+    /// True when the stream observed an explicit protocol terminal marker.
+    /// Empty + saw_done means the model cleanly chose silence, not stream death.
+    pub(super) saw_done: bool,
     /// S2/S3 of PLAN_NEXT_SESSION: true when the stream was broken
     /// out of mid-flight because a steer message arrived. The outer
     /// loop must drain steers and re-issue the iteration WITHOUT
@@ -50,11 +53,13 @@ impl super::AgentLoop {
         let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
         let mut turn_usage: Option<TurnUsage> = None;
         let mut stream_ok = false;
+        let mut saw_done = false;
         // Hoisted out of the retry loop so the post-loop tail can
         // surface it on the TurnStreamOutcome.
         let mut mid_stream_steer_flag = false;
 
         for retry in 0..=MAX_STREAM_RETRIES {
+            tracing::debug!(retry, "stream_turn: opening provider stream");
             let connect_result = tokio::select! {
                 _ = cancel.cancelled() => {
                     return Err(AgentError::Cancelled);
@@ -62,7 +67,10 @@ impl super::AgentLoop {
                 r = self.provider.stream_chat(request.clone()) => r,
             };
             let mut stream = match connect_result {
-                Ok(s) => s,
+                Ok(s) => {
+                    tracing::debug!(retry, "stream_turn: provider stream opened");
+                    s
+                }
                 Err(e) => {
                     if matches!(
                         &e,
@@ -131,7 +139,9 @@ impl super::AgentLoop {
             blocks.clear();
             tool_calls.clear();
             turn_usage = None;
+            saw_done = false;
             let mut mid_stream_error = None;
+            let mut first_chunk_seen = false;
 
             loop {
                 // S2 of PLAN_NEXT_SESSION: 3-arm select! — cancel,
@@ -171,11 +181,23 @@ impl super::AgentLoop {
                             mid_stream_steer_flag = true;
                             break;
                         }
-                        // Channel closed (sender dropped) — fall
-                        // through and keep streaming.
+                        // B80b: recv() returned None => the steer sender
+                        // is CLOSED. Drop the receiver so this arm parks
+                        // on `pending()` from now on. Without this, a
+                        // `continue` re-polls the closed channel, which
+                        // resolves None instantly on every poll and spins
+                        // the CPU whenever the model stream is not
+                        // immediately ready (same failure mode as B80b in
+                        // execute_readonly_batch).
+                        *steer_rx = None;
                         continue;
                     }
                 };
+
+                if !first_chunk_seen {
+                    first_chunk_seen = true;
+                    tracing::debug!(retry, "stream_turn: first stream chunk received");
+                }
 
                 match chunk {
                     StreamChunk::Text(t) => {
@@ -228,7 +250,10 @@ impl super::AgentLoop {
                         turn_usage = Some(u.clone());
                         let _ = tx.send(AgentEvent::UsageUpdate(u)).await;
                     }
-                    StreamChunk::Done => break,
+                    StreamChunk::Done => {
+                        saw_done = true;
+                        break;
+                    }
                     StreamChunk::Error(e) => {
                         mid_stream_error = Some(e);
                         break;
@@ -311,6 +336,7 @@ impl super::AgentLoop {
             tool_calls,
             turn_usage,
             empty,
+            saw_done,
             mid_stream_steer: mid_stream_steer_flag,
         })
     }

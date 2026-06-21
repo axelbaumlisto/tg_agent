@@ -91,6 +91,57 @@ pub fn logical_provider_name(tagged: &str) -> &str {
     }
 }
 
+/// Shared reqwest client builder for streaming LLM providers.
+///
+/// - `connect_timeout(10s)`: bound TCP+TLS establishment.
+/// - `read_timeout(DEFAULT_INTER_CHUNK_TIMEOUT)`: B78 — bound idle gaps
+///   between body reads (header-wait / first-byte / inter-chunk) at the
+///   transport layer, below the StreamExt inter-chunk guard. Aligns with
+///   the 60s inter-chunk policy so legitimate slow thinking streams that
+///   already pass the StreamExt guard are not newly killed.
+/// - `timeout(300s)`: total request deadline (unchanged).
+pub(crate) fn build_streaming_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(crate::provider::timeout::DEFAULT_INTER_CHUNK_TIMEOUT)
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .unwrap_or_default()
+}
+
+/// B71 + B81: thinking-class models (Claude via airpx, native Anthropic
+/// extended-thinking) reject an explicit `temperature` when thinking is
+/// enabled. B81 (2026-06-21 live): airpx `claude-sonnet-4-6` runs in
+/// *adaptive mode* where thinking is on by default server-side, so it
+/// rejects ANY explicit temperature ≠ 1 even when the request carries
+/// `reasoning: off` / no reasoning (error: "temperature may only be set
+/// to 1 when thinking is enabled or in adaptive mode"). The earlier B71
+/// rule — "thinking model + reasoning off + 0.0 <= temp < 1.0 → send" —
+/// was therefore unsafe and broke the research fallback chain. KISS-safe
+/// fix: for a thinking-capable model, NEVER serialize an explicit
+/// temperature; let the provider's adaptive default apply.
+/// Returns true only when it is safe to serialize `temperature`.
+pub(crate) fn should_send_temperature(
+    temp: Option<f32>,
+    reasoning_on: bool,
+    model_supports_thinking: bool,
+) -> bool {
+    match temp {
+        None => false,
+        Some(t) => {
+            if reasoning_on {
+                return false;
+            }
+            if model_supports_thinking {
+                // B81: adaptive-mode thinking proxies reject any explicit
+                // temperature regardless of reasoning flag.
+                return false;
+            }
+            t.is_finite() && (0.0..=1.0).contains(&t)
+        }
+    }
+}
+
 /// Pass-through impl so `Box<dyn Provider>` can stand in wherever
 /// `P: Provider` is required (notably as the inner of
 /// [`timeout::TimeoutProvider`]). R3 of `PLAN_NEXT_SESSION.md`.
@@ -171,6 +222,29 @@ mod tests {
         assert_eq!(json["name"], "bash");
         assert_eq!(json["description"], "Run a command");
         assert!(json["input_schema"]["properties"]["command"].is_object());
+    }
+
+    #[test]
+    fn should_send_temperature_matches_b71_b81_truth_table() {
+        // No temperature requested -> never send.
+        assert!(!should_send_temperature(None, false, false));
+        // reasoning_on -> never send (any model).
+        assert!(!should_send_temperature(Some(0.5), true, false));
+        assert!(!should_send_temperature(Some(0.5), true, true));
+        // Non-thinking model, reasoning off: send finite temp in [0,1].
+        assert!(should_send_temperature(Some(0.5), false, false));
+        assert!(should_send_temperature(Some(1.0), false, false));
+        assert!(!should_send_temperature(Some(-0.1), false, false));
+        assert!(!should_send_temperature(Some(1.5), false, false));
+        assert!(!should_send_temperature(Some(f32::NAN), false, false));
+        // B81: thinking-capable model (adaptive mode) -> NEVER send an
+        // explicit temperature, regardless of value or reasoning flag.
+        assert!(!should_send_temperature(Some(0.0), false, true));
+        assert!(!should_send_temperature(Some(0.5), false, true));
+        assert!(!should_send_temperature(Some(1.0), false, true));
+        assert!(!should_send_temperature(Some(-0.1), false, true));
+        assert!(!should_send_temperature(Some(1.5), false, true));
+        assert!(!should_send_temperature(Some(f32::NAN), false, true));
     }
 
     #[test]

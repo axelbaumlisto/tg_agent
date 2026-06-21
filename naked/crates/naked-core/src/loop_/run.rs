@@ -51,6 +51,7 @@ impl super::AgentLoop {
         let mut empty_budget = EmptyContentBudget::new();
         // R1: SteerPipeline owns pending vec + delivered set.
         let mut steer = SteerPipeline::new();
+        let started = std::time::Instant::now();
 
         'outer: for _iteration in 0..limit {
             if cancel.is_cancelled() {
@@ -71,6 +72,26 @@ impl super::AgentLoop {
 
             // Drain steer messages between iterations.
             steer.drain(&mut steer_rx, history, &tx).await;
+
+            if let Some(max_wall) = self.config.max_wall
+                && started.elapsed() >= max_wall
+            {
+                // B73: cooperative turn-level wall-clock budget. This check is
+                // intentionally at the iteration boundary (not a tokio::timeout
+                // wrapper) so streams/tools keep their own cancellation behavior
+                // and the B70 cleanup contract is preserved.
+                let msg = crate::error::WALL_TIMEOUT_MESSAGE.to_string();
+                let _ = tx.send(AgentEvent::Error(msg.clone())).await;
+                let _ = tx.send(AgentEvent::Idle).await;
+                self.config.record_health(
+                    crate::model_catalog::HealthEventKind::Error,
+                    None,
+                    Some("turn wall timeout".into()),
+                );
+                let rescued = steer.drain(&mut steer_rx, history, &tx).await;
+                bump_drained_on_abort_if_rescued(rescued);
+                return Err(AgentError::WallTimeout);
+            }
 
             // Checkpoint-restart cycle: if token usage exceeds threshold,
             // archive old messages and restart with fresh context.
@@ -120,15 +141,17 @@ impl super::AgentLoop {
             // Guard against "provider returned nothing" turns.
             //
             // Some providers (notably `glm-cn`/`glm-5-turbo`) can close a
-            // stream with zero output tokens, no tool calls, and no
-            // reasoning chunks. The first occurrence is almost always
-            // transient under load, so we retry the same request up to
-            // `MAX_EMPTY_CONTENT_RETRIES` times with a short back-off.
-            // Only when retries are exhausted do we surface an Error and
-            // return without polluting history (which would cause the
-            // "dirty-session 0-tok refusal" loop on subsequent turns).
+            // stream cleanly with zero output tokens, no tool calls, and no
+            // reasoning chunks. If we saw the protocol terminal marker, this
+            // is genuine model silence and retrying the same context will not
+            // help. Only defensive empty streams without Done use the retry
+            // budget; B65 turns abnormal SSE EOF into `StreamChunk::Error`,
+            // but keep this fallback for non-SSE/legacy providers.
+            // The terminal path below must keep Error + Idle + steer drain.
             if outcome.empty {
-                if let Some(delay) = empty_budget.next_delay() {
+                if !outcome.saw_done
+                    && let Some(delay) = empty_budget.next_delay()
+                {
                     crate::types::EMPTY_CONTENT_RETRY_COUNT
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.config.observer.on_retry(

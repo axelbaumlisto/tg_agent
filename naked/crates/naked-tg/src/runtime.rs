@@ -317,18 +317,32 @@ impl UpdateDispatcher {
         // If a turn is actively streaming for this chat, inject as steer edit
         // rather than a new message.
         let steer_key = (chat_id_raw, tid_raw);
-        let steered = {
-            let map = STEER_SENDERS.read().await;
-            if let Some(tx) = map.get(&steer_key) {
-                tx.try_send(naked_core::types::SteerMessage {
+        let steered = match crate::shared::RUN_REGISTRY.resolve_for_steer(
+            naked_tg::run_registry::ChatThreadKey::new(steer_key.0, steer_key.1),
+        ) {
+            naked_tg::run_registry::ResolveForSteer::Unique(run) => {
+                let map = STEER_SENDERS.read().await;
+                map.get(&run.run_id)
+                    .and_then(|tx| {
+                        tx.try_send(naked_core::types::SteerMessage {
+                            msg_id,
+                            text: edit_text.clone(),
+                            is_edit: true,
+                        })
+                        .ok()
+                    })
+                    .is_some()
+            }
+            naked_tg::run_registry::ResolveForSteer::Ambiguous(runs) => {
+                tracing::info!(
+                    chat_id = chat_id_raw,
                     msg_id,
-                    text: edit_text.clone(),
-                    is_edit: true,
-                })
-                .is_ok()
-            } else {
+                    active = runs.len(),
+                    "edited_message steer ambiguous; not picking a run"
+                );
                 false
             }
+            naked_tg::run_registry::ResolveForSteer::NotFound => false,
         };
 
         if steered {
@@ -492,8 +506,9 @@ async fn text_burst_key_if_eligible(deps: &BotDeps, msg: &Message) -> Option<alb
 }
 
 async fn steer_sender_exists(key: (i64, Option<i32>)) -> bool {
-    let map = STEER_SENDERS.read().await;
-    map.contains_key(&key)
+    !crate::shared::RUN_REGISTRY
+        .list_for_thread(naked_tg::run_registry::ChatThreadKey::new(key.0, key.1))
+        .is_empty()
 }
 
 fn should_count_coalesced(merged_len: usize) -> bool {

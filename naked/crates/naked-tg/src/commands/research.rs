@@ -94,7 +94,12 @@ pub(crate) async fn handle_research_cmd(
     let reply = match sub.as_str() {
         "" | "help" => "\
 /research list                  нумерованный список
-/research show <N|id>           spec + находки
+/research runs                  live runs in this chat/thread
+/research show <run_id>         live mirror текущего in-flight run
+/research steer <run_id> <text> steer a specific live run
+/research move <run_id> here    move live run bubble to this chat/thread
+/research fresh <N|id>          stored spec + свежие находки
+/research delta <N|id>          alias fresh
 /research run <N|id>            запустить прогон
 /research ask <N|id> <вопрос>   спросить по находкам
 /research pause <N|id>          пауза
@@ -163,7 +168,9 @@ pub(crate) async fn handle_research_cmd(
                     ));
                     ids.push(s.id.clone());
                 }
-                out.push_str("\n`/research show|run|pause|rm <N>`");
+                out.push_str(
+                    "\n`/research fresh|run|pause|rm <N>` (live: `/research show <run_id>`)",
+                );
                 // Store index for numeric refs.
                 LIST_INDEX.write().await.insert(ctx.chat_id.0, ids);
                 out
@@ -171,6 +178,28 @@ pub(crate) async fn handle_research_cmd(
             Err(e) => format!("error: {e}"),
         },
         "metrics" => format_research_metrics(agent, &tail).await,
+        "runs" => {
+            reply_html(
+                bot,
+                ctx,
+                format_live_runs_for_thread(
+                    &crate::shared::RUN_REGISTRY,
+                    ctx.chat_id.0,
+                    ctx.raw_thread_id(),
+                ),
+            )
+            .await?;
+            String::new()
+        }
+        "steer" => {
+            let msg = explicit_steer_live_run(&crate::shared::RUN_REGISTRY, ctx, &raw_tail).await;
+            reply_html(bot, ctx, msg).await?;
+            String::new()
+        }
+        "move" => {
+            move_live_run_here(deps, ctx, &raw_tail).await?;
+            String::new()
+        }
         "state" => {
             if tail.is_empty() {
                 "Usage: /research state <id>".to_string()
@@ -203,9 +232,11 @@ pub(crate) async fn handle_research_cmd(
                 }
             }
         }
-        "show" | "fresh" | "delta" => {
-            format_research_show(agent, &tail, sub == "fresh" || sub == "delta").await
+        "show" => {
+            send_live_run_snapshot(bot, ctx, &crate::shared::RUN_REGISTRY, &raw_tail).await?;
+            String::new()
         }
+        "fresh" | "delta" => format_research_show(agent, &tail, true).await,
         "run" => {
             // PLAN_BG_UNIFY_v2 T3: dispatch through scheduler for
             // heartbeat, timeout, resurrect, and concurrency cap.
@@ -439,12 +470,347 @@ async fn schedule_research_on(
     }
 }
 
-async fn format_research_show(agent: &Arc<AgentCore>, tail: &str, fresh_only: bool) -> String {
-    let usage = if fresh_only {
-        "Usage: /research fresh <id>"
-    } else {
-        "Usage: /research show <id>"
+pub(crate) async fn send_live_run_snapshot(
+    bot: &Bot,
+    ctx: &ChatCtx,
+    registry: &naked_tg::run_registry::RunRegistry,
+    run_id: &str,
+) -> Result<(), teloxide::RequestError> {
+    let run_id = run_id.trim();
+    let Some(run) = registry.get_run(run_id) else {
+        reply_html(bot, ctx, format_live_run_snapshot(registry, run_id)).await?;
+        return Ok(());
     };
+
+    if !matches!(
+        run.status,
+        naked_tg::run_registry::RunStatus::Streaming
+            | naked_tg::run_registry::RunStatus::AwaitingTool
+            | naked_tg::run_registry::RunStatus::Idle
+    ) {
+        reply_html(bot, ctx, format_live_run_snapshot(registry, run_id)).await?;
+        return Ok(());
+    }
+
+    if registry.mirror_sinks(run_id).len() >= naked_tg::run_registry::MIRROR_SINK_CAP {
+        reply_text(
+            bot,
+            ctx,
+            "⚠️ mirror limit reached for this run (home + 2 mirrors).",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let initial_html = if run.rendered.live_html.trim().is_empty() {
+        format!(
+            "⏳ mirroring run <code>{}</code>…",
+            naked_tg::markup::escape_html(run_id)
+        )
+    } else {
+        run.rendered.live_html.clone()
+    };
+    let sent = bot
+        .send_message(ctx.chat_id, initial_html)
+        .parse_mode(ParseMode::Html)
+        .maybe_thread(ctx.thread_id)
+        .maybe_reply_to(ctx.reply_to)
+        .reply_markup(crate::streaming::streaming_control_kb_for_run(run_id))
+        .await?;
+    match registry.add_mirror_sink(
+        run_id,
+        naked_tg::run_registry::RunSink::new(ctx.chat_id.0, ctx.raw_thread_id(), sent.id.0),
+    ) {
+        Ok(_) => {}
+        Err(naked_tg::run_registry::MirrorSinkError::SinkCapacityExceeded { .. }) => {
+            let _ = bot
+                .edit_message_text(
+                    ctx.chat_id,
+                    sent.id,
+                    "⚠️ mirror limit reached for this run (home + 2 mirrors).",
+                )
+                .await;
+            let _ = bot.edit_message_reply_markup(ctx.chat_id, sent.id).await;
+        }
+        Err(_) => {
+            let _ = bot
+                .edit_message_text(ctx.chat_id, sent.id, "run not found or expired")
+                .await;
+            let _ = bot.edit_message_reply_markup(ctx.chat_id, sent.id).await;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_live_runs_for_thread(
+    registry: &naked_tg::run_registry::RunRegistry,
+    chat_id: i64,
+    thread_id: Option<i32>,
+) -> String {
+    let runs = registry.list_for_thread(naked_tg::run_registry::ChatThreadKey::new(
+        chat_id, thread_id,
+    ));
+    if runs.is_empty() {
+        return "No live runs in this chat/thread.".to_string();
+    }
+    let mut out = String::from("🏃 <b>live runs here</b>\n");
+    for (idx, run) in runs
+        .iter()
+        .take(naked_tg::run_registry::MULTI_RUN_THREAD_CAP)
+        .enumerate()
+    {
+        let n = idx + 1;
+        let run_id = naked_tg::markup::escape_html(&run.run_id);
+        let label = run
+            .source_ref
+            .as_deref()
+            .map(naked_tg::markup::escape_html)
+            .unwrap_or_else(|| match &run.kind {
+                naked_tg::run_registry::RunKind::ChatTurn => "chat-turn".to_string(),
+                naked_tg::run_registry::RunKind::Research { spec_id } => {
+                    naked_tg::markup::escape_html(spec_id)
+                }
+                naked_tg::run_registry::RunKind::SubAgent { label } => {
+                    naked_tg::markup::escape_html(label)
+                }
+            });
+        let status = naked_tg::markup::escape_html(&format!("{:?}", run.status));
+        out.push_str(&format!(
+            "{n}. <code>{run_id}</code> · {label} · <code>{status}</code> · origin <code>{}:{:?}</code>\n",
+            run.origin.chat_id, run.origin.thread_id
+        ));
+    }
+    out.push_str("\nUse <code>/research steer &lt;run_id&gt; &lt;text&gt;</code> or <code>/research show &lt;run_id&gt;</code>.");
+    out
+}
+
+pub(crate) async fn move_live_run_here(
+    deps: &crate::message_handler::BotDeps,
+    ctx: &ChatCtx,
+    raw_tail: &str,
+) -> Result<(), teloxide::RequestError> {
+    let mut parts = raw_tail.split_whitespace();
+    let run_id = parts.next().unwrap_or("");
+    let here = parts.next().unwrap_or("");
+    if run_id.is_empty() || here != "here" || parts.next().is_some() {
+        reply_text(&deps.bot, ctx, "Usage: /research move <run_id> here").await?;
+        return Ok(());
+    }
+    let registry = &crate::shared::RUN_REGISTRY;
+    let new_origin = naked_tg::run_registry::RunOrigin::new(ctx.chat_id.0, ctx.raw_thread_id());
+    let options = if deps.config.run_registry_multi_stream_enabled {
+        naked_tg::run_registry::RegisterRunOptions::cap_three()
+    } else {
+        naked_tg::run_registry::RegisterRunOptions::step2_single_run()
+    };
+
+    let sent = deps
+        .bot
+        .send_message(
+            ctx.chat_id,
+            format!(
+                "↪ moved here: <code>{}</code>",
+                naked_tg::markup::escape_html(run_id)
+            ),
+        )
+        .parse_mode(ParseMode::Html)
+        .maybe_thread(ctx.thread_id)
+        .await?;
+
+    let plan = match registry.move_run(run_id, new_origin.clone(), options) {
+        Ok(plan) => plan,
+        Err(naked_tg::run_registry::MoveRunError::RunNotFound { .. }) => {
+            let _ = deps
+                .bot
+                .edit_message_text(ctx.chat_id, sent.id, "run not found or expired")
+                .await;
+            let _ = deps
+                .bot
+                .edit_message_reply_markup(ctx.chat_id, sent.id)
+                .await;
+            return Ok(());
+        }
+        Err(naked_tg::run_registry::MoveRunError::ThreadCapacityExceeded {
+            active, cap, ..
+        }) => {
+            let _ = deps
+                .bot
+                .edit_message_text(
+                    ctx.chat_id,
+                    sent.id,
+                    format!(
+                        "⚠️ destination already has {active}/{cap} active runs — abort or wait before moving here."
+                    ),
+                )
+                .await;
+            let _ = deps
+                .bot
+                .edit_message_reply_markup(ctx.chat_id, sent.id)
+                .await;
+            return Ok(());
+        }
+    };
+
+    let bound = registry.bind_message(
+        &plan.run_id,
+        naked_tg::run_registry::MessageKey::new(ctx.chat_id.0, sent.id.0),
+    );
+    match bound {
+        Ok(_) => {
+            crate::shared::CONTROL_CARDS
+                .write()
+                .await
+                .insert(plan.run_id.clone(), (ctx.chat_id, sent.id));
+            if let Err(e) = deps
+                .bot
+                .edit_message_reply_markup(ctx.chat_id, sent.id)
+                .reply_markup(crate::streaming::streaming_control_kb_for_run(&plan.run_id))
+                .await
+            {
+                tracing::warn!(
+                    run_id = %plan.run_id,
+                    chat = ctx.chat_id.0,
+                    message_id = sent.id.0,
+                    error = %e,
+                    "move re-home: failed to attach controls to destination bubble after bind"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                run_id = %plan.run_id,
+                chat = ctx.chat_id.0,
+                message_id = sent.id.0,
+                error = ?e,
+                "move re-home: bind_message failed after successful registry move; destination bubble left without controls"
+            );
+        }
+    }
+    deps.channel_map
+        .set(ctx.chat_id.0, ctx.raw_thread_id(), plan.session_id.clone())
+        .await;
+
+    if let Some(old) = plan.old_bubble.as_ref() {
+        let _ = deps
+            .bot
+            .edit_message_text(
+                teloxide::types::ChatId(old.chat_id),
+                teloxide::types::MessageId(old.message_id),
+                format!(
+                    "↪ moved to chat {}{}",
+                    plan.new_origin.chat_id,
+                    plan.new_origin
+                        .thread_id
+                        .map(|tid| format!(" / thread {tid}"))
+                        .unwrap_or_default()
+                ),
+            )
+            .await;
+        let _ = deps
+            .bot
+            .edit_message_reply_markup(
+                teloxide::types::ChatId(old.chat_id),
+                teloxide::types::MessageId(old.message_id),
+            )
+            .await;
+    }
+    Ok(())
+}
+
+pub(crate) async fn explicit_steer_live_run(
+    registry: &naked_tg::run_registry::RunRegistry,
+    ctx: &ChatCtx,
+    raw_tail: &str,
+) -> String {
+    let mut parts = raw_tail.splitn(2, char::is_whitespace);
+    let run_id = parts.next().unwrap_or("").trim();
+    let text = parts.next().unwrap_or("").trim();
+    if run_id.is_empty() || text.is_empty() {
+        return "Usage: /research steer <run_id> <text>".to_string();
+    }
+    let Some(control) = registry.control_for_run(run_id) else {
+        return format!(
+            "run not found or expired: <code>{}</code>",
+            naked_tg::markup::escape_html(run_id)
+        );
+    };
+    let msg_id = ctx.reply_to.map(|id| id.0).unwrap_or(0);
+    match control.steer.try_send(naked_core::types::SteerMessage {
+        msg_id,
+        text: text.to_string(),
+        is_edit: false,
+    }) {
+        Ok(()) => format!(
+            "↩️ accepted steer for <code>{}</code>",
+            naked_tg::markup::escape_html(&control.run_id)
+        ),
+        Err(_) => format!(
+            "run <code>{}</code> is busy; try again shortly",
+            naked_tg::markup::escape_html(&control.run_id)
+        ),
+    }
+}
+
+pub(crate) fn format_live_run_snapshot(
+    registry: &naked_tg::run_registry::RunRegistry,
+    run_id: &str,
+) -> String {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return "Usage: /research show <run_id>\n\
+                This command shows in-flight live runs only; use /research fresh <id> for stored findings."
+            .to_string();
+    }
+
+    let Some(run) = registry.get_run(run_id) else {
+        let run_id_html = naked_tg::markup::escape_html(run_id);
+        return format!(
+            "run not found or expired: <code>{run_id_html}</code>\n\
+             This shows in-flight runs only; use /research fresh &lt;id&gt; for stored findings."
+        );
+    };
+
+    let run_id_html = naked_tg::markup::escape_html(&run.run_id);
+    let source = run
+        .source_ref
+        .as_deref()
+        .map(naked_tg::markup::escape_html)
+        .unwrap_or_else(|| "—".to_string());
+    let status = naked_tg::markup::escape_html(&format!("{:?}", run.status));
+    let status_line = run
+        .rendered
+        .status_line
+        .as_deref()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            format!(
+                "\nline: <code>{}</code>",
+                naked_tg::markup::escape_html(line)
+            )
+        })
+        .unwrap_or_default();
+    let body = run
+        .rendered
+        .final_html
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+        .or_else(|| {
+            let html = run.rendered.live_html.trim();
+            (!html.is_empty()).then_some(html)
+        })
+        .unwrap_or("<i>(no cached render yet)</i>");
+
+    format!(
+        "📸 <b>Live run snapshot</b>\n\
+         run: <code>{run_id_html}</code>\n\
+         source: <code>{source}</code>\n\
+         status: <code>{status}</code>{status_line}\n\n{body}\n\n\
+         <i>Static snapshot only — use /research fresh &lt;id&gt; for stored findings.</i>"
+    )
+}
+
+async fn format_research_show(agent: &Arc<AgentCore>, tail: &str, fresh_only: bool) -> String {
+    let usage = "Usage: /research fresh <id>";
     if tail.is_empty() {
         return usage.to_string();
     }
@@ -581,6 +947,8 @@ mod tests {
     //! contract: adding/removing them changes how operators invoke commands.
     //! Source-text assertion is the simplest defence against silent removal.
 
+    use teloxide::Bot;
+
     fn source() -> &'static str {
         include_str!("research.rs")
     }
@@ -654,5 +1022,232 @@ mod tests {
             !prod.contains("BgGuard"),
             "must NOT use BgGuard (replaced by scheduler Inflight)"
         );
+    }
+
+    fn registry_with_cached_run() -> naked_tg::run_registry::RunRegistry {
+        use naked_core::types::SteerMessage;
+        use naked_tg::run_registry::{
+            RegisterRunInput, RegisterRunOptions, RenderedRunState, RunKind, RunOrigin, RunRegistry,
+        };
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = RunRegistry::new();
+        let (steer, _rx) = mpsc::channel::<SteerMessage>(4);
+        registry
+            .register_run(
+                RegisterRunInput {
+                    requested_run_id: Some("run-live-1".to_string()),
+                    session_id: "session-live-1".to_string(),
+                    origin: RunOrigin::new(6_196_099_449, Some(42)),
+                    kind: RunKind::Research {
+                        spec_id: "spec-live-1".to_string(),
+                    },
+                    source_ref: Some("spec-live-1".to_string()),
+                    steer,
+                    abort: CancellationToken::new(),
+                },
+                RegisterRunOptions::step2_single_run(),
+            )
+            .expect("register cached run");
+        registry.update_rendered_state(
+            "run-live-1",
+            RenderedRunState {
+                live_html: "<b>cached live tail</b>\nlast tool: research_run".to_string(),
+                final_html: None,
+                status_line: Some("Streaming #7".to_string()),
+            },
+        );
+        registry
+    }
+
+    #[test]
+    fn research_runs_lists_max_three_live_runs() {
+        use naked_core::types::SteerMessage;
+        use naked_tg::run_registry::{
+            RegisterRunInput, RegisterRunOptions, RunKind, RunOrigin, RunRegistry,
+        };
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = RunRegistry::new();
+        for idx in 0..3 {
+            let (steer, _rx) = mpsc::channel::<SteerMessage>(4);
+            registry
+                .register_run(
+                    RegisterRunInput {
+                        requested_run_id: Some(format!("run-{idx}")),
+                        session_id: format!("sid-{idx}"),
+                        origin: RunOrigin::new(777, Some(9)),
+                        kind: RunKind::Research {
+                            spec_id: format!("spec-{idx}"),
+                        },
+                        source_ref: Some(format!("spec-{idx}")),
+                        steer,
+                        abort: CancellationToken::new(),
+                    },
+                    RegisterRunOptions::cap_three(),
+                )
+                .unwrap();
+        }
+        let out = super::format_live_runs_for_thread(&registry, 777, Some(9));
+        assert!(out.contains("live runs here"), "got: {out}");
+        for idx in 0..3 {
+            assert!(out.contains(&format!("run-{idx}")), "got: {out}");
+            assert!(out.contains(&format!("spec-{idx}")), "got: {out}");
+        }
+        assert!(
+            out.contains("origin <code>777:Some(9)</code>"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn research_steer_explicit_run_id_targets_one() {
+        use naked_core::types::SteerMessage;
+        use naked_tg::run_registry::{
+            RegisterRunInput, RegisterRunOptions, RunKind, RunOrigin, RunRegistry,
+        };
+        use teloxide::types::{ChatId, MessageId};
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = RunRegistry::new();
+        let (tx_a, mut rx_a) = mpsc::channel::<SteerMessage>(4);
+        let (tx_b, mut rx_b) = mpsc::channel::<SteerMessage>(4);
+        for (run_id, sid, steer) in [("run-a", "sid-a", tx_a), ("run-b", "sid-b", tx_b)] {
+            registry
+                .register_run(
+                    RegisterRunInput {
+                        requested_run_id: Some(run_id.to_string()),
+                        session_id: sid.to_string(),
+                        origin: RunOrigin::new(777, None),
+                        kind: RunKind::ChatTurn,
+                        source_ref: None,
+                        steer,
+                        abort: CancellationToken::new(),
+                    },
+                    RegisterRunOptions::cap_three(),
+                )
+                .unwrap();
+        }
+        let ctx = crate::shared::ChatCtx {
+            chat_id: ChatId(777),
+            thread_id: None,
+            reply_to: Some(MessageId(1234)),
+        };
+        let out = super::explicit_steer_live_run(&registry, &ctx, "run-b please focus").await;
+        assert!(out.contains("run-b"), "got: {out}");
+        assert!(rx_a.try_recv().is_err(), "run A must be untouched");
+        let msg = rx_b.try_recv().expect("run B receives steer");
+        assert_eq!(msg.msg_id, 1234);
+        assert_eq!(msg.text, "please focus");
+        assert!(!msg.is_edit);
+    }
+
+    #[test]
+    fn show_snapshot_reads_cached_rendered_state_without_polling_events() {
+        let registry = registry_with_cached_run();
+        let out = super::format_live_run_snapshot(&registry, "run-live-1");
+        assert!(out.contains("📸 <b>Live run snapshot</b>"), "got: {out}");
+        assert!(out.contains("<code>run-live-1</code>"), "got: {out}");
+        assert!(out.contains("<b>cached live tail</b>"), "got: {out}");
+        assert!(out.contains("Streaming #7"), "got: {out}");
+        assert!(out.contains("/research fresh &lt;id&gt;"), "got: {out}");
+
+        // Type-level isolation is the real single-consumer proof: the formatter
+        // accepts only (&RunRegistry, run_id) and returns a String. There is no
+        // AgentHandle/events receiver/stream_response value to poll or clone.
+        let prod = source().split("#[cfg(test)]").next().unwrap_or("");
+        let formatter = prod
+            .split("pub(crate) fn format_live_run_snapshot")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn format_research_show").next())
+            .expect("formatter source section");
+        assert!(formatter.contains("registry: &naked_tg::run_registry::RunRegistry"));
+        assert!(formatter.contains("run_id: &str"));
+        assert!(
+            !formatter.contains("AgentHandle"),
+            "formatter must not mention AgentHandle"
+        );
+        assert!(
+            !formatter.contains("events"),
+            "formatter must not mention events"
+        );
+        assert!(
+            !formatter.contains("stream_response"),
+            "formatter must not call stream_response"
+        );
+    }
+
+    #[test]
+    fn show_snapshot_unknown_run_friendly() {
+        let registry = naked_tg::run_registry::RunRegistry::new();
+        let out = super::format_live_run_snapshot(&registry, "stale-run");
+        assert!(out.contains("run not found or expired"), "got: {out}");
+        assert!(out.contains("in-flight runs only"), "got: {out}");
+        assert!(out.contains("/research fresh &lt;id&gt;"), "got: {out}");
+        assert!(
+            !out.contains("findings:"),
+            "must not fall back to stored report: {out}"
+        );
+        assert!(
+            !out.contains("recent:"),
+            "must not fall back to stored report: {out}"
+        );
+    }
+
+    fn mock_bot(mock_url: &str) -> Bot {
+        let url = reqwest::Url::parse(mock_url).unwrap();
+        Bot::new("0:TEST_TOKEN").set_api_url(url)
+    }
+
+    #[tokio::test]
+    async fn show_live_run_mockbot_adds_one_mirror_bubble() {
+        use teloxide::types::ChatId;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry = registry_with_cached_run();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 4242,
+                    "date": 0,
+                    "chat": {"id": 777, "type": "private", "first_name": "x"},
+                    "text": "ack"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bot = mock_bot(&server.uri());
+        let ctx = crate::shared::ChatCtx {
+            chat_id: ChatId(777),
+            thread_id: None,
+            reply_to: None,
+        };
+        let _ = super::send_live_run_snapshot(&bot, &ctx, &registry, "run-live-1").await;
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "live /research show must send exactly one mirror bubble"
+        );
+        let body = std::str::from_utf8(&received[0].body).unwrap_or("");
+        assert!(body.contains("cached live tail"), "body={body}");
+        assert!(
+            body.contains("HTML"),
+            "mirror must be sent as HTML: body={body}"
+        );
+        assert!(
+            body.contains("s:abort:run-live-1"),
+            "mirror controls must target run_id: body={body}"
+        );
+        assert_eq!(registry.mirror_sinks("run-live-1").len(), 1);
     }
 }

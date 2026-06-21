@@ -258,16 +258,15 @@ pub(crate) async fn ask_permission(
     }
 }
 
-pub(crate) async fn flush_live(
+pub(crate) async fn flush_live_html(
     bot: &Bot,
     chat_id: ChatId,
     msg_id: MessageId,
-    view: &CompositeView,
+    html: &str,
     last_sent: &mut String,
     html_broken: &mut bool,
 ) -> bool {
-    let html = view.render_live();
-    let trimmed = truncate_str(&html, MAX_TG_MSG - 50);
+    let trimmed = truncate_str(html, MAX_TG_MSG - 50);
     if trimmed == *last_sent {
         return true;
     }

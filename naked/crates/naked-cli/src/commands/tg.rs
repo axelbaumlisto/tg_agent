@@ -140,7 +140,9 @@ async fn dispatch_mock_cmd(args: &[String]) -> Result<()> {
     let dispatch = mock.as_fn();
     let msg = SyntheticMessage::from_scheduler_spec(spec_id, chat, thread);
     let started = std::time::Instant::now();
-    (dispatch)(msg.clone()).await;
+    let latch: naked_tg::synthetic::SessionIdLatch =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let _ = (dispatch)(msg.clone(), latch).await;
     let elapsed_ms = started.elapsed().as_millis();
 
     let captured = mock.snapshot().await;

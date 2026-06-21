@@ -131,12 +131,22 @@ async fn handle_research_restart(
         Ok(handle) => {
             let pm = agent.session_provider_model(&session_id).await;
             let deps_clone = deps.clone();
+            let spec_id_owned = spec_id.to_string();
             tokio::spawn(async move {
-                crate::streaming::stream_response(
+                let run_ctx = crate::streaming::StreamRunContext {
+                    requested_run_id: None,
+                    session_id: session_id.clone(),
+                    kind: naked_tg::run_registry::RunKind::Research {
+                        spec_id: spec_id_owned.clone(),
+                    },
+                    source_ref: Some(spec_id_owned.clone()),
+                };
+                let _ = crate::streaming::stream_response(
                     &deps_clone,
                     cb_ctx,
                     handle,
                     format!("{}/{}", pm.0, pm.1),
+                    run_ctx,
                 )
                 .await;
             });

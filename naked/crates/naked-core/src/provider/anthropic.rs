@@ -8,7 +8,7 @@ use crate::config::ProviderConfig;
 use crate::error::{AgentError, Result};
 use crate::types::{ModelInfo, StreamChunk, TurnUsage};
 
-use super::{ChatRequest, Provider};
+use super::{ChatRequest, Provider, build_streaming_http_client, should_send_temperature};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -27,11 +27,7 @@ impl AnthropicProvider {
             .base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
+        let client = build_streaming_http_client();
         Self {
             display_name: name,
             config,
@@ -76,35 +72,14 @@ impl Provider for AnthropicProvider {
 
         let upstream_model = self.config.resolve_model_alias(&request.model);
 
-        let mut body = serde_json::json!({
-            "model": upstream_model,
-            "max_tokens": max_tokens,
-            "stream": true,
-            "system": request.system,
-            "messages": request.messages,
-        });
-
-        let reasoning_on = matches!(
-            request.reasoning.as_deref(),
-            Some("low" | "medium" | "high")
+        let mut body = build_anthropic_request_body(
+            &request,
+            max_tokens,
+            upstream_model,
+            self.config
+                .capabilities_for(&request.model)
+                .supports_thinking,
         );
-        if reasoning_on {
-            let budget = match request.reasoning.as_deref() {
-                Some("low") => max_tokens.min(4096),
-                Some("medium") => max_tokens.min(10240),
-                _ => max_tokens.min(32768),
-            };
-            body["thinking"] = serde_json::json!({
-                "type": "enabled",
-                "budget_tokens": budget,
-            });
-        }
-
-        if let Some(temp) = request.temperature
-            && !reasoning_on
-        {
-            body["temperature"] = serde_json::json!(temp);
-        }
         if !request.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(request.tools);
         }
@@ -156,6 +131,46 @@ impl Provider for AnthropicProvider {
     }
 }
 
+fn build_anthropic_request_body(
+    request: &ChatRequest,
+    max_tokens: u32,
+    upstream_model: &str,
+    model_caps_supports_thinking: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "max_tokens": max_tokens,
+        "stream": true,
+        "system": request.system,
+        "messages": request.messages,
+    });
+
+    let reasoning_on = matches!(
+        request.reasoning.as_deref(),
+        Some("low" | "medium" | "high")
+    );
+    if reasoning_on {
+        let budget = match request.reasoning.as_deref() {
+            Some("low") => max_tokens.min(4096),
+            Some("medium") => max_tokens.min(10240),
+            _ => max_tokens.min(32768),
+        };
+        body["thinking"] = serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": budget,
+        });
+    }
+
+    let model_supports_thinking =
+        model_caps_supports_thinking || upstream_model.contains("claude-");
+    if should_send_temperature(request.temperature, reasoning_on, model_supports_thinking)
+        && let Some(temp) = request.temperature
+    {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    body
+}
+
 fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = StreamChunk> + Send {
     async_stream::stream! {
         let byte_stream = response.bytes_stream();
@@ -167,6 +182,7 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
         let mut pending_tool_name = String::new();
         let mut pending_tool_json = String::new();
         let mut has_pending_tool = false;
+        let mut saw_done = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim().to_string();
@@ -182,9 +198,13 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
                 None => continue,
             };
 
+            // Some proxy bridges in front of Anthropic emit OpenAI-style [DONE]
+            // instead of `message_stop`. Both are explicit terminal markers
+            // (B65); only a silent close with no marker is an error.
             if data == "[DONE]" {
+                saw_done = true;
                 yield StreamChunk::Done;
-                return;
+                break;
             }
 
             let event: serde_json::Value = match serde_json::from_str(data) {
@@ -264,8 +284,9 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
                     }
                 }
                 "message_stop" => {
+                    saw_done = true;
                     yield StreamChunk::Done;
-                    return;
+                    break;
                 }
                 "error" => {
                     let msg = event
@@ -278,6 +299,10 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
                 }
                 _ => {}
             }
+        }
+
+        if !saw_done {
+            yield StreamChunk::Error("SSE stream closed without [DONE] or content".into());
         }
     }
 }
@@ -327,5 +352,155 @@ mod tests {
         };
         let p = AnthropicProvider::new("test-anthropic".into(), cfg);
         assert_eq!(p.name(), "test-anthropic");
+    }
+
+    fn b71_request(model: &str, temperature: Option<f32>, reasoning: Option<&str>) -> ChatRequest {
+        // REGISTRY-WAIVE: B16 — ChatRequest has no Default derive; provider tests construct it exhaustively.
+        ChatRequest {
+            model: model.into(),
+            system: String::new(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature,
+            reasoning: reasoning.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn b71_anthropic_reasoning_omits_temperature() {
+        let request = b71_request("claude-sonnet-4", Some(0.7), Some("medium"));
+        let body =
+            build_anthropic_request_body(&request, request.max_tokens, "claude-sonnet-4-6", true);
+        assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"));
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn b71_anthropic_thinking_model_rejects_temperature_one_when_reasoning_off() {
+        let request = b71_request("claude-sonnet-4", Some(1.0), Some("off"));
+        let body =
+            build_anthropic_request_body(&request, request.max_tokens, "claude-sonnet-4-6", true);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn b81_anthropic_thinking_model_omits_temperature_zero_no_reasoning() {
+        // B81: a thinking-capable model must not receive an explicit
+        // temperature even when reasoning is off and temp is 0.0
+        // (adaptive mode rejects any temperature != 1).
+        let request = b71_request("claude-sonnet-4", Some(0.0), None);
+        let body =
+            build_anthropic_request_body(&request, request.max_tokens, "claude-sonnet-4-6", true);
+        assert!(body.get("thinking").is_none());
+        assert!(
+            body.get("temperature").is_none(),
+            "B81: thinking model must omit explicit temperature; got {:?}",
+            body.get("temperature")
+        );
+    }
+
+    #[test]
+    fn b71_anthropic_plain_model_allows_temperature() {
+        let request = b71_request("plain-model", Some(0.7), None);
+        let body = build_anthropic_request_body(&request, request.max_tokens, "plain-model", false);
+        let temp = body["temperature"].as_f64().expect("temperature number");
+        assert!((temp - 0.7).abs() < 1e-6, "temperature={temp}");
+    }
+
+    async fn collect_anthropic_sse_chunks(body: &str) -> Vec<StreamChunk> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sse"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{}/sse", server.uri()))
+            .send()
+            .await
+            .expect("mock SSE response must be reachable");
+
+        sse_stream_from_response(response).collect().await
+    }
+
+    #[tokio::test]
+    async fn sse_stream_errors_when_closed_without_message_stop() {
+        let chunks = collect_anthropic_sse_chunks(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+        )
+        .await;
+
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Text(t) if t == "hello"))
+        );
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Error(msg) if msg == "SSE stream closed without [DONE] or content"
+        )));
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done))
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_message_stop_yields_done_without_error() {
+        let chunks = collect_anthropic_sse_chunks(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
+        .await;
+
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Text(t) if t == "hello"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done))
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Error(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_done_marker_yields_done_without_error() {
+        let chunks = collect_anthropic_sse_chunks(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: [DONE]\n\n",
+        )
+        .await;
+
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Text(t) if t == "hello"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done))
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Error(_)))
+        );
     }
 }

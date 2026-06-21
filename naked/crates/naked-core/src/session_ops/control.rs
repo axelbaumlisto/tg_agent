@@ -191,8 +191,11 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         let (eff_max_tokens, eff_temperature) =
             crate::turn::resolve_generation_params(&self.config(), &setup.provider_name, effective);
+        let max_wall = (session.metadata.channel == "research")
+            .then(|| std::time::Duration::from_secs(self.config().research.max_wall_seconds));
         let mut loop_config = crate::turn::build_loop_config(
             effective.max_iterations,
+            max_wall,
             cwd.clone(),
             setup.model.clone(),
             eff_max_tokens,

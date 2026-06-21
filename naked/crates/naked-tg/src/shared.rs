@@ -378,14 +378,13 @@ pub(crate) static SLASH_HINT_SHOWN: LazyLock<tokio::sync::RwLock<HashSet<i64>>> 
 // Was a per-(chat,thread) HashMap of paused research runs awaiting a
 // clarification reply. Replaced by single-mechanism flow: just send a new
 // message or `/research run <id>` to relaunch.
-pub(crate) type ModelSwitchMap =
-    HashMap<(i64, Option<i32>), naked_tg::model_switch::SharedModelSwitch>;
+pub(crate) type ModelSwitchMap = HashMap<String, naked_tg::model_switch::SharedModelSwitch>;
 pub(crate) static MODEL_SWITCHES: LazyLock<tokio::sync::RwLock<ModelSwitchMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 /// Steer senders: (chat_id, thread_id) → Sender<SteerMessage>.
 /// Populated when a streaming turn starts, removed when it ends.
 pub(crate) type SteerSenderMap =
-    HashMap<(i64, Option<i32>), tokio::sync::mpsc::Sender<naked_core::types::SteerMessage>>;
+    HashMap<String, tokio::sync::mpsc::Sender<naked_core::types::SteerMessage>>;
 pub(crate) static STEER_SENDERS: LazyLock<tokio::sync::RwLock<SteerSenderMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
@@ -403,7 +402,7 @@ pub(crate) static STEER_SENDERS: LazyLock<tokio::sync::RwLock<SteerSenderMap>> =
 /// moment the steer is in `history` and the model is guaranteed to
 /// see it on the next iteration.
 pub(crate) type SteerAckMap =
-    HashMap<(i64, Option<i32>, i32), (teloxide::types::ChatId, teloxide::types::MessageId)>;
+    HashMap<(String, i32), (teloxide::types::ChatId, teloxide::types::MessageId)>;
 pub(crate) static STEER_ACK_IDS: LazyLock<tokio::sync::RwLock<SteerAckMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
@@ -417,7 +416,7 @@ pub(crate) static STEER_ACK_IDS: LazyLock<tokio::sync::RwLock<SteerAckMap>> =
 /// stack two (would let user click an orphan button and confuse the
 /// callback router).
 pub(crate) type ControlCardMap =
-    HashMap<(i64, Option<i32>), (teloxide::types::ChatId, teloxide::types::MessageId)>;
+    HashMap<String, (teloxide::types::ChatId, teloxide::types::MessageId)>;
 pub(crate) static CONTROL_CARDS: LazyLock<tokio::sync::RwLock<ControlCardMap>> =
     LazyLock::new(|| tokio::sync::RwLock::new(HashMap::new()));
 
@@ -457,6 +456,10 @@ pub(crate) static PROCESS_STARTED_AT: LazyLock<std::time::Instant> =
 /// Global rate limiter instance — accessible from commands.rs for /metrics.
 pub(crate) static RATE_LIMITER: LazyLock<naked_tg::rate_limit::RateLimiter> =
     LazyLock::new(naked_tg::rate_limit::RateLimiter::new);
+
+/// CYCLE 2 Step 2: in-memory, kind-agnostic live Run control index.
+pub(crate) static RUN_REGISTRY: LazyLock<naked_tg::run_registry::RunRegistry> =
+    LazyLock::new(naked_tg::run_registry::RunRegistry::new);
 
 // ── Message helper functions ────────────────────────────────────────────────
 

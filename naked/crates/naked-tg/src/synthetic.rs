@@ -10,17 +10,26 @@
 //!
 //! # Solution
 //!
-//! The scheduler injects a [`SyntheticMessage`] into the normal message
-//! handling pipeline via a [`SyntheticDispatchFn`] closure that wiring.rs
-//! provides. The closure has access to `Bot` + all `BotDeps`; the scheduler
-//! only sees the opaque function type.
+//! The scheduler injects a [`SyntheticMessage`] into the agent turn pipeline
+//! via a [`SyntheticDispatchFn`] closure that wiring.rs provides. The closure
+//! resolves (or creates) a session bound to the operator's `(chat_id,
+//! thread_id)`, submits a prompt, and **drains the resulting `AgentHandle`
+//! to completion** — auto-approving permission requests, collecting errors,
+//! and returning a structured [`SyntheticDispatchOutcome`].
 //!
-//! A synthetic message is identical to a real Telegram message from the
-//! operator's perspective — it lands in the same `(chat_id, thread_id)`,
-//! creates a session in the `ChannelSessionMap`, and the operator can abort
-//! it with `/abort`. The only difference is that the bot does NOT echo the
-//! generated command text back to Telegram (to avoid polluting chat history
-//! with `/research run <id>` lines).
+//! When `StreamDeps` is wired (operator chat), the dispatch path renders a
+//! **live Telegram streaming bubble** via the SAME `stream_response` engine
+//! the chat path uses (`wiring/research_scheduler.rs:87-210`), with the Abort
+//! button — it is NOT headless. The **headless drain**
+//! (`drain_synthetic_agent_handle`, no streaming UI / no Abort button) remains
+//! only as the `StreamDeps == None` fallback (CLI / tests / no-bot).
+//! Either way, the scheduler awaits the outcome and maps it to ledger state
+//! (Completed / Failed / Timeout), and the operator can `/abort` the session
+//! because it is bound in the `ChannelSessionMap`.
+//!
+//! NB (B79): the synthetic gate that decides streaming-vs-headless must read
+//! the effective chat (`infl.chat_id.or(spec.chat_id)`), not `spec.chat_id`
+//! alone — see `scheduler/tasks.rs` and BUG_REGISTRY B79.
 //!
 //! # B57 (PLAN_RESEARCH_AGENT_FLOW_v1)
 //!
@@ -28,10 +37,31 @@
 //! with channel ≠ chat's. Fix: scheduler calls `dispatch_synthetic` which
 //! routes through the normal message handler → same chat session → operator
 //! can `/abort` like any other turn.
+//!
+//! # B64 (PLAN_SYNTHETIC_DISPATCH_FIX_v1)
+//!
+//! `FIRE-AND-FORGET`: dispatch closure discarded `AgentHandle`, returned
+//! instantly. Fix: `SyntheticDispatchFn` now returns
+//! `Result<SyntheticDispatchOutcome, String>` so the scheduler knows whether
+//! the turn succeeded, failed, or was cancelled.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use naked_core::research::StopReason;
+
+/// Outcome of a synthetic dispatch run. Carries enough information
+/// for the scheduler to decide success vs failure.
+#[derive(Debug, Clone)]
+pub struct SyntheticDispatchOutcome {
+    /// Session ID that was used for the turn.
+    pub session_id: String,
+    /// How the turn ended.
+    pub stop_reason: StopReason,
+    /// Collected `AgentEvent::Error` messages during drain.
+    pub errors: Vec<String>,
+}
 
 /// Where a synthetic message originates. Used for logging + to decide
 /// whether to suppress the outbound "echo" send_message to TG.
@@ -82,6 +112,10 @@ pub struct SyntheticMessage {
     /// Origin of this synthetic message. Controls log labels and echo
     /// suppression policy.
     pub source: SyntheticSource,
+    /// Optional RunRegistry identity supplied by an external launcher.
+    /// Research scheduler maps `Inflight.attempt_id` here; other sources leave
+    /// it empty and let the registry generate a kind-agnostic run id.
+    pub run_id: Option<String>,
 }
 
 impl SyntheticMessage {
@@ -89,6 +123,15 @@ impl SyntheticMessage {
     /// spec. Returns `None` if the spec has no `chat_id` configured (CLI /
     /// unattended runs fall back to the legacy direct-run path).
     pub fn from_scheduler_spec(spec_id: &str, chat_id: i64, thread_id: Option<i32>) -> Self {
+        Self::from_scheduler_spec_with_run_id(spec_id, chat_id, thread_id, None)
+    }
+
+    pub fn from_scheduler_spec_with_run_id(
+        spec_id: &str,
+        chat_id: i64,
+        thread_id: Option<i32>,
+        run_id: Option<String>,
+    ) -> Self {
         Self {
             chat_id,
             thread_id,
@@ -96,23 +139,41 @@ impl SyntheticMessage {
             source: SyntheticSource::Scheduler {
                 spec_id: spec_id.to_string(),
             },
+            run_id,
         }
     }
 }
 
 /// Opaque async function that the scheduler calls to inject a
-/// [`SyntheticMessage`] into the message-handling pipeline.
+/// [`SyntheticMessage`] into the agent turn pipeline.
 ///
-/// `wiring.rs` constructs this as a closure over `Bot` + `BotDeps`. The
-/// scheduler only holds `Arc<SyntheticDispatchFn>` — no `Bot` in scope.
+/// `wiring.rs` constructs this as a closure that resolves/creates a session,
+/// submits the prompt via `AgentCore::send_prompt`, drains the resulting
+/// `AgentHandle` to completion, and returns a structured
+/// [`SyntheticDispatchOutcome`]. The scheduler maps the outcome to ledger
+/// state (Completed / Failed).
+///
+/// The scheduler only holds `Arc<SyntheticDispatchFn>` — no `Bot` in scope.
 ///
 /// ## Why a boxed async fn instead of a trait?
 ///
 /// The scheduler config needs to be `Clone` + `Default`. A trait object would
 /// require `Arc<dyn …>` and async traits (which are not object-safe without
 /// boxing). The boxed closure is simpler and achieves the same result.
-pub type SyntheticDispatchFn =
-    Arc<dyn Fn(SyntheticMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+/// Shared latch that lets the dispatch closure publish the session-id
+/// *before* the blocking `stream_response()` call.  The scheduler's
+/// cancel branch reads it to call `agent.abort(sid)`.
+pub type SessionIdLatch = Arc<tokio::sync::Mutex<Option<String>>>;
+
+pub type SyntheticDispatchFn = Arc<
+    dyn Fn(
+            SyntheticMessage,
+            SessionIdLatch,
+        )
+            -> Pin<Box<dyn Future<Output = Result<SyntheticDispatchOutcome, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 // ────────────────────────────────────────────────────────────────────────
 // Testing surface — MockDispatcher
@@ -168,11 +229,11 @@ impl MockDispatcher {
     /// Construct the [`SyntheticDispatchFn`] suitable for
     /// [`crate::scheduler::SchedulerConfig::dispatch_fn`]. Each
     /// invocation appends the [`SyntheticMessage`] to the shared
-    /// capture log.
+    /// capture log and returns a default success outcome.
     pub fn as_fn(&self) -> SyntheticDispatchFn {
         let captured = self.captured.clone();
         let delay_ms = self.delay_ms;
-        Arc::new(move |msg: SyntheticMessage| {
+        Arc::new(move |msg: SyntheticMessage, sid_latch: SessionIdLatch| {
             let captured = captured.clone();
             Box::pin(async move {
                 if delay_ms > 0 {
@@ -184,7 +245,14 @@ impl MockDispatcher {
                     spec_id = ?msg.source.spec_id(),
                     "MockDispatcher captured synthetic message",
                 );
+                // Latch a mock session-id so cancel tests can observe it.
+                *sid_latch.lock().await = Some("mock".into());
                 captured.lock().await.push(msg);
+                Ok(SyntheticDispatchOutcome {
+                    session_id: "mock".into(),
+                    stop_reason: StopReason::AgentIdle,
+                    errors: vec![],
+                })
             })
         })
     }
@@ -211,25 +279,32 @@ impl MockDispatcher {
 // T6.2 (PLAN_RESEARCH_AGENT_FLOW_v1): dispatch_synthetic entry point.
 //
 // The scheduler holds an `Arc<SyntheticDispatchFn>` constructed by
-// wiring.rs (which has Bot + ChannelSessionMap + AgentCore in scope).
+// wiring.rs (which has ChannelSessionMap + AgentCore in scope).
 // When the scheduler decides a spec is due, it calls the closure with
-// a SyntheticMessage; the closure drives the message through the
-// regular agent turn machinery so the operator sees:
-//   - normal streaming bubble in their chat thread
-//   - the same ⏹ Abort button that any chat turn has
-//   - `/abort` works to cancel (no separate Stop callback path)
+// a SyntheticMessage; the closure:
+//   1. resolves/creates a session bound to (chat_id, thread_id)
+//   2. submits the prompt via AgentCore::send_prompt
+//   3. drives the AgentHandle to completion: streams a live bubble via
+//      `stream_response` when `StreamDeps` is present, else headless drain
+//   4. returns SyntheticDispatchOutcome to the scheduler
+//
+// When `StreamDeps` is wired (operator chat) the run renders a LIVE
+// streaming bubble with an Abort button via the shared `stream_response`
+// engine (`wiring/research_scheduler.rs:87-210`). The HEADLESS DRAIN
+// (no streaming bubble, no Abort button callback) is only the
+// `StreamDeps == None` fallback (CLI / tests). Either way the session IS
+// bound in ChannelSessionMap, so the operator can `/abort` it from the chat.
 //
 // Echo suppression: the closure does NOT call `bot.send_message` for
 // the synthetic command text itself — there is no operator-visible
-// "/research run X" line in chat history. The first visible message
-// is the bot's own streaming bubble.
+// "/research run X" line in chat history.
 //
 // This module provides the BUILDER for the closure. wiring.rs calls
 // `build_dispatch_fn(...)` once at boot, passes the result to
-// `SchedulerConfig::dispatch_fn`. The closure body is a thin wrapper
-// around `agent.send_prompt` + `streaming::stream_response` (the same
-// path message_handler.rs uses, minus addressing gates + media extraction
-// since synthetic messages are pure-text by construction).
+// `SchedulerConfig::dispatch_fn`. The closure body calls
+// `submit_synthetic_prompt` + `drain_synthetic_agent_handle` — a
+// structured drain that auto-approves permissions, collects errors,
+// and returns a result-bearing outcome.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Synthesize a turn for the given `(chat_id, thread_id)` and return the
@@ -237,11 +312,10 @@ impl MockDispatcher {
 /// `SyntheticDispatchFn` closure (wired in `wiring.rs`).
 ///
 /// This function isolates the **policy** of synthetic-turn dispatch from
-/// the **wiring** of `Bot` + `BotDeps`. The streaming itself (HTTP edits,
-/// Abort button, etc.) lives in `streaming::stream_response` — the caller
-/// plugs that in. Echo suppression: the caller does NOT echo `msg.text`
-/// as a separate `send_message` — the first operator-visible artifact is
-/// the bot's own streaming bubble.
+/// the **wiring** of session resolution + prompt submission. The caller
+/// is responsible for draining the returned `AgentHandle` — typically via
+/// `drain_synthetic_agent_handle` (headless drain with permission
+/// auto-approve).
 ///
 /// Returns:
 /// - `Ok((session_id, AgentHandle))` on success
@@ -305,12 +379,36 @@ pub async fn resolve_or_create_session(
 /// [`submit_synthetic_prompt`].  Returns `(session_id, AgentHandle)`.
 pub async fn dispatch_for_chat(
     agent: &std::sync::Arc<naked_core::AgentCore>,
-    channel_map: &std::sync::Arc<crate::channel_map::ChannelSessionMap>,
+    _channel_map: &std::sync::Arc<crate::channel_map::ChannelSessionMap>,
     chat_id: i64,
     thread_id: Option<i32>,
     spec_id: &str,
 ) -> Result<(String, naked_core::types::AgentHandle), String> {
-    let session_id = resolve_or_create_session(agent, channel_map, chat_id, thread_id).await;
+    // B64 follow-up: scheduler research runs use a FRESH session.
+    //
+    // Previously this called `resolve_or_create_session()` which returned
+    // the operator's existing chat session (100+ messages of unrelated
+    // context). The model then treated the synthetic prompt as a regular
+    // chat message instead of dispatching research tools. Additionally,
+    // reusing the chat session meant SessionBusy errors blocked the
+    // operator from chatting while research ran.
+    //
+    // Fix: always create a fresh "research" channel session with empty
+    // history. The model sees only the research command and acts
+    // accordingly. The operator's chat session is not touched.
+    //
+    // NOTE (B72): scheduled/synthetic research uses the PROVIDER-level
+    // fallback chain reached by the normal session provider resolution
+    // (`AgentCore::send_prompt` → setup/provider_svc → create_provider_chain).
+    // `research.fallback_models` is model-level fallback config consumed only
+    // by the legacy ResearchCoordinator (`runner_dispatch.rs`) and is NOT
+    // applied here. Wiring model-level fallback into synthetic dispatch is
+    // tracked as future work.
+    let workspace =
+        std::path::PathBuf::from(std::env::var("NAKED_WORKSPACE").unwrap_or_else(|_| ".".into()));
+    let session_id = agent
+        .create_session_with_channel(&workspace, "research")
+        .await;
     let msg = SyntheticMessage::from_scheduler_spec(spec_id, chat_id, thread_id);
     submit_synthetic_prompt(agent, session_id, &msg).await
 }
@@ -352,6 +450,10 @@ mod tests {
         assert_eq!(msg.text, "/research run spec-xyz");
     }
 
+    fn new_latch() -> SessionIdLatch {
+        std::sync::Arc::new(tokio::sync::Mutex::new(None))
+    }
+
     // ── MockDispatcher tests (replaces the previous include_str! sentinel) ──
 
     /// MockDispatcher captures messages exactly once per dispatch call.
@@ -361,7 +463,12 @@ mod tests {
         let dispatch = mock.as_fn();
 
         let msg = SyntheticMessage::from_scheduler_spec("spec-1", 12345, Some(7));
-        dispatch(msg.clone()).await;
+        let result = dispatch(msg.clone(), new_latch()).await;
+        assert!(result.is_ok(), "MockDispatcher should return Ok");
+        let outcome = result.unwrap();
+        assert_eq!(outcome.session_id, "mock");
+        assert_eq!(outcome.stop_reason, StopReason::AgentIdle);
+        assert!(outcome.errors.is_empty());
 
         let captured = mock.snapshot().await;
         assert_eq!(captured.len(), 1);
@@ -378,11 +485,10 @@ mod tests {
         let dispatch = mock.as_fn();
 
         for i in 0..3 {
-            dispatch(SyntheticMessage::from_scheduler_spec(
-                &format!("spec-{i}"),
-                1000 + i,
-                None,
-            ))
+            let _ = dispatch(
+                SyntheticMessage::from_scheduler_spec(&format!("spec-{i}"), 1000 + i, None),
+                new_latch(),
+            )
             .await;
         }
 
@@ -405,8 +511,16 @@ mod tests {
         let d1 = mock.as_fn();
         let d2 = mock_b.as_fn();
 
-        d1(SyntheticMessage::from_scheduler_spec("a", 1, None)).await;
-        d2(SyntheticMessage::from_scheduler_spec("b", 2, None)).await;
+        let _ = d1(
+            SyntheticMessage::from_scheduler_spec("a", 1, None),
+            new_latch(),
+        )
+        .await;
+        let _ = d2(
+            SyntheticMessage::from_scheduler_spec("b", 2, None),
+            new_latch(),
+        )
+        .await;
 
         // Either handle sees both messages.
         assert_eq!(mock.count().await, 2);
@@ -419,13 +533,21 @@ mod tests {
         let mock = MockDispatcher::new();
         let dispatch = mock.as_fn();
 
-        dispatch(SyntheticMessage::from_scheduler_spec("x", 1, None)).await;
+        let _ = dispatch(
+            SyntheticMessage::from_scheduler_spec("x", 1, None),
+            new_latch(),
+        )
+        .await;
         assert_eq!(mock.count().await, 1);
 
         mock.reset().await;
         assert_eq!(mock.count().await, 0);
 
-        dispatch(SyntheticMessage::from_scheduler_spec("y", 2, None)).await;
+        let _ = dispatch(
+            SyntheticMessage::from_scheduler_spec("y", 2, None),
+            new_latch(),
+        )
+        .await;
         assert_eq!(mock.count().await, 1);
         assert_eq!(mock.snapshot().await[0].source.spec_id(), Some("y"));
     }
@@ -438,7 +560,11 @@ mod tests {
         let mock = MockDispatcher::new().with_delay_ms(20);
         let dispatch = mock.as_fn();
         let start = std::time::Instant::now();
-        dispatch(SyntheticMessage::from_scheduler_spec("d", 1, None)).await;
+        let _ = dispatch(
+            SyntheticMessage::from_scheduler_spec("d", 1, None),
+            new_latch(),
+        )
+        .await;
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(15),
             "with_delay_ms(20) must produce ≥15ms latency, got {:?}",
@@ -467,6 +593,98 @@ mod tests {
         assert!(
             src.contains("synthetic prompt submitted"),
             "INFO log tag required for boot-time observability (scheduler tick → turn)"
+        );
+    }
+
+    /// B64: `SyntheticDispatchOutcome` must exist and carry session_id +
+    /// stop_reason + errors for the scheduler to map to ledger state.
+    #[test]
+    fn synthetic_dispatch_outcome_shape() {
+        let outcome = SyntheticDispatchOutcome {
+            session_id: "test-session".into(),
+            stop_reason: StopReason::AgentIdle,
+            errors: vec!["some error".into()],
+        };
+        assert_eq!(outcome.session_id, "test-session");
+        assert_eq!(outcome.stop_reason, StopReason::AgentIdle);
+        assert_eq!(outcome.errors.len(), 1);
+    }
+
+    /// B64: `SyntheticDispatchFn` must return Result, not ().
+    #[test]
+    fn dispatch_fn_returns_result() {
+        let src = include_str!("synthetic.rs");
+        assert!(
+            src.contains("Result<SyntheticDispatchOutcome, String>"),
+            "SyntheticDispatchFn must return Result<SyntheticDispatchOutcome, String>"
+        );
+    }
+
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// B72: scheduled/synthetic research must be understood as the normal
+    /// provider-chain path, not the legacy model-level fallback path.  This is
+    /// a source-shape guard (like the API sentinels above): comments may mention
+    /// the caveat, but executable code in the synthetic dispatch chain must not
+    /// start consulting `research.fallback_models` without deliberately updating
+    /// this test and the B72 registry entry.
+    #[test]
+    fn synthetic_research_does_not_consult_model_level_fallbacks() {
+        let synthetic_src = strip_line_comments(
+            include_str!("synthetic.rs")
+                .split("\n#[cfg(test)]")
+                .next()
+                .expect("synthetic.rs has production section"),
+        );
+        let wiring_src = strip_line_comments(include_str!("wiring/research_scheduler.rs"));
+        let session_control_src =
+            strip_line_comments(include_str!("../../naked-core/src/session_ops/control.rs"));
+        let legacy_dispatch_src = strip_line_comments(include_str!(
+            "../../naked-core/src/research/coordinator_mod/runner_dispatch.rs"
+        ));
+
+        assert!(
+            synthetic_src.contains("create_session_with_channel")
+                && synthetic_src.contains("\"research\""),
+            "synthetic dispatch must keep using a fresh research session"
+        );
+        assert!(
+            synthetic_src.contains("submit_synthetic_prompt(agent, session_id, &msg).await"),
+            "synthetic dispatch should enter the normal AgentCore::send_prompt path"
+        );
+        for (name, src) in [
+            ("synthetic.rs", synthetic_src.as_str()),
+            ("session_ops/control.rs", session_control_src.as_str()),
+        ] {
+            assert!(
+                !src.contains("fallback_models"),
+                "B72: {name} is on the synthetic path and must not silently start reading model-level research.fallback_models"
+            );
+        }
+        assert!(
+            wiring_src.contains("B72:") && wiring_src.contains("fallback_models.len()"),
+            "wiring may read fallback_models only for the explicit B72 boot WARN"
+        );
+        let wiring_dispatch_impl = wiring_src
+            .split("fn synthetic_dispatch_fn")
+            .nth(1)
+            .expect("research_scheduler.rs defines synthetic_dispatch_fn");
+        assert!(
+            !wiring_dispatch_impl.contains("fallback_models"),
+            "B72: the synthetic dispatch closure/streaming path must not consume model-level fallback_models"
+        );
+        assert!(
+            legacy_dispatch_src.contains("self.config.fallback_models"),
+            "legacy ResearchCoordinator must remain the documented fallback_models consumer"
+        );
+        assert!(
+            legacy_dispatch_src.contains("try_start_with_fallback"),
+            "legacy runner_dispatch.rs should still expose the model-level fallback path"
         );
     }
 }

@@ -49,9 +49,10 @@ pub(crate) mod scheduler_lock;
 pub(crate) mod telegram;
 
 use health::{
-    VisionShapeOutcome, audit_all_providers, audit_deduped_provider_targets,
-    boot_audit_dedup_enabled, boot_caps_invariant_sweep, check_multimodal_describer_health,
-    probe_deduped_target_with_created_provider, probe_vision_content_shape,
+    MultimodalDescriberHealth, VisionShapeOutcome, audit_all_providers,
+    audit_deduped_provider_targets, boot_audit_dedup_enabled, boot_caps_invariant_sweep,
+    check_multimodal_describer_health, probe_deduped_target_with_created_provider,
+    probe_vision_content_shape,
 };
 use invariants::{
     check_config_symlink_invariant, check_system_prompt_paths, populate_novnc_ip_allowlist,
@@ -132,7 +133,11 @@ pub(crate) async fn build() -> WiredBot {
     populate_novnc_ip_allowlist();
 
     // BUG_REGISTRY D-BOOT-DESCRIBER-WARN (B05 regression guard).
-    check_multimodal_describer_health(&config);
+    let describer_health = check_multimodal_describer_health(&config);
+    crate::metrics::set_config_describer_missing(matches!(
+        describer_health,
+        MultimodalDescriberHealth::Degraded
+    ));
 
     // BUG_REGISTRY D-BOOT-CAPS-INVARIANT (B03+B04 boot-time enforcement).
     // Walks every (provider, model) pair declared in config.providers,
@@ -286,12 +291,22 @@ pub(crate) async fn build() -> WiredBot {
 
     telegram::clear_webhook(&http_client, &base_url).await;
 
+    let stream_deps = research_scheduler::StreamDeps {
+        bot: bot.clone(),
+        config: config.clone(),
+        http_client: http_client.clone(),
+        base_url: base_url.clone(),
+        tg_attach_queue: tg_attach_queue.clone(),
+        bot_token: bot_token_arc.clone(),
+        bot_identity: bot_identity.clone(),
+    };
     let research_scheduler_handle = research_scheduler::start_research_scheduler(
         &agent,
         &config,
         &channel_map,
         &liveness,
         _scheduler_lock.is_some(),
+        Some(stream_deps),
     );
 
     let rate_limiter = RATE_LIMITER.clone();

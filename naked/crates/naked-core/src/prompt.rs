@@ -159,6 +159,53 @@ const INSTRUCTION_FILENAMES: &[&str] = &[
     ".cursor/rules/instructions.md",
 ];
 
+// B77: hermetic tests call this helper directly; it must collect only `dir`
+// and must not walk ancestors. The public function below owns the walk.
+fn collect_instructions_in_dir(
+    workspace: &Path,
+    dir: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    remaining: &mut usize,
+) -> Vec<String> {
+    let mut parts = Vec::new();
+
+    for name in INSTRUCTION_FILENAMES {
+        let path = dir.join(name);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !seen.insert(canonical) {
+            continue;
+        }
+        if *remaining == 0 {
+            break;
+        }
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let limit = MAX_PER_FILE_CHARS.min(*remaining);
+            // Char-boundary safe truncation — instruction files may
+            // contain non-ASCII (Russian/Cyrillic AGENTS.md sections,
+            // Vietnamese examples, etc.); a byte slice would panic.
+            let content = if trimmed.chars().count() > limit {
+                let mut t: String = trimmed.chars().take(limit).collect();
+                t.push_str("\n\n[truncated]");
+                t
+            } else {
+                trimmed.to_string()
+            };
+            *remaining = remaining.saturating_sub(content.len());
+            parts.push(format!(
+                "# {}\n{}",
+                path.strip_prefix(workspace).unwrap_or(&path).display(),
+                content
+            ));
+        }
+    }
+
+    parts
+}
+
 /// Walk from workspace upward, collecting instruction files with dedup and budgets.
 fn load_project_instructions(workspace: &Path) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
@@ -167,39 +214,12 @@ fn load_project_instructions(workspace: &Path) -> Option<String> {
 
     let mut dir = Some(workspace);
     while let Some(current) = dir {
-        for name in INSTRUCTION_FILENAMES {
-            let path = current.join(name);
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if !seen.insert(canonical) {
-                continue;
-            }
-            if remaining == 0 {
-                break;
-            }
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let limit = MAX_PER_FILE_CHARS.min(remaining);
-                // Char-boundary safe truncation — instruction files may
-                // contain non-ASCII (Russian/Cyrillic AGENTS.md sections,
-                // Vietnamese examples, etc.); a byte slice would panic.
-                let content = if trimmed.chars().count() > limit {
-                    let mut t: String = trimmed.chars().take(limit).collect();
-                    t.push_str("\n\n[truncated]");
-                    t
-                } else {
-                    trimmed.to_string()
-                };
-                remaining = remaining.saturating_sub(content.len());
-                parts.push(format!(
-                    "# {}\n{}",
-                    path.strip_prefix(workspace).unwrap_or(&path).display(),
-                    content
-                ));
-            }
-        }
+        parts.extend(collect_instructions_in_dir(
+            workspace,
+            current,
+            &mut seen,
+            &mut remaining,
+        ));
         dir = current.parent();
         if dir == Some(Path::new("")) || dir == Some(Path::new("/")) {
             break;
@@ -490,49 +510,68 @@ mod snapshot_tests {
         insta::assert_snapshot!("try_read_truncated_len", format!("{}", result.len()));
     }
 
-    /// 7. `load_project_instructions` returns None for an empty workspace.
+    /// 7. Single-directory instruction collection yields no parts for an empty dir.
     #[test]
-    fn snapshot_load_instructions_empty_is_none() {
+    fn collect_instructions_in_dir_empty_is_none() {
         let dir = tempdir().unwrap();
-        // Crucial: pass a path that has no parent matches either.
-        // Use canonicalize on tempdir which lives under /tmp; AGENTS.md
-        // could exist somewhere up the tree. To make this deterministic,
-        // we wrap the call in a check that returns the count of entries
-        // it found at the workspace level only.
-        let result = load_project_instructions(dir.path());
-        // result MAY pull an ancestor AGENTS.md; we snapshot only whether
-        // the workspace-local search yielded SOMETHING vs NOTHING.
-        let kind = match result {
-            None => "None",
-            Some(_) => "Some(<from-ancestor>)",
-        };
-        insta::assert_snapshot!("load_instructions_empty_workspace", kind);
+        let mut seen = std::collections::HashSet::new();
+        let mut remaining = MAX_TOTAL_INSTRUCTION_CHARS;
+
+        // B77: hermetic — helper must not walk ancestors (including `/tmp`).
+        let parts = collect_instructions_in_dir(dir.path(), dir.path(), &mut seen, &mut remaining);
+
+        assert!(
+            parts.is_empty(),
+            "empty dir yields no instruction parts (B77 hermetic)"
+        );
     }
 
-    /// 8. `load_project_instructions` picks up a workspace-local AGENTS.md.
+    /// 8. Single-directory collection picks up a workspace-local AGENTS.md.
     #[test]
-    fn snapshot_load_instructions_with_agents_md() {
+    fn collect_instructions_in_dir_with_agents_md() {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("AGENTS.md"),
             "# Project Rules\n- always read before editing\n- run cargo fmt\n",
         )
         .unwrap();
-        let result = load_project_instructions(dir.path()).unwrap();
-        // The output prefixes each file with `# <relpath>` then content.
-        // We strip the absolute tempdir prefix to keep the snapshot
-        // reproducible across machines.
-        let cleaned = result
-            .lines()
-            .map(|l| {
-                if l.starts_with("# AGENTS.md") || l.starts_with("# /") {
-                    "# AGENTS.md".to_string()
-                } else {
-                    l.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        insta::assert_snapshot!("load_instructions_with_agents_md", cleaned);
+        let mut seen = std::collections::HashSet::new();
+        let mut remaining = MAX_TOTAL_INSTRUCTION_CHARS;
+
+        // B77: hermetic — helper collects ONLY this dir, never ancestors.
+        let parts = collect_instructions_in_dir(dir.path(), dir.path(), &mut seen, &mut remaining);
+
+        // workspace == dir, so strip_prefix yields the relative "AGENTS.md" header.
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0],
+            "# AGENTS.md\n# Project Rules\n- always read before editing\n- run cargo fmt"
+        );
+    }
+
+    /// 9. Public instruction loading intentionally walks controlled ancestors.
+    #[test]
+    fn load_project_instructions_walks_controlled_ancestor() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            "controlled ancestor marker\n",
+        )
+        .unwrap();
+        let child = root.path().join("nested").join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let result = load_project_instructions(&child).expect("should find ancestor AGENTS.md");
+
+        // The public fn walks UP from child and finds root/AGENTS.md.
+        assert!(
+            result.contains("controlled ancestor marker"),
+            "public walk must find the controlled ancestor instruction"
+        );
+        // Ancestor is OUTSIDE workspace (child), so strip_prefix fails → absolute path header.
+        assert!(
+            result.contains(&root.path().join("AGENTS.md").display().to_string()),
+            "ancestor file rendered with absolute path header"
+        );
     }
 }

@@ -8,7 +8,7 @@ use crate::config::ProviderConfig;
 use crate::error::{AgentError, Result};
 use crate::types::{ModelInfo, StreamChunk, TurnUsage};
 
-use super::{ChatRequest, Provider};
+use super::{ChatRequest, Provider, build_streaming_http_client, should_send_temperature};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MAX_TOKENS: u32 = 16384;
@@ -26,11 +26,7 @@ impl OpenAiCompatProvider {
             .base_url
             .clone()
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
+        let client = build_streaming_http_client();
         Self {
             display_name: name,
             config,
@@ -83,19 +79,16 @@ impl Provider for OpenAiCompatProvider {
 
         let upstream_model = self.config.resolve_model_alias(&request.model);
 
-        let mut body = serde_json::json!({
-            "model": upstream_model,
-            "max_tokens": max_tokens,
-            "stream": true,
-            "stream_options": {"include_usage": true},
-            "messages": messages,
-        });
-
-        apply_reasoning_params(&mut body, &self.base_url, request.reasoning.as_deref());
-
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
+        let mut body = build_openai_request_body(
+            &request,
+            max_tokens,
+            messages,
+            upstream_model,
+            &self.base_url,
+            self.config
+                .capabilities_for(&request.model)
+                .supports_thinking,
+        );
 
         if !request.tools.is_empty() {
             let functions: Vec<serde_json::Value> = request
@@ -146,14 +139,41 @@ impl Provider for OpenAiCompatProvider {
     }
 }
 
-/// Apply `enable_thinking` / `reasoning_effort` to an OpenAI-compatible request body,
-/// gated by the provider `base_url`. Some providers (e.g. Groq) reject unknown fields
-/// with HTTP 400, so we never include them unless the host is known to accept them.
-fn apply_reasoning_params(body: &mut serde_json::Value, base_url: &str, reasoning: Option<&str>) {
+fn build_openai_request_body(
+    request: &ChatRequest,
+    max_tokens: u32,
+    messages: Vec<serde_json::Value>,
+    upstream_model: &str,
+    base_url: &str,
+    model_caps_supports_thinking: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "max_tokens": max_tokens,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "messages": messages,
+    });
+
+    let reasoning_on = apply_reasoning_params(&mut body, base_url, request.reasoning.as_deref());
+    let model_supports_thinking =
+        model_caps_supports_thinking || route_is_known_thinking_proxy(base_url);
+    if should_send_temperature(request.temperature, reasoning_on, model_supports_thinking)
+        && let Some(temp) = request.temperature
+    {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    body
+}
+
+fn route_supports_enable_thinking(base_url: &str) -> bool {
     let url_lc = base_url.to_lowercase();
-    let supports_enable_thinking =
-        url_lc.contains("dashscope") || url_lc.contains("aliyun") || url_lc.contains("aliyuncs");
-    let supports_reasoning_effort = url_lc.contains("openai.com")
+    url_lc.contains("dashscope") || url_lc.contains("aliyun") || url_lc.contains("aliyuncs")
+}
+
+fn route_supports_reasoning_effort(base_url: &str) -> bool {
+    let url_lc = base_url.to_lowercase();
+    url_lc.contains("openai.com")
         || url_lc.contains("fireworks")
         || url_lc.contains("openrouter")
         || url_lc.contains("api.deepseek.com")
@@ -170,7 +190,29 @@ fn apply_reasoning_params(body: &mut serde_json::Value, base_url: &str, reasonin
         // capable. Per their docs (airpx.cc/v1): supports `reasoning_effort`
         // (OpenAI style) and `thinking.budget_tokens` (Anthropic style).
         // Forwarding `reasoning_effort` covers OpenAI-compat path.
-        || url_lc.contains("airpx.cc");
+        || url_lc.contains("airpx.cc")
+}
+
+fn route_is_known_thinking_proxy(base_url: &str) -> bool {
+    base_url.to_lowercase().contains("airpx.cc")
+}
+
+fn reasoning_requested_on(reasoning: Option<&str>) -> bool {
+    matches!(reasoning, Some("low" | "medium" | "high"))
+}
+
+/// Apply `enable_thinking` / `reasoning_effort` to an OpenAI-compatible request body,
+/// gated by the provider `base_url`. Some providers (e.g. Groq) reject unknown fields
+/// with HTTP 400, so we never include them unless the host is known to accept them.
+/// Returns true when the route accepted a request to turn reasoning/thinking on.
+fn apply_reasoning_params(
+    body: &mut serde_json::Value,
+    base_url: &str,
+    reasoning: Option<&str>,
+) -> bool {
+    let supports_enable_thinking = route_supports_enable_thinking(base_url);
+    let supports_reasoning_effort = route_supports_reasoning_effort(base_url);
+    let requested_on = reasoning_requested_on(reasoning);
     match reasoning {
         Some("off") if supports_enable_thinking => {
             body["enable_thinking"] = serde_json::json!(false);
@@ -185,6 +227,7 @@ fn apply_reasoning_params(body: &mut serde_json::Value, base_url: &str, reasonin
         }
         None => {}
     }
+    requested_on && (supports_reasoning_effort || supports_enable_thinking)
 }
 
 /// When `emit_reasoning` is true, every assistant message gets a
@@ -431,6 +474,7 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
         let mut tool_calls: std::collections::HashMap<u32, (String, String, String)> =
             std::collections::HashMap::new();
         let mut usage: Option<TurnUsage> = None;
+        let mut saw_done = false;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim().to_string();
@@ -447,6 +491,7 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
             };
 
             if data == "[DONE]" {
+                saw_done = true;
                 break;
             }
 
@@ -518,10 +563,14 @@ fn sse_stream_from_response(response: reqwest::Response) -> impl Stream<Item = S
             }
         }
 
-        if let Some(u) = usage {
-            yield StreamChunk::Usage(u);
+        if !saw_done {
+            yield StreamChunk::Error("SSE stream closed without [DONE] or content".into());
+        } else {
+            if let Some(u) = usage {
+                yield StreamChunk::Usage(u);
+            }
+            yield StreamChunk::Done;
         }
-        yield StreamChunk::Done;
     }
 }
 

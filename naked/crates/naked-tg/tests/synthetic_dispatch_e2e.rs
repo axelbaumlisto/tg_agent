@@ -52,19 +52,22 @@ impl Provider for UnreachableProvider {
 }
 
 fn make_core(tmp: &TempDir) -> Arc<AgentCore> {
+    make_core_with_auto_first_run(tmp, true)
+}
+
+fn make_core_with_auto_first_run(tmp: &TempDir, auto_first_run: bool) -> Arc<AgentCore> {
     let cfg = Config {
         workspace: tmp.path().to_path_buf(),
         session_dir: tmp.path().join("sessions"),
         research: ResearchConfig {
             enabled: true,
             storage_dir: Some(tmp.path().join("research")),
-            // The test relies on a freshly-created spec being IMMEDIATELY
+            // Most tests rely on a freshly-created spec being IMMEDIATELY
             // due on the first scheduler tick. `auto_first_run = true`
             // sets `run_at = now` on create_research, which is the
-            // mechanism we want here (every other scheduler test disables
-            // it for determinism reasons, but for OUR test the immediate
-            // fire is the whole point).
-            auto_first_run: true,
+            // mechanism we want there. Operator-dispatch tests disable it
+            // so `dispatch_immediate` is the only trigger under test.
+            auto_first_run,
             ..Default::default()
         },
         ..Default::default()
@@ -168,6 +171,83 @@ async fn t_scheduler_dispatches_synthetic_message_to_mock() {
 /// run_research_* path takes over — which our UnreachableProvider makes
 /// surface as a soft failure (Err logged), but importantly the mock
 /// remains empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_operator_dispatch_uses_inflight_chat_without_mutating_spec() {
+    let tmp = TempDir::new().expect("tempdir");
+    let agent = make_core_with_auto_first_run(&tmp, false);
+
+    // Spec WITHOUT chat_id: old/CLI specs should remain portable and must not
+    // be mutated just because this attempt was launched from a chat.
+    let mut spec = make_spec_with_chat("beta-operator", 0);
+    spec.chat_id = None;
+    spec.thread_id = None;
+    spec.interval_seconds = None;
+    agent
+        .research_store()
+        .create_spec(&spec)
+        .await
+        .expect("create_spec");
+
+    let mock = MockDispatcher::new();
+    let cfg = SchedulerConfig {
+        tick_interval: Duration::from_secs(60),
+        max_concurrent_runs: 1,
+        task_timeout: Duration::from_secs(5),
+        dispatch_fn: Some(mock.as_fn()),
+        ..Default::default()
+    };
+    let (sched, hook) = ResearchScheduler::start(Arc::downgrade(&agent), cfg);
+    agent.set_scheduler_hook(hook.clone());
+
+    sched
+        .dispatch_immediate(
+            "beta-operator",
+            321_654,
+            Some(77),
+            "research-beta-operator".to_string(),
+            "/research run beta-operator".to_string(),
+        )
+        .await
+        .expect("dispatch_immediate");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    sched.shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let captured = mock.snapshot().await;
+    assert_eq!(
+        captured.len(),
+        1,
+        "operator dispatch should reach mock once"
+    );
+    let msg = &captured[0];
+    assert_eq!(
+        msg.chat_id, 321_654,
+        "chat_id comes from Inflight operator context"
+    );
+    assert_eq!(
+        msg.thread_id,
+        Some(77),
+        "thread_id comes from Inflight operator context"
+    );
+    assert_eq!(msg.text, "/research run beta-operator");
+    assert_eq!(msg.source.spec_id(), Some("beta-operator"));
+
+    let stored = agent
+        .research_store()
+        .load_spec("beta-operator")
+        .await
+        .expect("load stored spec");
+    assert_eq!(
+        stored.chat_id, None,
+        "ResearchSpec.chat_id must not be mutated"
+    );
+    assert_eq!(
+        stored.thread_id, None,
+        "ResearchSpec.thread_id must not be mutated"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t_scheduler_skips_mock_when_chat_id_missing() {
     let tmp = TempDir::new().expect("tempdir");

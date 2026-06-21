@@ -133,7 +133,7 @@ pub fn create_provider(name: &str, resolved: ResolvedProvider) -> Box<dyn Provid
                 model_aliases: resolved.model_aliases.clone(),
                 capabilities: HashMap::new(),
             };
-            create_single_provider(&tag, cfg)
+            wrap_with_timeout(create_single_provider(&tag, cfg))
         })
         .collect();
 
@@ -141,12 +141,20 @@ pub fn create_provider(name: &str, resolved: ResolvedProvider) -> Box<dyn Provid
         "Provider '{name}': {} keys configured for rotation",
         providers.len()
     );
-    wrap_with_timeout(Box::new(ResilientProvider::new(providers)))
+    Box::new(ResilientProvider::new(providers))
 }
 
-/// Wrap any provider in [`TimeoutProvider`] for connect + inter-chunk
-/// deadlock protection. Every provider MUST go through this before
-/// being returned to the caller.
+/// Wrap a concrete network provider path in [`TimeoutProvider`] for
+/// stream-open/connect + inter-chunk deadlock protection.
+///
+/// Invariant: every concrete network provider path returned by
+/// `create_provider` is timeout-guarded: the single-key path is wrapped
+/// directly, and each key of a multi-key provider is wrapped before entering
+/// the key-rotation aggregate (B78). Aggregate fallback chains — including the
+/// multi-key [`ResilientProvider`] and the outer global chain in
+/// [`create_provider_chain`] — are NOT additionally connect-timeout wrapped;
+/// doing so cancels the chain mid-iteration and defeats fallback when one
+/// entry is slow to fail (B66).
 fn wrap_with_timeout(inner: Box<dyn Provider>) -> Box<dyn Provider> {
     Box::new(TimeoutProvider::new(
         inner,
@@ -184,9 +192,9 @@ pub fn create_provider_chain(
     }
 
     if providers.len() == 1 {
-        wrap_with_timeout(providers.remove(0))
+        providers.remove(0)
     } else {
-        wrap_with_timeout(Box::new(ResilientProvider::new(providers)))
+        Box::new(ResilientProvider::new(providers))
     }
 }
 

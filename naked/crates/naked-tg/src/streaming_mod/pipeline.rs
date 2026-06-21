@@ -19,6 +19,7 @@ use super::*;
 pub(crate) async fn send_stream_placeholder(
     bot: &Bot,
     ctx: &ChatCtx,
+    run_id: &str,
 ) -> Option<teloxide::types::MessageId> {
     // Retry with exponential backoff: 2s, 5s, 10s.
     // Network blips to Telegram DC are transient (10-30s); without
@@ -30,7 +31,7 @@ pub(crate) async fn send_stream_placeholder(
         .send_message(ctx.chat_id, "⏳ thinking…")
         .maybe_thread(ctx.thread_id)
         .maybe_reply_to(ctx.reply_to)
-        .reply_markup(streaming_control_kb())
+        .reply_markup(streaming_control_kb_for_run(run_id))
         .await
     {
         Ok(m) => return Some(m.id),
@@ -46,7 +47,7 @@ pub(crate) async fn send_stream_placeholder(
             .send_message(ctx.chat_id, "⏳ thinking…")
             .maybe_thread(ctx.thread_id)
             .maybe_reply_to(ctx.reply_to)
-            .reply_markup(streaming_control_kb())
+            .reply_markup(streaming_control_kb_for_run(run_id))
             .await
         {
             Ok(m) => {
@@ -63,32 +64,59 @@ pub(crate) async fn send_stream_placeholder(
     None
 }
 
-pub(crate) fn streaming_control_kb() -> teloxide::types::InlineKeyboardMarkup {
+pub(crate) fn streaming_control_kb_for_run(run_id: &str) -> teloxide::types::InlineKeyboardMarkup {
     teloxide::types::InlineKeyboardMarkup::new(vec![vec![
-        teloxide::types::InlineKeyboardButton::callback("⏹ Stop", "stream:abort"),
-        teloxide::types::InlineKeyboardButton::callback("⏩ Send", "stream:sendnow"),
+        teloxide::types::InlineKeyboardButton::callback("⏹ Stop", format!("s:abort:{run_id}")),
+        teloxide::types::InlineKeyboardButton::callback("⏩ Send", format!("s:sendnow:{run_id}")),
     ]])
 }
 
-pub(crate) async fn register_turn_routing(ctx: ChatCtx, handle: &AgentHandle) {
-    let chat_id_raw = ctx.chat_id.0;
-    let tid = ctx.raw_thread_id();
-    let chat_key = (chat_id_raw, tid);
+pub(crate) async fn register_turn_routing(_ctx: ChatCtx, _handle: &AgentHandle) {
+    // Step 4: run routing is registered by run_id inside stream_response.
+}
 
-    STEER_SENDERS
-        .write()
-        .await
-        .insert(chat_key, handle.steer.clone());
+#[derive(Debug, Clone)]
+pub(crate) struct StreamRunContext {
+    /// Optional pre-existing external id. Research maps Inflight.attempt_id here;
+    /// chat turns leave it empty and let RunRegistry generate a kind-agnostic id.
+    pub(crate) requested_run_id: Option<naked_tg::run_registry::RunId>,
+    pub(crate) session_id: naked_tg::run_registry::SessionId,
+    pub(crate) kind: naked_tg::run_registry::RunKind,
+    pub(crate) source_ref: Option<naked_tg::run_registry::SourceRef>,
+}
+
+impl StreamRunContext {
+    pub(crate) fn chat_turn(session_id: String) -> Self {
+        Self {
+            requested_run_id: None,
+            session_id,
+            kind: naked_tg::run_registry::RunKind::ChatTurn,
+            source_ref: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamResponseOutcome {
+    /// True if the turn reached `AgentEvent::Idle` (clean completion/flush).
+    pub(crate) got_idle: bool,
+    /// True if the turn emitted B73's wall-clock timeout error before Idle.
+    pub(crate) wall_timeout: bool,
 }
 
 /// T3 (PLAN_v13_SOLID_AUDIT): takes `&BotDeps` for shared infra
 /// instead of 7 individual args.  Turn-specific params remain separate.
+/// Stream an agent turn's events to Telegram as live message edits.
+///
+/// Returns an outcome that distinguishes clean Idle from B73's timeout+Idle
+/// cleanup path; callers that do not need the distinction can ignore it.
 pub(crate) async fn stream_response(
     deps: &crate::message_handler::BotDeps,
     ctx: ChatCtx,
     handle: AgentHandle,
     model_tag: String,
-) {
+    run_ctx: StreamRunContext,
+) -> StreamResponseOutcome {
     let bot = deps.bot.clone();
     let channel_map = &deps.channel_map;
     let pending_perms = &deps.pending_perms;
@@ -100,18 +128,60 @@ pub(crate) async fn stream_response(
         mut events,
         permissions,
         steer,
+        abort,
     } = handle;
     let chat_id_raw = ctx.chat_id.0;
     let tid = ctx.raw_thread_id();
-    let chat_key_for_steer = (chat_id_raw, tid);
-
-    // Idempotent fallback for non-message callers (e.g. research callbacks).
-    if !STEER_SENDERS.read().await.contains_key(&chat_key_for_steer) {
-        STEER_SENDERS
-            .write()
-            .await
-            .insert(chat_key_for_steer, steer);
+    let _chat_key_for_steer = (chat_id_raw, tid);
+    let abort_for_reject = abort.clone();
+    let session_id_for_attach = run_ctx.session_id.clone();
+    let run_summary = match crate::shared::RUN_REGISTRY.register_run(
+        naked_tg::run_registry::RegisterRunInput {
+            requested_run_id: run_ctx.requested_run_id,
+            session_id: run_ctx.session_id,
+            origin: naked_tg::run_registry::RunOrigin::new(chat_id_raw, tid),
+            kind: run_ctx.kind,
+            source_ref: run_ctx.source_ref,
+            steer: steer.clone(),
+            abort,
+        },
+        {
+            if deps.config.run_registry_multi_stream_enabled {
+                naked_tg::run_registry::RegisterRunOptions::cap_three()
+            } else {
+                naked_tg::run_registry::RegisterRunOptions::step2_single_run()
+            }
+        },
+    ) {
+        Ok(summary) => summary,
+        Err(err) => {
+            if matches!(
+                err,
+                naked_tg::run_registry::RegisterRunError::ThreadCapacityExceeded { .. }
+            ) {
+                crate::metrics::record_run_registry_cap_reject();
+                let _ = bot
+                    .send_message(
+                        ctx.chat_id,
+                        "⚠️ 3 runs already active in this thread — abort or wait for one to finish before starting another.",
+                    )
+                    .maybe_thread(ctx.thread_id)
+                    .await;
+            }
+            tracing::warn!(chat_id = chat_id_raw, ?tid, error = ?err, "run registry rejected stream start");
+            abort_for_reject.cancel();
+            drain_rejected_stream(events, permissions).await;
+            return StreamResponseOutcome::default();
+        }
+    };
+    crate::metrics::record_run_registry_register();
+    let run_id = run_summary.run_id.clone();
+    let attach_workspace = deps.agent.session_workspace(&session_id_for_attach).await;
+    if let Some(workspace) = attach_workspace.clone() {
+        naked_tg::tg_attach::bind_workspace_run(workspace, run_id.clone()).await;
     }
+
+    STEER_SENDERS.write().await.insert(run_id.clone(), steer);
 
     tracing::debug!(
         chat_id = chat_id_raw,
@@ -132,14 +202,28 @@ pub(crate) async fn stream_response(
     // the buttons ride untouched through every streaming flush.
     // End-of-turn clears them with editMessageReplyMarkup (no
     // `.reply_markup()` arg) instead of deleting the message.
-    let placeholder = match send_stream_placeholder(&bot, &ctx).await {
+    let placeholder = match send_stream_placeholder(&bot, &ctx, &run_id).await {
         Some(id) => id,
-        None => return,
+        None => {
+            if let Some(workspace) = attach_workspace.as_deref() {
+                naked_tg::tg_attach::unbind_workspace_run(workspace, &run_id).await;
+            }
+            if crate::shared::RUN_REGISTRY.remove_run(&run_id).is_some() {
+                crate::metrics::record_run_registry_remove();
+            }
+            abort_for_reject.cancel();
+            drain_rejected_stream(events, permissions).await;
+            return StreamResponseOutcome::default();
+        }
     };
+    let _ = crate::shared::RUN_REGISTRY.bind_message(
+        &run_id,
+        naked_tg::run_registry::MessageKey::new(chat_id_raw, placeholder.0),
+    );
     crate::shared::CONTROL_CARDS
         .write()
         .await
-        .insert((chat_id_raw, tid), (ctx.chat_id, placeholder));
+        .insert(run_id.clone(), (ctx.chat_id, placeholder));
 
     let typing_client = http_client.clone();
     let typing_base = base_url.to_string();
@@ -158,14 +242,14 @@ pub(crate) async fn stream_response(
 
     // Register per-chat model-switch state so `/model` callbacks can
     // request an in-flight switch during this stream.
-    let chat_key = (chat_id_raw, tid);
     let model_switch = naked_tg::model_switch::new_shared();
     MODEL_SWITCHES
         .write()
         .await
-        .insert(chat_key, model_switch.clone());
+        .insert(run_id.clone(), model_switch.clone());
 
     let mut view = CompositeView::new(model_tag);
+    update_cached_run_state(&run_id, &view, None);
     let mut dirty = false;
     let mut last_sent = String::new();
     let mut html_broken = false;
@@ -183,6 +267,7 @@ pub(crate) async fn stream_response(
     flush_interval.tick().await; // consume first immediate tick
 
     let mut got_idle = false;
+    let mut wall_timeout = false;
     loop {
         let event = tokio::select! {
             ev = events.recv() => match ev {
@@ -253,10 +338,10 @@ pub(crate) async fn stream_response(
                     permission,
                 } => {
                     // Flush before showing permission dialog.
-                    let _ = flush_live(
+                    let _ = flush_live_to_all_sinks(
                         &bot,
-                        ctx.chat_id,
-                        placeholder,
+                        &run_id,
+                        primary_sink_or_fallback(&run_id, ctx, placeholder),
                         &view,
                         &mut last_sent,
                         &mut html_broken,
@@ -358,7 +443,7 @@ pub(crate) async fn stream_response(
                         let mut acks = crate::shared::STEER_ACK_IDS.write().await;
                         msg_ids
                             .iter()
-                            .filter_map(|mid| acks.remove(&(chat_id_raw, tid, *mid)))
+                            .filter_map(|mid| acks.remove(&(run_id.clone(), *mid)))
                             .collect()
                     };
                     for (chat, ack_id) in to_delete {
@@ -401,6 +486,9 @@ pub(crate) async fn stream_response(
                     if e.contains("cancelled") || e.contains("Cancelled") {
                         got_idle = true;
                     }
+                    if e == naked_core::error::WALL_TIMEOUT_MESSAGE {
+                        wall_timeout = true;
+                    }
                     let _ = handlers::handle_error(&mut view, &e);
                     dirty = true;
                 }
@@ -428,20 +516,22 @@ pub(crate) async fn stream_response(
             // Tick fired — time to flush.
             view.tick += 1;
             if dirty {
-                flush_live(
+                flush_live_to_all_sinks(
                     &bot,
-                    ctx.chat_id,
-                    placeholder,
+                    &run_id,
+                    primary_sink_or_fallback(&run_id, ctx, placeholder),
                     &view,
                     &mut last_sent,
                     &mut html_broken,
                 )
                 .await;
+                update_cached_run_state(&run_id, &view, None);
                 dirty = false;
 
                 // If the rate limiter has this chat blocked (429),
                 // stretch the ticker to avoid hammering.
-                let backoff = rate_limiter.streaming_interval(ctx.chat_id.0).await;
+                let primary = primary_sink_or_fallback(&run_id, ctx, placeholder);
+                let backoff = rate_limiter.streaming_interval(primary.ctx.chat_id.0).await;
                 if backoff > flush_interval.period() {
                     flush_interval = tokio::time::interval(backoff);
                     flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -453,7 +543,7 @@ pub(crate) async fn stream_response(
 
     notify_if_agent_died_without_idle(&bot, ctx, got_idle).await;
     typing_cancel.cancel();
-    cleanup_stream_registries(&bot, chat_key, chat_key_for_steer).await;
+    cleanup_stream_registries(&bot, &run_id).await;
 
     if aborted_for_switch {
         // Don't send final — the turn was interrupted. Edit placeholder to
@@ -461,13 +551,151 @@ pub(crate) async fn stream_response(
         RATE_LIMITER
             .edit_plain(&bot, ctx.chat_id, placeholder, "⚡ Switching model…")
             .await;
-        return;
+        if let Some(workspace) = attach_workspace.as_deref() {
+            naked_tg::tg_attach::unbind_workspace_run(workspace, &run_id).await;
+        }
+        if crate::shared::RUN_REGISTRY.remove_run(&run_id).is_some() {
+            crate::metrics::record_run_registry_remove();
+        }
+        return StreamResponseOutcome {
+            got_idle,
+            wall_timeout,
+        };
     }
 
     let final_html = view.render_final();
-    send_final(bot.clone(), ctx, placeholder, &final_html, &view).await;
-    send_provider_error_card_if_needed(&bot, ctx, &view).await;
-    deliver_queued_attachments(http_client, base_url, ctx, tg_attach_queue).await;
+    update_cached_run_state(&run_id, &view, Some(final_html.clone()));
+    let primary = primary_sink_or_fallback(&run_id, ctx, placeholder);
+    send_final_to_all_sinks(bot.clone(), &run_id, primary, &final_html, &view).await;
+    send_provider_error_card_if_needed(&bot, primary.ctx, &view).await;
+    deliver_queued_attachments(http_client, base_url, primary.ctx, tg_attach_queue, &run_id).await;
+    if let Some(workspace) = attach_workspace.as_deref() {
+        naked_tg::tg_attach::unbind_workspace_run(workspace, &run_id).await;
+    }
+    if crate::shared::RUN_REGISTRY.remove_run(&run_id).is_some() {
+        crate::metrics::record_run_registry_remove();
+    }
+    StreamResponseOutcome {
+        got_idle,
+        wall_timeout,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PrimaryRunSink {
+    ctx: ChatCtx,
+    message_id: teloxide::types::MessageId,
+}
+
+fn primary_sink_or_fallback(
+    run_id: &str,
+    fallback_ctx: ChatCtx,
+    fallback_msg: teloxide::types::MessageId,
+) -> PrimaryRunSink {
+    crate::shared::RUN_REGISTRY
+        .primary_sink(run_id)
+        .map(|sink| PrimaryRunSink {
+            ctx: ChatCtx {
+                chat_id: teloxide::types::ChatId(sink.chat_id),
+                thread_id: sink
+                    .thread_id
+                    .map(|id| teloxide::types::ThreadId(teloxide::types::MessageId(id))),
+                reply_to: None,
+            },
+            message_id: teloxide::types::MessageId(sink.message_id),
+        })
+        .unwrap_or(PrimaryRunSink {
+            ctx: fallback_ctx,
+            message_id: fallback_msg,
+        })
+}
+
+async fn flush_live_to_all_sinks(
+    bot: &Bot,
+    run_id: &str,
+    primary: PrimaryRunSink,
+    view: &CompositeView,
+    last_sent: &mut String,
+    html_broken: &mut bool,
+) -> bool {
+    let html = view.render_live();
+    let primary_ok = flush_live_html(
+        bot,
+        primary.ctx.chat_id,
+        primary.message_id,
+        &html,
+        last_sent,
+        html_broken,
+    )
+    .await;
+    for sink in crate::shared::RUN_REGISTRY.mirror_sinks(run_id) {
+        let mut mirror_last_sent = String::new();
+        let mut mirror_html_broken = false;
+        let _ = flush_live_html(
+            bot,
+            teloxide::types::ChatId(sink.chat_id),
+            teloxide::types::MessageId(sink.message_id),
+            &html,
+            &mut mirror_last_sent,
+            &mut mirror_html_broken,
+        )
+        .await;
+    }
+    primary_ok
+}
+
+async fn send_final_to_all_sinks(
+    bot: Bot,
+    run_id: &str,
+    primary: PrimaryRunSink,
+    final_html: &str,
+    view: &CompositeView,
+) {
+    send_final(
+        bot.clone(),
+        primary.ctx,
+        primary.message_id,
+        final_html,
+        view,
+    )
+    .await;
+    for sink in crate::shared::RUN_REGISTRY.mirror_sinks(run_id) {
+        let mirror_ctx = ChatCtx {
+            chat_id: teloxide::types::ChatId(sink.chat_id),
+            thread_id: sink
+                .thread_id
+                .map(|id| teloxide::types::ThreadId(teloxide::types::MessageId(id))),
+            reply_to: None,
+        };
+        send_final(
+            bot.clone(),
+            mirror_ctx,
+            teloxide::types::MessageId(sink.message_id),
+            final_html,
+            view,
+        )
+        .await;
+    }
+}
+
+async fn drain_rejected_stream(
+    mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
+    permissions: tokio::sync::mpsc::Sender<PermissionResponse>,
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::PermissionRequest { call_id, .. } => {
+                let _ = permissions
+                    .send(PermissionResponse {
+                        call_id,
+                        allowed: false,
+                    })
+                    .await;
+            }
+            AgentEvent::Idle => break,
+            _ => {}
+        }
+    }
 }
 
 async fn notify_if_agent_died_without_idle(bot: &Bot, ctx: ChatCtx, got_idle: bool) {
@@ -489,41 +717,58 @@ async fn notify_if_agent_died_without_idle(bot: &Bot, ctx: ChatCtx, got_idle: bo
         .await;
 }
 
-async fn cleanup_stream_registries(
-    bot: &Bot,
-    chat_key: (i64, Option<i32>),
-    chat_key_for_steer: (i64, Option<i32>),
-) {
-    let (chat_id_raw, tid) = chat_key;
-    MODEL_SWITCHES.write().await.remove(&chat_key);
-    STEER_SENDERS.write().await.remove(&chat_key_for_steer);
+async fn cleanup_stream_registries(bot: &Bot, run_id: &str) {
+    MODEL_SWITCHES.write().await.remove(run_id);
+    STEER_SENDERS.write().await.remove(run_id);
 
     // PLAN_MEDIA_UX_v1 M4 / B02: clear the [⏹ Стоп] [⏩ Send now] inline
     // keyboard from the placeholder (which now ALSO holds the final text).
-    if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
-        .write()
-        .await
-        .remove(&(chat_id_raw, tid))
-        && let Err(e) = bot.edit_message_reply_markup(chat, mid).await
-    {
-        tracing::debug!(
-            chat = chat.0,
-            msg = mid.0,
-            "control card clear failed (likely already cleared): {e}"
-        );
+    let mut control_keys: Vec<_> = crate::shared::RUN_REGISTRY
+        .bound_message_keys(run_id)
+        .into_iter()
+        .map(|key| {
+            (
+                teloxide::types::ChatId(key.chat_id),
+                teloxide::types::MessageId(key.message_id),
+            )
+        })
+        .collect();
+    if let Some((chat, mid)) = crate::shared::CONTROL_CARDS.write().await.remove(run_id) {
+        control_keys.push((chat, mid));
     }
-    cleanup_stale_steer_acks(bot, chat_id_raw, tid).await;
+    control_keys.sort_by_key(|(chat, mid)| (chat.0, mid.0));
+    control_keys.dedup();
+    for (chat, mid) in control_keys {
+        if let Err(e) = bot.edit_message_reply_markup(chat, mid).await {
+            tracing::debug!(
+                chat = chat.0,
+                msg = mid.0,
+                "control card clear failed (likely already cleared): {e}"
+            );
+        }
+    }
+    cleanup_stale_steer_acks(bot, run_id).await;
 }
 
-async fn cleanup_stale_steer_acks(bot: &Bot, chat_id_raw: i64, tid: Option<i32>) {
-    // S6 cleanup: any ack ids still parked for this chat/thread are unreachable
-    // now (turn ended without an Idle-time SteerReceived for them). Best-effort
-    // delete — prevents the temp "Принято" message from sticking around forever.
+fn update_cached_run_state(run_id: &str, view: &CompositeView, final_html: Option<String>) {
+    let status_line = Some(format!("{} #{}", view.phase, view.tick));
+    let _ = crate::shared::RUN_REGISTRY.update_rendered_state(
+        run_id,
+        naked_tg::run_registry::RenderedRunState {
+            live_html: view.render_live(),
+            final_html,
+            status_line,
+        },
+    );
+}
+
+async fn cleanup_stale_steer_acks(bot: &Bot, run_id: &str) {
+    // S6 cleanup: any ack ids still parked for this run are unreachable now.
     let stale: Vec<(teloxide::types::ChatId, teloxide::types::MessageId)> = {
         let mut acks = crate::shared::STEER_ACK_IDS.write().await;
         let keys: Vec<_> = acks
             .keys()
-            .filter(|(c, t, _)| *c == chat_id_raw && *t == tid)
+            .filter(|(rid, _)| rid == run_id)
             .cloned()
             .collect();
         keys.into_iter().filter_map(|k| acks.remove(&k)).collect()
@@ -562,9 +807,9 @@ async fn deliver_queued_attachments(
     base_url: &str,
     ctx: ChatCtx,
     tg_attach_queue: &naked_tg::tg_attach::AttachmentQueue,
+    run_id: &str,
 ) {
-    let attachments: Vec<naked_tg::tg_attach::StagedAttachment> =
-        tg_attach_queue.lock().await.drain(..).collect();
+    let attachments = naked_tg::tg_attach::drain_for_run(tg_attach_queue, run_id).await;
     for att in attachments {
         deliver_one_attachment(http_client, base_url, ctx, att).await;
     }

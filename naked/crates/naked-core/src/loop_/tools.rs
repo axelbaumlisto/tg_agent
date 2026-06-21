@@ -56,6 +56,16 @@ impl super::AgentLoop {
                         // (matches the semantics of the stream-side
                         // arm in stream_one_turn).
                         steer.record_winner_and_burst(msg, steer_rx);
+                    } else {
+                        // B80b: recv() returned None => the steer sender
+                        // is CLOSED (dropped). Without this, the select!
+                        // arm would keep resolving instantly with None on
+                        // every poll and spin the CPU at 100% for the
+                        // entire batch (observed live: a chat-driven
+                        // `research_run` burned >1 core for 30 min until
+                        // the scheduler sweep-timeout). Drop the receiver
+                        // so the arm parks on `pending()` forever instead.
+                        *steer_rx = None;
                     }
                 }
             }

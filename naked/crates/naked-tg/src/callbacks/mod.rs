@@ -59,6 +59,18 @@ pub(crate) async fn handle_callback(
     let action = CallbackAction::parse(&data);
     let prefix = CallbackAction::prefix(&data);
     tracing::info!(callback_data = %data, prefix, "handle_callback");
+    let cb_ctx = ChatCtx::from_callback(&q);
+    if !crate::shared::is_allowed(cb_ctx.chat_id.0, &config) {
+        crate::metrics::record_run_registry_callback_denied();
+        tracing::warn!(
+            chat_id = cb_ctx.chat_id.0,
+            "rejected callback from non-allowed chat"
+        );
+        bot.answer_callback_query(q.id.clone())
+            .text("not allowed")
+            .await?;
+        return Ok(());
+    }
 
     match action {
         CallbackAction::Permission { call_id, action } => {
@@ -96,7 +108,10 @@ pub(crate) async fn handle_callback(
             handle_model_page(&bot, &agent, &channel_map, &config, &q, page_str).await?;
         }
         CallbackAction::Stream { action } => {
-            handle_stream_action(&bot, &agent, &channel_map, &q, action).await?;
+            handle_stream_action(&bot, &agent, &channel_map, &q, action, None).await?;
+        }
+        CallbackAction::StreamRun { action, run_id } => {
+            handle_stream_action(&bot, &agent, &channel_map, &q, action, Some(run_id)).await?;
         }
         CallbackAction::Error { action } => {
             handle_error_callback(&bot, &q, action).await?;

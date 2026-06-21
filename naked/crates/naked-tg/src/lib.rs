@@ -21,6 +21,7 @@ pub mod per_chat_locks;
 pub mod persona;
 pub mod rate_limit;
 pub mod render;
+pub mod run_registry;
 // T4 (PLAN_v13_SOLID_AUDIT): 0 binary consumers after B4 removal.
 #[cfg(test)]
 pub mod research_html;

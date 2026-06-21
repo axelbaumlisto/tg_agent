@@ -297,10 +297,20 @@ pub(crate) async fn handle_message(
 
     match dispatch {
         PreparedDispatch::StartTurn(turn) => {
-            stream_response(&deps, ctx, turn.handle, turn.model_tag).await;
+            let run_ctx = crate::streaming::StreamRunContext::chat_turn(turn.session_id);
+            let _ = stream_response(&deps, ctx, turn.handle, turn.model_tag, run_ctx).await;
         }
-        PreparedDispatch::SteerAck { msg_id, key } => {
-            send_steer_ack(bot, ctx, msg_id, key).await?;
+        PreparedDispatch::SteerAck { msg_id, run_id } => {
+            send_steer_ack(bot, ctx, msg_id, run_id).await?;
+        }
+        PreparedDispatch::Ambiguous { count } => {
+            crate::shared::safe_send(
+                bot,
+                &ctx,
+                format!("{count} runs already active here; use /research steer <run_id> <text>"),
+                None,
+            )
+            .await?;
         }
         PreparedDispatch::Busy => {
             crate::shared::safe_send(bot, &ctx, crate::ux_text::BUSY_ACK.to_string(), None).await?;
@@ -343,19 +353,16 @@ fn build_multimodal_blocks(
 
 enum PreparedDispatch {
     StartTurn(PreparedTurn),
-    SteerAck {
-        msg_id: i32,
-        key: (i64, Option<i32>),
-    },
+    SteerAck { msg_id: i32, run_id: String },
+    Ambiguous { count: usize },
     Busy,
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 struct PreparedTurn {
     handle: AgentHandle,
     model_tag: String,
+    session_id: String,
 }
 
 fn should_count_session_busy_ack(steer_succeeded: bool) -> bool {
@@ -363,14 +370,14 @@ fn should_count_session_busy_ack(steer_succeeded: bool) -> bool {
 }
 
 fn session_busy_dispatch(
-    key: (i64, Option<i32>),
+    _key: (i64, Option<i32>),
     msg_id: i32,
-    steer_succeeded: bool,
+    steer_succeeded: Option<String>,
 ) -> PreparedDispatch {
-    if steer_succeeded {
-        PreparedDispatch::SteerAck { msg_id, key }
+    if let Some(run_id) = steer_succeeded {
+        PreparedDispatch::SteerAck { msg_id, run_id }
     } else {
-        if should_count_session_busy_ack(steer_succeeded) {
+        if should_count_session_busy_ack(false) {
             crate::metrics::record_session_busy_ack();
         }
         PreparedDispatch::Busy
@@ -455,7 +462,10 @@ async fn start_new_agent_turn(
             if matches!(&e, naked_core::error::AgentError::SessionBusy(_)) {
                 let key = (ctx.chat_id.0, ctx.raw_thread_id());
                 let steered = try_steer_active_turn(key, msg.id.0, &text).await;
-                return Ok(session_busy_dispatch(key, msg.id.0, steered));
+                return Ok(match steered {
+                    Ok(run_id) => session_busy_dispatch(key, msg.id.0, run_id),
+                    Err(count) => PreparedDispatch::Ambiguous { count },
+                });
             }
             return Ok(PreparedDispatch::Error {
                 message: format!("Error: {e}"),
@@ -467,6 +477,7 @@ async fn start_new_agent_turn(
     Ok(PreparedDispatch::StartTurn(PreparedTurn {
         handle,
         model_tag,
+        session_id: session_id.to_string(),
     }))
 }
 
@@ -590,20 +601,35 @@ async fn prepare_active_session_message(
 ) -> Result<PreparedDispatch, teloxide::RequestError> {
     let key = (ctx.chat_id.0, ctx.raw_thread_id());
     let steered = try_steer_active_turn(key, msg.id.0, &text).await;
-    Ok(session_busy_dispatch(key, msg.id.0, steered))
+    Ok(match steered {
+        Ok(run_id) => session_busy_dispatch(key, msg.id.0, run_id),
+        Err(count) => PreparedDispatch::Ambiguous { count },
+    })
 }
 
-async fn try_steer_active_turn(key: (i64, Option<i32>), msg_id: i32, text: &str) -> bool {
-    let map = STEER_SENDERS.read().await;
-    if let Some(steer_tx) = map.get(&key) {
-        let steer_msg = naked_core::types::SteerMessage {
-            msg_id,
-            text: text.to_string(),
-            is_edit: false,
-        };
-        steer_try_send(steer_tx, steer_msg)
-    } else {
-        false
+async fn try_steer_active_turn(
+    key: (i64, Option<i32>),
+    msg_id: i32,
+    text: &str,
+) -> Result<Option<String>, usize> {
+    let run_key = naked_tg::run_registry::ChatThreadKey::new(key.0, key.1);
+    match crate::shared::RUN_REGISTRY.resolve_for_steer(run_key) {
+        naked_tg::run_registry::ResolveForSteer::NotFound => Ok(None),
+        naked_tg::run_registry::ResolveForSteer::Ambiguous(runs) => Err(runs.len()),
+        naked_tg::run_registry::ResolveForSteer::Unique(run) => {
+            let map = STEER_SENDERS.read().await;
+            if let Some(steer_tx) = map.get(&run.run_id) {
+                let steer_msg = naked_core::types::SteerMessage {
+                    msg_id,
+                    text: text.to_string(),
+                    is_edit: false,
+                };
+                if steer_try_send(steer_tx, steer_msg) {
+                    return Ok(Some(run.run_id));
+                }
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -618,7 +644,7 @@ async fn send_steer_ack(
     bot: &Bot,
     ctx: ChatCtx,
     msg_id: i32,
-    key: (i64, Option<i32>),
+    run_id: String,
 ) -> Result<(), teloxide::RequestError> {
     let ack = bot
         .send_message(ctx.chat_id, crate::ux_text::STEER_ACK)
@@ -628,7 +654,7 @@ async fn send_steer_ack(
     crate::shared::STEER_ACK_IDS
         .write()
         .await
-        .insert((key.0, key.1, msg_id), (ctx.chat_id, ack.id));
+        .insert((run_id, msg_id), (ctx.chat_id, ack.id));
     Ok(())
 }
 
@@ -728,20 +754,20 @@ mod tests {
         let key = (42, Some(7));
         let msg_id = 1001;
         let before = crate::metrics::snapshot().session_busy_ack;
-        let busy = super::session_busy_dispatch(key, msg_id, false);
+        let busy = super::session_busy_dispatch(key, msg_id, None);
         let after_busy = crate::metrics::snapshot().session_busy_ack;
         assert_eq!(after_busy, before + 1);
         assert!(matches!(busy, super::PreparedDispatch::Busy));
 
-        let steered = super::session_busy_dispatch(key, msg_id, true);
+        let steered = super::session_busy_dispatch(key, msg_id, Some("run-1".to_string()));
         let after_steer = crate::metrics::snapshot().session_busy_ack;
         assert_eq!(after_steer, after_busy);
         assert!(matches!(
             steered,
             super::PreparedDispatch::SteerAck {
                 msg_id: actual_msg_id,
-                key: actual_key,
-            } if actual_msg_id == msg_id && actual_key == key
+                ref run_id,
+            } if actual_msg_id == msg_id && run_id == "run-1"
         ));
     }
 
@@ -770,7 +796,7 @@ mod tests {
             "Busy dispatch arm must use the central BUSY_ACK constant"
         );
         assert!(
-            dispatch_match.contains("send_steer_ack(bot, ctx, msg_id, key)"),
+            dispatch_match.contains("send_steer_ack(bot, ctx, msg_id, run_id)"),
             "SteerAck dispatch arm should stay delegated to send_steer_ack"
         );
 
@@ -790,20 +816,20 @@ mod tests {
         let key = (42, Some(7));
         let msg_id = 1001;
 
-        let steered = super::session_busy_dispatch(key, msg_id, true);
+        let steered = super::session_busy_dispatch(key, msg_id, Some("run-1".to_string()));
         assert!(matches!(
             steered,
             super::PreparedDispatch::SteerAck {
                 msg_id: actual_msg_id,
-                key: actual_key,
-            } if actual_msg_id == msg_id && actual_key == key
+                ref run_id,
+            } if actual_msg_id == msg_id && run_id == "run-1"
         ));
         assert!(
             !matches!(steered, super::PreparedDispatch::Error { ref message } if message.starts_with("Error:")),
             "SessionBusy with steer available must not render as Error:"
         );
 
-        let busy = super::session_busy_dispatch(key, msg_id, false);
+        let busy = super::session_busy_dispatch(key, msg_id, None);
         assert!(matches!(busy, super::PreparedDispatch::Busy));
         assert!(
             !matches!(busy, super::PreparedDispatch::Error { ref message } if message.starts_with("Error:")),
@@ -821,7 +847,7 @@ mod tests {
             "active-session no-steer path must steer-or-Busy, never append to live Session.history"
         );
         assert!(
-            active_fn.contains("session_busy_dispatch(key, msg.id.0, steered)"),
+            active_fn.contains("session_busy_dispatch(key, msg.id.0, run_id)"),
             "active-session path must reuse the steer-or-Busy decision helper"
         );
     }
@@ -848,7 +874,7 @@ mod tests {
 
         assert!(!steered, "full steer channel must be treated as no-steer");
         assert!(matches!(
-            super::session_busy_dispatch(key, msg_id, steered),
+            super::session_busy_dispatch(key, msg_id, steered.then(|| "run-full".to_string())),
             super::PreparedDispatch::Busy
         ));
     }

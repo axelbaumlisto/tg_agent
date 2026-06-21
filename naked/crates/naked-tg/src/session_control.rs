@@ -28,12 +28,8 @@ pub(crate) async fn abort_mapped_session(
     }
 }
 
-pub(crate) async fn clear_control_card(bot: &Bot, chat_id: i64, thread_id: Option<i32>) {
-    if let Some((chat, mid)) = crate::shared::CONTROL_CARDS
-        .write()
-        .await
-        .remove(&(chat_id, thread_id))
-    {
+pub(crate) async fn clear_control_card_for_run(bot: &Bot, run_id: &str) {
+    if let Some((chat, mid)) = crate::shared::CONTROL_CARDS.write().await.remove(run_id) {
         let _ = bot.edit_message_reply_markup(chat, mid).await;
     }
 }

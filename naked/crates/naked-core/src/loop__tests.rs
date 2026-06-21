@@ -43,6 +43,105 @@ impl Provider for MockProvider {
     }
 }
 
+struct DoneAndQueueSteerProvider {
+    steer_tx: mpsc::Sender<SteerMessage>,
+    call_count: std::sync::Arc<AtomicUsize>,
+}
+
+struct DoneAndQueueSteerStream {
+    steer_tx: mpsc::Sender<SteerMessage>,
+    yielded: bool,
+}
+
+impl tokio_stream::Stream for DoneAndQueueSteerStream {
+    type Item = StreamChunk;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.yielded {
+            return std::task::Poll::Ready(None);
+        }
+        self.yielded = true;
+        let _ = self.steer_tx.try_send(SteerMessage {
+            msg_id: 70,
+            text: "terminal empty steer".into(),
+            is_edit: false,
+        });
+        std::task::Poll::Ready(Some(StreamChunk::Done))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for DoneAndQueueSteerProvider {
+    fn name(&self) -> &str {
+        "done-and-queue-steer"
+    }
+
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        vec![]
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(DoneAndQueueSteerStream {
+            steer_tx: self.steer_tx.clone(),
+            yielded: false,
+        }))
+    }
+}
+
+struct DelayedToolUseAndQueueSteerProvider {
+    steer_tx: mpsc::Sender<SteerMessage>,
+    delay: std::time::Duration,
+    call_count: std::sync::Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Provider for DelayedToolUseAndQueueSteerProvider {
+    fn name(&self) -> &str {
+        "delayed-tool-use-and-queue-steer"
+    }
+
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        vec![]
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>> {
+        let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if idx == 0 {
+            let steer_tx = self.steer_tx.clone();
+            let delay = self.delay;
+            Ok(Box::pin(async_stream::stream! {
+                tokio::time::sleep(delay).await;
+                let _ = steer_tx.try_send(SteerMessage {
+                    msg_id: 71,
+                    text: "wall timeout steer".into(),
+                    is_edit: false,
+                });
+                yield StreamChunk::ToolUse {
+                    id: "call-timeout".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text": "force another iteration"}),
+                };
+                yield StreamChunk::Done;
+            }))
+        } else {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                StreamChunk::Text("should not reach second provider call".into()),
+                StreamChunk::Done,
+            ])))
+        }
+    }
+}
+
 struct EchoTool;
 
 #[async_trait::async_trait]
@@ -76,6 +175,7 @@ fn make_loop(provider: MockProvider, tools: Vec<Box<dyn Tool>>) -> AgentLoop {
         crate::tool::registry::ToolRegistry::new(tools),
         LoopConfig {
             max_iterations: 10,
+            max_wall: None,
             cwd: std::path::PathBuf::from("/tmp"),
             model: "mock".into(),
             max_tokens: 1024,
@@ -94,21 +194,17 @@ async fn loop_zero_token_turn_does_not_pollute_history() {
     // polluting history (otherwise every subsequent turn sees
     // `{role:assistant, content:[]}` and refuses in a loop).
     //
-    // The provider is wired to return three identical empty streams
-    // (initial + `MAX_EMPTY_CONTENT_RETRIES` retries) so the budget is
-    // exhausted before we hit the MockProvider fallback.
-    let empty_stream = || {
-        vec![
-            StreamChunk::Usage(TurnUsage {
-                input_tokens: 42,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            }),
-            StreamChunk::Done,
-        ]
-    };
-    let provider = MockProvider::new(vec![empty_stream(), empty_stream(), empty_stream()]);
+    // A clean terminal marker with zero content is genuine model silence
+    // (B70), so it must fail once without retrying or hitting fallback.
+    let provider = MockProvider::new(vec![vec![
+        StreamChunk::Usage(TurnUsage {
+            input_tokens: 42,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        }),
+        StreamChunk::Done,
+    ]]);
     let agent_loop = make_loop(provider, vec![]);
     let mut history = ConversationHistory::new("sys".into());
     history.push_user("hi");
@@ -148,14 +244,83 @@ async fn loop_zero_token_turn_does_not_pollute_history() {
 }
 
 #[tokio::test]
-async fn loop_empty_then_text_retries_and_succeeds() {
-    // Targeted regression for `glm-5-turbo`-style transient empty
-    // responses: the loop must transparently retry and surface the
-    // text from the second attempt, returning Ok without exposing
-    // an Error event for the (recovered) hiccup.
+async fn loop_empty_with_done_does_not_retry_and_drains_pending_steer() {
+    let (steer_tx_for_provider, steer_rx) = mpsc::channel(16);
+    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let agent_loop = AgentLoop::new(
+        Box::new(DoneAndQueueSteerProvider {
+            steer_tx: steer_tx_for_provider,
+            call_count: call_count.clone(),
+        }),
+        crate::tool::registry::ToolRegistry::new(vec![]),
+        LoopConfig {
+            max_iterations: 10,
+            max_wall: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "mock".into(),
+            max_tokens: 1024,
+            ..Default::default()
+        },
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("ping");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop
+        .run(&mut history, tx, cancel, None, Some(steer_rx))
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(AgentError::Provider(_)) | Err(AgentError::ProviderTyped(_))
+        ),
+        "clean empty-Done silence must fail terminally without retry; got {result:?}"
+    );
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "empty + saw_done must not retry or hit fallback"
+    );
+
+    let steer_in_history = history
+        .messages()
+        .iter()
+        .any(|m| m.role == Role::User && m.text_content().contains("terminal empty steer"));
+    assert!(
+        steer_in_history,
+        "terminal empty cleanup must drain pending steer into history"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error(s) if s.contains("no content"))),
+        "terminal empty cleanup must emit Error; got events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Idle)),
+        "terminal empty cleanup must emit Idle; got events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::SteerReceived { text, .. } if text.contains("terminal empty steer"))),
+        "terminal empty cleanup must emit SteerReceived while draining; got events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn loop_empty_without_done_then_text_retries_and_succeeds() {
+    // Defensive fallback for non-SSE/legacy providers: an empty stream
+    // that ends without Done may be transport death, so the loop still
+    // retries and surfaces the text from the second attempt.
     let provider = MockProvider::new(vec![
-        // attempt 1: empty stream
-        vec![StreamChunk::Done],
+        // attempt 1: empty stream without terminal marker
+        vec![],
         // attempt 2 (retry): real text
         vec![
             StreamChunk::Text("hi after retry".into()),
@@ -206,8 +371,8 @@ async fn loop_two_empty_then_text_succeeds_at_budget_edge() {
     // followed by text must still succeed — exhausting the retry
     // budget on the very last attempt.
     let provider = MockProvider::new(vec![
-        vec![StreamChunk::Done],
-        vec![StreamChunk::Done],
+        vec![],
+        vec![],
         vec![
             StreamChunk::Text("third time lucky".into()),
             StreamChunk::Done,
@@ -233,6 +398,115 @@ async fn loop_two_empty_then_text_succeeds_at_budget_edge() {
         }
     }
     assert_eq!(text_combined, "third time lucky");
+}
+
+#[tokio::test]
+async fn loop_wall_timeout_at_iteration_boundary_drains_pending_steer() {
+    let (steer_tx_for_provider, steer_rx) = mpsc::channel(16);
+    let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let agent_loop = AgentLoop::new(
+        Box::new(DelayedToolUseAndQueueSteerProvider {
+            steer_tx: steer_tx_for_provider,
+            delay: std::time::Duration::from_millis(5),
+            call_count: call_count.clone(),
+        }),
+        crate::tool::registry::ToolRegistry::new(vec![Box::new(EchoTool)]),
+        LoopConfig {
+            max_iterations: 10,
+            max_wall: Some(std::time::Duration::from_millis(1)),
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "mock".into(),
+            max_tokens: 1024,
+            ..Default::default()
+        },
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("force tool loop");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop
+        .run(&mut history, tx, cancel, None, Some(steer_rx))
+        .await;
+    assert!(
+        matches!(result, Err(AgentError::WallTimeout)),
+        "wall budget must abort at the iteration boundary; got {result:?}"
+    );
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "timeout must happen before the second provider call"
+    );
+
+    let steer_in_history = history
+        .messages()
+        .iter()
+        .any(|m| m.role == Role::User && m.text_content().contains("wall timeout steer"));
+    assert!(
+        steer_in_history,
+        "wall-timeout cleanup must drain pending steer into history"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Error(s) if s.contains(crate::error::WALL_TIMEOUT_MESSAGE))
+        ),
+        "wall-timeout cleanup must emit Error; got events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Idle)),
+        "wall-timeout cleanup must emit Idle; got events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::SteerReceived { text, .. } if text.contains("wall timeout steer"))),
+        "wall-timeout cleanup must emit SteerReceived while draining; got events: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn loop_max_wall_none_preserves_existing_tool_flow() {
+    let provider = MockProvider::new(vec![
+        vec![
+            StreamChunk::ToolUse {
+                id: "call1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "ping"}),
+            },
+            StreamChunk::Done,
+        ],
+        vec![StreamChunk::Text("Done!".into()), StreamChunk::Done],
+    ]);
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let agent_loop = make_loop(provider, tools);
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("test");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(
+        result.is_ok(),
+        "max_wall=None must preserve existing flow: {result:?}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Idle)));
+    assert!(
+        history
+            .messages()
+            .iter()
+            .any(|m| m.text_content().contains("Done!"))
+    );
 }
 
 #[tokio::test]
@@ -355,6 +629,7 @@ async fn loop_max_iterations() {
         crate::tool::registry::ToolRegistry::new(tools),
         LoopConfig {
             max_iterations: 3,
+            max_wall: None,
             cwd: std::path::PathBuf::from("/tmp"),
             model: "mock".into(),
             max_tokens: 1024,
@@ -700,6 +975,7 @@ async fn loop_policy_deny_blocks_tool() {
         crate::tool::registry::ToolRegistry::new(vec![Box::new(EchoTool)]),
         LoopConfig {
             max_iterations: 10,
+            max_wall: None,
             cwd: std::path::PathBuf::from("/tmp"),
             model: "mock".into(),
             max_tokens: 1024,
@@ -1286,5 +1562,248 @@ async fn steer_after_idle_does_not_get_lost() {
     assert!(
         steer_answered,
         "S1: model must respond to the drained steer, not exit at Idle"
+    );
+}
+
+// ── B80b: closed steer channel must not CPU-spin in execute_readonly_batch ──
+
+/// A read-only tool whose execute-future parks on a real `tokio::time::sleep`
+/// (an EXTERNAL timer waker — it does NOT self-wake). Every poll of the
+/// wrapper is counted. A correctly-parking `select!` loop polls this future
+/// ~twice (once initially, once when the timer wakes it). A busy-spinning
+/// loop re-polls the in-flight `join` — and therefore this future — over and
+/// over during the sleep window, inflating the count by orders of magnitude.
+struct PollCountingTool {
+    polls: std::sync::Arc<AtomicUsize>,
+    delay: std::time::Duration,
+}
+
+struct SleepPollCounter {
+    polls: std::sync::Arc<AtomicUsize>,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl std::future::Future for SleepPollCounter {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        self.sleep.as_mut().poll(cx)
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for PollCountingTool {
+    fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: B16 — exhaustive test ToolSpec ctor, mirrors EchoTool above
+        ToolSpec {
+            name: "echo".into(),
+            description: "Poll-counting echo".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            permission: Permission::ReadOnly,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cwd: &std::path::Path,
+    ) -> crate::types::ToolResult {
+        SleepPollCounter {
+            polls: self.polls.clone(),
+            sleep: Box::pin(tokio::time::sleep(self.delay)),
+        }
+        .await;
+        crate::types::ToolResult {
+            output: "echoed".into(),
+            is_error: false,
+        }
+    }
+}
+
+/// B80b regression: when `steer_rx` is `Some` but its sender is CLOSED,
+/// the `execute_readonly_batch` select! steer arm used to resolve `None`
+/// instantly on every poll. Because the arm body did nothing on `None`,
+/// the `loop { select! { ... } }` re-entered immediately and busy-spun:
+/// every iteration re-polled the in-flight `join` (and therefore the
+/// running tool future) while burning CPU, instead of parking until the
+/// tool actually made progress.
+///
+/// Detection is deterministic via a poll counter on a timer-backed tool
+/// future. A correct (parking) loop polls the tool future only a handful
+/// of times (initial poll + the timer wake). A spinning loop re-polls the
+/// in-flight join every iteration for the whole sleep window, inflating
+/// the count into the thousands. We assert a tight upper budget.
+#[tokio::test]
+async fn b80b_closed_steer_channel_does_not_spin_in_readonly_batch() {
+    let polls = std::sync::Arc::new(AtomicUsize::new(0));
+
+    // iter 0: call the read-only `echo` tool; iter 1: finish.
+    let provider = MockProvider::new(vec![
+        vec![
+            StreamChunk::ToolUse {
+                id: "c1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "hi"}),
+            },
+            StreamChunk::Done,
+        ],
+        vec![StreamChunk::Text("done".into()), StreamChunk::Done],
+    ]);
+    let agent_loop = make_loop(
+        provider,
+        vec![Box::new(PollCountingTool {
+            polls: polls.clone(),
+            delay: std::time::Duration::from_millis(200),
+        })],
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("run a tool");
+
+    // Build a steer channel and immediately drop the SENDER so the
+    // receiver observes a closed channel (recv() -> None forever).
+    let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(16);
+    drop(steer_tx);
+
+    let (tx, _rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.run(&mut history, tx, cancel, None, Some(steer_rx)),
+    )
+    .await;
+
+    assert!(result.is_ok(), "B80b: turn must complete (no hang)");
+    assert!(
+        result.unwrap().is_ok(),
+        "B80b: turn should complete successfully after the tool"
+    );
+
+    let observed = polls.load(Ordering::SeqCst);
+    // Parking loop polls the timer-backed tool ~2-3 times over the 200ms
+    // window. A spin re-polls it thousands of times. 100 is comfortably
+    // above the parking count yet far below any spin.
+    assert!(
+        observed <= 100,
+        "B80b: tool future polled {observed} times (budget 100); the closed \
+         steer channel is busy-spinning the readonly-batch select! loop \
+         instead of parking (regression)"
+    );
+}
+
+// ── B80a: an inner AgentLoop whose event channel is not drained deadlocks ──
+
+/// A read-only tool that emits more `ToolOutput` progress events than the
+/// event channel can buffer. Mirrors a chatty inner research turn.
+struct ChattyTool {
+    bursts: usize,
+}
+
+#[async_trait::async_trait]
+impl Tool for ChattyTool {
+    fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: B16 — exhaustive test ToolSpec ctor, mirrors EchoTool above
+        ToolSpec {
+            name: "echo".into(),
+            description: "Chatty echo".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            permission: Permission::ReadOnly,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cwd: &std::path::Path,
+    ) -> crate::types::ToolResult {
+        crate::types::ToolResult {
+            output: "echoed".into(),
+            is_error: false,
+        }
+    }
+
+    async fn execute_with_progress(
+        &self,
+        _input: serde_json::Value,
+        _cwd: &std::path::Path,
+        progress: mpsc::Sender<AgentEvent>,
+    ) -> crate::types::ToolResult {
+        // Each .send().await parks if the channel is full; with no drainer
+        // this blocks forever (the B80a deadlock). With a drainer it
+        // completes. This is exactly the inner research loop's behaviour.
+        for i in 0..self.bursts {
+            let _ = progress
+                .send(AgentEvent::ToolOutput {
+                    call_id: "c1".into(),
+                    chunk: format!("chunk {i}"),
+                })
+                .await;
+        }
+        crate::types::ToolResult {
+            output: "echoed".into(),
+            is_error: false,
+        }
+    }
+}
+
+/// B80a regression: the inner research `AgentLoop` emits events into a
+/// BOUNDED channel (`mpsc::channel(256)`). If the receiver is never
+/// drained, the loop's own `tx.send().await` parks forever once the
+/// buffer fills — the tool never returns and the parent turn hangs (the
+/// live 30-minute CPU-burning hang). `research_run` fixes this by spawning
+/// a forwarder that always drains the inner receiver. This test reproduces
+/// the mechanism at the AgentLoop level: with a chatty tool emitting far
+/// more than the buffer, the turn completes ONLY when a concurrent drainer
+/// reads the events.
+#[tokio::test]
+async fn b80a_inner_loop_completes_only_when_events_are_drained() {
+    // Tool emits 300 events; event channel buffers 8 -> must be drained.
+    let provider = MockProvider::new(vec![
+        vec![
+            StreamChunk::ToolUse {
+                id: "c1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "hi"}),
+            },
+            StreamChunk::Done,
+        ],
+        vec![StreamChunk::Text("done".into()), StreamChunk::Done],
+    ]);
+    let agent_loop = make_loop(provider, vec![Box::new(ChattyTool { bursts: 300 })]);
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("run a tool");
+
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+    let cancel = CancellationToken::new();
+
+    // Concurrent drainer (the role research_run's forwarder plays).
+    let drainer = tokio::spawn(async move {
+        let mut n = 0usize;
+        while rx.recv().await.is_some() {
+            n += 1;
+        }
+        n
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.run(&mut history, tx, cancel, None, None),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "B80a: inner loop must complete when its events are drained; it hung \
+         (the undrained-bounded-channel deadlock that froze research_run)"
+    );
+    assert!(
+        result.unwrap().is_ok(),
+        "B80a: turn should complete successfully"
+    );
+
+    let drained = drainer.await.unwrap();
+    assert!(
+        drained >= 300,
+        "B80a: drainer must observe all >256 emitted events; saw {drained}"
     );
 }
