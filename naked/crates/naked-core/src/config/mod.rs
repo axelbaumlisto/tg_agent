@@ -117,6 +117,13 @@ pub struct Config {
     /// Default false preserves legacy per-call bash process spawning.
     #[serde(default)]
     pub persistent_bash_enabled: bool,
+    /// PLAN_SNAPSHOTS_DISABLE_FLAG_v1: master switch for per-turn workspace
+    /// snapshots (legacy git-stash + side-git SnapshotRepo at
+    /// ~/.naked/snapshots/<hash>/.git). Default false = DISABLED — no capture
+    /// spawns, no side repo. Set true to restore the pre-turn safety-net snapshot
+    /// feeding /undo and the revert_turn tool.
+    #[serde(default)]
+    pub snapshots_enabled: bool,
     /// Process-wide byte budget for the bounded read_file/file_snapshot cache.
     #[serde(default = "default_fs_cache_max_bytes")]
     pub fs_cache_max_bytes: u64,
@@ -353,6 +360,7 @@ impl Default for Config {
             hashline_edit_enabled: false,
             fs_cache_enabled: false,
             persistent_bash_enabled: false,
+            snapshots_enabled: false,
             fs_cache_max_bytes: default_fs_cache_max_bytes(),
             fff_fast_index_enabled: false,
             fff_fast_index_max_workspaces: default_fff_fast_index_max_workspaces(),

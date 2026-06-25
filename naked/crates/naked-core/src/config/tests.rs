@@ -345,6 +345,7 @@ fn default_config_empty() {
     assert!(!cfg.hashline_edit_enabled);
     assert!(!cfg.fs_cache_enabled);
     assert!(!cfg.persistent_bash_enabled);
+    assert!(!cfg.snapshots_enabled);
     assert_eq!(cfg.fs_cache_max_bytes, 64 * 1024 * 1024);
     assert!(!cfg.fff_fast_index_enabled);
     assert_eq!(cfg.fff_fast_index_max_workspaces, 4);
@@ -1470,6 +1471,26 @@ fn fs_cache_flag_default_false_root_parse() {
     .unwrap();
     assert!(!nested.fs_cache_enabled);
     assert_eq!(nested.fs_cache_max_bytes, 64 * 1024 * 1024);
+}
+
+#[test]
+fn snapshots_enabled_flag_default_false_root_parse() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.snapshots_enabled);
+
+    let empty: Config = serde_json::from_str("{}").unwrap();
+    assert!(!empty.snapshots_enabled);
+
+    let root: Config = serde_json::from_str(r#"{"snapshots_enabled":true}"#).unwrap();
+    assert!(root.snapshots_enabled);
+
+    let nested: Config =
+        serde_json::from_str(r#"{"telegram":{"snapshots_enabled":true}}"#).unwrap();
+    assert!(!nested.snapshots_enabled);
+
+    let encoded = serde_json::to_string(&root).unwrap();
+    let roundtrip: Config = serde_json::from_str(&encoded).unwrap();
+    assert!(roundtrip.snapshots_enabled);
 }
 
 #[test]

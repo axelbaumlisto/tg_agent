@@ -156,40 +156,47 @@ impl AgentCore {
         }
         session.updated_at = chrono::Utc::now();
 
-        // Fire-and-forget: pre-turn snapshot + memory classification.
+        // Fire-and-forget: pre-turn snapshots (when snapshots_enabled=true) + memory classification.
         // T1 of PLAN_QUALITY_v1: in addition to the legacy git-stash
-        // snapshot we also capture into the side-git SnapshotRepo
+        // snapshot we can also capture into the side-git SnapshotRepo
         // (`~/.naked/snapshots/<hash>/.git`). This is what the
-        // model-callable `revert_turn` tool + the `/restore` slash
+        // model-callable `revert_turn` tool + the `/undo` slash
         // command read from. Both paths are non-fatal: a missing
         // git binary or read-only fs degrades to a debug log; the
         // turn proceeds.
-        let ws = session.workspace.clone();
+        let snapshots_enabled = self.config().snapshots_enabled;
         let turn_seq = session.history.message_count() as u64;
-        tokio::spawn(async move {
-            if let Some(msg) = crate::snapshot::pre_turn_snapshot(&ws, turn_seq).await {
-                tracing::debug!(stash = %msg, "pre-turn legacy stash snapshot");
-            }
-        });
-        let ws_side = session.workspace.clone();
-        tokio::task::spawn_blocking(move || {
-            match crate::snapshot::SnapshotRepo::open_or_init(&ws_side) {
-                Ok(repo) => match repo.capture(&format!("pre-turn:{turn_seq}")) {
-                    Ok(Some(id)) => {
-                        // R5 of PLAN_RESILIENCE_v1: bump counter +
-                        // info-level log so operators see snapshots
-                        // in journalctl, not just at debug.
-                        crate::types::SNAPSHOT_CAPTURE_COUNT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let short = &id.as_str()[..id.as_str().len().min(8)];
-                        tracing::info!(seq = turn_seq, id = short, "pre-turn snapshot captured");
-                    }
-                    Ok(None) => tracing::debug!("pre-turn snapshot: no changes to capture"),
-                    Err(e) => tracing::debug!("pre-turn side snapshot skipped: {e}"),
-                },
-                Err(e) => tracing::debug!("pre-turn side snapshot init skipped: {e}"),
-            }
-        });
+        if snapshots_enabled {
+            let ws = session.workspace.clone();
+            tokio::spawn(async move {
+                if let Some(msg) = crate::snapshot::pre_turn_snapshot(&ws, turn_seq).await {
+                    tracing::debug!(stash = %msg, "pre-turn legacy stash snapshot");
+                }
+            });
+            let ws_side = session.workspace.clone();
+            tokio::task::spawn_blocking(move || {
+                match crate::snapshot::SnapshotRepo::open_or_init(&ws_side) {
+                    Ok(repo) => match repo.capture(&format!("pre-turn:{turn_seq}")) {
+                        Ok(Some(id)) => {
+                            // R5 of PLAN_RESILIENCE_v1: bump counter +
+                            // info-level log so operators see snapshots
+                            // in journalctl, not just at debug.
+                            crate::types::SNAPSHOT_CAPTURE_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let short = &id.as_str()[..id.as_str().len().min(8)];
+                            tracing::info!(
+                                seq = turn_seq,
+                                id = short,
+                                "pre-turn snapshot captured"
+                            );
+                        }
+                        Ok(None) => tracing::debug!("pre-turn snapshot: no changes to capture"),
+                        Err(e) => tracing::debug!("pre-turn side snapshot skipped: {e}"),
+                    },
+                    Err(e) => tracing::debug!("pre-turn side snapshot init skipped: {e}"),
+                }
+            });
+        }
         {
             let prov = self.provider_for(&provider_name).await;
             let sender = self.session_sender(session_id).await;
@@ -439,7 +446,10 @@ mod tests {
     use crate::error::{AgentError, Result};
     use crate::provider::{ChatRequest, Provider};
     use crate::session::SessionState;
-    use crate::types::{AgentEvent, ModelInfo, SESSION_DOUBLE_TURN_REJECTED_COUNT, StreamChunk};
+    use crate::types::{
+        AgentEvent, ModelInfo, SESSION_DOUBLE_TURN_REJECTED_COUNT, SNAPSHOT_CAPTURE_COUNT,
+        StreamChunk,
+    };
     use async_trait::async_trait;
     use futures_util::Stream;
     use std::pin::Pin;
@@ -499,6 +509,13 @@ mod tests {
     }
 
     fn blocking_core(provider: Arc<BlockingProvider>) -> (tempfile::TempDir, Arc<AgentCore>) {
+        blocking_core_with_snapshots(provider, false)
+    }
+
+    fn blocking_core_with_snapshots(
+        provider: Arc<BlockingProvider>,
+        snapshots_enabled: bool,
+    ) -> (tempfile::TempDir, Arc<AgentCore>) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace = tmp.path().join("workspace");
         let memory = crate::config::MemoryConfig {
@@ -515,6 +532,7 @@ mod tests {
             default_provider: "blocking".into(),
             default_model: "blocking-model".into(),
             memory,
+            snapshots_enabled,
             ..Default::default()
         };
         std::fs::create_dir_all(&config.workspace).expect("workspace dir");
@@ -556,6 +574,135 @@ mod tests {
         while provider.stream_calls.load(Ordering::Relaxed) < expected {
             provider.started.notified().await;
         }
+    }
+
+    async fn init_dirty_workspace_git_repo(workspace: &std::path::Path, dirty_name: &str) {
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(workspace)
+            .output()
+            .await
+            .expect("git init command");
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(workspace)
+            .output()
+            .await
+            .expect("git config email command");
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(workspace)
+            .output()
+            .await
+            .expect("git config name command");
+        tokio::fs::write(workspace.join("README.md"), "# test\n")
+            .await
+            .expect("write readme");
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(workspace)
+            .output()
+            .await
+            .expect("git add command");
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(workspace)
+            .output()
+            .await
+            .expect("git commit command");
+        tokio::fs::write(workspace.join(dirty_name), "dirty\n")
+            .await
+            .expect("write dirty file");
+    }
+
+    fn remove_snapshot_side_dir(workspace: &std::path::Path) -> std::path::PathBuf {
+        let git_dir = crate::snapshot::snapshot_git_dir(workspace).expect("snapshot git dir");
+        if let Some(snapshot_dir) = git_dir.parent()
+            && snapshot_dir.exists()
+        {
+            std::fs::remove_dir_all(snapshot_dir).expect("remove snapshot side dir");
+        }
+        git_dir
+    }
+
+    async fn has_naked_pre_turn_stash(workspace: &std::path::Path) -> bool {
+        crate::snapshot::list_snapshots(workspace)
+            .await
+            .iter()
+            .any(|entry| entry.message.starts_with("naked:pre-turn:"))
+    }
+
+    #[tokio::test]
+    async fn snapshots_disabled_turn_creates_no_side_repo() {
+        let _guard = DISPATCH_TEST_LOCK.lock().await;
+        let provider = BlockingProvider::new();
+        let (_tmp, core) = blocking_core_with_snapshots(provider.clone(), false);
+        let workspace = core.config().workspace.clone();
+        init_dirty_workspace_git_repo(&workspace, "dirty-disabled.txt").await;
+        let git_dir = remove_snapshot_side_dir(&workspace);
+        let _counter_before = SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed);
+        let sid = core.create_session(&workspace).await;
+
+        provider.release.add_permits(1);
+        let handle = core.send_prompt(&sid, "probe").await.expect("turn starts");
+        drain_until_idle(handle.events).await;
+
+        // SNAPSHOT_CAPTURE_COUNT is process-global and may be bumped by a
+        // concurrent enabled-snapshot test under the default cargo harness.
+        // The workspace-specific side-dir/stash/file-still-dirty checks are
+        // the rerevert-proof assertions for the disabled gate.
+        for _ in 0..50 {
+            assert!(
+                !git_dir.exists(),
+                "disabled turn created side repo at {git_dir:?}"
+            );
+            assert!(
+                !has_naked_pre_turn_stash(&workspace).await,
+                "disabled turn created a naked:pre-turn stash"
+            );
+            assert!(
+                workspace.join("dirty-disabled.txt").exists(),
+                "disabled turn legacy-stashed the dirty file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshots_enabled_turn_creates_side_repo() {
+        let _guard = DISPATCH_TEST_LOCK.lock().await;
+        let provider = BlockingProvider::new();
+        let (_tmp, core) = blocking_core_with_snapshots(provider.clone(), true);
+        let workspace = core.config().workspace.clone();
+        tokio::fs::write(workspace.join("capture-me.txt"), "capture me\n")
+            .await
+            .expect("write capture input");
+        let git_dir = remove_snapshot_side_dir(&workspace);
+        let counter_before = SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed);
+        let expected_counter = counter_before.saturating_add(1);
+        let sid = core.create_session(&workspace).await;
+
+        provider.release.add_permits(1);
+        let handle = core.send_prompt(&sid, "probe").await.expect("turn starts");
+        drain_until_idle(handle.events).await;
+
+        for _ in 0..100 {
+            if git_dir.exists()
+                && SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed) >= expected_counter
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            git_dir.exists(),
+            "enabled turn did not create side repo at {git_dir:?}"
+        );
+        assert!(
+            SNAPSHOT_CAPTURE_COUNT.load(Ordering::Relaxed) >= expected_counter,
+            "enabled turn did not bump snapshot capture counter"
+        );
     }
 
     #[tokio::test]

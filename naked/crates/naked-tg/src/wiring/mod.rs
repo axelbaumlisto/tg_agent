@@ -68,6 +68,13 @@ pub(crate) async fn build() -> WiredBot {
         "loaded config hash"
     );
     let _ = crate::shared::CONFIG_LOADED_HASH.set(loaded_config_hash);
+    if config.snapshots_enabled {
+        tracing::info!("snapshots enabled: per-turn rollback safety net active");
+    } else {
+        tracing::info!(
+            "snapshots disabled: per-turn rollback safety net OFF; set snapshots_enabled=true to re-enable"
+        );
+    }
     let provider =
         naked_core::build_provider_from_config(&config).expect("Failed to build provider");
     let agent = Arc::new(AgentCore::new(config.clone(), provider));

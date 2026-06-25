@@ -94,7 +94,7 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         FffState::new(ctx.workspace)
     };
 
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         bash_tool,
         Box::new(ReadFileTool::new(fs_cache.clone())),
         Box::new(FileSnapshotTool::new(fs_cache.clone())),
@@ -134,7 +134,6 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         Box::new(super::git_tools::GitDiffTool),
         Box::new(super::apply_patch::ApplyPatchTool::new(fs_cache)),
         Box::new(super::diagnostics::DiagnosticsTool),
-        Box::new(super::revert_turn::RevertTurnTool),
         Box::new(super::validate_data::ValidateDataTool),
         Box::new(super::todo_tool::TodoTool::new(ctx.todo_list.clone())),
         Box::new(super::plan_tool::PlanTool::new(ctx.plan_state.clone())),
@@ -142,7 +141,17 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         Box::new(super::recall_archive::RecallArchiveTool::new(
             ctx.config.session_dir.clone(),
         )),
-    ]
+    ];
+
+    // PLAN_SNAPSHOTS_DISABLE_FLAG_v1: only register revert_turn when snapshots
+    // are enabled, so disabled sessions never advertise a Dangerous tool
+    // (no approval prompt, no open_or_init / side-repo creation).
+    // Mirrors research_tools gating.
+    if ctx.config.snapshots_enabled {
+        tools.push(Box::new(super::revert_turn::RevertTurnTool));
+    }
+
+    tools
 }
 
 /// Build research tools (if enabled).
@@ -301,6 +310,45 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "research_launch"),
             "research_launch must NOT be in the list (removed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_turn_registered_only_when_snapshots_enabled() {
+        async fn tool_names_for(snapshots_enabled: bool) -> Vec<String> {
+            let tc = TestCore::build();
+            let core = &tc.core;
+            let mut config = core.config().as_ref().clone();
+            config.snapshots_enabled = snapshots_enabled;
+            core.reload_config(config);
+
+            let workspace = tc.workspace();
+            std::fs::create_dir_all(&workspace).expect("test workspace dir");
+            let session_id = core.create_session(&workspace).await;
+            let config = core.config();
+            let effective = config.default_effective();
+            let provider = core.provider_for(&config.default_provider).await;
+            core.build_tool_registry_for(
+                &session_id,
+                &effective,
+                &provider,
+                &effective.model,
+                &workspace,
+            )
+            .await
+            .tool_names()
+        }
+
+        let disabled = tool_names_for(false).await;
+        assert!(
+            !disabled.iter().any(|name| name == "revert_turn"),
+            "revert_turn must not be registered when snapshots are disabled; got: {disabled:?}"
+        );
+
+        let enabled = tool_names_for(true).await;
+        assert!(
+            enabled.iter().any(|name| name == "revert_turn"),
+            "revert_turn must be registered when snapshots are enabled; got: {enabled:?}"
         );
     }
 }

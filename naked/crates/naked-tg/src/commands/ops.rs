@@ -242,6 +242,16 @@ pub(crate) async fn cmd_undo(
     config: &Config,
     ctx: &ChatCtx,
 ) -> Result<(), teloxide::RequestError> {
+    if !config.snapshots_enabled {
+        super::reply_text(
+            bot,
+            ctx,
+            "❌ snapshots disabled: /undo is off; set snapshots_enabled=true to re-enable per-turn rollback",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let sid = super::get_or_create_session(*ctx, agent, channel_map, config).await;
     let workspace = agent.session_workspace(&sid).await.unwrap_or_default();
     match naked_core::snapshot::undo_last(&workspace).await {
