@@ -83,6 +83,10 @@ pub(crate) struct StreamRunContext {
     pub(crate) session_id: naked_tg::run_registry::SessionId,
     pub(crate) kind: naked_tg::run_registry::RunKind,
     pub(crate) source_ref: Option<naked_tg::run_registry::SourceRef>,
+    /// Optional final keyboard to leave on the primary stream bubble after the
+    /// live [Stop]/[Send] controls are removed. Streaming remains generic: the
+    /// caller decides what markup, if any, belongs to this run kind.
+    pub(crate) final_reply_markup: Option<teloxide::types::InlineKeyboardMarkup>,
 }
 
 impl StreamRunContext {
@@ -92,6 +96,7 @@ impl StreamRunContext {
             session_id,
             kind: naked_tg::run_registry::RunKind::ChatTurn,
             source_ref: None,
+            final_reply_markup: None,
         }
     }
 }
@@ -135,6 +140,7 @@ pub(crate) async fn stream_response(
     let _chat_key_for_steer = (chat_id_raw, tid);
     let abort_for_reject = abort.clone();
     let session_id_for_attach = run_ctx.session_id.clone();
+    let final_reply_markup = run_ctx.final_reply_markup.clone();
     let run_summary = match crate::shared::RUN_REGISTRY.register_run(
         naked_tg::run_registry::RegisterRunInput {
             requested_run_id: run_ctx.requested_run_id,
@@ -300,6 +306,9 @@ pub(crate) async fn stream_response(
 
         let has_event = event.is_some();
         if let Some(event) = event {
+            if !matches!(&event, AgentEvent::Heartbeat) {
+                let _ = crate::shared::RUN_REGISTRY.mark_run_progress(&run_id);
+            }
             match event {
                 AgentEvent::ThinkingDelta(t) => {
                     dirty = handlers::handle_thinking_delta(&mut view, &t) != ViewAction::Clean;
@@ -499,6 +508,9 @@ pub(crate) async fn stream_response(
             }
         } // end if let Some(event)
 
+        crate::shared::RUN_REGISTRY
+            .warn_silent_runs(naked_tg::run_registry::ACTIVE_RUN_SILENCE_WARN_THRESHOLD);
+
         // Check for in-flight model switch at every yield point.
         if naked_tg::model_switch::check_and_take(&model_switch)
             .await
@@ -543,9 +555,9 @@ pub(crate) async fn stream_response(
 
     notify_if_agent_died_without_idle(&bot, ctx, got_idle).await;
     typing_cancel.cancel();
-    cleanup_stream_registries(&bot, &run_id).await;
 
     if aborted_for_switch {
+        cleanup_stream_registries(&bot, &run_id, None).await;
         // Don't send final — the turn was interrupted. Edit placeholder to
         // indicate switch in progress.
         RATE_LIMITER
@@ -567,6 +579,7 @@ pub(crate) async fn stream_response(
     update_cached_run_state(&run_id, &view, Some(final_html.clone()));
     let primary = primary_sink_or_fallback(&run_id, ctx, placeholder);
     send_final_to_all_sinks(bot.clone(), &run_id, primary, &final_html, &view).await;
+    cleanup_stream_registries(&bot, &run_id, final_reply_markup).await;
     send_provider_error_card_if_needed(&bot, primary.ctx, &view).await;
     deliver_queued_attachments(http_client, base_url, primary.ctx, tg_attach_queue, &run_id).await;
     if let Some(workspace) = attach_workspace.as_deref() {
@@ -717,14 +730,26 @@ async fn notify_if_agent_died_without_idle(bot: &Bot, ctx: ChatCtx, got_idle: bo
         .await;
 }
 
-async fn cleanup_stream_registries(bot: &Bot, run_id: &str) {
+async fn cleanup_stream_registries(
+    bot: &Bot,
+    run_id: &str,
+    final_reply_markup: Option<teloxide::types::InlineKeyboardMarkup>,
+) {
     MODEL_SWITCHES.write().await.remove(run_id);
     STEER_SENDERS.write().await.remove(run_id);
 
     // PLAN_MEDIA_UX_v1 M4 / B02: clear the [⏹ Стоп] [⏩ Send now] inline
-    // keyboard from the placeholder (which now ALSO holds the final text).
-    let mut control_keys: Vec<_> = crate::shared::RUN_REGISTRY
-        .bound_message_keys(run_id)
+    // keyboard from stream bubbles. B86 may replace that live-control keyboard
+    // with a caller-supplied final keyboard on exactly one primary bubble;
+    // streaming does not inspect the domain semantics of that markup.
+    let bound_keys = crate::shared::RUN_REGISTRY.bound_message_keys(run_id);
+    let final_target = final_reply_markup.as_ref().and_then(|_| {
+        bound_keys
+            .iter()
+            .min_by_key(|key| (key.message_id, key.chat_id))
+            .map(|key| (key.chat_id, key.message_id))
+    });
+    let mut control_keys: Vec<_> = bound_keys
         .into_iter()
         .map(|key| {
             (
@@ -739,11 +764,22 @@ async fn cleanup_stream_registries(bot: &Bot, run_id: &str) {
     control_keys.sort_by_key(|(chat, mid)| (chat.0, mid.0));
     control_keys.dedup();
     for (chat, mid) in control_keys {
-        if let Err(e) = bot.edit_message_reply_markup(chat, mid).await {
+        let result = if final_target == Some((chat.0, mid.0)) {
+            if let Some(markup) = final_reply_markup.clone() {
+                bot.edit_message_reply_markup(chat, mid)
+                    .reply_markup(markup)
+                    .await
+            } else {
+                bot.edit_message_reply_markup(chat, mid).await
+            }
+        } else {
+            bot.edit_message_reply_markup(chat, mid).await
+        };
+        if let Err(e) = result {
             tracing::debug!(
                 chat = chat.0,
                 msg = mid.0,
-                "control card clear failed (likely already cleared): {e}"
+                "control card cleanup failed (likely already cleared): {e}"
             );
         }
     }

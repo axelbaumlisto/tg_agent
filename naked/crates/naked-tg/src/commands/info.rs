@@ -68,7 +68,12 @@ pub(crate) async fn cmd_health(
         lines.push(format!("  <b>{name}</b>: {info}"));
     }
 
-    // ── 2) Liveness sources (F2 wiring) ─────────────────
+    // ── 2) Loaded config hash (S7 / RC-14 B42 observability) ───────
+    lines.push(naked_tg::config_hash::render_health_config_hash(
+        crate::shared::CONFIG_LOADED_HASH.get(),
+    ));
+
+    // ── 3) Liveness sources (F2 wiring) ─────────────────
     if let Some(reg) = crate::shared::LIVENESS_REGISTRY.get() {
         lines.push(String::new());
         lines.push("🪺 <b>Liveness</b>".to_string());
@@ -86,7 +91,7 @@ pub(crate) async fn cmd_health(
         }
     }
 
-    // ── 3) Operational counters (F3 instrumentation) ───────────
+    // ── 4) Operational counters (F3 instrumentation) ───────────
     use std::sync::atomic::Ordering;
     let snap = crate::metrics::snapshot();
     let steer_delivered = naked_core::types::STEER_DELIVERED_COUNT.load(Ordering::Relaxed);
@@ -110,7 +115,7 @@ pub(crate) async fn cmd_health(
         snap.stream_button_click_abort, snap.stream_button_click_sendnow, supervisor_restart,
     ));
 
-    // ── 4) Coherence ladder (T7 of PLAN_QUALITY_v1) ─────────
+    // ── 5) Coherence ladder (T7 of PLAN_QUALITY_v1) ─────────
     // Pure derivation from existing process-wide counters — no
     // separate state, no I/O. Healthy is the default; we degrade
     // when empty-retries climb and recover after a successful
@@ -124,7 +129,7 @@ pub(crate) async fn cmd_health(
         coh.description(),
     ));
 
-    // ── 5) Uptime ──────────────────────────────────
+    // ── 6) Uptime ──────────────────────────────────
     let up = crate::shared::PROCESS_STARTED_AT.elapsed();
     lines.push(String::new());
     lines.push(format!("⏱ <b>Uptime</b>: {}", fmt_age(up)));

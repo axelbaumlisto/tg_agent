@@ -27,10 +27,14 @@ async-stream = "0.3"
 regex = "1"
 base64 = { workspace = true }
 blake3 = { workspace = true }
+# RATIONALE: PLAN_FAST_BACKEND_v2 Step B requires explicit SHA-256 full-file stale-edit preconditions.
+sha2 = "0.10"
 toml = "0.8"
 unicode-normalization = "0.1"
-fff-search = "0.7.1"
-fff-query-parser = "0.7.1"
+# RATIONALE: PLAN_FAST_BACKEND_v1 Step 2b needs fff 0.9.5 SharedFilePicker/new_with_shared_state fast-index lifecycle.
+fff-search = "0.9.5"
+# RATIONALE: keep query parser version aligned with fff-search 0.9.5 API.
+fff-query-parser = "0.9.5"
 parking_lot = "0.12.5"
 
 [dev-dependencies]
@@ -40,6 +44,13 @@ filetime = "0.2"
 tracing-subscriber = { workspace = true }
 wiremock = "0.6"
 insta = "1"
+# RATIONALE: PLAN_FAST_BACKEND_v1 Step 1a hot-path microbench harness (dev-only), async_tokio drives async Tool trait.
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+# RATIONALE: registers benches/hotpath.rs as a custom-harness (criterion) benchmark target.
+[[bench]]
+name = "hotpath"
+harness = false
 
 [lints]
 workspace = true

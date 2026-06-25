@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgentError, Result};
 use crate::research::{
-    self, ResearchContext, ResearchPatch, ResearchSpec, ResearchStore, RunEventRegistry,
-    VerifiedRunReport, apply_research_patch, new_research_id,
+    self, PatchField, ResearchContext, ResearchPatch, ResearchSpec, ResearchStore,
+    RunEventRegistry, VerifiedRunReport, apply_research_patch, new_research_id,
 };
 
 pub struct ResearchState {
@@ -99,6 +99,63 @@ pub struct ResearchService {
     config: Arc<arc_swap::ArcSwap<crate::config::Config>>,
 }
 
+/// Schedule semantics for creating a brand-new research spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateSchedule {
+    /// Create a one-shot spec due immediately, with no recurrence.
+    OneShotNow,
+}
+
+impl CreateSchedule {
+    fn into_triggers(
+        self,
+    ) -> (
+        Option<u64>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+    ) {
+        match self {
+            Self::OneShotNow => (None, Some(chrono::Utc::now()), None),
+        }
+    }
+}
+
+/// Schedule mutation semantics for an existing research spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleUpdate {
+    /// Clear all schedule triggers; the spec remains in the store.
+    Off,
+    /// Recur at a fixed interval in seconds.
+    Interval(u64),
+    /// Recur using a cron expression.
+    Cron(String),
+}
+
+impl ScheduleUpdate {
+    fn into_patch(self) -> ResearchPatch {
+        match self {
+            Self::Off => ResearchPatch {
+                interval_seconds: PatchField::Clear,
+                run_at: PatchField::Clear,
+                cron: PatchField::Clear,
+                ..Default::default()
+            },
+            Self::Interval(seconds) => ResearchPatch {
+                interval_seconds: PatchField::Set(seconds),
+                run_at: PatchField::Clear,
+                cron: PatchField::Clear,
+                ..Default::default()
+            },
+            Self::Cron(expr) => ResearchPatch {
+                interval_seconds: PatchField::Clear,
+                run_at: PatchField::Clear,
+                cron: PatchField::Set(expr),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 impl ResearchService {
     pub fn new(
         state: Arc<ResearchState>,
@@ -129,6 +186,7 @@ impl ResearchService {
         session_id: Option<String>,
         chat_id: Option<i64>,
         thread_id: Option<i32>,
+        schedule: CreateSchedule,
     ) -> Result<ResearchSpec> {
         let cfg = self.cfg();
         if !cfg.research.enabled {
@@ -139,19 +197,7 @@ impl ResearchService {
             seeds = cfg.research.default_sources.clone();
         }
         let rcfg = &cfg.research;
-        let cron = rcfg.default_cron.clone();
-        let interval = if cron.is_some() {
-            None
-        } else if rcfg.default_interval_seconds > 0 {
-            Some(rcfg.default_interval_seconds)
-        } else {
-            None
-        };
-        let run_at = if rcfg.auto_first_run {
-            Some(chrono::Utc::now())
-        } else {
-            None
-        };
+        let (interval, run_at, cron) = schedule.into_triggers();
 
         let spec = ResearchSpec {
             id: new_research_id(topic),
@@ -240,6 +286,11 @@ impl ResearchService {
         Ok(spec)
     }
 
+    pub async fn set_research_schedule(&self, id: &str, update: ScheduleUpdate) -> Result<()> {
+        self.update_research(id, update.into_patch()).await?;
+        Ok(())
+    }
+
     // ── Run events / cancellation registry ─────────────────────────────────
 
     pub fn research_run_events(&self) -> research::RunEventRegistry {
@@ -316,7 +367,8 @@ impl ResearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::research::FsResearchStore;
+    use crate::research::{FsResearchStore, ResearchCreateTool};
+    use crate::tool::Tool;
 
     #[test]
     fn research_state_constructs() {
@@ -342,7 +394,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let svc = make_service(tmp.path(), true);
         let spec = svc
-            .create_research("da nang rentals", vec![], None, None, None)
+            .create_research(
+                "da nang rentals",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         let all = svc.list_research().await.unwrap();
@@ -351,11 +410,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_oneshotnow_sets_run_at_no_recurrence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_service(tmp.path(), true);
+        let spec = svc
+            .create_research(
+                "one-shot now",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(spec.interval_seconds, None);
+        assert_eq!(spec.cron, None);
+        assert!(spec.run_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn set_research_schedule_interval_clears_oneshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_service(tmp.path(), true);
+        let spec = svc
+            .create_research(
+                "interval later",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
+            .await
+            .unwrap();
+        assert!(spec.run_at.is_some());
+
+        svc.set_research_schedule(&spec.id, ScheduleUpdate::Interval(3_600))
+            .await
+            .unwrap();
+        let updated = svc.load_research(&spec.id).await.unwrap();
+        assert_eq!(updated.interval_seconds, Some(3_600));
+        assert_eq!(updated.cron, None);
+        assert_eq!(updated.run_at, None);
+    }
+
+    #[tokio::test]
+    async fn set_research_schedule_off_clears_all_triggers_keeps_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = make_service(tmp.path(), true);
+        let spec = svc
+            .create_research(
+                "off keeps spec",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
+            .await
+            .unwrap();
+        svc.update_research(
+            &spec.id,
+            ResearchPatch {
+                interval_seconds: PatchField::Set(21_600),
+                run_at: PatchField::Set(chrono::Utc::now() - chrono::Duration::hours(1)),
+                cron: PatchField::Set("0 * * * *".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        svc.set_research_schedule(&spec.id, ScheduleUpdate::Off)
+            .await
+            .unwrap();
+        let updated = svc.load_research(&spec.id).await.unwrap();
+        assert_eq!(updated.interval_seconds, None);
+        assert_eq!(updated.cron, None);
+        assert_eq!(updated.run_at, None);
+        let all = svc.list_research().await.unwrap();
+        assert!(all.iter().any(|s| s.id == spec.id));
+    }
+
+    #[tokio::test]
+    async fn research_create_tool_unchanged_oneshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ResearchStore> = Arc::new(FsResearchStore::new(tmp.path().into()));
+        let tool = ResearchCreateTool::new(store.clone(), crate::config::ResearchConfig::default());
+        let result = tool
+            .execute(
+                serde_json::json!({ "topic": "tool one-shot" }),
+                std::path::Path::new("."),
+            )
+            .await;
+        assert!(!result.is_error, "tool failed: {}", result.output);
+        let payload: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let spec_id = payload["id"].as_str().unwrap();
+        let spec = store.load_spec(spec_id).await.unwrap();
+
+        assert_eq!(spec.interval_seconds, None);
+        assert_eq!(spec.cron, None);
+        assert_eq!(spec.run_at, None);
+    }
+
+    #[tokio::test]
     async fn create_when_disabled_returns_config_error() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = make_service(tmp.path(), false);
         let err = svc
-            .create_research("x", vec![], None, None, None)
+            .create_research("x", vec![], None, None, None, CreateSchedule::OneShotNow)
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Config(_)));
@@ -366,7 +531,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let svc = make_service(tmp.path(), true);
         let spec = svc
-            .create_research("topic", vec!["u".into()], None, None, None)
+            .create_research(
+                "topic",
+                vec!["u".into()],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         svc.set_research_paused_with_reason(&spec.id, true, Some("flake".into()))
@@ -390,7 +562,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let svc = make_service(tmp.path(), true);
         let spec = svc
-            .create_research("transient", vec!["x".into()], None, None, None)
+            .create_research(
+                "transient",
+                vec!["x".into()],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         svc.delete_research(&spec.id).await.unwrap();

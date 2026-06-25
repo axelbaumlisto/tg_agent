@@ -48,6 +48,14 @@ pub struct LoopConfig {
     /// B73: cooperative deadline for research/synthetic turns; `None` preserves
     /// existing behavior and does not interrupt a single long stream/tool mid-flight.
     pub max_wall: Option<std::time::Duration>,
+    /// Optional absolute deadline for a single gated tool execution.
+    /// B83: enforced cooperatively through the turn CancellationToken so
+    /// heartbeat/steer cleanup runs; `None` preserves existing behavior.
+    pub tool_deadline: Option<std::time::Duration>,
+    /// Optional coarse backstop for provider-open + stream-read inside one turn.
+    /// S2b/B83: enforced by cancelling the turn token cooperatively; `None`
+    /// preserves legacy stream behavior exactly.
+    pub turn_backstop: Option<std::time::Duration>,
     pub cwd: std::path::PathBuf,
     pub model: String,
     pub max_tokens: u32,
@@ -103,6 +111,8 @@ impl Default for LoopConfig {
         Self {
             max_iterations: 0,
             max_wall: None,
+            tool_deadline: None,
+            turn_backstop: None,
             cwd: std::env::current_dir().unwrap_or_default(),
             model: String::new(),
             max_tokens: 16384,

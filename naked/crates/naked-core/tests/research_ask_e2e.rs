@@ -13,10 +13,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use naked_core::AgentCore;
 use naked_core::config::Config;
 use naked_core::provider::{ChatRequest, Provider};
 use naked_core::types::{ModelInfo, StreamChunk};
+use naked_core::{AgentCore, CreateSchedule};
 use tempfile::tempdir;
 use tokio_stream::Stream;
 
@@ -100,7 +100,14 @@ async fn ask_research_returns_no_findings_message_when_corpus_empty() {
     let provider = ScriptedProvider::new("(should not be called)");
     let agent = make_core(provider.clone());
     let spec = agent
-        .create_research("empty-ask", vec![], None, None, None)
+        .create_research(
+            "empty-ask",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let answer = agent
@@ -125,6 +132,7 @@ async fn ask_research_packages_findings_into_prompt_and_returns_llm_reply() {
             None,
             None,
             None,
+            CreateSchedule::OneShotNow,
         )
         .await
         .expect("create");
@@ -204,6 +212,7 @@ async fn ask_research_truncates_oversized_excerpts() {
             None,
             None,
             None,
+            CreateSchedule::OneShotNow,
         )
         .await
         .expect("create");
@@ -247,7 +256,14 @@ async fn ask_research_rejects_empty_question() {
     let provider = ScriptedProvider::new("nope");
     let agent = make_core(provider);
     let spec = agent
-        .create_research("ask-empty", vec![], None, None, None)
+        .create_research(
+            "ask-empty",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let err = agent

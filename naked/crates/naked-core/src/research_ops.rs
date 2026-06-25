@@ -22,6 +22,7 @@ use crate::research::{
     self, ResearchCoordinator, ResearchPatch, ResearchSpec, ResearchStore, RunReport,
     VerifiedRunReport,
 };
+use crate::services::research::{CreateSchedule, ScheduleUpdate};
 use crate::types;
 use crate::{AgentCore, AgentCoreResearchRunner, acquire_research_permit};
 
@@ -73,9 +74,10 @@ impl AgentCore {
         session_id: Option<String>,
         chat_id: Option<i64>,
         thread_id: Option<i32>,
+        schedule: CreateSchedule,
     ) -> Result<ResearchSpec> {
         self.research_svc
-            .create_research(topic, sources, session_id, chat_id, thread_id)
+            .create_research(topic, sources, session_id, chat_id, thread_id, schedule)
             .await
     }
 
@@ -108,6 +110,10 @@ impl AgentCore {
 
     pub async fn update_research(&self, id: &str, patch: ResearchPatch) -> Result<ResearchSpec> {
         self.research_svc.update_research(id, patch).await
+    }
+
+    pub async fn set_research_schedule(&self, id: &str, update: ScheduleUpdate) -> Result<()> {
+        self.research_svc.set_research_schedule(id, update).await
     }
 
     pub fn research_run_events(&self) -> research::RunEventRegistry {
@@ -396,6 +402,10 @@ impl research::ResearchRunner for AgentCore {
 
     async fn set_research_paused(&self, id: &str, paused: bool) -> Result<()> {
         self.set_research_paused(id, paused).await
+    }
+
+    async fn set_research_schedule(&self, id: &str, update: ScheduleUpdate) -> Result<()> {
+        self.set_research_schedule(id, update).await
     }
 
     async fn update_research(

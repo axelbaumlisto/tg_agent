@@ -1303,6 +1303,7 @@ mod tests {
                 session_id: format!("cap-l3-sid-{unique}-3"),
                 kind: RunKind::ChatTurn,
                 source_ref: None,
+                final_reply_markup: None,
             },
         )
         .await;
@@ -1589,6 +1590,7 @@ mod tests {
                     session_id: session_id_for_stream,
                     kind: RunKind::ChatTurn,
                     source_ref: None,
+                    final_reply_markup: None,
                 },
             )
             .await
@@ -1714,6 +1716,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_completion_attaches_controls_only_for_recurring() {
+        use naked_core::types::{AgentEvent, AgentHandle};
+        use naked_tg::run_registry::RunKind;
+        use teloxide::types::InlineKeyboardMarkup;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        async fn run_stream(
+            server: &MockServer,
+            chat_id: i64,
+            run_id: String,
+            final_reply_markup: Option<InlineKeyboardMarkup>,
+        ) -> Vec<String> {
+            let bot = mock_bot(&server.uri());
+            let deps = test_bot_deps(
+                bot,
+                test_config(),
+                std::sync::Arc::new(ChannelSessionMap::new()),
+                server.uri(),
+            );
+            let (events_tx, events_rx) = mpsc::channel(4);
+            let (perm_tx, _perm_rx) = mpsc::channel(1);
+            let (steer_tx, _steer_rx) = mpsc::channel(1);
+            let session_id = format!("{run_id}-sid");
+            events_tx
+                .send(AgentEvent::TextDelta("done".to_string()))
+                .await
+                .unwrap();
+            events_tx.send(AgentEvent::Idle).await.unwrap();
+
+            let _outcome = crate::streaming::pipeline::stream_response(
+                &deps,
+                crate::shared::ChatCtx {
+                    chat_id: ChatId(chat_id),
+                    thread_id: None,
+                    reply_to: None,
+                },
+                AgentHandle {
+                    events: events_rx,
+                    permissions: perm_tx,
+                    steer: steer_tx,
+                    abort: CancellationToken::new(),
+                },
+                "test-model".to_string(),
+                crate::streaming::pipeline::StreamRunContext {
+                    requested_run_id: Some(run_id.clone()),
+                    session_id,
+                    kind: RunKind::Research {
+                        spec_id: format!("{run_id}-spec"),
+                    },
+                    source_ref: Some(format!("{run_id}-spec")),
+                    final_reply_markup,
+                },
+            )
+            .await;
+            let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|req| String::from_utf8_lossy(&req.body).to_string())
+                .collect()
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 1, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let recurring_run = format!("d6-recurring-run-{unique}");
+        let one_shot_run = format!("d6-one-shot-run-{unique}");
+        let recurring_bodies = run_stream(
+            &server,
+            980_000 + unique as i64,
+            recurring_run,
+            Some(naked_tg::research_controls::keyboard_scheduled(
+                "recurring-spec",
+            )),
+        )
+        .await;
+        assert!(
+            recurring_bodies
+                .iter()
+                .any(|body| body.contains("reply_markup")
+                    && body.contains("r:rm:recurring-spec")
+                    && body.contains("r:uns:recurring-spec")),
+            "completed recurring run must leave scheduled controls on the bubble; bodies={recurring_bodies:#?}"
+        );
+
+        let before_one_shot = recurring_bodies.len();
+        let all_bodies = run_stream(&server, 990_000 + unique as i64, one_shot_run, None).await;
+        let one_shot_bodies = &all_bodies[before_one_shot..];
+        assert!(
+            !one_shot_bodies.iter().any(|body| body.contains("r:rm:")
+                || body.contains("r:uns:")
+                || body.contains("r:sch:")),
+            "run with no final markup must only clear live controls, not attach research controls; bodies={one_shot_bodies:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn mirror_fanout_consumes_agent_events_once() {
         use naked_core::types::{AgentEvent, AgentHandle};
         use naked_tg::run_registry::RunKind;
@@ -1801,6 +1916,7 @@ mod tests {
                     session_id: session_id_for_stream,
                     kind: RunKind::ChatTurn,
                     source_ref: None,
+                    final_reply_markup: None,
                 },
             )
             .await

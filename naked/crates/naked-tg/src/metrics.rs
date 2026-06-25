@@ -7,6 +7,9 @@
 //! configure. When we promote multimodal routing to production we can swap
 //! these to `metrics::counter!` calls without changing call-sites.
 
+use naked_core::metrics_hist::{
+    DurationHistogramSnapshot, LatencySnapshot, ToolClass, tool_snapshot,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Photos that took the **native** path (raw bytes attached to the chat
@@ -317,9 +320,10 @@ pub struct MediaRoutingSnapshot {
     pub research_cancel_propagation_count: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PrometheusInputs {
     media: MediaRoutingSnapshot,
+    latency: LatencySnapshot,
     sentinel_leaks: u64,
     empty_retries: u64,
     turn_ok: u64,
@@ -341,6 +345,30 @@ struct PrometheusInputs {
     provider_invalid_request: u64,
     scheduler_dispatch_skipped: u64,
     cfg_ext_write: u64,
+    stale_edit_reject: u64,
+    git_history_guard_block: u64,
+    hashline_edit_applied: u64,
+    hashline_edit_stale_anchor: u64,
+    hashline_edit_overlap: u64,
+    hashline_edit_out_of_bounds: u64,
+    hashline_edit_disabled: u64,
+    fs_cache_hit: u64,
+    fs_cache_miss: u64,
+    fs_cache_stale_bypass: u64,
+    fs_cache_invalidate: u64,
+    fs_cache_too_large: u64,
+    persistent_bash_ok: u64,
+    persistent_bash_timeout: u64,
+    persistent_bash_killed: u64,
+    persistent_bash_restart: u64,
+    persistent_bash_error: u64,
+    persistent_bash_disabled: u64,
+    persistent_bash_busy: u64,
+    fff_picker_created: u64,
+    fff_picker_reused: u64,
+    fff_picker_cap_fallback: u64,
+    fff_grep_fast_index: u64,
+    fff_grep_fallback: u64,
     ip_hallucin: u64,
     research_store_corrupt_rows: u64,
     research_store_files_healed: u64,
@@ -350,7 +378,103 @@ struct PrometheusInputs {
     text_coalesced: u64,
     session_busy_ack: u64,
     memory_pollution: u64,
+    active_run_max_silent_seconds: u64,
+    config_loaded_hash: Option<String>,
     model_health_body: String,
+}
+
+impl Default for PrometheusInputs {
+    fn default() -> Self {
+        Self {
+            media: MediaRoutingSnapshot::default(),
+            latency: LatencySnapshot {
+                turn_under_1s: 0,
+                turn_1s_to_10s: 0,
+                turn_10s_to_60s: 0,
+                turn_over_60s: 0,
+                turn_sum_ms: 0,
+                turn_count: 0,
+                ttft_under_500ms: 0,
+                ttft_500ms_to_2s: 0,
+                ttft_2s_to_10s: 0,
+                ttft_over_10s: 0,
+                ttft_sum_ms: 0,
+                ttft_count: 0,
+                provider_under_500ms: 0,
+                provider_500ms_to_2s: 0,
+                provider_2s_to_10s: 0,
+                provider_over_10s: 0,
+                provider_sum_ms: 0,
+                provider_count: 0,
+                tool_grep: DurationHistogramSnapshot::default(),
+                tool_read: DurationHistogramSnapshot::default(),
+                tool_edit: DurationHistogramSnapshot::default(),
+                tool_write: DurationHistogramSnapshot::default(),
+                tool_bash: DurationHistogramSnapshot::default(),
+                tool_apply_patch: DurationHistogramSnapshot::default(),
+                tool_other: DurationHistogramSnapshot::default(),
+                fff_cold_build: DurationHistogramSnapshot::default(),
+                parent_fsync: DurationHistogramSnapshot::default(),
+            },
+            sentinel_leaks: 0,
+            empty_retries: 0,
+            turn_ok: 0,
+            turn_err: 0,
+            steer_delivered: 0,
+            steer_soft_interrupted: 0,
+            steer_drained_on_abort: 0,
+            supervisor_restart: 0,
+            snapshot_capture: 0,
+            lsp_emitted: 0,
+            permission_match: 0,
+            hook_fire: 0,
+            subagent_resolve: 0,
+            provider_perm_blacklist: 0,
+            crash_notified: 0,
+            vision_mismatch: 0,
+            provider_connect_timeout: 0,
+            provider_inter_chunk_timeout: 0,
+            provider_invalid_request: 0,
+            scheduler_dispatch_skipped: 0,
+            cfg_ext_write: 0,
+            stale_edit_reject: 0,
+            git_history_guard_block: 0,
+            hashline_edit_applied: 0,
+            hashline_edit_stale_anchor: 0,
+            hashline_edit_overlap: 0,
+            hashline_edit_out_of_bounds: 0,
+            hashline_edit_disabled: 0,
+            fs_cache_hit: 0,
+            fs_cache_miss: 0,
+            fs_cache_stale_bypass: 0,
+            fs_cache_invalidate: 0,
+            fs_cache_too_large: 0,
+            persistent_bash_ok: 0,
+            persistent_bash_timeout: 0,
+            persistent_bash_killed: 0,
+            persistent_bash_restart: 0,
+            persistent_bash_error: 0,
+            persistent_bash_disabled: 0,
+            persistent_bash_busy: 0,
+            fff_picker_created: 0,
+            fff_picker_reused: 0,
+            fff_picker_cap_fallback: 0,
+            fff_grep_fast_index: 0,
+            fff_grep_fallback: 0,
+            ip_hallucin: 0,
+            research_store_corrupt_rows: 0,
+            research_store_files_healed: 0,
+            research_store_heal_failed: 0,
+            research_store_file_lock_wait: 0,
+            concurrent_same_key_turns: 0,
+            text_coalesced: 0,
+            session_busy_ack: 0,
+            memory_pollution: 0,
+            active_run_max_silent_seconds: 0,
+            config_loaded_hash: None,
+            model_health_body: String::new(),
+        }
+    }
 }
 
 impl MediaRoutingSnapshot {
@@ -403,6 +527,7 @@ impl MediaRoutingSnapshot {
         .unwrap_or_default();
         let inputs = PrometheusInputs {
             media: *self,
+            latency: naked_core::metrics_hist::snapshot(),
             sentinel_leaks: naked_core::types::SENTINEL_LEAK_COUNT.load(Ordering::Relaxed),
             empty_retries: naked_core::types::EMPTY_CONTENT_RETRY_COUNT.load(Ordering::Relaxed),
             turn_ok: naked_core::types::TURN_COMPLETED_COUNT.load(Ordering::Relaxed),
@@ -436,6 +561,48 @@ impl MediaRoutingSnapshot {
             scheduler_dispatch_skipped: naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT
                 .load(Ordering::Relaxed),
             cfg_ext_write: naked_core::types::CONFIG_EXTERNAL_WRITE_COUNT.load(Ordering::Relaxed),
+            stale_edit_reject: naked_core::types::STALE_EDIT_REJECT_COUNT.load(Ordering::Relaxed),
+            git_history_guard_block: naked_core::types::GIT_HISTORY_GUARD_BLOCK_COUNT
+                .load(Ordering::Relaxed),
+            hashline_edit_applied: naked_core::types::HASHLINE_EDIT_APPLIED_COUNT
+                .load(Ordering::Relaxed),
+            hashline_edit_stale_anchor: naked_core::types::HASHLINE_EDIT_STALE_ANCHOR_COUNT
+                .load(Ordering::Relaxed),
+            hashline_edit_overlap: naked_core::types::HASHLINE_EDIT_OVERLAP_COUNT
+                .load(Ordering::Relaxed),
+            hashline_edit_out_of_bounds: naked_core::types::HASHLINE_EDIT_OUT_OF_BOUNDS_COUNT
+                .load(Ordering::Relaxed),
+            hashline_edit_disabled: naked_core::types::HASHLINE_EDIT_DISABLED_COUNT
+                .load(Ordering::Relaxed),
+            fs_cache_hit: naked_core::types::FS_CACHE_HIT_COUNT.load(Ordering::Relaxed),
+            fs_cache_miss: naked_core::types::FS_CACHE_MISS_COUNT.load(Ordering::Relaxed),
+            fs_cache_stale_bypass: naked_core::types::FS_CACHE_STALE_BYPASS_COUNT
+                .load(Ordering::Relaxed),
+            fs_cache_invalidate: naked_core::types::FS_CACHE_INVALIDATE_COUNT
+                .load(Ordering::Relaxed),
+            fs_cache_too_large: naked_core::types::FS_CACHE_TOO_LARGE_COUNT.load(Ordering::Relaxed),
+            persistent_bash_ok: naked_core::types::PERSISTENT_BASH_OK_COUNT.load(Ordering::Relaxed),
+            persistent_bash_timeout: naked_core::types::PERSISTENT_BASH_TIMEOUT_COUNT
+                .load(Ordering::Relaxed),
+            persistent_bash_killed: naked_core::types::PERSISTENT_BASH_KILLED_COUNT
+                .load(Ordering::Relaxed),
+            persistent_bash_restart: naked_core::types::PERSISTENT_BASH_RESTART_COUNT
+                .load(Ordering::Relaxed),
+            persistent_bash_error: naked_core::types::PERSISTENT_BASH_ERROR_COUNT
+                .load(Ordering::Relaxed),
+            persistent_bash_disabled: naked_core::types::PERSISTENT_BASH_DISABLED_COUNT
+                .load(Ordering::Relaxed),
+            persistent_bash_busy: naked_core::types::PERSISTENT_BASH_BUSY_COUNT
+                .load(Ordering::Relaxed),
+            fff_picker_created: naked_core::types::FFF_PICKER_REGISTRY_CREATED_COUNT
+                .load(Ordering::Relaxed),
+            fff_picker_reused: naked_core::types::FFF_PICKER_REGISTRY_REUSED_COUNT
+                .load(Ordering::Relaxed),
+            fff_picker_cap_fallback: naked_core::types::FFF_PICKER_REGISTRY_CAP_FALLBACK_COUNT
+                .load(Ordering::Relaxed),
+            fff_grep_fast_index: naked_core::types::FFF_GREP_FAST_INDEX_COUNT
+                .load(Ordering::Relaxed),
+            fff_grep_fallback: naked_core::types::FFF_GREP_FALLBACK_COUNT.load(Ordering::Relaxed),
             ip_hallucin: naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed),
             research_store_corrupt_rows:
                 naked_core::types::RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT
@@ -450,6 +617,11 @@ impl MediaRoutingSnapshot {
             text_coalesced: self.text_coalesced,
             session_busy_ack: self.session_busy_ack,
             memory_pollution,
+            active_run_max_silent_seconds: crate::shared::RUN_REGISTRY
+                .active_run_max_silent_seconds(),
+            config_loaded_hash: crate::shared::CONFIG_LOADED_HASH
+                .get()
+                .map(|hash| hash.hash_hex.clone()),
             model_health_body,
         };
         render_prometheus_from(&inputs)
@@ -457,6 +629,18 @@ impl MediaRoutingSnapshot {
 }
 
 fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
+    let latency_extra_metrics = render_latency_extra_metrics(&inputs.latency);
+    let config_loaded_hash_metric = inputs
+        .config_loaded_hash
+        .as_deref()
+        .map(|hash| {
+            format!(
+                "# HELP naked_tg_config_loaded_hash (B42/RC-14) Loaded config file hash captured immediately after Config::load.\n\
+                 # TYPE naked_tg_config_loaded_hash gauge\n\
+                 naked_tg_config_loaded_hash{{hash=\"{hash}\"}} 1\n"
+            )
+        })
+        .unwrap_or_default();
     format!(
         "# HELP naked_tg_native_route_chosen_total Photos sent via native path.\n\
              # TYPE naked_tg_native_route_chosen_total counter\n\
@@ -555,6 +739,45 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_core_config_external_write_total (B42) state/naked.json modified by external process detected by D-CONFIG-MTIME-WATCH.\n\
              # TYPE naked_core_config_external_write_total counter\n\
              naked_core_config_external_write_total {cfg_ext_write}\n\
+             {config_loaded_hash_metric}\
+             # HELP naked_core_stale_edit_reject_total Stale edit precondition failures rejected before writing.\n\
+             # TYPE naked_core_stale_edit_reject_total counter\n\
+             naked_core_stale_edit_reject_total {stale_edit_reject}\n\
+             # HELP naked_core_git_history_guard_block_total Git history-destructive bash commands blocked (B85).\n\
+             # TYPE naked_core_git_history_guard_block_total counter\n\
+             naked_core_git_history_guard_block_total {git_history_guard_block}\n\
+             # HELP naked_core_hashline_edit_total Hashline edit outcomes.\n\
+             # TYPE naked_core_hashline_edit_total counter\n\
+             naked_core_hashline_edit_total{{outcome=\"applied\"}} {hashline_edit_applied}\n\
+             naked_core_hashline_edit_total{{outcome=\"stale_anchor\"}} {hashline_edit_stale_anchor}\n\
+             naked_core_hashline_edit_total{{outcome=\"overlap\"}} {hashline_edit_overlap}\n\
+             naked_core_hashline_edit_total{{outcome=\"out_of_bounds\"}} {hashline_edit_out_of_bounds}\n\
+             naked_core_hashline_edit_total{{outcome=\"disabled\"}} {hashline_edit_disabled}\n\
+             # HELP naked_core_fs_cache_total File-system content cache outcomes.\n\
+             # TYPE naked_core_fs_cache_total counter\n\
+             naked_core_fs_cache_total{{outcome=\"hit\"}} {fs_cache_hit}\n\
+             naked_core_fs_cache_total{{outcome=\"miss\"}} {fs_cache_miss}\n\
+             naked_core_fs_cache_total{{outcome=\"stale_bypass\"}} {fs_cache_stale_bypass}\n\
+             naked_core_fs_cache_total{{outcome=\"invalidate\"}} {fs_cache_invalidate}\n\
+             naked_core_fs_cache_total{{outcome=\"too_large\"}} {fs_cache_too_large}\n\
+             # HELP naked_core_persistent_bash_total Persistent bash execution outcomes.\n\
+             # TYPE naked_core_persistent_bash_total counter\n\
+             naked_core_persistent_bash_total{{outcome=\"ok\"}} {persistent_bash_ok}\n\
+             naked_core_persistent_bash_total{{outcome=\"timeout\"}} {persistent_bash_timeout}\n\
+             naked_core_persistent_bash_total{{outcome=\"killed\"}} {persistent_bash_killed}\n\
+             naked_core_persistent_bash_total{{outcome=\"restart\"}} {persistent_bash_restart}\n\
+             naked_core_persistent_bash_total{{outcome=\"error\"}} {persistent_bash_error}\n\
+             naked_core_persistent_bash_total{{outcome=\"disabled\"}} {persistent_bash_disabled}\n\
+             naked_core_persistent_bash_total{{outcome=\"busy\"}} {persistent_bash_busy}\n\
+             # HELP naked_core_fff_picker_registry_total fff fast-index picker registry outcomes.\n\
+             # TYPE naked_core_fff_picker_registry_total counter\n\
+             naked_core_fff_picker_registry_total{{outcome=\"created\"}} {fff_picker_created}\n\
+             naked_core_fff_picker_registry_total{{outcome=\"reused\"}} {fff_picker_reused}\n\
+             naked_core_fff_picker_registry_total{{outcome=\"cap_fallback\"}} {fff_picker_cap_fallback}\n\
+             # HELP naked_core_fff_grep_total fff grep requests by backend.\n\
+             # TYPE naked_core_fff_grep_total counter\n\
+             naked_core_fff_grep_total{{backend=\"fast_index\"}} {fff_grep_fast_index}\n\
+             naked_core_fff_grep_total{{backend=\"fallback\"}} {fff_grep_fallback}\n\
              # HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n\
              # TYPE naked_core_ip_token_hallucination_total counter\n\
              naked_core_ip_token_hallucination_total {ip_hallucin}\n\
@@ -600,6 +823,9 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_tg_config_describer_missing (B05) Set to 1 when the default model is not vision-capable AND no tg_media.vision describer fallback is configured.\n\
              # TYPE naked_tg_config_describer_missing gauge\n\
              naked_tg_config_describer_missing {config_describer_missing}\n\
+             # HELP naked_tg_active_run_max_silent_seconds Maximum age of non-heartbeat progress silence across active runs.\n\
+             # TYPE naked_tg_active_run_max_silent_seconds gauge\n\
+             naked_tg_active_run_max_silent_seconds {active_run_max_silent_seconds}\n\
              # HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n\
              # TYPE naked_tg_research_cancel_propagation_total counter\n\
              naked_tg_research_cancel_propagation_total{{bucket=\"under_3s\"}} {cancel_u3s}\n\
@@ -611,6 +837,43 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_tg_research_cancel_propagation_count (T11) Total cancel observations recorded.\n\
              # TYPE naked_tg_research_cancel_propagation_count counter\n\
              naked_tg_research_cancel_propagation_count {cancel_count}\n\
+             # HELP naked_core_agent_turn_duration_total Agent turn wall duration (ms)\n\
+             # TYPE naked_core_agent_turn_duration_total counter\n\
+             naked_core_agent_turn_duration_total{{bucket=\"under_1s\"}} {turn_duration_under_1s}\n\
+             naked_core_agent_turn_duration_total{{bucket=\"1s_to_10s\"}} {turn_duration_1s_to_10s}\n\
+             naked_core_agent_turn_duration_total{{bucket=\"10s_to_60s\"}} {turn_duration_10s_to_60s}\n\
+             naked_core_agent_turn_duration_total{{bucket=\"over_60s\"}} {turn_duration_over_60s}\n\
+             # HELP naked_core_agent_turn_duration_sum_ms Agent turn wall duration (ms)\n\
+             # TYPE naked_core_agent_turn_duration_sum_ms counter\n\
+             naked_core_agent_turn_duration_sum_ms {turn_duration_sum_ms}\n\
+             # HELP naked_core_agent_turn_duration_count Agent turn wall duration observations\n\
+             # TYPE naked_core_agent_turn_duration_count counter\n\
+             naked_core_agent_turn_duration_count {turn_duration_count}\n\
+             # HELP naked_core_agent_ttft_total Time to first text token (ms)\n\
+             # TYPE naked_core_agent_ttft_total counter\n\
+             naked_core_agent_ttft_total{{bucket=\"under_500ms\"}} {ttft_under_500ms}\n\
+             naked_core_agent_ttft_total{{bucket=\"500ms_to_2s\"}} {ttft_500ms_to_2s}\n\
+             naked_core_agent_ttft_total{{bucket=\"2s_to_10s\"}} {ttft_2s_to_10s}\n\
+             naked_core_agent_ttft_total{{bucket=\"over_10s\"}} {ttft_over_10s}\n\
+             # HELP naked_core_agent_ttft_sum_ms Time to first text token (ms)\n\
+             # TYPE naked_core_agent_ttft_sum_ms counter\n\
+             naked_core_agent_ttft_sum_ms {ttft_sum_ms}\n\
+             # HELP naked_core_agent_ttft_count Time to first text token observations\n\
+             # TYPE naked_core_agent_ttft_count counter\n\
+             naked_core_agent_ttft_count {ttft_count}\n\
+             # HELP naked_core_provider_stream_open_total Provider connect to first chunk (ms, successful streams only)\n\
+             # TYPE naked_core_provider_stream_open_total counter\n\
+             naked_core_provider_stream_open_total{{bucket=\"under_500ms\"}} {provider_stream_open_under_500ms}\n\
+             naked_core_provider_stream_open_total{{bucket=\"500ms_to_2s\"}} {provider_stream_open_500ms_to_2s}\n\
+             naked_core_provider_stream_open_total{{bucket=\"2s_to_10s\"}} {provider_stream_open_2s_to_10s}\n\
+             naked_core_provider_stream_open_total{{bucket=\"over_10s\"}} {provider_stream_open_over_10s}\n\
+             # HELP naked_core_provider_stream_open_sum_ms Provider connect to first chunk (ms, successful streams only)\n\
+             # TYPE naked_core_provider_stream_open_sum_ms counter\n\
+             naked_core_provider_stream_open_sum_ms {provider_stream_open_sum_ms}\n\
+             # HELP naked_core_provider_stream_open_count Provider stream-open observations (successful streams only)\n\
+             # TYPE naked_core_provider_stream_open_count counter\n\
+             naked_core_provider_stream_open_count {provider_stream_open_count}\n\
+             {latency_extra_metrics}\
              {model_health_body}",
         native = inputs.media.native_route_chosen,
         oversize = inputs.media.native_route_downgraded_oversize,
@@ -645,6 +908,31 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         provider_invalid_request = inputs.provider_invalid_request,
         scheduler_dispatch_skipped = inputs.scheduler_dispatch_skipped,
         cfg_ext_write = inputs.cfg_ext_write,
+        config_loaded_hash_metric = config_loaded_hash_metric,
+        stale_edit_reject = inputs.stale_edit_reject,
+        git_history_guard_block = inputs.git_history_guard_block,
+        hashline_edit_applied = inputs.hashline_edit_applied,
+        hashline_edit_stale_anchor = inputs.hashline_edit_stale_anchor,
+        hashline_edit_overlap = inputs.hashline_edit_overlap,
+        hashline_edit_out_of_bounds = inputs.hashline_edit_out_of_bounds,
+        hashline_edit_disabled = inputs.hashline_edit_disabled,
+        fs_cache_hit = inputs.fs_cache_hit,
+        fs_cache_miss = inputs.fs_cache_miss,
+        fs_cache_stale_bypass = inputs.fs_cache_stale_bypass,
+        fs_cache_invalidate = inputs.fs_cache_invalidate,
+        fs_cache_too_large = inputs.fs_cache_too_large,
+        persistent_bash_ok = inputs.persistent_bash_ok,
+        persistent_bash_timeout = inputs.persistent_bash_timeout,
+        persistent_bash_killed = inputs.persistent_bash_killed,
+        persistent_bash_restart = inputs.persistent_bash_restart,
+        persistent_bash_error = inputs.persistent_bash_error,
+        persistent_bash_disabled = inputs.persistent_bash_disabled,
+        persistent_bash_busy = inputs.persistent_bash_busy,
+        fff_picker_created = inputs.fff_picker_created,
+        fff_picker_reused = inputs.fff_picker_reused,
+        fff_picker_cap_fallback = inputs.fff_picker_cap_fallback,
+        fff_grep_fast_index = inputs.fff_grep_fast_index,
+        fff_grep_fallback = inputs.fff_grep_fallback,
         ip_hallucin = inputs.ip_hallucin,
         research_store_corrupt_rows = inputs.research_store_corrupt_rows,
         research_store_files_healed = inputs.research_store_files_healed,
@@ -664,13 +952,121 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         text_coalesced = inputs.text_coalesced,
         session_busy_ack = inputs.session_busy_ack,
         config_describer_missing = inputs.media.config_describer_missing,
+        active_run_max_silent_seconds = inputs.active_run_max_silent_seconds,
         cancel_u3s = inputs.media.research_cancel_propagation_under_3s,
         cancel_3s_30s = inputs.media.research_cancel_propagation_3s_to_30s,
         cancel_o30s = inputs.media.research_cancel_propagation_over_30s,
         cancel_sum_ms = inputs.media.research_cancel_propagation_sum_ms,
         cancel_count = inputs.media.research_cancel_propagation_count,
+        turn_duration_under_1s = inputs.latency.turn_under_1s,
+        turn_duration_1s_to_10s = inputs.latency.turn_1s_to_10s,
+        turn_duration_10s_to_60s = inputs.latency.turn_10s_to_60s,
+        turn_duration_over_60s = inputs.latency.turn_over_60s,
+        turn_duration_sum_ms = inputs.latency.turn_sum_ms,
+        turn_duration_count = inputs.latency.turn_count,
+        ttft_under_500ms = inputs.latency.ttft_under_500ms,
+        ttft_500ms_to_2s = inputs.latency.ttft_500ms_to_2s,
+        ttft_2s_to_10s = inputs.latency.ttft_2s_to_10s,
+        ttft_over_10s = inputs.latency.ttft_over_10s,
+        ttft_sum_ms = inputs.latency.ttft_sum_ms,
+        ttft_count = inputs.latency.ttft_count,
+        provider_stream_open_under_500ms = inputs.latency.provider_under_500ms,
+        provider_stream_open_500ms_to_2s = inputs.latency.provider_500ms_to_2s,
+        provider_stream_open_2s_to_10s = inputs.latency.provider_2s_to_10s,
+        provider_stream_open_over_10s = inputs.latency.provider_over_10s,
+        provider_stream_open_sum_ms = inputs.latency.provider_sum_ms,
+        provider_stream_open_count = inputs.latency.provider_count,
+        latency_extra_metrics = latency_extra_metrics,
         model_health_body = inputs.model_health_body,
     )
+}
+
+fn render_latency_extra_metrics(latency: &LatencySnapshot) -> String {
+    let mut out = String::new();
+    out.push_str("# HELP naked_core_tool_duration_total Tool execution wall duration (ms), by bounded tool class.\n");
+    out.push_str("# TYPE naked_core_tool_duration_total counter\n");
+    for class in ToolClass::ALL {
+        push_labeled_duration_buckets(
+            &mut out,
+            "naked_core_tool_duration_total",
+            "tool",
+            class.label(),
+            tool_snapshot(latency, class),
+        );
+    }
+    out.push_str("# HELP naked_core_tool_duration_sum_ms Tool execution wall duration (ms), by bounded tool class.\n");
+    out.push_str("# TYPE naked_core_tool_duration_sum_ms counter\n");
+    for class in ToolClass::ALL {
+        let hist = tool_snapshot(latency, class);
+        out.push_str(&format!(
+            "naked_core_tool_duration_sum_ms{{tool=\"{}\"}} {}\n",
+            class.label(),
+            hist.sum_ms
+        ));
+    }
+    out.push_str("# HELP naked_core_tool_duration_count Tool execution wall duration (ms), by bounded tool class. observations\n");
+    out.push_str("# TYPE naked_core_tool_duration_count counter\n");
+    for class in ToolClass::ALL {
+        let hist = tool_snapshot(latency, class);
+        out.push_str(&format!(
+            "naked_core_tool_duration_count{{tool=\"{}\"}} {}\n",
+            class.label(),
+            hist.count
+        ));
+    }
+
+    push_single_duration_histogram(
+        &mut out,
+        "naked_core_fff_cold_build",
+        "fff cold fast-index picker build duration (ms).",
+        latency.fff_cold_build,
+    );
+    push_single_duration_histogram(
+        &mut out,
+        "naked_core_parent_fsync",
+        "Parent directory fsync duration for atomic writes (ms).",
+        latency.parent_fsync,
+    );
+    out
+}
+
+fn push_labeled_duration_buckets(
+    out: &mut String,
+    metric: &str,
+    label_name: &str,
+    label_value: &str,
+    hist: DurationHistogramSnapshot,
+) {
+    out.push_str(&format!(
+        "{metric}{{{label_name}=\"{label_value}\",bucket=\"under_10ms\"}} {}\n\
+         {metric}{{{label_name}=\"{label_value}\",bucket=\"10ms_to_100ms\"}} {}\n\
+         {metric}{{{label_name}=\"{label_value}\",bucket=\"100ms_to_1s\"}} {}\n\
+         {metric}{{{label_name}=\"{label_value}\",bucket=\"over_1s\"}} {}\n",
+        hist.under_10ms, hist.ms_10_to_100, hist.ms_100_to_1s, hist.over_1s
+    ));
+}
+
+fn push_single_duration_histogram(
+    out: &mut String,
+    metric_base: &str,
+    help: &str,
+    hist: DurationHistogramSnapshot,
+) {
+    out.push_str(&format!("# HELP {metric_base}_total {help}\n"));
+    out.push_str(&format!("# TYPE {metric_base}_total counter\n"));
+    out.push_str(&format!(
+        "{metric_base}_total{{bucket=\"under_10ms\"}} {}\n\
+         {metric_base}_total{{bucket=\"10ms_to_100ms\"}} {}\n\
+         {metric_base}_total{{bucket=\"100ms_to_1s\"}} {}\n\
+         {metric_base}_total{{bucket=\"over_1s\"}} {}\n",
+        hist.under_10ms, hist.ms_10_to_100, hist.ms_100_to_1s, hist.over_1s
+    ));
+    out.push_str(&format!("# HELP {metric_base}_sum_ms {help}\n"));
+    out.push_str(&format!("# TYPE {metric_base}_sum_ms counter\n"));
+    out.push_str(&format!("{metric_base}_sum_ms {}\n", hist.sum_ms));
+    out.push_str(&format!("# HELP {metric_base}_count {help} observations\n"));
+    out.push_str(&format!("# TYPE {metric_base}_count counter\n"));
+    out.push_str(&format!("{metric_base}_count {}\n", hist.count));
 }
 
 /// Build the HTTP response for a metrics request. Accepts only
@@ -754,6 +1150,18 @@ pub fn serve_prometheus_if_enabled() {
 mod tests {
     use super::*;
 
+    fn metric_value(body: &str, metric_line_prefix: &str) -> u64 {
+        let line = body
+            .lines()
+            .find(|line| line.starts_with(metric_line_prefix))
+            .unwrap_or_else(|| panic!("missing metric line `{metric_line_prefix}` in:\n{body}"));
+        line.split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing value for metric line `{line}`"))
+            .parse::<u64>()
+            .unwrap_or_else(|err| panic!("invalid value for metric line `{line}`: {err}"))
+    }
+
     #[test]
     fn render_prometheus_from_golden() {
         let inputs = PrometheusInputs {
@@ -789,6 +1197,98 @@ mod tests {
                 research_cancel_propagation_sum_ms: 22,
                 research_cancel_propagation_count: 23,
             },
+            latency: LatencySnapshot {
+                turn_under_1s: 100,
+                turn_1s_to_10s: 101,
+                turn_10s_to_60s: 102,
+                turn_over_60s: 103,
+                turn_sum_ms: 104,
+                turn_count: 105,
+                ttft_under_500ms: 106,
+                ttft_500ms_to_2s: 107,
+                ttft_2s_to_10s: 108,
+                ttft_over_10s: 109,
+                ttft_sum_ms: 110,
+                ttft_count: 111,
+                provider_under_500ms: 112,
+                provider_500ms_to_2s: 113,
+                provider_2s_to_10s: 114,
+                provider_over_10s: 115,
+                provider_sum_ms: 116,
+                provider_count: 117,
+                tool_grep: DurationHistogramSnapshot {
+                    under_10ms: 118,
+                    ms_10_to_100: 119,
+                    ms_100_to_1s: 120,
+                    over_1s: 121,
+                    sum_ms: 122,
+                    count: 123,
+                },
+                tool_read: DurationHistogramSnapshot {
+                    under_10ms: 124,
+                    ms_10_to_100: 125,
+                    ms_100_to_1s: 126,
+                    over_1s: 127,
+                    sum_ms: 128,
+                    count: 129,
+                },
+                tool_edit: DurationHistogramSnapshot {
+                    under_10ms: 130,
+                    ms_10_to_100: 131,
+                    ms_100_to_1s: 132,
+                    over_1s: 133,
+                    sum_ms: 134,
+                    count: 135,
+                },
+                tool_write: DurationHistogramSnapshot {
+                    under_10ms: 136,
+                    ms_10_to_100: 137,
+                    ms_100_to_1s: 138,
+                    over_1s: 139,
+                    sum_ms: 140,
+                    count: 141,
+                },
+                tool_bash: DurationHistogramSnapshot {
+                    under_10ms: 142,
+                    ms_10_to_100: 143,
+                    ms_100_to_1s: 144,
+                    over_1s: 145,
+                    sum_ms: 146,
+                    count: 147,
+                },
+                tool_apply_patch: DurationHistogramSnapshot {
+                    under_10ms: 148,
+                    ms_10_to_100: 149,
+                    ms_100_to_1s: 150,
+                    over_1s: 151,
+                    sum_ms: 152,
+                    count: 153,
+                },
+                tool_other: DurationHistogramSnapshot {
+                    under_10ms: 154,
+                    ms_10_to_100: 155,
+                    ms_100_to_1s: 156,
+                    over_1s: 157,
+                    sum_ms: 158,
+                    count: 159,
+                },
+                fff_cold_build: DurationHistogramSnapshot {
+                    under_10ms: 160,
+                    ms_10_to_100: 161,
+                    ms_100_to_1s: 162,
+                    over_1s: 163,
+                    sum_ms: 164,
+                    count: 165,
+                },
+                parent_fsync: DurationHistogramSnapshot {
+                    under_10ms: 166,
+                    ms_10_to_100: 167,
+                    ms_100_to_1s: 168,
+                    over_1s: 169,
+                    sum_ms: 170,
+                    count: 171,
+                },
+            },
             sentinel_leaks: 24,
             empty_retries: 25,
             turn_ok: 26,
@@ -810,6 +1310,30 @@ mod tests {
             provider_invalid_request: 392,
             scheduler_dispatch_skipped: 393,
             cfg_ext_write: 40,
+            stale_edit_reject: 406,
+            git_history_guard_block: 408,
+            hashline_edit_applied: 407,
+            hashline_edit_stale_anchor: 408,
+            hashline_edit_overlap: 409,
+            hashline_edit_out_of_bounds: 410,
+            hashline_edit_disabled: 411,
+            fs_cache_hit: 412,
+            fs_cache_miss: 413,
+            fs_cache_stale_bypass: 414,
+            fs_cache_invalidate: 415,
+            fs_cache_too_large: 416,
+            persistent_bash_ok: 417,
+            persistent_bash_timeout: 418,
+            persistent_bash_killed: 419,
+            persistent_bash_restart: 420,
+            persistent_bash_error: 421,
+            persistent_bash_disabled: 422,
+            persistent_bash_busy: 423,
+            fff_picker_created: 401,
+            fff_picker_reused: 402,
+            fff_picker_cap_fallback: 403,
+            fff_grep_fast_index: 404,
+            fff_grep_fallback: 405,
             ip_hallucin: 41,
             research_store_corrupt_rows: 42,
             research_store_files_healed: 43,
@@ -819,6 +1343,8 @@ mod tests {
             text_coalesced: 47,
             session_busy_ack: 48,
             memory_pollution: 0,
+            active_run_max_silent_seconds: 49,
+            config_loaded_hash: None,
             model_health_body: "# model health\nnaked_model_health_probe 777\n".to_string(),
         };
         let expected = concat!(
@@ -919,6 +1445,44 @@ mod tests {
             "# HELP naked_core_config_external_write_total (B42) state/naked.json modified by external process detected by D-CONFIG-MTIME-WATCH.\n",
             "# TYPE naked_core_config_external_write_total counter\n",
             "naked_core_config_external_write_total 40\n",
+            "# HELP naked_core_stale_edit_reject_total Stale edit precondition failures rejected before writing.\n",
+            "# TYPE naked_core_stale_edit_reject_total counter\n",
+            "naked_core_stale_edit_reject_total 406\n",
+            "# HELP naked_core_git_history_guard_block_total Git history-destructive bash commands blocked (B85).\n",
+            "# TYPE naked_core_git_history_guard_block_total counter\n",
+            "naked_core_git_history_guard_block_total 408\n",
+            "# HELP naked_core_hashline_edit_total Hashline edit outcomes.\n",
+            "# TYPE naked_core_hashline_edit_total counter\n",
+            "naked_core_hashline_edit_total{outcome=\"applied\"} 407\n",
+            "naked_core_hashline_edit_total{outcome=\"stale_anchor\"} 408\n",
+            "naked_core_hashline_edit_total{outcome=\"overlap\"} 409\n",
+            "naked_core_hashline_edit_total{outcome=\"out_of_bounds\"} 410\n",
+            "naked_core_hashline_edit_total{outcome=\"disabled\"} 411\n",
+            "# HELP naked_core_fs_cache_total File-system content cache outcomes.\n",
+            "# TYPE naked_core_fs_cache_total counter\n",
+            "naked_core_fs_cache_total{outcome=\"hit\"} 412\n",
+            "naked_core_fs_cache_total{outcome=\"miss\"} 413\n",
+            "naked_core_fs_cache_total{outcome=\"stale_bypass\"} 414\n",
+            "naked_core_fs_cache_total{outcome=\"invalidate\"} 415\n",
+            "naked_core_fs_cache_total{outcome=\"too_large\"} 416\n",
+            "# HELP naked_core_persistent_bash_total Persistent bash execution outcomes.\n",
+            "# TYPE naked_core_persistent_bash_total counter\n",
+            "naked_core_persistent_bash_total{outcome=\"ok\"} 417\n",
+            "naked_core_persistent_bash_total{outcome=\"timeout\"} 418\n",
+            "naked_core_persistent_bash_total{outcome=\"killed\"} 419\n",
+            "naked_core_persistent_bash_total{outcome=\"restart\"} 420\n",
+            "naked_core_persistent_bash_total{outcome=\"error\"} 421\n",
+            "naked_core_persistent_bash_total{outcome=\"disabled\"} 422\n",
+            "naked_core_persistent_bash_total{outcome=\"busy\"} 423\n",
+            "# HELP naked_core_fff_picker_registry_total fff fast-index picker registry outcomes.\n",
+            "# TYPE naked_core_fff_picker_registry_total counter\n",
+            "naked_core_fff_picker_registry_total{outcome=\"created\"} 401\n",
+            "naked_core_fff_picker_registry_total{outcome=\"reused\"} 402\n",
+            "naked_core_fff_picker_registry_total{outcome=\"cap_fallback\"} 403\n",
+            "# HELP naked_core_fff_grep_total fff grep requests by backend.\n",
+            "# TYPE naked_core_fff_grep_total counter\n",
+            "naked_core_fff_grep_total{backend=\"fast_index\"} 404\n",
+            "naked_core_fff_grep_total{backend=\"fallback\"} 405\n",
             "# HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n",
             "# TYPE naked_core_ip_token_hallucination_total counter\n",
             "naked_core_ip_token_hallucination_total 41\n",
@@ -964,6 +1528,9 @@ mod tests {
             "# HELP naked_tg_config_describer_missing (B05) Set to 1 when the default model is not vision-capable AND no tg_media.vision describer fallback is configured.\n",
             "# TYPE naked_tg_config_describer_missing gauge\n",
             "naked_tg_config_describer_missing 1\n",
+            "# HELP naked_tg_active_run_max_silent_seconds Maximum age of non-heartbeat progress silence across active runs.\n",
+            "# TYPE naked_tg_active_run_max_silent_seconds gauge\n",
+            "naked_tg_active_run_max_silent_seconds 49\n",
             "# HELP naked_tg_research_cancel_propagation_total (T11/B56) Cancel propagation latency buckets (ms).\n",
             "# TYPE naked_tg_research_cancel_propagation_total counter\n",
             "naked_tg_research_cancel_propagation_total{bucket=\"under_3s\"} 19\n",
@@ -975,10 +1542,284 @@ mod tests {
             "# HELP naked_tg_research_cancel_propagation_count (T11) Total cancel observations recorded.\n",
             "# TYPE naked_tg_research_cancel_propagation_count counter\n",
             "naked_tg_research_cancel_propagation_count 23\n",
+            "# HELP naked_core_agent_turn_duration_total Agent turn wall duration (ms)\n",
+            "# TYPE naked_core_agent_turn_duration_total counter\n",
+            "naked_core_agent_turn_duration_total{bucket=\"under_1s\"} 100\n",
+            "naked_core_agent_turn_duration_total{bucket=\"1s_to_10s\"} 101\n",
+            "naked_core_agent_turn_duration_total{bucket=\"10s_to_60s\"} 102\n",
+            "naked_core_agent_turn_duration_total{bucket=\"over_60s\"} 103\n",
+            "# HELP naked_core_agent_turn_duration_sum_ms Agent turn wall duration (ms)\n",
+            "# TYPE naked_core_agent_turn_duration_sum_ms counter\n",
+            "naked_core_agent_turn_duration_sum_ms 104\n",
+            "# HELP naked_core_agent_turn_duration_count Agent turn wall duration observations\n",
+            "# TYPE naked_core_agent_turn_duration_count counter\n",
+            "naked_core_agent_turn_duration_count 105\n",
+            "# HELP naked_core_agent_ttft_total Time to first text token (ms)\n",
+            "# TYPE naked_core_agent_ttft_total counter\n",
+            "naked_core_agent_ttft_total{bucket=\"under_500ms\"} 106\n",
+            "naked_core_agent_ttft_total{bucket=\"500ms_to_2s\"} 107\n",
+            "naked_core_agent_ttft_total{bucket=\"2s_to_10s\"} 108\n",
+            "naked_core_agent_ttft_total{bucket=\"over_10s\"} 109\n",
+            "# HELP naked_core_agent_ttft_sum_ms Time to first text token (ms)\n",
+            "# TYPE naked_core_agent_ttft_sum_ms counter\n",
+            "naked_core_agent_ttft_sum_ms 110\n",
+            "# HELP naked_core_agent_ttft_count Time to first text token observations\n",
+            "# TYPE naked_core_agent_ttft_count counter\n",
+            "naked_core_agent_ttft_count 111\n",
+            "# HELP naked_core_provider_stream_open_total Provider connect to first chunk (ms, successful streams only)\n",
+            "# TYPE naked_core_provider_stream_open_total counter\n",
+            "naked_core_provider_stream_open_total{bucket=\"under_500ms\"} 112\n",
+            "naked_core_provider_stream_open_total{bucket=\"500ms_to_2s\"} 113\n",
+            "naked_core_provider_stream_open_total{bucket=\"2s_to_10s\"} 114\n",
+            "naked_core_provider_stream_open_total{bucket=\"over_10s\"} 115\n",
+            "# HELP naked_core_provider_stream_open_sum_ms Provider connect to first chunk (ms, successful streams only)\n",
+            "# TYPE naked_core_provider_stream_open_sum_ms counter\n",
+            "naked_core_provider_stream_open_sum_ms 116\n",
+            "# HELP naked_core_provider_stream_open_count Provider stream-open observations (successful streams only)\n",
+            "# TYPE naked_core_provider_stream_open_count counter\n",
+            "naked_core_provider_stream_open_count 117\n",
+            "# HELP naked_core_tool_duration_total Tool execution wall duration (ms), by bounded tool class.\n",
+            "# TYPE naked_core_tool_duration_total counter\n",
+            "naked_core_tool_duration_total{tool=\"grep\",bucket=\"under_10ms\"} 118\n",
+            "naked_core_tool_duration_total{tool=\"grep\",bucket=\"10ms_to_100ms\"} 119\n",
+            "naked_core_tool_duration_total{tool=\"grep\",bucket=\"100ms_to_1s\"} 120\n",
+            "naked_core_tool_duration_total{tool=\"grep\",bucket=\"over_1s\"} 121\n",
+            "naked_core_tool_duration_total{tool=\"read\",bucket=\"under_10ms\"} 124\n",
+            "naked_core_tool_duration_total{tool=\"read\",bucket=\"10ms_to_100ms\"} 125\n",
+            "naked_core_tool_duration_total{tool=\"read\",bucket=\"100ms_to_1s\"} 126\n",
+            "naked_core_tool_duration_total{tool=\"read\",bucket=\"over_1s\"} 127\n",
+            "naked_core_tool_duration_total{tool=\"edit\",bucket=\"under_10ms\"} 130\n",
+            "naked_core_tool_duration_total{tool=\"edit\",bucket=\"10ms_to_100ms\"} 131\n",
+            "naked_core_tool_duration_total{tool=\"edit\",bucket=\"100ms_to_1s\"} 132\n",
+            "naked_core_tool_duration_total{tool=\"edit\",bucket=\"over_1s\"} 133\n",
+            "naked_core_tool_duration_total{tool=\"write\",bucket=\"under_10ms\"} 136\n",
+            "naked_core_tool_duration_total{tool=\"write\",bucket=\"10ms_to_100ms\"} 137\n",
+            "naked_core_tool_duration_total{tool=\"write\",bucket=\"100ms_to_1s\"} 138\n",
+            "naked_core_tool_duration_total{tool=\"write\",bucket=\"over_1s\"} 139\n",
+            "naked_core_tool_duration_total{tool=\"bash\",bucket=\"under_10ms\"} 142\n",
+            "naked_core_tool_duration_total{tool=\"bash\",bucket=\"10ms_to_100ms\"} 143\n",
+            "naked_core_tool_duration_total{tool=\"bash\",bucket=\"100ms_to_1s\"} 144\n",
+            "naked_core_tool_duration_total{tool=\"bash\",bucket=\"over_1s\"} 145\n",
+            "naked_core_tool_duration_total{tool=\"apply_patch\",bucket=\"under_10ms\"} 148\n",
+            "naked_core_tool_duration_total{tool=\"apply_patch\",bucket=\"10ms_to_100ms\"} 149\n",
+            "naked_core_tool_duration_total{tool=\"apply_patch\",bucket=\"100ms_to_1s\"} 150\n",
+            "naked_core_tool_duration_total{tool=\"apply_patch\",bucket=\"over_1s\"} 151\n",
+            "naked_core_tool_duration_total{tool=\"other\",bucket=\"under_10ms\"} 154\n",
+            "naked_core_tool_duration_total{tool=\"other\",bucket=\"10ms_to_100ms\"} 155\n",
+            "naked_core_tool_duration_total{tool=\"other\",bucket=\"100ms_to_1s\"} 156\n",
+            "naked_core_tool_duration_total{tool=\"other\",bucket=\"over_1s\"} 157\n",
+            "# HELP naked_core_tool_duration_sum_ms Tool execution wall duration (ms), by bounded tool class.\n",
+            "# TYPE naked_core_tool_duration_sum_ms counter\n",
+            "naked_core_tool_duration_sum_ms{tool=\"grep\"} 122\n",
+            "naked_core_tool_duration_sum_ms{tool=\"read\"} 128\n",
+            "naked_core_tool_duration_sum_ms{tool=\"edit\"} 134\n",
+            "naked_core_tool_duration_sum_ms{tool=\"write\"} 140\n",
+            "naked_core_tool_duration_sum_ms{tool=\"bash\"} 146\n",
+            "naked_core_tool_duration_sum_ms{tool=\"apply_patch\"} 152\n",
+            "naked_core_tool_duration_sum_ms{tool=\"other\"} 158\n",
+            "# HELP naked_core_tool_duration_count Tool execution wall duration (ms), by bounded tool class. observations\n",
+            "# TYPE naked_core_tool_duration_count counter\n",
+            "naked_core_tool_duration_count{tool=\"grep\"} 123\n",
+            "naked_core_tool_duration_count{tool=\"read\"} 129\n",
+            "naked_core_tool_duration_count{tool=\"edit\"} 135\n",
+            "naked_core_tool_duration_count{tool=\"write\"} 141\n",
+            "naked_core_tool_duration_count{tool=\"bash\"} 147\n",
+            "naked_core_tool_duration_count{tool=\"apply_patch\"} 153\n",
+            "naked_core_tool_duration_count{tool=\"other\"} 159\n",
+            "# HELP naked_core_fff_cold_build_total fff cold fast-index picker build duration (ms).\n",
+            "# TYPE naked_core_fff_cold_build_total counter\n",
+            "naked_core_fff_cold_build_total{bucket=\"under_10ms\"} 160\n",
+            "naked_core_fff_cold_build_total{bucket=\"10ms_to_100ms\"} 161\n",
+            "naked_core_fff_cold_build_total{bucket=\"100ms_to_1s\"} 162\n",
+            "naked_core_fff_cold_build_total{bucket=\"over_1s\"} 163\n",
+            "# HELP naked_core_fff_cold_build_sum_ms fff cold fast-index picker build duration (ms).\n",
+            "# TYPE naked_core_fff_cold_build_sum_ms counter\n",
+            "naked_core_fff_cold_build_sum_ms 164\n",
+            "# HELP naked_core_fff_cold_build_count fff cold fast-index picker build duration (ms). observations\n",
+            "# TYPE naked_core_fff_cold_build_count counter\n",
+            "naked_core_fff_cold_build_count 165\n",
+            "# HELP naked_core_parent_fsync_total Parent directory fsync duration for atomic writes (ms).\n",
+            "# TYPE naked_core_parent_fsync_total counter\n",
+            "naked_core_parent_fsync_total{bucket=\"under_10ms\"} 166\n",
+            "naked_core_parent_fsync_total{bucket=\"10ms_to_100ms\"} 167\n",
+            "naked_core_parent_fsync_total{bucket=\"100ms_to_1s\"} 168\n",
+            "naked_core_parent_fsync_total{bucket=\"over_1s\"} 169\n",
+            "# HELP naked_core_parent_fsync_sum_ms Parent directory fsync duration for atomic writes (ms).\n",
+            "# TYPE naked_core_parent_fsync_sum_ms counter\n",
+            "naked_core_parent_fsync_sum_ms 170\n",
+            "# HELP naked_core_parent_fsync_count Parent directory fsync duration for atomic writes (ms). observations\n",
+            "# TYPE naked_core_parent_fsync_count counter\n",
+            "naked_core_parent_fsync_count 171\n",
             "# model health\n",
             "naked_model_health_probe 777\n",
         );
         assert_eq!(render_prometheus_from(&inputs), expected);
+    }
+
+    #[test]
+    fn prometheus_latency_histograms_render_real_record_deltas() {
+        let before = MediaRoutingSnapshot::default().render_prometheus();
+        let turn_bucket = "naked_core_agent_turn_duration_total{bucket=\"1s_to_10s\"}";
+        let turn_count = "naked_core_agent_turn_duration_count";
+        let turn_sum = "naked_core_agent_turn_duration_sum_ms";
+        let ttft_bucket = "naked_core_agent_ttft_total{bucket=\"500ms_to_2s\"}";
+        let ttft_count = "naked_core_agent_ttft_count";
+        let ttft_sum = "naked_core_agent_ttft_sum_ms";
+        let provider_bucket = "naked_core_provider_stream_open_total{bucket=\"500ms_to_2s\"}";
+        let provider_count = "naked_core_provider_stream_open_count";
+        let provider_sum = "naked_core_provider_stream_open_sum_ms";
+
+        let before_turn_bucket = metric_value(&before, turn_bucket);
+        let before_turn_count = metric_value(&before, turn_count);
+        let before_turn_sum = metric_value(&before, turn_sum);
+        let before_ttft_bucket = metric_value(&before, ttft_bucket);
+        let before_ttft_count = metric_value(&before, ttft_count);
+        let before_ttft_sum = metric_value(&before, ttft_sum);
+        let before_provider_bucket = metric_value(&before, provider_bucket);
+        let before_provider_count = metric_value(&before, provider_count);
+        let before_provider_sum = metric_value(&before, provider_sum);
+
+        naked_core::metrics_hist::record_turn_duration(1_234);
+        naked_core::metrics_hist::record_ttft(750);
+        naked_core::metrics_hist::record_provider_stream_open(750);
+
+        let after = MediaRoutingSnapshot::default().render_prometheus();
+        assert_eq!(metric_value(&after, turn_bucket), before_turn_bucket + 1);
+        assert_eq!(metric_value(&after, turn_count), before_turn_count + 1);
+        assert_eq!(metric_value(&after, turn_sum), before_turn_sum + 1_234);
+        assert_eq!(metric_value(&after, ttft_bucket), before_ttft_bucket + 1);
+        assert_eq!(metric_value(&after, ttft_count), before_ttft_count + 1);
+        assert_eq!(metric_value(&after, ttft_sum), before_ttft_sum + 750);
+        assert_eq!(
+            metric_value(&after, provider_bucket),
+            before_provider_bucket + 1
+        );
+        assert_eq!(
+            metric_value(&after, provider_count),
+            before_provider_count + 1
+        );
+        assert_eq!(
+            metric_value(&after, provider_sum),
+            before_provider_sum + 750
+        );
+    }
+
+    #[test]
+    fn prometheus_per_tool_latency_render_real_record_deltas() {
+        let before = MediaRoutingSnapshot::default().render_prometheus();
+        let bucket = "naked_core_tool_duration_total{tool=\"grep\",bucket=\"over_1s\"}";
+        let count = "naked_core_tool_duration_count{tool=\"grep\"}";
+        let sum = "naked_core_tool_duration_sum_ms{tool=\"grep\"}";
+        let before_bucket = metric_value(&before, bucket);
+        let before_count = metric_value(&before, count);
+        let before_sum = metric_value(&before, sum);
+
+        naked_core::metrics_hist::record_tool_duration("grep_search", 1_234);
+
+        let after = MediaRoutingSnapshot::default().render_prometheus();
+        assert_eq!(metric_value(&after, bucket), before_bucket + 1);
+        assert_eq!(metric_value(&after, count), before_count + 1);
+        assert_eq!(metric_value(&after, sum), before_sum + 1_234);
+    }
+
+    #[test]
+    fn per_tool_unknown_name_buckets_to_other() {
+        let before = MediaRoutingSnapshot::default().render_prometheus();
+        let other_bucket = "naked_core_tool_duration_total{tool=\"other\",bucket=\"100ms_to_1s\"}";
+        let other_count = "naked_core_tool_duration_count{tool=\"other\"}";
+        let other_sum = "naked_core_tool_duration_sum_ms{tool=\"other\"}";
+        let forbidden_dynamic_bucket =
+            "naked_core_tool_duration_total{tool=\"some_weird_tool\",bucket=\"100ms_to_1s\"}";
+        let before_bucket = metric_value(&before, other_bucket);
+        let before_count = metric_value(&before, other_count);
+        let before_sum = metric_value(&before, other_sum);
+
+        naked_core::metrics_hist::record_tool_duration("some_weird_tool", 250);
+
+        let after = MediaRoutingSnapshot::default().render_prometheus();
+        assert_eq!(metric_value(&after, other_bucket), before_bucket + 1);
+        assert_eq!(metric_value(&after, other_count), before_count + 1);
+        assert_eq!(metric_value(&after, other_sum), before_sum + 250);
+        assert!(
+            !after.contains(forbidden_dynamic_bucket),
+            "unknown tool names must not create unbounded Prometheus labels"
+        );
+    }
+
+    #[test]
+    fn render_prometheus_includes_fff_fast_index_counters() {
+        let inputs = PrometheusInputs {
+            fff_picker_created: 1,
+            fff_picker_reused: 2,
+            fff_picker_cap_fallback: 3,
+            fff_grep_fast_index: 4,
+            fff_grep_fallback: 5,
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_core_fff_picker_registry_total"));
+        assert!(rendered.contains("# TYPE naked_core_fff_picker_registry_total counter"));
+        assert!(rendered.contains("naked_core_fff_picker_registry_total{outcome=\"created\"} 1"));
+        assert!(rendered.contains("naked_core_fff_picker_registry_total{outcome=\"reused\"} 2"));
+        assert!(
+            rendered.contains("naked_core_fff_picker_registry_total{outcome=\"cap_fallback\"} 3")
+        );
+        assert!(rendered.contains("# HELP naked_core_fff_grep_total"));
+        assert!(rendered.contains("# TYPE naked_core_fff_grep_total counter"));
+        assert!(rendered.contains("naked_core_fff_grep_total{backend=\"fast_index\"} 4"));
+        assert!(rendered.contains("naked_core_fff_grep_total{backend=\"fallback\"} 5"));
+    }
+
+    #[test]
+    fn render_prometheus_includes_v2_ideal_tools_counters() {
+        let inputs = PrometheusInputs {
+            stale_edit_reject: 1,
+            hashline_edit_applied: 2,
+            hashline_edit_stale_anchor: 3,
+            hashline_edit_overlap: 4,
+            hashline_edit_out_of_bounds: 5,
+            hashline_edit_disabled: 6,
+            fs_cache_hit: 7,
+            fs_cache_miss: 8,
+            fs_cache_stale_bypass: 9,
+            fs_cache_invalidate: 10,
+            fs_cache_too_large: 11,
+            persistent_bash_ok: 12,
+            persistent_bash_timeout: 13,
+            persistent_bash_killed: 14,
+            persistent_bash_restart: 15,
+            persistent_bash_error: 16,
+            persistent_bash_disabled: 17,
+            persistent_bash_busy: 18,
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_core_stale_edit_reject_total"));
+        assert!(rendered.contains("# TYPE naked_core_stale_edit_reject_total counter"));
+        assert!(rendered.contains("naked_core_stale_edit_reject_total 1"));
+        assert!(rendered.contains("# HELP naked_core_hashline_edit_total"));
+        assert!(rendered.contains("# TYPE naked_core_hashline_edit_total counter"));
+        assert!(rendered.contains("naked_core_hashline_edit_total{outcome=\"applied\"} 2"));
+        assert!(rendered.contains("naked_core_hashline_edit_total{outcome=\"stale_anchor\"} 3"));
+        assert!(rendered.contains("naked_core_hashline_edit_total{outcome=\"overlap\"} 4"));
+        assert!(rendered.contains("naked_core_hashline_edit_total{outcome=\"out_of_bounds\"} 5"));
+        assert!(rendered.contains("naked_core_hashline_edit_total{outcome=\"disabled\"} 6"));
+        assert!(rendered.contains("# HELP naked_core_fs_cache_total"));
+        assert!(rendered.contains("# TYPE naked_core_fs_cache_total counter"));
+        assert!(rendered.contains("naked_core_fs_cache_total{outcome=\"hit\"} 7"));
+        assert!(rendered.contains("naked_core_fs_cache_total{outcome=\"miss\"} 8"));
+        assert!(rendered.contains("naked_core_fs_cache_total{outcome=\"stale_bypass\"} 9"));
+        assert!(rendered.contains("naked_core_fs_cache_total{outcome=\"invalidate\"} 10"));
+        assert!(rendered.contains("naked_core_fs_cache_total{outcome=\"too_large\"} 11"));
+        assert!(rendered.contains("# HELP naked_core_persistent_bash_total"));
+        assert!(rendered.contains("# TYPE naked_core_persistent_bash_total counter"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"ok\"} 12"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"timeout\"} 13"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"killed\"} 14"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"restart\"} 15"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"error\"} 16"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"disabled\"} 17"));
+        assert!(rendered.contains("naked_core_persistent_bash_total{outcome=\"busy\"} 18"));
     }
 
     #[test]
@@ -1033,6 +1874,110 @@ mod tests {
         assert!(rendered.contains("# TYPE naked_tg_config_describer_missing gauge"));
         assert!(rendered.contains("naked_tg_config_describer_missing 1"));
         assert!(!rendered.contains("naked_tg_config_describer_missing_total"));
+    }
+
+    #[test]
+    fn prometheus_includes_config_loaded_hash_info_gauge() {
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            config_loaded_hash: Some("0123456789abcdef".to_string()),
+            ..PrometheusInputs::default()
+        });
+        assert!(rendered.contains("# HELP naked_tg_config_loaded_hash"));
+        assert!(rendered.contains("# TYPE naked_tg_config_loaded_hash gauge"));
+        assert!(rendered.contains("naked_tg_config_loaded_hash{hash=\"0123456789abcdef\"} 1"));
+    }
+
+    #[test]
+    fn prometheus_includes_active_run_max_silent_seconds_gauge() {
+        use naked_tg::run_registry::{
+            RegisterRunInput, RegisterRunOptions, RunKind, RunOrigin, RunRegistry,
+        };
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = RunRegistry::new();
+        let (steer, _rx) = mpsc::channel(1);
+        registry
+            .register_run(
+                RegisterRunInput {
+                    requested_run_id: Some("run-silent".to_string()),
+                    session_id: "sid-silent".to_string(),
+                    origin: RunOrigin::new(42, None),
+                    kind: RunKind::ChatTurn,
+                    source_ref: None,
+                    steer,
+                    abort: CancellationToken::new(),
+                },
+                RegisterRunOptions::cap_three(),
+            )
+            .expect("register run");
+        let base = Instant::now();
+        registry.mark_run_progress_at("run-silent", base).unwrap();
+        let silent_seconds =
+            registry.active_run_max_silent_seconds_at(base + Duration::from_secs(73));
+
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            active_run_max_silent_seconds: silent_seconds,
+            ..PrometheusInputs::default()
+        });
+        assert!(rendered.contains("# HELP naked_tg_active_run_max_silent_seconds"));
+        assert!(rendered.contains("# TYPE naked_tg_active_run_max_silent_seconds gauge"));
+        assert!(rendered.contains("naked_tg_active_run_max_silent_seconds 73"));
+    }
+
+    #[test]
+    fn prometheus_active_run_silent_gauge_reflects_shared_registry() {
+        use naked_tg::run_registry::{RegisterRunInput, RegisterRunOptions, RunKind, RunOrigin};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let run_id = format!("metrics-shared-silent-run-{unique}");
+        let session_id = format!("metrics-shared-silent-sid-{unique}");
+        let chat_id = 9_000_000_000_i64 + (unique % 1_000_000) as i64;
+        let (steer, _rx) = mpsc::channel(1);
+        let registry = &crate::shared::RUN_REGISTRY;
+        let _ = registry.remove_run(&run_id);
+        registry
+            .register_run(
+                RegisterRunInput {
+                    requested_run_id: Some(run_id.clone()),
+                    session_id,
+                    origin: RunOrigin::new(chat_id, None),
+                    kind: RunKind::ChatTurn,
+                    source_ref: None,
+                    steer,
+                    abort: CancellationToken::new(),
+                },
+                RegisterRunOptions::cap_three(),
+            )
+            .expect("register shared run");
+        registry
+            .mark_run_progress_at(&run_id, Instant::now() - Duration::from_secs(3_600))
+            .expect("backdate shared run progress");
+
+        let rendered = MediaRoutingSnapshot::default().render_prometheus();
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("naked_tg_active_run_max_silent_seconds "))
+            .unwrap_or_else(|| panic!("missing active-run silence gauge in:\n{rendered}"));
+        let value = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing gauge value in `{line}`"))
+            .parse::<u64>()
+            .unwrap_or_else(|err| panic!("invalid gauge value in `{line}`: {err}"));
+        let _ = registry.remove_run(&run_id);
+
+        assert!(
+            value >= 3_600,
+            "production render path must read shared RUN_REGISTRY silence age; got {value}"
+        );
     }
 
     #[test]

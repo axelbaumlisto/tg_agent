@@ -52,8 +52,10 @@ impl super::AgentLoop {
         // R1: SteerPipeline owns pending vec + delivered set.
         let mut steer = SteerPipeline::new();
         let started = std::time::Instant::now();
+        let mut first_token_at: Option<std::time::Instant> = None;
 
-        'outer: for _iteration in 0..limit {
+        let result: Result<TurnUsage> = async {
+            'outer: for _iteration in 0..limit {
             if cancel.is_cancelled() {
                 // PLAN_NEXT_SESSION §A.2 S6 follow-up: preserve any
                 // in-flight user input across an abort. Without this
@@ -108,6 +110,8 @@ impl super::AgentLoop {
                     &tx,
                     &mut steer_rx,
                     &mut steer,
+                    started,
+                    &mut first_token_at,
                 )
                 .await
             {
@@ -115,6 +119,19 @@ impl super::AgentLoop {
                 Err(AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::ContextWindowExceeded { .. },
                 )) => continue 'outer,
+                Err(AgentError::WallTimeout) => {
+                    let msg = crate::error::WALL_TIMEOUT_MESSAGE.to_string();
+                    let _ = tx.send(AgentEvent::Error(msg)).await;
+                    let _ = tx.send(AgentEvent::Idle).await;
+                    self.config.record_health(
+                        crate::model_catalog::HealthEventKind::Error,
+                        None,
+                        Some("turn provider/stream backstop timeout".into()),
+                    );
+                    let rescued = steer.drain(&mut steer_rx, history, &tx).await;
+                    bump_drained_on_abort_if_rescued(rescued);
+                    return Err(AgentError::WallTimeout);
+                }
                 Err(e) => {
                     // Same context-preservation guarantee as the
                     // pre-iteration cancel check above. Cheap (drain
@@ -346,7 +363,7 @@ impl super::AgentLoop {
                     continue;
                 }
 
-                let result = self
+                let result = match self
                     .execute_tool_with_heartbeat(
                         &name,
                         input.clone(),
@@ -356,7 +373,24 @@ impl super::AgentLoop {
                         &mut steer_rx,
                         &mut steer,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(AgentError::WallTimeout) => {
+                        let msg = crate::error::WALL_TIMEOUT_MESSAGE.to_string();
+                        let _ = tx.send(AgentEvent::Error(msg)).await;
+                        let _ = tx.send(AgentEvent::Idle).await;
+                        self.config.record_health(
+                            crate::model_catalog::HealthEventKind::Error,
+                            None,
+                            Some("tool wall timeout".into()),
+                        );
+                        let rescued = steer.drain(&mut steer_rx, history, &tx).await;
+                        bump_drained_on_abort_if_rescued(rescued);
+                        return Err(AgentError::WallTimeout);
+                    }
+                    Err(e) => return Err(e),
+                };
 
                 // T2 of PLAN_QUALITY_v1: post-edit LSP hook. Compute
                 // the edited paths and ask the LSP manager for
@@ -437,9 +471,17 @@ impl super::AgentLoop {
             }
         }
 
-        let _ = tx
-            .send(AgentEvent::Error("Max iterations exceeded".into()))
-            .await;
-        Err(AgentError::MaxIterations(self.config.max_iterations))
+            let _ = tx
+                .send(AgentEvent::Error("Max iterations exceeded".into()))
+                .await;
+            Err(AgentError::MaxIterations(self.config.max_iterations))
+        }
+        .await;
+
+        crate::metrics_hist::record_turn_duration(started.elapsed().as_millis() as u64);
+        if let Some(first) = first_token_at {
+            crate::metrics_hist::record_ttft(first.duration_since(started).as_millis() as u64);
+        }
+        result
     }
 }

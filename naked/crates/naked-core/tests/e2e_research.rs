@@ -41,9 +41,9 @@ async fn t86_deep_research_phase1_outline() {
         let prov_arc: Arc<dyn Provider> = Arc::from(provider);
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(BashTool::new(60)),
-            Box::new(ReadFileTool),
-            Box::new(WriteFileTool),
-            Box::new(EditFileTool),
+            Box::new(ReadFileTool::default()),
+            Box::new(WriteFileTool::default()),
+            Box::new(EditFileTool::default()),
             Box::new(GlobSearchTool),
             Box::new(GrepSearchTool),
             Box::new(WebSearchTool::from_legacy_exa(exa_keys.clone())),
@@ -260,9 +260,9 @@ async fn t89_deep_research_full_cycle() {
         );
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(BashTool::new(120)),
-            Box::new(ReadFileTool),
-            Box::new(WriteFileTool),
-            Box::new(EditFileTool),
+            Box::new(ReadFileTool::default()),
+            Box::new(WriteFileTool::default()),
+            Box::new(EditFileTool::default()),
             Box::new(GlobSearchTool),
             Box::new(GrepSearchTool),
             Box::new(WebSearchTool::from_legacy_exa(exa_keys.clone())),
@@ -473,6 +473,7 @@ async fn t102_research_jaguar_e2e() {
             None,
             None,
             Some(10),
+            naked_core::CreateSchedule::OneShotNow,
         )
         .await
     {

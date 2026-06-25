@@ -33,7 +33,7 @@
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio_stream::{Stream, StreamExt};
@@ -113,6 +113,7 @@ impl<P: Provider> Provider for TimeoutProvider<P> {
         //    stream-open. tokio::time::timeout is cancel-safe; if it
         //    fires the inner future is dropped and the connection is
         //    closed by reqwest's RAII.
+        let started = Instant::now();
         let connect_fut = self.inner.stream_chat(request);
         let inner_stream = match tokio::time::timeout(self.connect_timeout, connect_fut).await {
             Ok(Ok(s)) => s,
@@ -138,8 +139,17 @@ impl<P: Provider> Provider for TimeoutProvider<P> {
         //    can retry / surface it without special-casing.
         let provider_label = self.inner.name().to_string();
         let budget = self.inter_chunk_timeout;
+        let mut first_chunk_seen = false;
         let guarded = inner_stream.timeout(budget).map(move |item| match item {
-            Ok(chunk) => chunk,
+            Ok(chunk) => {
+                if !first_chunk_seen && !matches!(chunk, StreamChunk::Error(_)) {
+                    first_chunk_seen = true;
+                    crate::metrics_hist::record_provider_stream_open(
+                        started.elapsed().as_millis() as u64
+                    );
+                }
+                chunk
+            }
             Err(_elapsed) => {
                 crate::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
                 StreamChunk::Error(format!(
@@ -240,6 +250,7 @@ mod tests {
         let wrapped =
             TimeoutProvider::new(provider, Duration::from_millis(50), Duration::from_secs(60));
         let before = crate::types::PROVIDER_CONNECT_TIMEOUT_COUNT.load(Ordering::Relaxed);
+        let before_latency = crate::metrics_hist::snapshot();
         let started = std::time::Instant::now();
         let res = wrapped.stream_chat(make_request()).await;
         let elapsed = started.elapsed();
@@ -261,6 +272,99 @@ mod tests {
         }
         let after = crate::types::PROVIDER_CONNECT_TIMEOUT_COUNT.load(Ordering::Relaxed);
         assert_eq!(after - before, 1, "connect timeout counter delta");
+        let after_latency = crate::metrics_hist::snapshot();
+        assert_eq!(
+            after_latency.provider_count - before_latency.provider_count,
+            0,
+            "connect-timeout failures are not successful stream-open samples"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_stream_open_records_delay_until_first_chunk() {
+        let provider = DelayProvider {
+            connect_delay: Duration::from_millis(0),
+            chunks: vec![
+                (Duration::from_millis(600), StreamChunk::Text("hi".into())),
+                (Duration::from_millis(0), StreamChunk::Done),
+            ],
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let wrapped =
+            TimeoutProvider::new(provider, Duration::from_secs(5), Duration::from_secs(5));
+        let before = crate::metrics_hist::snapshot();
+
+        let mut s = wrapped.stream_chat(make_request()).await.unwrap();
+        let first = s.next().await.unwrap();
+        assert!(matches!(first, StreamChunk::Text(t) if t == "hi"));
+
+        let after_first = crate::metrics_hist::snapshot();
+        assert_eq!(after_first.provider_count - before.provider_count, 1);
+        assert_eq!(
+            after_first.provider_500ms_to_2s - before.provider_500ms_to_2s,
+            1
+        );
+        assert!(
+            after_first.provider_sum_ms - before.provider_sum_ms >= 600,
+            "provider stream-open sum delta must include first-chunk delay"
+        );
+
+        let second = s.next().await.unwrap();
+        assert!(matches!(second, StreamChunk::Done));
+        let after_second = crate::metrics_hist::snapshot();
+        assert_eq!(after_second.provider_count, after_first.provider_count);
+        assert_eq!(
+            after_second.provider_500ms_to_2s,
+            after_first.provider_500ms_to_2s
+        );
+        assert_eq!(after_second.provider_sum_ms, after_first.provider_sum_ms);
+    }
+
+    #[tokio::test]
+    async fn provider_stream_open_not_recorded_when_first_chunk_is_error() {
+        let provider = DelayProvider {
+            connect_delay: Duration::from_millis(0),
+            chunks: vec![(
+                Duration::from_millis(0),
+                StreamChunk::Error("upstream failed before text".into()),
+            )],
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let wrapped =
+            TimeoutProvider::new(provider, Duration::from_secs(5), Duration::from_secs(5));
+        let before = crate::metrics_hist::snapshot();
+
+        let mut s = wrapped.stream_chat(make_request()).await.unwrap();
+        let first = s.next().await.unwrap();
+        assert!(matches!(first, StreamChunk::Error(msg) if msg == "upstream failed before text"));
+
+        let after = crate::metrics_hist::snapshot();
+        assert_eq!(after.provider_count - before.provider_count, 0);
+        assert_eq!(after.provider_sum_ms - before.provider_sum_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_stream_open_not_recorded_for_synthetic_inter_chunk_timeout_before_first_chunk()
+     {
+        let provider = DelayProvider {
+            connect_delay: Duration::from_millis(0),
+            chunks: vec![(
+                Duration::from_secs(300),
+                StreamChunk::Text("never arrives".into()),
+            )],
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let wrapped =
+            TimeoutProvider::new(provider, Duration::from_secs(5), Duration::from_millis(50));
+        let before = crate::metrics_hist::snapshot();
+
+        let mut s = wrapped.stream_chat(make_request()).await.unwrap();
+        let first = s.next().await.unwrap();
+        assert!(matches!(first, StreamChunk::Error(msg) if msg.contains("inter-chunk timeout")));
+
+        let after = crate::metrics_hist::snapshot();
+        assert_eq!(after.provider_count - before.provider_count, 0);
+        assert_eq!(after.provider_sum_ms - before.provider_sum_ms, 0);
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 
 pub mod bot_identity;
 pub mod channel_map;
+pub mod config_hash;
 pub mod cron_util;
 pub mod helpers;
 pub mod media_helpers;
@@ -30,6 +31,7 @@ pub mod supervised;
 pub use scheduler as research_scheduler;
 pub mod guarded;
 pub mod markup;
+pub mod research_controls;
 #[cfg(test)]
 pub mod research_ui;
 pub mod scheduler_lock;

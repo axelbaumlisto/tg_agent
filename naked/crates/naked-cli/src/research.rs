@@ -139,7 +139,14 @@ async fn cmd_new(agent: &Arc<AgentCore>, args: &[String]) -> Result<()> {
         .map(|s| s.to_string())
         .collect();
     let spec = agent
-        .create_research(&topic, sources, None, None, None)
+        .create_research(
+            &topic,
+            sources,
+            None,
+            None,
+            None,
+            naked_core::CreateSchedule::OneShotNow,
+        )
         .await?;
     println!("{}", spec.id);
     Ok(())
@@ -376,7 +383,14 @@ async fn cmd_probe(agent: &Arc<AgentCore>, args: &[String]) -> Result<()> {
     agent.init_mcp().await;
 
     let spec = agent
-        .create_research(&topic, urls.clone(), None, None, None)
+        .create_research(
+            &topic,
+            urls.clone(),
+            None,
+            None,
+            None,
+            naked_core::CreateSchedule::OneShotNow,
+        )
         .await?;
     let _ = agent
         .update_research(

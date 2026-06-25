@@ -447,6 +447,12 @@ pub(crate) static LIVENESS_REGISTRY: std::sync::OnceLock<
     std::sync::Arc<naked_core::liveness::LivenessRegistry>,
 > = std::sync::OnceLock::new();
 
+/// S7 / RC-14: loaded config hash captured immediately after
+/// `Config::load_with_source_bytes` at boot. Read by `/health` and
+/// `/metrics`; observability only, never used to refuse boot.
+pub(crate) static CONFIG_LOADED_HASH: std::sync::OnceLock<naked_tg::config_hash::ConfigLoadedHash> =
+    std::sync::OnceLock::new();
+
 /// F4: process start time. Stamped on first read (effectively when
 /// the bot boots and any code path touches `shared`). `/health`
 /// renders `now - PROCESS_STARTED_AT` as the uptime line.

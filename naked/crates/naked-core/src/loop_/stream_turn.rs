@@ -6,11 +6,57 @@ use crate::loop_observer::RetryKind;
 use crate::provider::ChatRequest;
 use crate::retry::Backoff;
 use crate::types::{AgentEvent, ContentBlock, SteerMessage, StreamChunk, TurnUsage};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{BASE_RETRY_DELAY_MS, MAX_STREAM_RETRIES};
+
+struct TurnBackstop {
+    fired: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TurnBackstop {
+    fn new(deadline: Option<std::time::Duration>, cancel: &CancellationToken) -> Self {
+        let fired = Arc::new(AtomicBool::new(false));
+        let handle = deadline.map(|deadline| {
+            let cancel = cancel.clone();
+            let fired_for_task = Arc::clone(&fired);
+            tokio::spawn(async move {
+                tokio::time::sleep(deadline).await;
+                fired_for_task.store(true, Ordering::SeqCst);
+                cancel.cancel();
+            })
+        });
+        Self { fired, handle }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    async fn disarm(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for TurnBackstop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 /// Outcome of a single provider turn returned by [`AgentLoop::stream_one_turn`].
 /// The outer loop in [`AgentLoop::run`] decides what to do with empty turns
@@ -45,6 +91,8 @@ impl super::AgentLoop {
         tx: &mpsc::Sender<AgentEvent>,
         steer_rx: &mut Option<mpsc::Receiver<SteerMessage>>,
         steer: &mut super::steers::SteerPipeline,
+        _started: Instant,
+        first_token_at: &mut Option<Instant>,
     ) -> Result<TurnStreamOutcome> {
         let mut text_acc = String::new();
         let mut thinking_acc = String::new();
@@ -54,6 +102,7 @@ impl super::AgentLoop {
         let mut turn_usage: Option<TurnUsage> = None;
         let mut stream_ok = false;
         let mut saw_done = false;
+        let mut backstop = TurnBackstop::new(self.config.turn_backstop, cancel);
         // Hoisted out of the retry loop so the post-loop tail can
         // surface it on the TurnStreamOutcome.
         let mut mid_stream_steer_flag = false;
@@ -62,6 +111,9 @@ impl super::AgentLoop {
             tracing::debug!(retry, "stream_turn: opening provider stream");
             let connect_result = tokio::select! {
                 _ = cancel.cancelled() => {
+                    if backstop.fired() {
+                        return Err(AgentError::WallTimeout);
+                    }
                     return Err(AgentError::Cancelled);
                 }
                 r = self.provider.stream_chat(request.clone()) => r,
@@ -152,6 +204,9 @@ impl super::AgentLoop {
                 // the "Принято — доставлю между шагами" hang.
                 let chunk = tokio::select! {
                     _ = cancel.cancelled() => {
+                        if backstop.fired() {
+                            return Err(AgentError::WallTimeout);
+                        }
                         return Err(AgentError::Cancelled);
                     }
                     next = stream.next() => match next {
@@ -204,6 +259,9 @@ impl super::AgentLoop {
                         let cleaned =
                             crate::stream_filter::filter_fake_tool_delta(&t, &mut in_fake_tool);
                         if !cleaned.is_empty() {
+                            if first_token_at.is_none() {
+                                *first_token_at = Some(Instant::now());
+                            }
                             let _ = tx.send(AgentEvent::TextDelta(cleaned.clone())).await;
                             text_acc.push_str(&cleaned);
                         } else if !t.is_empty() {
@@ -322,6 +380,8 @@ impl super::AgentLoop {
                 },
             ));
         }
+
+        backstop.disarm().await;
 
         if !thinking_acc.is_empty() {
             blocks.push(ContentBlock::Thinking { text: thinking_acc });

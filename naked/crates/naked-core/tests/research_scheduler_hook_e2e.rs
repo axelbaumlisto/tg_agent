@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use naked_core::AgentCore;
+use naked_core::CreateSchedule;
 use naked_core::PatchField;
 use naked_core::ResearchPatch;
 use naked_core::config::Config;
@@ -104,6 +105,7 @@ async fn scheduler_hook_fires_on_create_update_pause_delete() {
             None,
             None,
             None,
+            CreateSchedule::OneShotNow,
         )
         .await
         .expect("create");
@@ -143,7 +145,14 @@ async fn scheduler_hook_fires_on_create_update_pause_delete() {
 async fn set_paused_with_reason_persists_reason_on_pause() {
     let agent = make_core();
     let spec = agent
-        .create_research("reason-test", vec![], None, None, None)
+        .create_research(
+            "reason-test",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let id = spec.id.clone();
@@ -170,7 +179,14 @@ async fn set_paused_with_reason_persists_reason_on_pause() {
 async fn set_paused_with_reason_clears_reason_on_resume() {
     let agent = make_core();
     let spec = agent
-        .create_research("clear-reason-test", vec![], None, None, None)
+        .create_research(
+            "clear-reason-test",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let id = spec.id.clone();
@@ -193,7 +209,14 @@ async fn set_paused_with_reason_clears_reason_on_resume() {
 async fn legacy_set_paused_does_not_set_reason() {
     let agent = make_core();
     let spec = agent
-        .create_research("legacy-pause", vec![], None, None, None)
+        .create_research(
+            "legacy-pause",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let id = spec.id.clone();
@@ -210,7 +233,14 @@ async fn legacy_set_paused_does_not_set_reason() {
 async fn reset_research_failures_clears_pause_and_reason() {
     let agent = make_core();
     let spec = agent
-        .create_research("reset-test", vec![], None, None, None)
+        .create_research(
+            "reset-test",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let id = spec.id.clone();
@@ -258,7 +288,14 @@ async fn reset_research_failures_invokes_hook_reset_and_notifies_update() {
     agent.set_scheduler_hook(hook.clone());
 
     let spec = agent
-        .create_research("reset-hook", vec![], None, None, None)
+        .create_research(
+            "reset-hook",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     agent
@@ -274,7 +311,14 @@ async fn reset_research_failures_invokes_hook_reset_and_notifies_update() {
 async fn reset_research_failures_is_idempotent_on_healthy_spec() {
     let agent = make_core();
     let spec = agent
-        .create_research("healthy", vec![], None, None, None)
+        .create_research(
+            "healthy",
+            vec![],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let id = spec.id.clone();
@@ -293,7 +337,14 @@ async fn default_scheduler_hook_is_noop_and_safe() {
     // panicking and without crashing on the noop notify().
     let agent = make_core();
     let spec = agent
-        .create_research("noop-test", vec!["https://x".into()], None, None, None)
+        .create_research(
+            "noop-test",
+            vec!["https://x".into()],
+            None,
+            None,
+            None,
+            CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create");
     let id = spec.id.clone();

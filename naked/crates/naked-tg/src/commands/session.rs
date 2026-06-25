@@ -15,8 +15,15 @@ pub(crate) async fn cmd_new(
     if let Some(prev) = channel_map.get(chat_id, tid).await {
         agent.close_session_summary(&prev).await;
     }
+    // B84: `/new` must honour the per-chat persona workspace, exactly like
+    // `get_or_create_session` does. Using the global `config.workspace` here
+    // rebound a persona chat (e.g. grep_app) back to the bot's own dir,
+    // losing the project cwd + the `<workspace>/.naked/system_prompt.md`
+    // persona prompt — so a `/new` in a project chat started answering about
+    // the bot's own project instead of the bound one.
+    let workspace = super::resolve_session_workspace(chat_id, config).await;
     let session_id = agent
-        .create_session_with_channel(&config.workspace, "telegram")
+        .create_session_with_channel(&workspace, "telegram")
         .await;
     channel_map.set(chat_id, tid, session_id.clone()).await;
     channel_map.disable_yolo(chat_id, tid).await;

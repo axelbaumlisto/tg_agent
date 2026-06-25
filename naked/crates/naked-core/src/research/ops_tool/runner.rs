@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::tool::Tool;
 use crate::types::{Permission, ToolResult, ToolSpec};
-use crate::{PatchField, ResearchPatch};
+use crate::{PatchField, ResearchPatch, ScheduleUpdate};
 
 use super::super::ResearchRunner;
 
@@ -203,6 +203,20 @@ impl Tool for ResearchUpdateSpecTool {
             None => return ToolResult::err("agent core is no longer available"),
         };
 
+        let schedule = if input.get("clear_schedule").and_then(|v| v.as_bool()) == Some(true) {
+            Some(ScheduleUpdate::Off)
+        } else if let Some(v) = input.get("interval_seconds") {
+            if v.is_null() {
+                Some(ScheduleUpdate::Off)
+            } else if let Some(n) = v.as_u64() {
+                Some(ScheduleUpdate::Interval(n))
+            } else {
+                return ToolResult::err("`interval_seconds` must be an integer or null");
+            }
+        } else {
+            None
+        };
+
         let mut patch = ResearchPatch::default();
         if let Some(t) = input.get("topic").and_then(|v| v.as_str()) {
             patch.topic = Some(t.to_string());
@@ -220,18 +234,6 @@ impl Tool for ResearchUpdateSpecTool {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect(),
             );
-        }
-        // interval_seconds: missing → no-op, null → clear, integer → set
-        if input.get("clear_schedule").and_then(|v| v.as_bool()) == Some(true) {
-            patch.interval_seconds = PatchField::Clear;
-        } else if let Some(v) = input.get("interval_seconds") {
-            if v.is_null() {
-                patch.interval_seconds = PatchField::Clear;
-            } else if let Some(n) = v.as_u64() {
-                patch.interval_seconds = PatchField::Set(n);
-            } else {
-                return ToolResult::err("`interval_seconds` must be an integer or null");
-            }
         }
         if let Some(p) = input.get("provider").and_then(|v| v.as_str()) {
             patch.provider = Some(p.to_string());
@@ -259,13 +261,19 @@ impl Tool for ResearchUpdateSpecTool {
             Err(e) => return ToolResult::err(format!("failed to update spec: {e}")),
         };
 
+        if let Some(schedule) = schedule
+            && let Err(e) = runner.set_research_schedule(&spec_id, schedule).await
+        {
+            return ToolResult::err(format!("failed to update schedule: {e}"));
+        }
+
         if let Some(p) = input.get("paused").and_then(|v| v.as_bool())
             && let Err(e) = runner.set_research_paused(&spec_id, p).await
         {
             return ToolResult::err(format!("paused flag updated failed: {e}"));
         }
 
-        // Re-load to reflect the paused flag too.
+        // Re-load to reflect the schedule and paused flag too.
         let final_spec = runner.load_research(&spec_id).await.ok().unwrap_or(updated);
 
         ToolResult::ok(

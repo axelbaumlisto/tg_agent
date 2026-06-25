@@ -365,4 +365,36 @@ mod tests {
         // Unlike full escape_html, this minimal version does NOT escape quotes
         assert_eq!(escape_html_min("he said \"hi\""), "he said \"hi\"");
     }
+
+    // B84: `/new` (cmd_new) and the lazy `get_or_create_session` path must BOTH
+    // resolve the workspace via `resolve_session_workspace` so a persona chat
+    // keeps its bound project dir. This test pins that a persona chat resolves
+    // to its own workspace, and a non-persona chat falls back to the global
+    // `config.workspace`. Before B84, cmd_new hardcoded `config.workspace`,
+    // rebinding a persona `/new` to the bot's own dir.
+    #[tokio::test]
+    async fn b84_resolve_session_workspace_honours_persona() {
+        use naked_core::config::{ChatPersona, Config};
+        let mut config = Config {
+            workspace: std::path::PathBuf::from("/tmp/global-bot-workspace"),
+            ..Config::default()
+        };
+        config.chat_personas.insert(
+            -5489340241,
+            ChatPersona {
+                name: "grep_app".into(),
+                workspace: std::path::PathBuf::from("/tmp/persona-grep-app"),
+                allow_slash_commands: true,
+            },
+        );
+
+        // Persona chat → its own workspace (NOT the global one).
+        let ws = resolve_session_workspace(-5489340241, &config).await;
+        assert_eq!(ws, std::path::PathBuf::from("/tmp/persona-grep-app"));
+        assert_ne!(ws, config.workspace);
+
+        // Non-persona chat → global fallback.
+        let ws_other = resolve_session_workspace(12345, &config).await;
+        assert_eq!(ws_other, config.workspace);
+    }
 }

@@ -43,10 +43,16 @@ impl SearchEngine for ExaEngine {
     async fn search(&self, query: &str, num: usize) -> Result<Vec<SearchHit>, String> {
         let key = self.pool.next().ok_or("exa: key pool empty")?;
 
+        // `type: "fast"` (~0.95s) over `"auto"` (~1.35s): measured 2026-06-22 across
+        // 4 live queries, a consistent ~30% latency cut with NO meaningful quality loss
+        // (fast still returns canonical docs.rs/official sources; `"instant"` is ~44%
+        // faster but degrades to fork/mirror URLs, so it was rejected). web_search is the
+        // dominant tool-latency class (`naked_core_tool_duration{tool="other"}`), so this
+        // is the cheapest high-leverage hot-path win. See PLAN_BACKEND_HARDENING readiness.
         let body = serde_json::json!({
             "query": query,
             "numResults": num,
-            "type": "auto",
+            "type": "fast",
             "contents": {
                 "text": { "maxCharacters": 800, "includeHtmlTags": false }
             },

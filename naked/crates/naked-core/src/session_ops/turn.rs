@@ -390,6 +390,10 @@ impl AgentCore {
             sender_id,
             todo_list: &self.shared_tools.todo_list,
             plan_state: &self.shared_tools.plan_state,
+            fff_registry: &self.shared_tools.fff_registry,
+            fs_cache: &self.shared_tools.fs_cache,
+            persistent_bash: &self.shared_tools.persistent_bash,
+            session_id,
         })
         .await;
 

@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::AgentCore;
 use crate::config::Config;
 use crate::error::Result;
 use crate::provider::{ChatRequest, Provider};
 use crate::types::{ModelInfo, StreamChunk};
+use crate::{AgentCore, CreateSchedule};
 
 /// Minimal provider that returns an empty stream.
 pub struct NoopProvider;
@@ -129,7 +129,14 @@ mod tests {
         let tc = TestCore::build();
         let spec = tc
             .core
-            .create_research("test topic", vec![], None, None, None)
+            .create_research(
+                "test topic",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         assert!(spec.id.contains("test-topic"));
@@ -140,11 +147,25 @@ mod tests {
     async fn test_core_research_list() {
         let tc = TestCore::build();
         tc.core
-            .create_research("topic a", vec![], None, None, None)
+            .create_research(
+                "topic a",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         tc.core
-            .create_research("topic b", vec![], None, None, None)
+            .create_research(
+                "topic b",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         let list = tc.core.list_research().await.unwrap();
@@ -253,7 +274,14 @@ mod research_ops_tests {
         let tc = TestCore::build();
         let spec = tc
             .core
-            .create_research("apartments samui", vec![], None, None, None)
+            .create_research(
+                "apartments samui",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         let loaded = tc.core.load_research(&spec.id).await.unwrap();
@@ -265,7 +293,14 @@ mod research_ops_tests {
         let tc = TestCore::build();
         let spec = tc
             .core
-            .create_research("temp topic", vec![], None, None, None)
+            .create_research(
+                "temp topic",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         tc.core.delete_research(&spec.id).await.unwrap();
@@ -277,7 +312,14 @@ mod research_ops_tests {
         let tc = TestCore::build();
         let spec = tc
             .core
-            .create_research("pausable", vec![], None, None, None)
+            .create_research(
+                "pausable",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         tc.core.set_research_paused(&spec.id, true).await.unwrap();
@@ -290,7 +332,14 @@ mod research_ops_tests {
         let tc = TestCore::build();
         let spec = tc
             .core
-            .create_research("patchable", vec![], None, None, None)
+            .create_research(
+                "patchable",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .unwrap();
         let patch = crate::ResearchPatch {
@@ -329,45 +378,50 @@ mod provider_ops_tests {
         assert!(skills.is_empty());
     }
 
-    // ── Research auto-scheduling tests ──────────────────────────────
+    // ── Research create schedule semantics ─────────────────────────
 
     #[tokio::test]
-    async fn create_research_gets_default_interval() {
+    async fn create_research_oneshot_ignores_default_interval() {
         let tc = TestCore::build();
-        // Config default: default_interval_seconds = 21600
         let spec = tc
             .core
-            .create_research("test topic", vec![], None, None, None)
+            .create_research(
+                "test topic",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .expect("create_research");
-        assert_eq!(
-            spec.interval_seconds,
-            Some(tc.core.config().research.default_interval_seconds),
-            "new spec should inherit default_interval_seconds from config"
-        );
+        assert_eq!(spec.interval_seconds, None);
+        assert_eq!(spec.cron, None);
     }
 
     #[tokio::test]
-    async fn create_research_auto_first_run() {
+    async fn create_research_oneshot_sets_first_run_now() {
         let tc = TestCore::build();
-        // Config default: auto_first_run = true
         assert!(tc.core.config().research.auto_first_run);
         let spec = tc
             .core
-            .create_research("test first run", vec![], None, None, None)
+            .create_research(
+                "test first run",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .expect("create_research");
-        assert!(
-            spec.run_at.is_some(),
-            "auto_first_run=true should set run_at"
-        );
-        // run_at should be very recent (within last 5 seconds)
+        assert!(spec.run_at.is_some(), "OneShotNow should set run_at");
         let age = chrono::Utc::now() - spec.run_at.unwrap();
         assert!(age.num_seconds() < 5, "run_at should be ~now");
     }
 
     #[tokio::test]
-    async fn create_research_cron_overrides_interval() {
+    async fn create_research_oneshot_ignores_default_cron() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = Config {
             workspace: tmp.path().join("workspace"),
@@ -387,42 +441,18 @@ mod provider_ops_tests {
         core.init_self_ref();
 
         let spec = core
-            .create_research("cron test", vec![], None, None, None)
-            .await
-            .expect("create_research");
-        assert_eq!(spec.cron.as_deref(), Some("0 10 * * *"));
-        assert_eq!(
-            spec.interval_seconds, None,
-            "cron should take priority, interval should be None"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_research_zero_interval_means_manual() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let config = Config {
-            workspace: tmp.path().join("workspace"),
-            session_dir: tmp.path().join("sessions"),
-            research: crate::config::ResearchConfig {
-                storage_dir: Some(tmp.path().join("research")),
-                default_interval_seconds: 0,
-                auto_first_run: false,
-                ..Default::default()
-            },
-            default_provider: "noop".into(),
-            default_model: "noop-model".into(),
-            ..Default::default()
-        };
-
-        let core = Arc::new(AgentCore::new(config, Box::new(NoopProvider)));
-        core.init_self_ref();
-
-        let spec = core
-            .create_research("manual only", vec![], None, None, None)
+            .create_research(
+                "cron test",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .expect("create_research");
         assert_eq!(spec.interval_seconds, None);
         assert_eq!(spec.cron, None);
-        assert_eq!(spec.run_at, None);
+        assert!(spec.run_at.is_some());
     }
 }

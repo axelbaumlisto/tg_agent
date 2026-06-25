@@ -38,7 +38,7 @@ async fn multi_edit_three_replacements() {
     )
     .unwrap();
 
-    let tool = EditFileTool;
+    let tool = EditFileTool::default();
     let result = tool
         .execute(
             serde_json::json!({
@@ -71,7 +71,7 @@ async fn multi_edit_backward_compat() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f.txt"), "old text here").unwrap();
 
-    let tool = EditFileTool;
+    let tool = EditFileTool::default();
     // Legacy format (no edits array)
     let result = tool
         .execute(
@@ -284,7 +284,7 @@ async fn read_file_image_returns_base64() {
     ];
     std::fs::write(dir.path().join("test.png"), png_data).unwrap();
 
-    let tool = ReadFileTool;
+    let tool = ReadFileTool::default();
     let result = tool
         .execute(serde_json::json!({"file_path": "test.png"}), dir.path())
         .await;

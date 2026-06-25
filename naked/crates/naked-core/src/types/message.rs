@@ -209,6 +209,85 @@ pub static SCHEDULER_DISPATCH_SKIPPED_COUNT: std::sync::atomic::AtomicU64 =
 pub static CONFIG_EXTERNAL_WRITE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// PLAN_FAST_BACKEND_v2 Step B: explicit stale-edit precondition rejected a
+/// write before atomic_replace_file, preserving the live file unchanged.
+pub static STALE_EDIT_REJECT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// B85: production L1 policy-denies for bash commands containing a git
+/// history-destructive operation (reset/checkout/switch/restore/clean/rebase/
+/// revert/force-push) in a shared repo. Append-only git (add/commit/push) is
+/// allowed and NOT counted here. The L2 execute-time backstop blocks safely but
+/// is intentionally uncounted.
+pub static GIT_HISTORY_GUARD_BLOCK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v2 Step C: hashline edit outcomes. Intended Prometheus
+/// shape: `naked_core_hashline_edit_total{outcome=...}` (rendering deferred).
+pub static HASHLINE_EDIT_APPLIED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HASHLINE_EDIT_STALE_ANCHOR_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HASHLINE_EDIT_OVERLAP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HASHLINE_EDIT_OUT_OF_BOUNDS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HASHLINE_EDIT_DISABLED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v2 Step D: bounded read_file/file_snapshot cache outcomes.
+/// Intended Prometheus shape: `naked_core_fs_cache_total{outcome=...}`
+/// (rendering deferred to Step F).
+pub static FS_CACHE_HIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FS_CACHE_MISS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FS_CACHE_STALE_BYPASS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FS_CACHE_INVALIDATE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FS_CACHE_TOO_LARGE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v2 Step E: persistent bash outcomes. Intended Prometheus
+/// shape: `naked_core_persistent_bash_total{outcome=...}` (rendering deferred
+/// to Step F).
+pub static PERSISTENT_BASH_OK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PERSISTENT_BASH_TIMEOUT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PERSISTENT_BASH_KILLED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PERSISTENT_BASH_RESTART_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PERSISTENT_BASH_ERROR_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PERSISTENT_BASH_DISABLED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PERSISTENT_BASH_BUSY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v1 Step 2b: fff fast-index registry created a new
+/// long-lived picker for a canonical workspace.
+pub static FFF_PICKER_REGISTRY_CREATED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v1 Step 2b: fff fast-index registry reused an existing
+/// long-lived picker for a canonical workspace.
+pub static FFF_PICKER_REGISTRY_REUSED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v1 Step 2b: workspace cap/disabled mode forced legacy
+/// fallback picker creation instead of spawning another watcher.
+pub static FFF_PICKER_REGISTRY_CAP_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v1 Step 2b: grep requests served by the shared fast index.
+pub static FFF_GREP_FAST_INDEX_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_FAST_BACKEND_v1 Step 2b: grep requests served by fallback legacy picker.
+pub static FFF_GREP_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard): bumped
 /// each time an outgoing assistant message mentions noVNC/VNC
 /// keyword AND contains an `IP:port` token that's NOT in the

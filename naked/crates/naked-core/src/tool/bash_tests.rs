@@ -1,6 +1,9 @@
 use super::*;
 use crate::tool::Tool;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[test]
 fn classify_read_only_commands() {
     assert_eq!(classify_bash("ls -la"), BashRisk::ReadOnly);
@@ -135,6 +138,87 @@ async fn execute_respects_cwd() {
     assert!(result.output.trim().contains(dir.path().to_str().unwrap()));
 }
 
+#[tokio::test]
+async fn persistent_bash_flag_off_is_per_call_legacy() {
+    let manager = Arc::new(super::super::persistent_bash::PersistentBashManager::new());
+    let tool = BashTool::new(10);
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "export NAKED_FLAG_OFF=leak"}),
+            Path::new("/tmp"),
+        )
+        .await;
+    assert!(!result.is_error);
+    assert_eq!(manager.session_count().await, 0);
+
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "printf '%s' \"${NAKED_FLAG_OFF:-unset}\""}),
+            Path::new("/tmp"),
+        )
+        .await;
+    assert!(!result.is_error);
+    assert_eq!(result.output, "unset");
+}
+
+struct MockOps {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl super::super::ops::ToolOps for MockOps {
+    async fn read_file(&self, _path: &Path) -> std::io::Result<String> {
+        Ok(String::new())
+    }
+
+    async fn write_file(&self, _path: &Path, _contents: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn file_exists(&self, _path: &Path) -> bool {
+        true
+    }
+
+    async fn exec(
+        &self,
+        command: &str,
+        _cwd: &Path,
+        _timeout_secs: u64,
+    ) -> std::io::Result<super::super::ops::ExecResult> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(command, "echo remote");
+        Ok(super::super::ops::ExecResult {
+            stdout: b"remote\n".to_vec(),
+            stderr: Vec::new(),
+            exit_code: 0,
+        })
+    }
+
+    fn label(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn persistent_bash_remote_ops_path_unchanged() {
+    let ops = Arc::new(MockOps {
+        calls: AtomicUsize::new(0),
+    });
+    let manager = Arc::new(super::super::persistent_bash::PersistentBashManager::new());
+    let tool = BashTool::with_ops(10, ops.clone()).with_persistent(manager.clone(), "s".into());
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "echo remote"}),
+            Path::new("/tmp"),
+        )
+        .await;
+
+    assert!(!result.is_error);
+    assert_eq!(result.output.trim(), "remote");
+    assert_eq!(ops.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(manager.session_count().await, 0);
+}
+
 #[test]
 fn blocks_systemctl_restart() {
     assert!(is_self_destructive(
@@ -162,4 +246,129 @@ fn allows_normal_commands() {
     assert!(!is_self_destructive(
         "cat /etc/systemd/system/naked-tg.service"
     ));
+}
+
+// ── B85: git history-destructive guard ──────────────────────────────────────
+
+#[test]
+fn b85_git_append_only_ops_allowed() {
+    // add / commit / push (no --force) ADD to history → never blocked.
+    assert_eq!(git_history_destructive_op("git add -A"), None);
+    assert_eq!(git_history_destructive_op("git add ."), None);
+    assert_eq!(
+        git_history_destructive_op("git commit -m 'fix: thing'"),
+        None
+    );
+    assert_eq!(git_history_destructive_op("git commit -am 'wip'"), None);
+    assert_eq!(git_history_destructive_op("git push"), None);
+    assert_eq!(git_history_destructive_op("git push origin main"), None);
+    assert_eq!(
+        git_history_destructive_op("git push -u origin feature"),
+        None
+    );
+    // read-only git stays allowed.
+    assert_eq!(git_history_destructive_op("git log --oneline"), None);
+    assert_eq!(git_history_destructive_op("git status"), None);
+    assert_eq!(git_history_destructive_op("git diff HEAD~1"), None);
+    // pipelines of allowed ops.
+    assert_eq!(
+        git_history_destructive_op("git add -A && git commit -m x && git push"),
+        None
+    );
+}
+
+#[test]
+fn b85_git_history_destructive_ops_blocked() {
+    assert_eq!(
+        git_history_destructive_op("git reset --hard HEAD~3"),
+        Some("reset")
+    );
+    assert_eq!(
+        git_history_destructive_op("git reset HEAD file"),
+        Some("reset")
+    );
+    assert_eq!(
+        git_history_destructive_op("git checkout -- ."),
+        Some("checkout")
+    );
+    assert_eq!(
+        git_history_destructive_op("git checkout main"),
+        Some("checkout")
+    );
+    assert_eq!(
+        git_history_destructive_op("git switch other-branch"),
+        Some("switch")
+    );
+    assert_eq!(
+        git_history_destructive_op("git restore src/x.rs"),
+        Some("restore")
+    );
+    assert_eq!(git_history_destructive_op("git clean -fd"), Some("clean"));
+    assert_eq!(
+        git_history_destructive_op("git rebase -i HEAD~5"),
+        Some("rebase")
+    );
+    assert_eq!(
+        git_history_destructive_op("git revert abc123"),
+        Some("revert")
+    );
+    // force-push variants.
+    assert_eq!(
+        git_history_destructive_op("git push --force"),
+        Some("push --force")
+    );
+    assert_eq!(
+        git_history_destructive_op("git push --force-with-lease origin main"),
+        Some("push --force")
+    );
+    assert_eq!(
+        git_history_destructive_op("git push -f origin main"),
+        Some("push --force")
+    );
+    // hidden inside a pipeline after an allowed op.
+    assert_eq!(
+        git_history_destructive_op("git add -A && git reset --hard"),
+        Some("reset")
+    );
+    // with -C path global flag before the subcommand.
+    assert_eq!(
+        git_history_destructive_op("git -C /repo checkout main"),
+        Some("checkout")
+    );
+}
+
+#[test]
+fn b85_no_false_positives() {
+    // Non-git commands that merely CONTAIN the words must not be blocked.
+    assert_eq!(git_history_destructive_op("cargo test reset_logic"), None);
+    assert_eq!(git_history_destructive_op("ls checkout/"), None);
+    assert_eq!(git_history_destructive_op("cat restore.md"), None);
+    assert_eq!(git_history_destructive_op("./switch.sh"), None);
+    assert_eq!(
+        git_history_destructive_op("echo 'git reset is dangerous'"),
+        None
+    );
+    // `git push` plain must NOT match the -f force heuristic via an unrelated -f.
+    assert_eq!(
+        git_history_destructive_op("grep -f patterns.txt file"),
+        None
+    );
+    assert_eq!(
+        git_history_destructive_op("git push && grep -f patterns.txt file"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn b85_execute_blocks_git_reset_end_to_end() {
+    use serde_json::json;
+    let tool = BashTool::new(10);
+    let res = tool
+        .execute(
+            json!({"command": "git reset --hard HEAD~2"}),
+            std::path::Path::new("/tmp"),
+        )
+        .await;
+    assert!(res.is_error, "git reset --hard must be blocked: {res:?}");
+    assert!(res.output.contains("discards or rewrites"));
 }

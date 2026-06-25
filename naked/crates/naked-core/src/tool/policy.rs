@@ -213,6 +213,17 @@ impl PolicyRule for SafetyRule {
                 "\u{1f6d1} Blocked: command matches safety pattern `{pattern}`"
             )));
         }
+        if name == "bash"
+            && let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+            && let Some(op) = crate::tool::bash::git_history_destructive_op(cmd)
+        {
+            // policy classification is the production denial event for this metric.
+            crate::types::GIT_HISTORY_GUARD_BLOCK_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(ToolDecision::Deny(
+                crate::tool::bash::git_history_block_reason(op),
+            ));
+        }
         None
     }
 }
@@ -493,6 +504,103 @@ mod tests {
     fn is_blocked_returns_pattern() {
         assert_eq!(is_blocked_command("rm -rf /"), Some("rm -rf /"));
         assert_eq!(is_blocked_command("ls -la"), None);
+    }
+
+    #[test]
+    fn b85b_policy_denies_git_reset_before_approval() {
+        let policy = default_pipeline(None);
+        let d = policy.classify(
+            "bash",
+            &serde_json::json!({"command": "git reset --hard HEAD~1"}),
+            Path::new("/tmp"),
+            Permission::WorkspaceWrite,
+        );
+        assert!(matches!(d, ToolDecision::Deny(msg) if msg.contains("discards or rewrites")));
+    }
+
+    #[test]
+    fn b85b_policy_allows_append_only_git() {
+        let policy = default_pipeline(None);
+        for cmd in [
+            "git add -A",
+            "git commit -m x",
+            "git push",
+            "git push origin main",
+        ] {
+            let d = policy.classify(
+                "bash",
+                &serde_json::json!({"command": cmd}),
+                Path::new("/tmp"),
+                Permission::WorkspaceWrite,
+            );
+            assert_eq!(
+                d,
+                ToolDecision::AskUser(Permission::WorkspaceWrite),
+                "append-only git should remain approvable: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn b85b_policy_denies_git_reset_even_when_readonly_auto_execute() {
+        let policy = default_pipeline(None);
+        let d = policy.classify(
+            "bash",
+            &serde_json::json!({"command": "git reset --hard HEAD~1"}),
+            Path::new("/tmp"),
+            Permission::ReadOnly,
+        );
+        assert!(matches!(d, ToolDecision::Deny(_)));
+    }
+
+    #[test]
+    fn b85b_policy_counter_increments_at_l1() {
+        let before =
+            crate::types::GIT_HISTORY_GUARD_BLOCK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let policy = default_pipeline(None);
+        let d = policy.classify(
+            "bash",
+            &serde_json::json!({"command": "git reset --hard HEAD~1"}),
+            Path::new("/tmp"),
+            Permission::WorkspaceWrite,
+        );
+        let after =
+            crate::types::GIT_HISTORY_GUARD_BLOCK_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(d, ToolDecision::Deny(_)));
+        let expected_minimum = before.saturating_add(1);
+        assert!(
+            after >= expected_minimum,
+            "L1 policy deny should increment counter: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn b85b_policy_denies_force_push() {
+        let policy = default_pipeline(None);
+        for cmd in [
+            "git push -f origin main",
+            "git push --force-with-lease origin main",
+        ] {
+            let d = policy.classify(
+                "bash",
+                &serde_json::json!({"command": cmd}),
+                Path::new("/tmp"),
+                Permission::WorkspaceWrite,
+            );
+            assert!(matches!(d, ToolDecision::Deny(_)), "should deny: {cmd}");
+        }
+    }
+
+    #[test]
+    fn b85b_policy_allows_push_then_unrelated_grep_f() {
+        let policy = default_pipeline(None);
+        let d = policy.classify(
+            "bash",
+            &serde_json::json!({"command": "git push && grep -f patterns.txt file"}),
+            Path::new("/tmp"),
+            Permission::WorkspaceWrite,
+        );
+        assert_eq!(d, ToolDecision::AskUser(Permission::WorkspaceWrite));
     }
 
     // ── CompositePolicy / pipeline tests ─────────────────────────────

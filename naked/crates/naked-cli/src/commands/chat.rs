@@ -8,8 +8,10 @@ use std::time::Duration;
 use anyhow::Result;
 use naked_core::AgentCore;
 use naked_core::config::Config;
-use naked_core::types::{AgentEvent, AgentHandle, PermissionResponse, TurnUsage};
+use naked_core::types::{AgentHandle, PermissionResponse, TurnUsage};
 use naked_core::util::head_truncate;
+
+use crate::event_map::{TranscriptUpdate, map_event};
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -163,8 +165,8 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
     let mut last_usage: Option<TurnUsage> = None;
 
     while let Some(event) = events.recv().await {
-        match event {
-            AgentEvent::ThinkingDelta(t) => {
+        match map_event(event) {
+            TranscriptUpdate::AppendThinking(t) => {
                 if !got_content {
                     spinning.store(false, Ordering::Relaxed);
                     got_content = true;
@@ -172,7 +174,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                 eprint!("\x1b[2m{t}\x1b[0m");
                 io::stderr().flush()?;
             }
-            AgentEvent::TextDelta(t) => {
+            TranscriptUpdate::AppendText(t) => {
                 if !got_content {
                     spinning.store(false, Ordering::Relaxed);
                     got_content = true;
@@ -181,7 +183,12 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                 print!("{t}");
                 io::stdout().flush()?;
             }
-            AgentEvent::ToolStart { name, input, .. } => {
+            TranscriptUpdate::ToolStarted {
+                call_id,
+                name,
+                input,
+            } => {
+                let _ = call_id;
                 if !got_content {
                     spinning.store(false, Ordering::Relaxed);
                     got_content = true;
@@ -191,15 +198,17 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                 eprintln!("\x1b[38;5;245m│\x1b[0m {preview}");
                 eprintln!("\x1b[38;5;245m╰──────╯\x1b[0m");
             }
-            AgentEvent::ToolEnd {
+            TranscriptUpdate::ToolEnded {
+                call_id,
                 name,
-                state,
+                ok,
                 output,
-                ..
             } => {
-                let (icon, color) = match state {
-                    naked_core::types::ToolState::Completed => ("✓", "\x1b[32m"),
-                    naked_core::types::ToolState::Error => ("✗", "\x1b[31m"),
+                let _ = call_id;
+                let (icon, color) = if ok {
+                    ("✓", "\x1b[32m")
+                } else {
+                    ("✗", "\x1b[31m")
                 };
                 if output.len() > 500 {
                     eprintln!("{color}{icon} {name}\x1b[0m ({}b)", output.len());
@@ -211,7 +220,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                     eprintln!("{color}{icon} {name}\x1b[0m");
                 }
             }
-            AgentEvent::PermissionRequest {
+            TranscriptUpdate::Permission {
                 call_id,
                 tool_name,
                 input,
@@ -242,8 +251,8 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                     .send(PermissionResponse { call_id, allowed })
                     .await;
             }
-            AgentEvent::Heartbeat => {}
-            AgentEvent::SubAgentProgress {
+            TranscriptUpdate::Heartbeat => {}
+            TranscriptUpdate::SubAgent {
                 agent_id,
                 event: sa_ev,
             } => {
@@ -284,7 +293,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                     }
                 }
             }
-            AgentEvent::ContextCompacted {
+            TranscriptUpdate::ContextCompacted {
                 before_msgs,
                 after_msgs,
                 summary_hint,
@@ -295,7 +304,7 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                     "\x1b[33m[context compacted: {before_msgs} msgs → {after_msgs} | {files_count} files | {hint}]\x1b[0m"
                 );
             }
-            AgentEvent::CycleRestarted {
+            TranscriptUpdate::CycleRestarted {
                 cycle_number,
                 archived_messages,
                 archive_path,
@@ -304,26 +313,27 @@ pub(crate) async fn run_turn(handle: AgentHandle) -> Result<()> {
                     "\x1b[36m[cycle restart #{cycle_number}: {archived_messages} messages archived → {archive_path}]\x1b[0m"
                 );
             }
-            AgentEvent::ToolOutput { chunk, .. } => {
+            TranscriptUpdate::ToolOutput { call_id, chunk } => {
+                let _ = call_id;
                 // Show last line of bash output inline:
                 if let Some(last) = chunk.lines().last() {
                     eprint!("\r\x1b[2K\x1b[90m  > {last}\x1b[0m");
                 }
             }
-            AgentEvent::SteerReceived { text, msg_ids: _ } => {
+            TranscriptUpdate::SteerReceived { text } => {
                 eprintln!("\x1b[36m[steer: {text}]\x1b[0m");
             }
-            AgentEvent::UsageUpdate(u) => {
+            TranscriptUpdate::Usage(u) => {
                 last_usage = Some(u);
             }
-            AgentEvent::Error(e) => {
+            TranscriptUpdate::Error(e) => {
                 if !got_content {
                     spinning.store(false, Ordering::Relaxed);
                     got_content = true;
                 }
                 eprintln!("\n\x1b[31m[error: {e}]\x1b[0m");
             }
-            AgentEvent::Idle => {
+            TranscriptUpdate::TurnDone => {
                 println!();
             }
         }

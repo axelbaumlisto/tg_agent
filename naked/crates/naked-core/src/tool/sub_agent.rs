@@ -10,7 +10,7 @@ use crate::history::ConversationHistory;
 use crate::loop_::{AgentLoop, LoopConfig};
 use crate::provider::Provider;
 use crate::tool::bash::BashTool;
-use crate::tool::file_ops::{EditFileTool, ReadFileTool, WriteFileTool};
+use crate::tool::file_ops::{EditFileTool, FileSnapshotTool, ReadFileTool, WriteFileTool};
 use crate::tool::registry::ToolRegistry;
 use crate::tool::search::{GlobSearchTool, GrepSearchTool};
 use crate::tool::web_search::WebSearchTool;
@@ -28,6 +28,8 @@ pub struct SubAgentTool {
     tool_timeout_secs: u64,
     exa_keys: Vec<String>,
     registry: AgentRegistry,
+    stale_edit_guard_enabled: bool,
+    hashline_edit_enabled: bool,
 }
 
 impl SubAgentTool {
@@ -43,7 +45,19 @@ impl SubAgentTool {
             tool_timeout_secs,
             exa_keys,
             registry: AgentRegistry::new(),
+            stale_edit_guard_enabled: false,
+            hashline_edit_enabled: false,
         }
+    }
+
+    pub fn with_stale_edit_guard(mut self, enabled: bool) -> Self {
+        self.stale_edit_guard_enabled = enabled;
+        self
+    }
+
+    pub fn with_hashline_edit(mut self, enabled: bool) -> Self {
+        self.hashline_edit_enabled = enabled;
+        self
     }
 
     pub fn with_registry(mut self, registry: AgentRegistry) -> Self {
@@ -58,7 +72,8 @@ impl SubAgentTool {
     fn build_tools(&self, mode: &str) -> ToolRegistry {
         let tools: Vec<Box<dyn Tool>> = match mode {
             "explore" => vec![
-                Box::new(ReadFileTool),
+                Box::new(ReadFileTool::default()),
+                Box::new(FileSnapshotTool::default()),
                 Box::new(GlobSearchTool),
                 Box::new(GrepSearchTool),
                 Box::new(BashTool::new(self.tool_timeout_secs)),
@@ -66,9 +81,13 @@ impl SubAgentTool {
             ],
             _ => vec![
                 Box::new(BashTool::new(self.tool_timeout_secs)),
-                Box::new(ReadFileTool),
-                Box::new(WriteFileTool),
-                Box::new(EditFileTool),
+                Box::new(ReadFileTool::default()),
+                Box::new(FileSnapshotTool::default()),
+                Box::new(WriteFileTool::default()),
+                Box::new(
+                    EditFileTool::new(self.stale_edit_guard_enabled)
+                        .with_hashline_edit(self.hashline_edit_enabled),
+                ),
                 Box::new(GlobSearchTool),
                 Box::new(GrepSearchTool),
                 Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),

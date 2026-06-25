@@ -101,6 +101,148 @@ struct DelayedToolUseAndQueueSteerProvider {
     call_count: std::sync::Arc<AtomicUsize>,
 }
 
+struct DelayedTextProvider {
+    delay: std::time::Duration,
+    text: String,
+}
+
+struct HungStreamOpenProvider;
+
+#[async_trait::async_trait]
+impl Provider for HungStreamOpenProvider {
+    fn name(&self) -> &str {
+        "hung-stream-open"
+    }
+
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        vec![]
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>> {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        Ok(Box::pin(tokio_stream::iter(vec![StreamChunk::Done])))
+    }
+}
+
+struct DelayedFailProvider {
+    delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl Provider for DelayedFailProvider {
+    fn name(&self) -> &str {
+        "slow-qwen-fail"
+    }
+
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        vec![]
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>> {
+        tokio::time::sleep(self.delay).await;
+        Err(AgentError::ProviderTyped(
+            crate::provider::error::ProviderError::Other {
+                status: 503,
+                body: "synthetic slow primary failure".into(),
+            },
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for DelayedTextProvider {
+    fn name(&self) -> &str {
+        "delayed-text"
+    }
+
+    fn models(&self) -> Vec<crate::types::ModelInfo> {
+        vec![]
+    }
+
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>> {
+        let delay = self.delay;
+        let text = self.text.clone();
+        Ok(Box::pin(async_stream::stream! {
+            tokio::time::sleep(delay).await;
+            yield StreamChunk::Text(text);
+            yield StreamChunk::Done;
+        }))
+    }
+}
+
+fn make_delayed_text_loop(delay: std::time::Duration, text: impl Into<String>) -> AgentLoop {
+    AgentLoop::new(
+        Box::new(DelayedTextProvider {
+            delay,
+            text: text.into(),
+        }),
+        crate::tool::registry::ToolRegistry::new(vec![]),
+        LoopConfig {
+            max_iterations: 10,
+            max_wall: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "delayed-text".into(),
+            max_tokens: 1024,
+            ..Default::default()
+        },
+    )
+}
+
+fn make_provider_backstop_loop(
+    provider: Box<dyn Provider>,
+    turn_backstop: std::time::Duration,
+) -> AgentLoop {
+    AgentLoop::new(
+        provider,
+        crate::tool::registry::ToolRegistry::new(vec![]),
+        LoopConfig {
+            max_iterations: 10,
+            max_wall: Some(std::time::Duration::from_secs(60)),
+            tool_deadline: Some(std::time::Duration::from_secs(60)),
+            turn_backstop: Some(turn_backstop),
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "mock".into(),
+            max_tokens: 1024,
+            ..Default::default()
+        },
+    )
+}
+
+fn turn_bucket_delta_total(
+    before: crate::metrics_hist::LatencySnapshot,
+    after: crate::metrics_hist::LatencySnapshot,
+) -> u64 {
+    (after.turn_under_1s - before.turn_under_1s)
+        + (after.turn_1s_to_10s - before.turn_1s_to_10s)
+        + (after.turn_10s_to_60s - before.turn_10s_to_60s)
+        + (after.turn_over_60s - before.turn_over_60s)
+}
+
+fn observed_turn_bucket_delta(
+    before: crate::metrics_hist::LatencySnapshot,
+    after: crate::metrics_hist::LatencySnapshot,
+    observed_ms: u64,
+) -> u64 {
+    if observed_ms < 1_000 {
+        after.turn_under_1s - before.turn_under_1s
+    } else if observed_ms < 10_000 {
+        after.turn_1s_to_10s - before.turn_1s_to_10s
+    } else if observed_ms < 60_000 {
+        after.turn_10s_to_60s - before.turn_10s_to_60s
+    } else {
+        after.turn_over_60s - before.turn_over_60s
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for DelayedToolUseAndQueueSteerProvider {
     fn name(&self) -> &str {
@@ -644,6 +786,89 @@ async fn loop_max_iterations() {
 
     let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
     assert!(matches!(result, Err(AgentError::MaxIterations(3))));
+}
+
+#[tokio::test]
+async fn agent_turn_duration_records_on_successful_text_turn() {
+    let before = crate::metrics_hist::snapshot();
+    let agent_loop = make_delayed_text_loop(std::time::Duration::from_millis(600), "delayed hello");
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("hi");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(result.is_ok());
+
+    let mut saw_text_delta = false;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AgentEvent::TextDelta(text) if text == "delayed hello") {
+            saw_text_delta = true;
+        }
+    }
+    assert!(saw_text_delta, "delayed text turn must emit TextDelta");
+
+    let after = crate::metrics_hist::snapshot();
+    let turn_sum_delta = after.turn_sum_ms - before.turn_sum_ms;
+    assert_eq!(after.turn_count - before.turn_count, 1);
+    assert!(
+        turn_sum_delta >= 600,
+        "turn sum delta was {turn_sum_delta}ms"
+    );
+    assert_eq!(observed_turn_bucket_delta(before, after, turn_sum_delta), 1);
+    assert_eq!(turn_bucket_delta_total(before, after), 1);
+}
+
+#[tokio::test]
+async fn agent_ttft_records_first_text_delta_after_provider_delay() {
+    let before = crate::metrics_hist::snapshot();
+    let agent_loop = make_delayed_text_loop(std::time::Duration::from_millis(600), "delayed ttft");
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("hi");
+
+    let (tx, _rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(result.is_ok());
+
+    let after = crate::metrics_hist::snapshot();
+    let ttft_sum_delta = after.ttft_sum_ms - before.ttft_sum_ms;
+    assert_eq!(after.ttft_count - before.ttft_count, 1);
+    assert!(
+        ttft_sum_delta >= 600,
+        "ttft sum delta was {ttft_sum_delta}ms"
+    );
+    assert_eq!(after.ttft_500ms_to_2s - before.ttft_500ms_to_2s, 1);
+    assert_eq!(after.turn_count - before.turn_count, 1);
+}
+
+#[tokio::test]
+async fn agent_turn_duration_records_on_provider_error() {
+    let before = crate::metrics_hist::snapshot();
+    let provider = MockProvider::new(vec![
+        vec![StreamChunk::Error("API overloaded".into())],
+        vec![StreamChunk::Error("API overloaded".into())],
+        vec![StreamChunk::Error("API overloaded".into())],
+        vec![StreamChunk::Error("API overloaded".into())],
+    ]);
+    let agent_loop = make_loop(provider, vec![]);
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("hi");
+
+    let (tx, _rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(matches!(
+        result,
+        Err(AgentError::Provider(_)) | Err(AgentError::ProviderTyped(_))
+    ));
+
+    let after = crate::metrics_hist::snapshot();
+    assert_eq!(after.turn_count - before.turn_count, 1);
+    assert_eq!(turn_bucket_delta_total(before, after), 1);
 }
 
 #[tokio::test]
@@ -1620,6 +1845,69 @@ impl Tool for PollCountingTool {
     }
 }
 
+struct WritePollCountingTool {
+    polls: std::sync::Arc<AtomicUsize>,
+    delay: std::time::Duration,
+}
+
+struct HangingWriteTool {
+    delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl Tool for HangingWriteTool {
+    fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: B16 — exhaustive test ToolSpec ctor, mirrors write_poll test tool above
+        ToolSpec {
+            name: "hang_write".into(),
+            description: "Write-permission tool that sleeps past the in-turn deadline".into(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+            permission: Permission::WorkspaceWrite,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cwd: &std::path::Path,
+    ) -> crate::types::ToolResult {
+        tokio::time::sleep(self.delay).await;
+        crate::types::ToolResult {
+            output: "unexpectedly completed".into(),
+            is_error: false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WritePollCountingTool {
+    fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: B16 — exhaustive test ToolSpec ctor, mirrors PollCountingTool above
+        ToolSpec {
+            name: "write_poll".into(),
+            description: "Write-permission poll-counting tool".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            permission: Permission::WorkspaceWrite,
+        }
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cwd: &std::path::Path,
+    ) -> crate::types::ToolResult {
+        SleepPollCounter {
+            polls: self.polls.clone(),
+            sleep: Box::pin(tokio::time::sleep(self.delay)),
+        }
+        .await;
+        crate::types::ToolResult {
+            output: "write-poll done".into(),
+            is_error: false,
+        }
+    }
+}
+
 /// B80b regression: when `steer_rx` is `Some` but its sender is CLOSED,
 /// the `execute_readonly_batch` select! steer arm used to resolve `None`
 /// instantly on every poll. Because the arm body did nothing on `None`,
@@ -1688,6 +1976,262 @@ async fn b80b_closed_steer_channel_does_not_spin_in_readonly_batch() {
         "B80b: tool future polled {observed} times (budget 100); the closed \
          steer channel is busy-spinning the readonly-batch select! loop \
          instead of parking (regression)"
+    );
+}
+
+/// B82 regression: same closed-steer spin class as B80b, but in the
+/// gated single-tool heartbeat path (`execute_tool_with_heartbeat`). This
+/// must NOT be a naive clone of the B80b test: the tool is
+/// `WorkspaceWrite`, so `classify_tool_calls` puts it in `gated_calls`
+/// rather than the read-only batch, and `permission_rx == None` exercises
+/// the loop's non-interactive auto-approve path before execution.
+#[tokio::test]
+async fn b82_closed_steer_channel_does_not_spin_in_single_tool_heartbeat() {
+    let polls = std::sync::Arc::new(AtomicUsize::new(0));
+
+    // iter 0: call the non-readonly tool; iter 1: finish.
+    let provider = MockProvider::new(vec![
+        vec![
+            StreamChunk::ToolUse {
+                id: "c1".into(),
+                name: "write_poll".into(),
+                input: serde_json::json!({"text": "hi"}),
+            },
+            StreamChunk::Done,
+        ],
+        vec![StreamChunk::Text("done".into()), StreamChunk::Done],
+    ]);
+    let agent_loop = make_loop(
+        provider,
+        vec![Box::new(WritePollCountingTool {
+            polls: polls.clone(),
+            delay: std::time::Duration::from_millis(200),
+        })],
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("run a write tool");
+
+    // Build a steer channel and immediately drop the SENDER so the
+    // receiver observes a closed channel (recv() -> None forever).
+    let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(16);
+    drop(steer_tx);
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent_loop.run(&mut history, tx, cancel, None, Some(steer_rx)),
+    )
+    .await;
+
+    assert!(result.is_ok(), "B82: turn must complete (no hang)");
+    assert!(
+        result.unwrap().is_ok(),
+        "B82: turn should complete successfully after the gated tool"
+    );
+
+    let mut saw_write_tool_end = false;
+    let mut saw_spurious_close_banner = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            AgentEvent::ToolEnd { name, .. } if name == "write_poll" => {
+                saw_write_tool_end = true;
+            }
+            AgentEvent::ToolOutput { chunk, .. } if chunk.contains("Steer queued") => {
+                saw_spurious_close_banner = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_write_tool_end,
+        "B82: write_poll ToolEnd proves the non-readonly gated single-tool route executed"
+    );
+    assert!(
+        !saw_spurious_close_banner,
+        "B82: closed steer channel must not emit a spurious queued-steer banner"
+    );
+
+    let observed = polls.load(Ordering::SeqCst);
+    assert!(
+        observed <= 100,
+        "B82: tool future polled {observed} times (budget 100); the closed \
+         steer channel is busy-spinning execute_tool_with_heartbeat instead \
+         of parking (regression)"
+    );
+}
+
+/// B83 regression: a single hung gated tool used to outlive `max_wall`
+/// because B73 checks only at the outer iteration boundary. The deadline
+/// must cancel through the existing CancellationToken path (not drop the
+/// tool future) so heartbeat/steer cleanup runs and the turn returns a
+/// distinct wall-timeout error before the outer rerevert guard trips.
+#[tokio::test]
+async fn b83_in_turn_deadline_aborts_hung_tool() {
+    let provider = MockProvider::new(vec![vec![
+        StreamChunk::ToolUse {
+            id: "c1".into(),
+            name: "hang_write".into(),
+            input: serde_json::json!({}),
+        },
+        StreamChunk::Done,
+    ]]);
+    let agent_loop = AgentLoop::new(
+        Box::new(provider),
+        crate::tool::registry::ToolRegistry::new(vec![Box::new(HangingWriteTool {
+            delay: std::time::Duration::from_secs(60),
+        })]),
+        LoopConfig {
+            max_iterations: 10,
+            max_wall: Some(std::time::Duration::from_secs(60)),
+            tool_deadline: Some(std::time::Duration::from_millis(200)),
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "mock".into(),
+            max_tokens: 1024,
+            ..Default::default()
+        },
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("run a hung write tool");
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    let (_steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(16);
+    let started = std::time::Instant::now();
+
+    let outer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent_loop.run(&mut history, tx, cancel, None, Some(steer_rx)),
+    )
+    .await;
+
+    let result = outer.expect("B83: outer timeout tripped; in-turn tool deadline did not abort");
+    assert!(
+        matches!(result, Err(AgentError::WallTimeout)),
+        "B83: deadline must return WallTimeout, not Cancelled/success; got {result:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "B83: tool deadline should fire well before the 60s tool sleep; elapsed {:?}",
+        started.elapsed()
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Error(s) if s.contains(crate::error::WALL_TIMEOUT_MESSAGE))
+        ),
+        "B83: timeout cleanup must emit Error; got events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Idle)),
+        "B83: timeout cleanup must emit Idle; got events: {events:?}"
+    );
+}
+
+/// S2b/B83 regression: provider stream-open can hang inside one iteration.
+/// The coarse turn backstop must cancel through the existing token and return
+/// WallTimeout before the outer rerevert guard trips.
+#[tokio::test]
+async fn b83_turn_backstop_aborts_hung_provider_open() {
+    let agent_loop = make_provider_backstop_loop(
+        Box::new(HungStreamOpenProvider),
+        std::time::Duration::from_millis(200),
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("open a provider stream that never returns");
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    let started = std::time::Instant::now();
+
+    let outer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent_loop.run(&mut history, tx, cancel, None, None),
+    )
+    .await;
+
+    let result = outer.expect("B83/S2b: outer timeout tripped; turn backstop did not abort");
+    assert!(
+        matches!(result, Err(AgentError::WallTimeout)),
+        "B83/S2b: backstop must return WallTimeout; got {result:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "B83/S2b: backstop should fire well before the 60s provider-open sleep; elapsed {:?}",
+        started.elapsed()
+    );
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Error(s) if s.contains(crate::error::WALL_TIMEOUT_MESSAGE))
+        ),
+        "B83/S2b: timeout cleanup must emit Error; got events: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Idle)),
+        "B83/S2b: timeout cleanup must emit Idle; got events: {events:?}"
+    );
+}
+
+/// S2b/B83 false-positive guard: a slow but legitimate fallback chain must
+/// complete when the ceiling is generously above its latency.
+#[tokio::test]
+async fn b83_legit_slow_fallback_turn_survives_backstop() {
+    let provider = crate::provider::resilient::ResilientProvider::new(vec![
+        Box::new(DelayedFailProvider {
+            delay: std::time::Duration::from_millis(250),
+        }),
+        Box::new(DelayedTextProvider {
+            delay: std::time::Duration::from_millis(500),
+            text: "fallback ok".into(),
+        }),
+    ]);
+    let agent_loop =
+        make_provider_backstop_loop(Box::new(provider), std::time::Duration::from_secs(5));
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("survive a slow fallback turn");
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent_loop.run(&mut history, tx, cancel, None, None),
+    )
+    .await
+    .expect("B83/S2b false-positive guard should complete before outer timeout");
+
+    assert!(
+        result.is_ok(),
+        "B83/S2b: generous backstop must not kill a legitimate slow fallback; got {result:?}"
+    );
+
+    let mut saw_text = false;
+    let mut saw_idle = false;
+    let mut saw_timeout_error = false;
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            AgentEvent::TextDelta(t) if t.contains("fallback ok") => saw_text = true,
+            AgentEvent::Idle => saw_idle = true,
+            AgentEvent::Error(e) if e.contains(crate::error::WALL_TIMEOUT_MESSAGE) => {
+                saw_timeout_error = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_text, "B83/S2b: fallback success text was not streamed");
+    assert!(saw_idle, "B83/S2b: successful fallback turn must end Idle");
+    assert!(
+        !saw_timeout_error,
+        "B83/S2b: false-positive guard saw timeout error despite successful fallback"
     );
 }
 

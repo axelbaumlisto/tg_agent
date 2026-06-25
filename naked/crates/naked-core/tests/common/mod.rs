@@ -101,9 +101,9 @@ pub async fn get_working_provider(config: &Config) -> Option<(Box<dyn Provider>,
 pub fn build_tools() -> ToolRegistry {
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(BashTool::new(30)),
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
+        Box::new(ReadFileTool::default()),
+        Box::new(WriteFileTool::default()),
+        Box::new(EditFileTool::default()),
         Box::new(GlobSearchTool),
         Box::new(GrepSearchTool),
         Box::new(SkillTool::new(SkillResolver::new(vec![]), &[])),
@@ -365,9 +365,9 @@ pub fn build_tools_with_skill_roots(roots: Vec<PathBuf>) -> ToolRegistry {
     let available = resolver.list();
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(BashTool::new(30)),
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
+        Box::new(ReadFileTool::default()),
+        Box::new(WriteFileTool::default()),
+        Box::new(EditFileTool::default()),
         Box::new(GlobSearchTool),
         Box::new(GrepSearchTool),
         Box::new(SkillTool::new(resolver, &available)),
@@ -378,9 +378,9 @@ pub fn build_tools_with_skill_roots(roots: Vec<PathBuf>) -> ToolRegistry {
 pub fn build_tools_with_mcp(mcp_tools: Vec<Box<dyn Tool>>) -> ToolRegistry {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(BashTool::new(30)),
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
+        Box::new(ReadFileTool::default()),
+        Box::new(WriteFileTool::default()),
+        Box::new(EditFileTool::default()),
         Box::new(GlobSearchTool),
         Box::new(GrepSearchTool),
         Box::new(SkillTool::new(SkillResolver::new(vec![]), &[])),
@@ -1258,9 +1258,9 @@ use naked_core::tool::memory::MemoryTool;
 pub fn build_tools_with_memory(workspace: PathBuf) -> ToolRegistry {
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(BashTool::new(30)),
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
+        Box::new(ReadFileTool::default()),
+        Box::new(WriteFileTool::default()),
+        Box::new(EditFileTool::default()),
         Box::new(GlobSearchTool),
         Box::new(GrepSearchTool),
         Box::new(MemoryTool::new(workspace)),

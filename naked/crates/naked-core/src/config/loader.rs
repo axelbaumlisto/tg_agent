@@ -7,14 +7,29 @@ use crate::error::{AgentError, Result};
 use super::session::expand_tilde;
 use super::{Config, dirs_home};
 
+pub type ConfigSourceBytes = Option<(PathBuf, Vec<u8>)>;
+
 impl Config {
     pub fn load() -> Result<Self> {
+        Ok(Self::load_with_source_bytes()?.0)
+    }
+
+    /// Load config plus the exact JSON file bytes that were parsed, when a
+    /// file exists. The byte snapshot is for boot observability only: callers
+    /// can hash the deterministic raw file bytes without re-serializing
+    /// `Config` (which contains maps).
+    pub fn load_with_source_bytes() -> Result<(Self, ConfigSourceBytes)> {
         Self::load_dotenv();
 
-        let mut cfg = if let Ok(path) = std::env::var("NAKED_CONFIG") {
-            Self::from_json_file(Path::new(&path))?
+        let (mut cfg, source) = if let Ok(path) = std::env::var("NAKED_CONFIG") {
+            let path = PathBuf::from(path);
+            let (cfg, bytes) = Self::from_json_file_with_bytes(&path)?;
+            (cfg, Some((path, bytes)))
+        } else if let Some(path) = Self::discover_json_path() {
+            let (cfg, bytes) = Self::from_json_file_with_bytes(&path)?;
+            (cfg, Some((path, bytes)))
         } else {
-            Self::discover_json()?
+            (Self::default(), None)
         };
 
         cfg.apply_env_overrides();
@@ -48,19 +63,26 @@ impl Config {
 
         cfg.validate_and_warn();
 
-        Ok(cfg)
+        Ok((cfg, source))
     }
 
     /// Load from a specific JSON file.
     pub fn from_json_file(path: &Path) -> Result<Self> {
+        Ok(Self::from_json_file_with_bytes(path)?.0)
+    }
+
+    fn from_json_file_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
         if !path.exists() {
             return Err(AgentError::Config(format!(
                 "config file not found: {}",
                 path.display()
             )));
         }
-        let data = std::fs::read_to_string(path)?;
-        Self::from_json_str(&data)
+        let bytes = std::fs::read(path)?;
+        let data = std::str::from_utf8(&bytes).map_err(|e| {
+            AgentError::ConfigParse(format!("{} is not valid UTF-8 JSON: {e}", path.display()))
+        })?;
+        Ok((Self::from_json_str(data)?, bytes))
     }
 
     /// Parse from JSON string.
@@ -78,7 +100,7 @@ impl Config {
 
     /// Search standard locations for config JSON.
     /// Walks up parent directories (like git) to find config.
-    fn discover_json() -> Result<Self> {
+    fn discover_json_path() -> Option<PathBuf> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let mut dir = cwd.as_path();
@@ -88,7 +110,7 @@ impl Config {
                 let path = dir.join(name);
                 if path.exists() {
                     tracing::info!("Loading config from {}", path.display());
-                    return Self::from_json_file(&path);
+                    return Some(path);
                 }
             }
             match dir.parent() {
@@ -100,10 +122,10 @@ impl Config {
         let home = dirs_home().join(".naked/config.json");
         if home.exists() {
             tracing::info!("Loading config from {}", home.display());
-            return Self::from_json_file(&home);
+            return Some(home);
         }
 
-        Ok(Self::default())
+        None
     }
 
     /// Walk up from cwd to find `.env`, like `discover_json`.

@@ -72,6 +72,11 @@ pub use tool::{ResearchListTool, ResearchSaveCursorTool, ResearchSaveTool, Resea
 pub trait ResearchRunner: Send + Sync {
     async fn load_research(&self, id: &str) -> crate::error::Result<ResearchSpec>;
     async fn set_research_paused(&self, id: &str, paused: bool) -> crate::error::Result<()>;
+    async fn set_research_schedule(
+        &self,
+        id: &str,
+        update: crate::services::research::ScheduleUpdate,
+    ) -> crate::error::Result<()>;
     async fn update_research(
         &self,
         id: &str,

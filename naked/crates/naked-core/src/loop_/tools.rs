@@ -5,6 +5,10 @@ use crate::history::ConversationHistory;
 use crate::provider::ChatRequest;
 use crate::tool::registry::ToolRegistry;
 use crate::types::{AgentEvent, Permission, SteerMessage};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -29,9 +33,14 @@ impl super::AgentLoop {
                 let cwd = cwd.to_path_buf();
                 let progress = tx.clone();
                 async move {
+                    let started = std::time::Instant::now();
                     let result = tools
                         .execute_with_progress(&name, input, &cwd, progress)
                         .await;
+                    crate::metrics_hist::record_tool_duration(
+                        &name,
+                        started.elapsed().as_millis() as u64,
+                    );
                     (id, name, result)
                 }
             })
@@ -211,7 +220,19 @@ impl super::AgentLoop {
             }
         });
 
+        let deadline_fired = Arc::new(AtomicBool::new(false));
+        let mut deadline_handle = self.config.tool_deadline.map(|deadline| {
+            let cancel = cancel.clone();
+            let deadline_fired = Arc::clone(&deadline_fired);
+            tokio::spawn(async move {
+                tokio::time::sleep(deadline).await;
+                deadline_fired.store(true, Ordering::SeqCst);
+                cancel.cancel();
+            })
+        });
+
         let progress_tx = tx.clone();
+        let started = std::time::Instant::now();
         let tool_fut = self
             .tools
             .execute_with_progress(name, input, &self.config.cwd, progress_tx);
@@ -221,9 +242,17 @@ impl super::AgentLoop {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
+                        if let Some(handle) = deadline_handle.take() {
+                            handle.abort();
+                            let _ = handle.await;
+                        }
                         heartbeat_cancel.cancel();
                         let _ = hb_handle.await;
-                        return Err(AgentError::Cancelled);
+                        return if deadline_fired.load(Ordering::SeqCst) {
+                            Err(AgentError::WallTimeout)
+                        } else {
+                            Err(AgentError::Cancelled)
+                        };
                     }
                     r = &mut tool_fut => break r,
                     msg = async {
@@ -239,14 +268,21 @@ impl super::AgentLoop {
                             }).await;
                             // R1: pipeline-owned, with burst.
                             steer.record_winner_and_burst(msg, steer_rx);
+                        } else {
+                            *steer_rx = None;
                         }
                     }
                 }
             }
         };
 
+        if let Some(handle) = deadline_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
         heartbeat_cancel.cancel();
         let _ = hb_handle.await;
+        crate::metrics_hist::record_tool_duration(name, started.elapsed().as_millis() as u64);
         Ok(result)
     }
 }

@@ -45,6 +45,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<()> {
         "prune-dead-keys" => return prune_dead_keys::prune_dead_keys_cmd(&args[2..]),
         "vacuum-sessions" => return vacuum::vacuum_sessions_cmd(&args[2..]).await,
         "research" => return crate::research::research_cmd(&args[2..]).await,
+        "tui" => return crate::tui::tui_main(&args[2..]).await,
         "agent" => return agent::agent_cmd(&args[2..]).await,
         "skills" => return skills::skills_cmd(&args[2..]).await,
         "tg" => return tg::tg_cmd(&args[2..]).await,
@@ -67,6 +68,7 @@ fn print_usage() {
     println!("  research          Research subsystem operator commands");
     println!("  skills            Inspect the skill registry");
     println!("  tg                Telegram subsystem helpers (off-bot; mocks + diagnostics)");
+    println!("  tui               Interactive full-screen terminal UI (ratatui)");
     println!("  vacuum-sessions   Migrate and GC session artifacts");
     println!();
     println!("Run `naked <subcommand> help` for subcommand-specific usage.");

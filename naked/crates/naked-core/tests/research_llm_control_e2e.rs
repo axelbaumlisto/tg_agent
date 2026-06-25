@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use naked_core::AgentCore;
+use naked_core::CreateSchedule;
 use naked_core::PatchField;
 use naked_core::ResearchPatch;
 use naked_core::config::{Config, ResearchConfig};
@@ -186,7 +187,7 @@ async fn setup() -> Option<TestSetup> {
 /// Pre-seed a research spec on disk so the LLM has something to act on.
 async fn seed_spec(core: &Arc<AgentCore>, topic: &str, interval: Option<u64>) -> ResearchSpec {
     let spec = core
-        .create_research(topic, vec![], None, None, None)
+        .create_research(topic, vec![], None, None, None, CreateSchedule::OneShotNow)
         .await
         .expect("seed create_research");
     if let Some(secs) = interval {

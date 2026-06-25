@@ -191,11 +191,16 @@ Keep each section concise. Preserve exact paths and identifiers.";
 
         let (eff_max_tokens, eff_temperature) =
             crate::turn::resolve_generation_params(&self.config(), &setup.provider_name, effective);
+        let cfg = self.config();
         let max_wall = (session.metadata.channel == "research")
-            .then(|| std::time::Duration::from_secs(self.config().research.max_wall_seconds));
+            .then(|| std::time::Duration::from_secs(cfg.research.max_wall_seconds));
+        let turn_backstop = cfg
+            .turn_deadline_backstop_enabled
+            .then(|| std::time::Duration::from_secs(cfg.turn_deadline_secs));
         let mut loop_config = crate::turn::build_loop_config(
             effective.max_iterations,
             max_wall,
+            turn_backstop,
             cwd.clone(),
             setup.model.clone(),
             eff_max_tokens,
@@ -204,7 +209,7 @@ Keep each section concise. Preserve exact paths and identifiers.";
             setup.provider_name.clone(),
             self.provider_svc.health(),
             self.token_tracker.clone(),
-            &self.config().session_dir,
+            &cfg.session_dir,
             session_id,
         );
         // PLAN_QUALITY_v1 wiring: copy installed managers from

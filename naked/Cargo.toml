@@ -9,6 +9,11 @@ license = "MIT"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
+# RATIONALE: `naked tui` interactive terminal frontend (PLAN_NAKED_TUI_v1) —
+# ratatui full-screen render + crossterm async EventStream. Matched pair
+# (ratatui's crossterm_0_29 backend ↔ crossterm 0.29) to avoid a version split.
+ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

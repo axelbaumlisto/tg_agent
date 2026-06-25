@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 use naked_core::AgentCore;
 use naked_core::config::Config;
-use naked_core::research::StopReason;
+use naked_core::research::{ResearchSpec, StopReason};
 use naked_core::types::{AgentEvent, AgentHandle, PermissionResponse};
 use naked_tg::channel_map::ChannelSessionMap;
 use naked_tg::synthetic::SyntheticDispatchOutcome;
@@ -206,6 +206,18 @@ async fn stream_research_turn(
         "streaming research turn to chat bubble"
     );
 
+    let final_markup = match agent.load_research(spec_id).await {
+        Ok(spec) => Some(final_markup_for_research_spec(&spec)),
+        Err(e) => {
+            tracing::debug!(
+                spec_id = %spec_id,
+                error = %e,
+                "research final keyboard skipped: spec load failed"
+            );
+            None
+        }
+    };
+
     let run_ctx = crate::streaming::StreamRunContext {
         requested_run_id: msg.run_id.clone(),
         session_id: session_id.to_string(),
@@ -213,6 +225,7 @@ async fn stream_research_turn(
             spec_id: spec_id.to_string(),
         },
         source_ref: Some(spec_id.to_string()),
+        final_reply_markup: final_markup,
     };
     let outcome =
         crate::streaming::stream_response(&research_deps, ctx, handle, model_tag, run_ctx).await;
@@ -228,6 +241,13 @@ async fn stream_research_turn(
         },
         errors: vec![], // errors rendered in bubble by stream_response
     }
+}
+
+pub(crate) fn final_markup_for_research_spec(
+    spec: &ResearchSpec,
+) -> teloxide::types::InlineKeyboardMarkup {
+    naked_tg::research_controls::scheduled_keyboard_for_spec(spec)
+        .unwrap_or_else(|| naked_tg::research_controls::keyboard_schedule_opt_in(&spec.id))
 }
 
 /// B64: Headless drain for a synthetic agent turn. Kept as fallback for
@@ -313,7 +333,29 @@ pub(crate) async fn drain_synthetic_agent_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teloxide::types::InlineKeyboardButtonKind;
     use tokio::sync::mpsc;
+
+    fn callbacks(markup: &teloxide::types::InlineKeyboardMarkup) -> Vec<&str> {
+        markup
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => data.as_str(),
+                other => panic!("expected callback button, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn spec_with(id: &str, interval_seconds: Option<u64>, cron: Option<&str>) -> ResearchSpec {
+        ResearchSpec {
+            id: id.to_string(),
+            interval_seconds,
+            cron: cron.map(str::to_string),
+            ..Default::default()
+        }
+    }
 
     fn fake_handle(
         buf: usize,
@@ -332,6 +374,21 @@ mod tests {
             abort: tokio_util::sync::CancellationToken::new(),
         };
         (ev_tx, perm_rx, handle)
+    }
+
+    #[test]
+    fn final_markup_for_research_spec_recurring_vs_oneshot() {
+        let recurring = spec_with("recurring-spec", Some(3600), None);
+        let one_shot = spec_with("one-shot-spec", None, None);
+
+        assert_eq!(
+            callbacks(&final_markup_for_research_spec(&recurring)),
+            vec!["r:rm:recurring-spec", "r:uns:recurring-spec"]
+        );
+        assert_eq!(
+            callbacks(&final_markup_for_research_spec(&one_shot)),
+            vec!["r:sch:one-shot-spec"]
+        );
     }
 
     #[test]

@@ -207,11 +207,15 @@ impl Tool for ResearchRunTool {
         let provider_arc = core.provider();
         let tools = Self::build_inner_tools(&core);
         let cfg = core.config();
+        let max_wall = std::time::Duration::from_secs(cfg.research.max_wall_seconds);
+        let turn_backstop = cfg
+            .turn_deadline_backstop_enabled
+            .then(|| std::time::Duration::from_secs(cfg.turn_deadline_secs));
         let loop_config = LoopConfig {
             max_iterations: RESEARCH_RUN_MAX_ITERATIONS,
-            max_wall: Some(std::time::Duration::from_secs(
-                cfg.research.max_wall_seconds,
-            )),
+            max_wall: Some(max_wall),
+            tool_deadline: Some(max_wall),
+            turn_backstop,
             cwd: cwd.to_path_buf(),
             model: cfg.default_model.clone(),
             provider: cfg.default_provider.clone(),
@@ -406,6 +410,7 @@ impl Provider for ArcProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CreateSchedule;
     use crate::test_support::TestCore;
     use std::sync::Arc;
 
@@ -520,7 +525,14 @@ mod tests {
         let tc = TestCore::build();
         // Create a spec so load_research succeeds.
         tc.core
-            .create_research("test-topic", vec![], None, None, None)
+            .create_research(
+                "test-topic",
+                vec![],
+                None,
+                None,
+                None,
+                CreateSchedule::OneShotNow,
+            )
             .await
             .expect("create_research");
         let specs = tc.core.list_research().await.expect("list");

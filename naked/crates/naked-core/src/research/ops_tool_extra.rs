@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 
 use super::context::ResearchContext;
 use super::store::ResearchStore;
+use crate::ScheduleUpdate;
 use crate::config::ResearchConfig;
 use crate::tool::Tool;
 use crate::types::{Permission, ToolResult, ToolSpec};
-use crate::{PatchField, ResearchPatch};
 
 pub struct ResearchPauseTool {
     runner: Weak<dyn super::ResearchRunner>,
@@ -237,18 +237,14 @@ impl Tool for ResearchSetScheduleTool {
 
         // Apply schedule first (if requested).
         if let Some(v) = interval_field {
-            let interval_patch = if v.is_null() {
-                PatchField::Clear
+            let update = if v.is_null() {
+                ScheduleUpdate::Off
             } else if let Some(n) = v.as_u64() {
-                PatchField::Set(n)
+                ScheduleUpdate::Interval(n)
             } else {
                 return ToolResult::err("`interval_seconds` must be an integer or null");
             };
-            let patch = ResearchPatch {
-                interval_seconds: interval_patch,
-                ..Default::default()
-            };
-            if let Err(e) = runner.update_research(&spec_id, patch).await {
+            if let Err(e) = runner.set_research_schedule(&spec_id, update).await {
                 return ToolResult::err(format!("failed to update schedule: {e}"));
             }
         }

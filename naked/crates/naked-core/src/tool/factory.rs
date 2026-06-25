@@ -20,8 +20,9 @@ use crate::skill::tool::SkillTool;
 use crate::tool::Tool;
 use crate::tool::agent_control::{AgentStatusTool, AgentStopTool};
 use crate::tool::bash::BashTool;
+use crate::tool::fff_registry::FffRegistryConfig;
 use crate::tool::fff_tools::FffState;
-use crate::tool::file_ops::{EditFileTool, ReadFileTool, WriteFileTool};
+use crate::tool::file_ops::{EditFileTool, FileSnapshotTool, ReadFileTool, WriteFileTool};
 use crate::tool::memory::MemoryTool;
 use crate::tool::remote::RemoteContext;
 // Old search tools replaced by fff (SIMD + frecency):
@@ -44,6 +45,10 @@ pub(crate) struct CoreToolCtx<'a> {
     pub sender_id: Option<String>,
     pub todo_list: &'a crate::tool::todo_tool::TodoList,
     pub plan_state: &'a crate::tool::plan_tool::PlanState,
+    pub fff_registry: &'a Arc<crate::tool::fff_registry::FffPickerRegistry>,
+    pub fs_cache: &'a Arc<crate::tool::fs_cache::FsCache>,
+    pub persistent_bash: &'a Arc<crate::tool::persistent_bash::PersistentBashManager>,
+    pub session_id: &'a str,
 }
 
 /// Build core tools: bash, file ops, search, web, memory, sub-agent.
@@ -54,11 +59,18 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         ctx.config.tool_timeout_secs,
         ctx.config.exa_api_keys.clone(),
     )
+    .with_stale_edit_guard(ctx.config.stale_edit_guard_enabled)
+    .with_hashline_edit(ctx.config.hashline_edit_enabled)
     .with_registry(ctx.agent_registry.clone());
 
     let bash_tool: Box<dyn Tool> = if ctx.remote_ctx.is_remote().await {
         let ops = ctx.remote_ctx.ops().await;
         Box::new(BashTool::with_ops(ctx.config.tool_timeout_secs, ops))
+    } else if ctx.config.persistent_bash_enabled {
+        Box::new(
+            BashTool::new(ctx.config.tool_timeout_secs)
+                .with_persistent(ctx.persistent_bash.clone(), ctx.session_id.to_string()),
+        )
     } else {
         Box::new(BashTool::new(ctx.config.tool_timeout_secs))
     };
@@ -66,14 +78,32 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
     let memory_ctx = crate::tool::memory::MemoryContext::new();
     memory_ctx.set_user_id(ctx.sender_id.clone());
 
-    // fff-powered search engine (SIMD + frecency):
-    let fff_state = FffState::new(ctx.workspace);
+    let fs_cache = if ctx.config.fs_cache_enabled {
+        ctx.fs_cache.set_max_bytes(ctx.config.fs_cache_max_bytes);
+        Some(ctx.fs_cache.clone())
+    } else {
+        None
+    };
+
+    // fff-powered search engine. Fast-index mode reuses one process-wide
+    // picker per canonical workspace; flag-off falls back to legacy per-turn state.
+    let fff_cfg = FffRegistryConfig::from_config(ctx.config);
+    let fff_state = if fff_cfg.enabled {
+        FffState::with_registry(ctx.fff_registry.clone(), ctx.workspace, fff_cfg)
+    } else {
+        FffState::new(ctx.workspace)
+    };
 
     vec![
         bash_tool,
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
+        Box::new(ReadFileTool::new(fs_cache.clone())),
+        Box::new(FileSnapshotTool::new(fs_cache.clone())),
+        Box::new(WriteFileTool::new(fs_cache.clone())),
+        Box::new(
+            EditFileTool::new(ctx.config.stale_edit_guard_enabled)
+                .with_hashline_edit(ctx.config.hashline_edit_enabled)
+                .with_fs_cache(fs_cache.clone()),
+        ),
         // fff-powered search (SIMD + frecency + git-aware):
         Box::new(crate::tool::fff_tools::FffFindTool::new(&fff_state)),
         Box::new(crate::tool::fff_tools::FffGrepTool::new(&fff_state)),
@@ -102,7 +132,7 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
         Box::new(super::test_runner::RunTestsTool),
         Box::new(super::git_tools::GitLogTool),
         Box::new(super::git_tools::GitDiffTool),
-        Box::new(super::apply_patch::ApplyPatchTool),
+        Box::new(super::apply_patch::ApplyPatchTool::new(fs_cache)),
         Box::new(super::diagnostics::DiagnosticsTool),
         Box::new(super::revert_turn::RevertTurnTool),
         Box::new(super::validate_data::ValidateDataTool),

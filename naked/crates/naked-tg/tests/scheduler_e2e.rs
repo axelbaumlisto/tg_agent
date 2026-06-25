@@ -211,7 +211,14 @@ async fn t_reschedule_replaces_interval() {
     // last_run < run_at, which is always true when last_run = now-60s and
     // run_at = creation-time ≈ now-epsilon).
     let spec = core
-        .create_research("rolling daily refresh", vec![], None, None, None)
+        .create_research(
+            "rolling daily refresh",
+            vec![],
+            None,
+            None,
+            None,
+            naked_core::CreateSchedule::OneShotNow,
+        )
         .await
         .expect("create_research");
     let id = spec.id.clone();

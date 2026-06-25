@@ -88,9 +88,9 @@ async fn run_prompt(provider: Box<dyn Provider>, model: &str, prompt: &str) -> O
 
     let tools: Vec<Box<dyn naked_core::tool::Tool>> = vec![
         Box::new(BashTool::new(15)),
-        Box::new(ReadFileTool),
-        Box::new(WriteFileTool),
-        Box::new(EditFileTool),
+        Box::new(ReadFileTool::default()),
+        Box::new(WriteFileTool::default()),
+        Box::new(EditFileTool::default()),
         Box::new(GlobSearchTool),
         Box::new(GrepSearchTool),
     ];

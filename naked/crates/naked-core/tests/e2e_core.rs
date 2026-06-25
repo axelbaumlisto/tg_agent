@@ -685,9 +685,9 @@ async fn t48_search_outside_workspace() {
 async fn t49_file_ops_permission_escalation() {
     let workspace = tempfile::tempdir().unwrap();
 
-    let write_tool = WriteFileTool;
-    let edit_tool = EditFileTool;
-    let read_tool = ReadFileTool;
+    let write_tool = WriteFileTool::default();
+    let edit_tool = EditFileTool::default();
+    let read_tool = ReadFileTool::default();
 
     // Inside workspace → WorkspaceWrite
     let perm = write_tool.effective_permission(
@@ -842,7 +842,7 @@ async fn t57_read_file_size_limit() {
     let data = vec![b'x'; 11 * 1024 * 1024];
     std::fs::write(&big_file, &data).unwrap();
 
-    let tool = ReadFileTool;
+    let tool = ReadFileTool::default();
     let result = tool
         .execute(
             serde_json::json!({"file_path": big_file.to_str().unwrap()}),
@@ -998,7 +998,7 @@ async fn t65_read_binary_file_detection() {
     let png = tmp.path().join("image.png");
     std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00").unwrap();
 
-    let tool = ReadFileTool;
+    let tool = ReadFileTool::default();
     let result = tool
         .execute(serde_json::json!({"file_path": "image.png"}), tmp.path())
         .await;
@@ -1282,7 +1282,7 @@ async fn t74_readfile_output_truncation() {
         .collect();
     std::fs::write(tmp.path().join("big.txt"), &content).unwrap();
 
-    let tool = ReadFileTool;
+    let tool = ReadFileTool::default();
     let result = tool
         .execute(serde_json::json!({"file_path": "big.txt"}), tmp.path())
         .await;
@@ -1562,7 +1562,7 @@ async fn t92_heartbeat_during_tool_execution() {
 
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(BashTool::new(30)),
-        Box::new(ReadFileTool),
+        Box::new(ReadFileTool::default()),
         Box::new(GlobSearchTool),
         Box::new(GrepSearchTool),
     ];

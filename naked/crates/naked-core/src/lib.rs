@@ -14,6 +14,7 @@ pub mod loop_;
 pub mod loop_guard;
 pub mod loop_observer;
 pub mod lsp;
+pub mod metrics_hist;
 pub mod prompt;
 pub mod services;
 pub mod session;
@@ -68,6 +69,10 @@ pub mod stream_filter;
 pub mod token_tracker;
 pub mod types;
 pub mod util;
+
+#[cfg(test)]
+#[path = "code_agent_e2e_tests.rs"]
+mod code_agent_e2e_tests;
 
 #[cfg(test)]
 mod core_tests {
@@ -214,6 +219,9 @@ pub(crate) struct CatalogState {
 pub struct SharedToolState {
     pub(crate) todo_list: tool::todo_tool::TodoList,
     pub(crate) plan_state: tool::plan_tool::PlanState,
+    pub(crate) fff_registry: Arc<tool::fff_registry::FffPickerRegistry>,
+    pub(crate) fs_cache: Arc<tool::fs_cache::FsCache>,
+    pub(crate) persistent_bash: Arc<tool::persistent_bash::PersistentBashManager>,
 }
 
 impl SharedToolState {
@@ -221,6 +229,11 @@ impl SharedToolState {
         Self {
             todo_list: tool::todo_tool::TodoList::new(),
             plan_state: tool::plan_tool::PlanState::new(),
+            fff_registry: Arc::new(tool::fff_registry::FffPickerRegistry::new()),
+            fs_cache: Arc::new(tool::fs_cache::FsCache::new(
+                tool::fs_cache::DEFAULT_FS_CACHE_MAX_BYTES,
+            )),
+            persistent_bash: Arc::new(tool::persistent_bash::PersistentBashManager::new()),
         }
     }
 }
@@ -606,3 +619,4 @@ pub(crate) use services::research_adapter::AgentCoreResearchRunner;
 // Re-export from research submodules for backward compatibility.
 pub use research::patch::{PatchField, ResearchPatch, apply_research_patch};
 pub use research::runlog::write_research_memory_link_for;
+pub use services::research::{CreateSchedule, ScheduleUpdate};

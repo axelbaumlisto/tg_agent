@@ -92,6 +92,44 @@ pub struct Config {
     /// Default false preserves the current single-run-per-thread behaviour.
     #[serde(default)]
     pub run_registry_multi_stream_enabled: bool,
+    /// PLAN_BACKEND_HARDENING_v1 S2b rollout flag for the coarse provider/stream
+    /// turn-body backstop. Default false preserves legacy stream behavior exactly.
+    #[serde(default)]
+    pub turn_deadline_backstop_enabled: bool,
+    /// Coarse provider/stream turn-body backstop ceiling in seconds when
+    /// `turn_deadline_backstop_enabled` is true. This must stay above full
+    /// fallback-chain latency; it is a hang backstop, not an SLA.
+    #[serde(default = "default_turn_deadline_secs")]
+    pub turn_deadline_secs: u64,
+    /// PLAN_FAST_BACKEND_v2 Step B rollout flag for explicit stale-edit preconditions.
+    /// Default false preserves legacy edit_file behaviour.
+    #[serde(default)]
+    pub stale_edit_guard_enabled: bool,
+    /// PLAN_FAST_BACKEND_v2 Step C rollout flag for hashline/content-anchored edit mode.
+    /// Default false preserves legacy edit_file behaviour.
+    #[serde(default)]
+    pub hashline_edit_enabled: bool,
+    /// PLAN_FAST_BACKEND_v2 Step D rollout flag for bounded read_file/file_snapshot cache.
+    /// Default false preserves legacy direct filesystem reads.
+    #[serde(default)]
+    pub fs_cache_enabled: bool,
+    /// PLAN_FAST_BACKEND_v2 Step E rollout flag for session-scoped persistent bash.
+    /// Default false preserves legacy per-call bash process spawning.
+    #[serde(default)]
+    pub persistent_bash_enabled: bool,
+    /// Process-wide byte budget for the bounded read_file/file_snapshot cache.
+    #[serde(default = "default_fs_cache_max_bytes")]
+    pub fs_cache_max_bytes: u64,
+    /// PLAN_FAST_BACKEND_v1 Step 2b rollout flag for fff's long-lived fast index.
+    /// Default false preserves the legacy per-turn FilePicker path.
+    #[serde(default)]
+    pub fff_fast_index_enabled: bool,
+    /// Max canonical workspaces allowed to hold long-lived fff watchers/indexes.
+    #[serde(default = "default_fff_fast_index_max_workspaces")]
+    pub fff_fast_index_max_workspaces: usize,
+    /// Hard mmap/content cache byte cap per indexed workspace.
+    #[serde(default = "default_fff_fast_index_cache_max_bytes")]
+    pub fff_fast_index_cache_max_bytes: u64,
     /// Exa.ai API keys for web search (round-robin rotation)
     #[serde(default)]
     pub exa_api_keys: Vec<String>,
@@ -223,6 +261,14 @@ fn default_enforce_model_capabilities() -> bool {
     true
 }
 
+fn default_fff_fast_index_max_workspaces() -> usize {
+    4
+}
+
+fn default_fff_fast_index_cache_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
 pub use provider::{ProviderConfig, ResolvedProvider};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -266,8 +312,14 @@ fn default_max_tokens() -> u32 {
 fn default_tool_timeout() -> u64 {
     120
 }
+fn default_turn_deadline_secs() -> u64 {
+    900
+}
 fn default_session_dir() -> PathBuf {
     PathBuf::from(".naked/sessions")
+}
+fn default_fs_cache_max_bytes() -> u64 {
+    crate::tool::fs_cache::DEFAULT_FS_CACHE_MAX_BYTES
 }
 pub(crate) fn dirs_home() -> PathBuf {
     std::env::var("HOME")
@@ -295,6 +347,16 @@ impl Default for Config {
             session_dir: default_session_dir(),
             telegram: TelegramConfig::default(),
             run_registry_multi_stream_enabled: false,
+            turn_deadline_backstop_enabled: false,
+            turn_deadline_secs: default_turn_deadline_secs(),
+            stale_edit_guard_enabled: false,
+            hashline_edit_enabled: false,
+            fs_cache_enabled: false,
+            persistent_bash_enabled: false,
+            fs_cache_max_bytes: default_fs_cache_max_bytes(),
+            fff_fast_index_enabled: false,
+            fff_fast_index_max_workspaces: default_fff_fast_index_max_workspaces(),
+            fff_fast_index_cache_max_bytes: default_fff_fast_index_cache_max_bytes(),
             exa_api_keys: Vec::new(),
             tg_media: TgMediaConfig::default(),
             research: ResearchConfig::default(),

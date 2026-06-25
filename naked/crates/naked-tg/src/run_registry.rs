@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use naked_core::types::SteerMessage;
 use tokio::sync::mpsc;
@@ -19,6 +20,25 @@ pub type SourceRef = String;
 pub const STEP2_SINGLE_RUN_CAP: usize = 1;
 pub const MULTI_RUN_THREAD_CAP: usize = 3;
 pub const MIRROR_SINK_CAP: usize = 2;
+pub const ACTIVE_RUN_SILENCE_WARN_THRESHOLD: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SilenceState {
+    pub silence_age: Duration,
+    pub alert: bool,
+}
+
+pub fn run_silence_state(
+    last_progress: Instant,
+    now: Instant,
+    threshold: Duration,
+) -> SilenceState {
+    let silence_age = now.saturating_duration_since(last_progress);
+    SilenceState {
+        silence_age,
+        alert: silence_age > threshold,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChatThreadKey {
@@ -144,6 +164,8 @@ pub struct RunHandle {
     pub abort: CancellationToken,
     pub bubble_message_id: Option<i32>,
     pub rendered: RenderedRunState,
+    last_progress: Instant,
+    silence_warned: bool,
     mirror_sinks: Vec<RunSink>,
     bound_messages: HashSet<MessageKey>,
 }
@@ -161,6 +183,8 @@ impl RunHandle {
             abort: input.abort,
             bubble_message_id: None,
             rendered: RenderedRunState::default(),
+            last_progress: Instant::now(),
+            silence_warned: false,
             mirror_sinks: Vec::new(),
             bound_messages: HashSet::new(),
         }
@@ -516,6 +540,14 @@ impl RunRegistry {
         self.lock_state().summaries_for_thread(key)
     }
 
+    /// Returns true while a run with this generic source reference is registered.
+    ///
+    /// `by_spec_id` is removed in `remove_run` on completion/abort/failure, so
+    /// membership here means the run is currently active.
+    pub fn has_active_run_for_source_ref(&self, source_ref: &str) -> bool {
+        self.lock_state().by_spec_id.contains_key(source_ref)
+    }
+
     pub fn get_run(&self, run_id: &str) -> Option<RunSummary> {
         self.lock_state().by_run.get(run_id).map(RunHandle::summary)
     }
@@ -651,6 +683,67 @@ impl RunRegistry {
         Some(handle.summary())
     }
 
+    pub fn mark_run_progress(&self, run_id: &str) -> Option<RunSummary> {
+        self.mark_run_progress_at(run_id, Instant::now())
+    }
+
+    pub fn mark_run_progress_at(&self, run_id: &str, now: Instant) -> Option<RunSummary> {
+        let mut state = self.lock_state();
+        let handle = state.by_run.get_mut(run_id)?;
+        handle.last_progress = now;
+        handle.silence_warned = false;
+        Some(handle.summary())
+    }
+
+    pub fn active_run_max_silent_seconds(&self) -> u64 {
+        self.active_run_max_silent_seconds_at(Instant::now())
+    }
+
+    pub fn active_run_max_silent_seconds_at(&self, now: Instant) -> u64 {
+        let state = self.lock_state();
+        state
+            .by_run
+            .values()
+            .map(|handle| run_silence_state(handle.last_progress, now, Duration::ZERO).silence_age)
+            .max()
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    pub fn warn_silent_runs(&self, threshold: Duration) {
+        self.warn_silent_runs_at(Instant::now(), threshold);
+    }
+
+    pub fn warn_silent_runs_at(&self, now: Instant, threshold: Duration) {
+        let warnings = {
+            let mut state = self.lock_state();
+            let mut warnings = Vec::new();
+            for handle in state.by_run.values_mut() {
+                let silence = run_silence_state(handle.last_progress, now, threshold);
+                if silence.alert && !handle.silence_warned {
+                    handle.silence_warned = true;
+                    warnings.push((
+                        handle.run_id.clone(),
+                        handle.session_id.clone(),
+                        handle.kind.clone(),
+                        silence.silence_age.as_secs(),
+                    ));
+                }
+            }
+            warnings
+        };
+        for (run_id, session_id, kind, silent_seconds) in warnings {
+            tracing::warn!(
+                run_id = %run_id,
+                session_id = %session_id,
+                ?kind,
+                silent_seconds,
+                threshold_seconds = threshold.as_secs(),
+                "active run has emitted no non-heartbeat progress past threshold"
+            );
+        }
+    }
+
     #[cfg(test)]
     fn contains_run(&self, run_id: &str) -> bool {
         self.lock_state().by_run.contains_key(run_id)
@@ -769,6 +862,80 @@ mod tests {
     }
 
     #[test]
+    fn run_silence_state_thresholds() {
+        let last_progress = Instant::now();
+        let threshold = Duration::from_secs(10);
+        assert_eq!(
+            run_silence_state(
+                last_progress,
+                last_progress + Duration::from_secs(9),
+                threshold
+            ),
+            SilenceState {
+                silence_age: Duration::from_secs(9),
+                alert: false,
+            }
+        );
+        assert_eq!(
+            run_silence_state(
+                last_progress,
+                last_progress + Duration::from_secs(10),
+                threshold
+            ),
+            SilenceState {
+                silence_age: Duration::from_secs(10),
+                alert: false,
+            }
+        );
+        assert_eq!(
+            run_silence_state(
+                last_progress,
+                last_progress + Duration::from_secs(11),
+                threshold
+            ),
+            SilenceState {
+                silence_age: Duration::from_secs(11),
+                alert: true,
+            }
+        );
+    }
+
+    #[test]
+    fn run_registry_tracks_active_run_silence_age() {
+        let registry = RunRegistry::new();
+        register(&registry, "run-a", "sid-a", 100, None, 3);
+        let base = Instant::now();
+        registry.mark_run_progress_at("run-a", base).unwrap();
+        assert_eq!(
+            registry.active_run_max_silent_seconds_at(base + Duration::from_secs(37)),
+            37
+        );
+        registry
+            .mark_run_progress_at("run-a", base + Duration::from_secs(40))
+            .unwrap();
+        assert_eq!(
+            registry.active_run_max_silent_seconds_at(base + Duration::from_secs(41)),
+            1
+        );
+    }
+
+    #[test]
+    fn run_registry_silence_warn_debounces_until_progress() {
+        let registry = RunRegistry::new();
+        register(&registry, "run-a", "sid-a", 100, None, 3);
+        let base = Instant::now();
+        registry.mark_run_progress_at("run-a", base).unwrap();
+        registry.warn_silent_runs_at(base + Duration::from_secs(11), Duration::from_secs(10));
+        assert!(registry.lock_state().by_run["run-a"].silence_warned);
+        registry.warn_silent_runs_at(base + Duration::from_secs(12), Duration::from_secs(10));
+        assert!(registry.lock_state().by_run["run-a"].silence_warned);
+        registry
+            .mark_run_progress_at("run-a", base + Duration::from_secs(13))
+            .unwrap();
+        assert!(!registry.lock_state().by_run["run-a"].silence_warned);
+    }
+
+    #[test]
     fn run_registry_register_run_inserts_all_indexes() {
         let registry = RunRegistry::new();
         let summary = register(&registry, "attempt-1", "sid-1", 100, Some("spec-1"), 1);
@@ -784,6 +951,19 @@ mod tests {
             ResolveForSteer::Unique(_)
         ));
         assert_eq!(registry.source_ref_count(), 1);
+    }
+
+    #[test]
+    fn has_active_run_for_source_ref_tracks_registration_lifetime() {
+        let registry = RunRegistry::new();
+        assert!(!registry.has_active_run_for_source_ref("spec-x"));
+
+        register(&registry, "run-x", "sid-x", 100, Some("spec-x"), 1);
+        assert!(registry.has_active_run_for_source_ref("spec-x"));
+        assert!(!registry.has_active_run_for_source_ref("spec-other"));
+
+        registry.remove_run("run-x").expect("remove registered run");
+        assert!(!registry.has_active_run_for_source_ref("spec-x"));
     }
 
     #[test]

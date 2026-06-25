@@ -57,6 +57,14 @@ async fn resolve_spec_ref(chat_id: i64, tail: &str) -> String {
     tail.to_string()
 }
 
+fn recurring_marker(spec: &naked_core::research::ResearchSpec) -> &'static str {
+    if spec.interval_seconds.is_some() || spec.cron.is_some() {
+        " 🔁"
+    } else {
+        ""
+    }
+}
+
 // Dead-code marker — the legacy orchestration layer (heartbeat waterfall,
 // stop/restart keyboards, ResearchOutcome enum, finalize_research_ui) is gone.
 // All research runs go through synthetic_dispatch::dispatch_for_chat.
@@ -124,6 +132,7 @@ pub(crate) async fn handle_research_cmd(
                         None,
                         Some(ctx.chat_id.0),
                         ctx.raw_thread_id(),
+                        naked_core::CreateSchedule::OneShotNow,
                     )
                     .await
                 {
@@ -163,13 +172,14 @@ pub(crate) async fn handle_research_cmd(
                             format_age(age)
                         })
                         .unwrap_or_else(|| "—".into());
+                    let recurring = recurring_marker(s);
                     out.push_str(&format!(
-                        "{status} {n}. {short_topic}{ellip} ({total}) · {last_run}\n"
+                        "{status} {n}. {short_topic}{ellip} ({total}) · {last_run}{recurring}\n"
                     ));
                     ids.push(s.id.clone());
                 }
                 out.push_str(
-                    "\n`/research fresh|run|pause|rm <N>` (live: `/research show <run_id>`)",
+                    "\n`/research fresh|run|pause|rm <N>` · off: `/research schedule <N> off` (live: `/research show <run_id>`)",
                 );
                 // Store index for numeric refs.
                 LIST_INDEX.write().await.insert(ctx.chat_id.0, ids);
@@ -323,12 +333,11 @@ pub(crate) async fn handle_research_cmd(
             } else {
                 match action {
                     "off" | "disable" => {
-                        let patch = naked_core::ResearchPatch {
-                            interval_seconds: naked_core::PatchField::Clear,
-                            ..Default::default()
-                        };
-                        match agent.update_research(id, patch).await {
-                            Ok(_) => format!("⏹ schedule cleared for `{id}`"),
+                        match agent
+                            .set_research_schedule(id, naked_core::ScheduleUpdate::Off)
+                            .await
+                        {
+                            Ok(()) => format!("⏹ schedule cleared for `{id}`"),
                             Err(e) => format!("error: {e}"),
                         }
                     }
@@ -380,6 +389,7 @@ pub(crate) async fn handle_research_cmd(
                     None,
                     Some(ctx.chat_id.0),
                     ctx.raw_thread_id(),
+                    naked_core::CreateSchedule::OneShotNow,
                 )
                 .await
             {
@@ -456,14 +466,13 @@ async fn schedule_research_on(
     let Some(s) = secs else {
         return format!("bad interval `{arg}` — try `3600`, `30m`, `1h`, `1d`");
     };
-    let patch = naked_core::ResearchPatch {
-        interval_seconds: naked_core::PatchField::Set(s),
-        ..Default::default()
-    };
-    match agent.update_research(id, patch).await {
-        Ok(spec) => format!(
+    match agent
+        .set_research_schedule(id, naked_core::ScheduleUpdate::Interval(s))
+        .await
+    {
+        Ok(()) => format!(
             "⏰ scheduled `{id}` — every {} (verify={})",
-            format_interval(spec.interval_seconds.unwrap_or(s)),
+            format_interval(s),
             agent.config().research.verify_by_default
         ),
         Err(e) => format!("error: {e}"),
@@ -1200,6 +1209,36 @@ mod tests {
     fn mock_bot(mock_url: &str) -> Bot {
         let url = reqwest::Url::parse(mock_url).unwrap();
         Bot::new("0:TEST_TOKEN").set_api_url(url)
+    }
+
+    fn test_research_spec(
+        interval_seconds: Option<u64>,
+        cron: Option<&str>,
+    ) -> naked_core::research::ResearchSpec {
+        naked_core::research::ResearchSpec {
+            id: "test-spec".into(),
+            topic: "test topic".into(),
+            interval_seconds,
+            cron: cron.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn research_list_marks_recurring_not_oneshot() {
+        let interval = test_research_spec(Some(21_600), None);
+        assert_eq!(super::recurring_marker(&interval), " 🔁");
+
+        let cron = test_research_spec(None, Some("0 * * * *"));
+        assert_eq!(super::recurring_marker(&cron), " 🔁");
+
+        let one_shot = test_research_spec(None, None);
+        assert_eq!(super::recurring_marker(&one_shot), "");
+
+        assert!(
+            source().contains("/research schedule <N> off"),
+            "list footer must advertise the recurring off-switch"
+        );
     }
 
     #[tokio::test]

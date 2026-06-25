@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,6 +8,8 @@ use serde::Deserialize;
 use crate::types::{Permission, ToolResult, ToolSpec};
 
 use super::Tool;
+
+pub(crate) const MAX_COLLECTED: usize = 512 * 1024; // 512KB max
 
 // ── Bash command classification ────────────────────────────────────────────
 
@@ -181,10 +184,77 @@ fn is_self_destructive(cmd: &str) -> bool {
     patterns.iter().any(|p| lower.contains(&p.to_lowercase()))
 }
 
+/// B85: Block git operations that DISCARD or REWRITE existing work in a shared
+/// repo. Operator policy (2026-06-22): a coding agent in someone else's repo may
+/// `git add` / `commit` / `push` (these only ADD to history, nothing is lost),
+/// but MUST NOT `reset` / `checkout` / `switch` / `restore` / `clean` /
+/// `push --force` / `rebase` (these throw away or move other users' work).
+///
+/// Returns the offending subcommand name when the command contains a blocked
+/// git operation anywhere in a `;`/`|`/`&&` pipeline. Matching is on the FIRST
+/// two tokens after a `git` token so `cargo test reset` or a file literally
+/// named "checkout" is not a false positive.
+pub(crate) fn git_history_destructive_op(cmd: &str) -> Option<&'static str> {
+    // Subcommands that can lose/move existing work. `clean` removes untracked
+    // files; `restore` discards working-tree changes; `reset`/`checkout`/`switch`
+    // move HEAD or overwrite files; `rebase` rewrites history.
+    const BLOCKED_GIT_SUBCMDS: &[&str] = &[
+        "reset", "checkout", "switch", "restore", "clean", "rebase", "revert",
+    ];
+    for segment in cmd.split(&['|', ';', '&', '\n'][..]) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            // Find a `git` token (allows env prefixes like `GIT_DIR=… git reset`).
+            if tokens[i] == "git" {
+                // Skip global flags like `-C path`, `--no-pager` to reach the subcommand.
+                let mut j = i + 1;
+                while j < tokens.len()
+                    && (tokens[j].starts_with('-')
+                        || (j >= 1 && (tokens[j - 1] == "-C" || tokens[j - 1] == "--git-dir")))
+                {
+                    j += 1;
+                }
+                if let Some(sub) = tokens.get(j) {
+                    let sub_lower = sub.to_ascii_lowercase();
+                    if let Some(found) = BLOCKED_GIT_SUBCMDS.iter().find(|b| **b == sub_lower) {
+                        return Some(found);
+                    }
+                    // Force-push: `git push --force` / `-f` / `--force-with-lease`
+                    // rewrites the remote ref. Plain `git push` is allowed
+                    // (append-only). Scope force detection to this same shell
+                    // segment so `git push && grep -f patterns.txt file` stays allowed.
+                    if sub_lower == "push"
+                        && tokens[j + 1..].iter().any(|token| {
+                            let token = token.to_ascii_lowercase();
+                            matches!(token.as_str(), "-f" | "--force" | "--force-with-lease")
+                        })
+                    {
+                        return Some("push --force");
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+pub(crate) fn git_history_block_reason(op: &str) -> String {
+    format!(
+        "Blocked: `git {op}` discards or rewrites existing work in a shared repo. You may \
+         `git add`/`commit`/`push` (append-only), but not reset/checkout/switch/restore/clean/\
+         rebase/revert/force-push. If the operator explicitly wants this, they must run it in \
+         their own terminal."
+    )
+}
+
 pub struct BashTool {
     timeout: Duration,
     /// B7: Optional remote ops. When set, commands run via SSH.
     ops: Option<std::sync::Arc<dyn super::ops::ToolOps>>,
+    /// Optional local persistent bash session. Never used for remote ops.
+    persistent: Option<(Arc<super::persistent_bash::PersistentBashManager>, String)>,
 }
 
 impl BashTool {
@@ -192,6 +262,7 @@ impl BashTool {
         Self {
             timeout: Duration::from_secs(timeout_secs),
             ops: None,
+            persistent: None,
         }
     }
 
@@ -200,7 +271,17 @@ impl BashTool {
         Self {
             timeout: Duration::from_secs(timeout_secs),
             ops: Some(ops),
+            persistent: None,
         }
+    }
+
+    pub fn with_persistent(
+        mut self,
+        manager: Arc<super::persistent_bash::PersistentBashManager>,
+        session_id: String,
+    ) -> Self {
+        self.persistent = Some((manager, session_id));
+        self
     }
 
     /// Parse + validate input. Shared by execute() and execute_with_progress().
@@ -211,6 +292,11 @@ impl BashTool {
                 "Blocked: this command would restart/kill the bot process. \
                  Use the operator's terminal instead.",
             ));
+        }
+        if let Some(op) = git_history_destructive_op(&input.command) {
+            // execute-time backstop; intentionally NOT counted — production loop
+            // attempts are counted at L1 policy.
+            return Err(ToolResult::err(git_history_block_reason(op)));
         }
         let timeout = input
             .timeout
@@ -291,7 +377,24 @@ impl Tool for BashTool {
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => ExecOutcome::Timeout,
                 Err(e) => ExecOutcome::ExecErr(e.to_string()),
             }
+        } else if let Some((manager, session_id)) = &self.persistent {
+            match manager.get_or_create(session_id, timeout).await {
+                Ok(shell) => match shell.run(&input.command, cwd, timeout).await {
+                    Ok(output) => ExecOutcome::Ok {
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                        success: output.exit_code == 0,
+                    },
+                    Err(super::persistent_bash::PersistentBashError::Timeout) => {
+                        ExecOutcome::Timeout
+                    }
+                    Err(e) => ExecOutcome::ExecErr(e.to_string()),
+                },
+                Err(super::persistent_bash::PersistentBashError::Timeout) => ExecOutcome::Timeout,
+                Err(e) => ExecOutcome::ExecErr(e.to_string()),
+            }
         } else {
+            super::persistent_bash::PersistentBashOutcome::Disabled.bump();
             match tokio::time::timeout(timeout, async {
                 tokio::process::Command::new("bash")
                     .arg("-c")
@@ -331,8 +434,8 @@ impl Tool for BashTool {
         cwd: &Path,
         progress: tokio::sync::mpsc::Sender<crate::types::AgentEvent>,
     ) -> ToolResult {
-        // For remote ops, fall back to non-streaming execute.
-        if self.ops.is_some() {
+        // For remote ops and persistent local shells, fall back to non-streaming execute.
+        if self.ops.is_some() || self.persistent.is_some() {
             return self.execute(input, cwd).await;
         }
 
@@ -387,8 +490,6 @@ impl Tool for BashTool {
         // Collector: accumulate all output + send ToolOutput every 2s.
         const TAIL_LINES: usize = 5;
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
-        const MAX_COLLECTED: usize = 512 * 1024; // 512KB max
-
         let mut all_lines: Vec<String> = Vec::new();
         let mut total_bytes: usize = 0;
         let mut last_progress = std::time::Instant::now();

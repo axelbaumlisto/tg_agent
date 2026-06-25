@@ -718,6 +718,7 @@ pub fn resolve_auto_model(
 pub(crate) fn build_loop_config(
     max_iterations: usize,
     max_wall: Option<std::time::Duration>,
+    turn_backstop: Option<std::time::Duration>,
     cwd: std::path::PathBuf,
     model: String,
     max_tokens: u32,
@@ -732,6 +733,8 @@ pub(crate) fn build_loop_config(
     crate::loop_::LoopConfig {
         max_iterations,
         max_wall,
+        tool_deadline: max_wall,
+        turn_backstop,
         cwd,
         model,
         max_tokens,

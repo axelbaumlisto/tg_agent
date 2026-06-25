@@ -5,8 +5,23 @@
 
 use crate::types::{Permission, ToolResult, ToolSpec};
 use std::path::Path;
+use std::sync::Arc;
 
-pub struct ApplyPatchTool;
+pub struct ApplyPatchTool {
+    fs_cache: Option<Arc<super::fs_cache::FsCache>>,
+}
+
+impl ApplyPatchTool {
+    pub fn new(fs_cache: Option<Arc<super::fs_cache::FsCache>>) -> Self {
+        Self { fs_cache }
+    }
+}
+
+impl Default for ApplyPatchTool {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 #[async_trait::async_trait]
 impl crate::tool::Tool for ApplyPatchTool {
@@ -48,6 +63,7 @@ impl crate::tool::Tool for ApplyPatchTool {
             cwd.join(file_path)
         };
 
+        let _file_guard = super::file_lock::lock_file(&path).await;
         let old = match tokio::fs::read_to_string(&path).await {
             Ok(s) => s,
             Err(e) => {
@@ -58,12 +74,18 @@ impl crate::tool::Tool for ApplyPatchTool {
         match apply_unified_diff(&old, patch) {
             Ok(new_content) => {
                 let diff = super::diff_format::unified_diff(file_path, &old, &new_content);
-                match tokio::fs::write(&path, &new_content).await {
-                    Ok(()) => ToolResult::ok(if diff.is_empty() {
-                        "Patch applied (no changes)".to_string()
-                    } else {
-                        format!("Patch applied:\n\n{diff}")
-                    }),
+                match super::atomic_write::atomic_replace_file(&path, new_content.as_bytes()).await
+                {
+                    Ok(()) => {
+                        if let Some(cache) = &self.fs_cache {
+                            cache.invalidate(&path).await;
+                        }
+                        ToolResult::ok(if diff.is_empty() {
+                            "Patch applied (no changes)".to_string()
+                        } else {
+                            format!("Patch applied:\n\n{diff}")
+                        })
+                    }
                     Err(e) => ToolResult::err(format!("Write failed: {e}")),
                 }
             }
@@ -178,6 +200,118 @@ fn matches_context(lines: &[String], start: usize, context: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::Tool;
+
+    #[tokio::test]
+    async fn apply_patch_uses_atomic_replace_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("patch.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let tool = ApplyPatchTool::default();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": "patch.txt",
+                    "patch": "@@ -2,1 +2,1 @@\n-beta\n+BETA\n"
+                }),
+                dir.path(),
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert_no_atomic_temps(dir.path(), "patch.txt");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_failure_leaves_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let path = protected.join("patch.txt");
+        let original = "alpha\nbeta\ngamma\n";
+        std::fs::write(&path, original).unwrap();
+
+        let original_mode = make_read_only_dir(&protected);
+        let tool = ApplyPatchTool::default();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "patch": "@@ -2,1 +2,1 @@\n-beta\n+BETA\n"
+                }),
+                dir.path(),
+            )
+            .await;
+        restore_dir_mode(&protected, original_mode);
+
+        assert!(result.is_error);
+        assert!(result.output.contains("Write failed:"), "{}", result.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_no_atomic_temps(&protected, "patch.txt");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_serializes_concurrent_same_file() {
+        for i in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("patch.txt");
+            std::fs::write(&path, "a = 1\nb = 2\n").unwrap();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let cwd_a = dir.path().to_path_buf();
+            let barrier_a = barrier.clone();
+            let patch_a = tokio::spawn(async move {
+                barrier_a.wait().await;
+                ApplyPatchTool::default()
+                    .execute(
+                        serde_json::json!({
+                            "path": "patch.txt",
+                            "patch": "@@ -1,1 +1,1 @@\n-a = 1\n+a = 10\n"
+                        }),
+                        &cwd_a,
+                    )
+                    .await
+            });
+
+            let cwd_b = dir.path().to_path_buf();
+            let barrier_b = barrier.clone();
+            let patch_b = tokio::spawn(async move {
+                barrier_b.wait().await;
+                ApplyPatchTool::default()
+                    .execute(
+                        serde_json::json!({
+                            "path": "patch.txt",
+                            "patch": "@@ -2,1 +2,1 @@\n-b = 2\n+b = 20\n"
+                        }),
+                        &cwd_b,
+                    )
+                    .await
+            });
+
+            let (result_a, result_b) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::join!(patch_a, patch_b)
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("concurrent apply_patch ops timed out on iteration {i}")
+                });
+            let result_a = result_a.unwrap();
+            let result_b = result_b.unwrap();
+            assert!(!result_a.is_error, "iteration {i}: {}", result_a.output);
+            assert!(!result_b.is_error, "iteration {i}: {}", result_b.output);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "a = 10\nb = 20\n",
+                "iteration {i} lost one concurrent patch"
+            );
+        }
+    }
 
     #[test]
     fn simple_add_line() {
@@ -211,4 +345,39 @@ mod tests {
         assert_eq!(parse_hunk_header("@@ -10,3 +10,5 @@"), 9);
         assert_eq!(parse_hunk_header("@@ -1,1 +1,1 @@"), 0);
     }
+
+    fn assert_no_atomic_temps(dir: &Path, file_name: &str) {
+        let prefix = format!(".{file_name}.tmp.");
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    fn make_read_only_dir(path: &Path) -> Option<std::fs::Permissions> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = std::fs::metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Some(original)
+    }
+
+    #[cfg(not(unix))]
+    fn make_read_only_dir(_path: &Path) -> Option<std::fs::Permissions> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn restore_dir_mode(path: &Path, original: Option<std::fs::Permissions>) {
+        if let Some(original) = original {
+            std::fs::set_permissions(path, original).unwrap();
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn restore_dir_mode(_path: &Path, _original: Option<std::fs::Permissions>) {}
 }

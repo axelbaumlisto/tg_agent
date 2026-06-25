@@ -339,6 +339,16 @@ fn default_config_empty() {
     assert!(cfg.default_provider.is_empty());
     assert_eq!(cfg.max_iterations, 0);
     assert!(!cfg.run_registry_multi_stream_enabled);
+    assert!(!cfg.turn_deadline_backstop_enabled);
+    assert_eq!(cfg.turn_deadline_secs, 900);
+    assert!(!cfg.stale_edit_guard_enabled);
+    assert!(!cfg.hashline_edit_enabled);
+    assert!(!cfg.fs_cache_enabled);
+    assert!(!cfg.persistent_bash_enabled);
+    assert_eq!(cfg.fs_cache_max_bytes, 64 * 1024 * 1024);
+    assert!(!cfg.fff_fast_index_enabled);
+    assert_eq!(cfg.fff_fast_index_max_workspaces, 4);
+    assert_eq!(cfg.fff_fast_index_cache_max_bytes, 256 * 1024 * 1024);
 }
 
 #[test]
@@ -1405,6 +1415,151 @@ fn run_registry_multi_stream_enabled_parses_at_root_not_nested() {
     let nested: Config =
         serde_json::from_str(r#"{"telegram":{"run_registry_multi_stream_enabled":true}}"#).unwrap();
     assert!(!nested.run_registry_multi_stream_enabled);
+}
+
+#[test]
+fn stale_edit_guard_flag_default_false_root_parse() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.stale_edit_guard_enabled);
+
+    let root: Config = serde_json::from_str(r#"{"stale_edit_guard_enabled":true}"#).unwrap();
+    assert!(root.stale_edit_guard_enabled);
+
+    let nested: Config =
+        serde_json::from_str(r#"{"telegram":{"stale_edit_guard_enabled":true}}"#).unwrap();
+    assert!(!nested.stale_edit_guard_enabled);
+}
+
+#[test]
+fn hashline_flag_default_false_root_parse() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.hashline_edit_enabled);
+
+    let root: Config = serde_json::from_str(r#"{"hashline_edit_enabled":true}"#).unwrap();
+    assert!(root.hashline_edit_enabled);
+
+    let nested: Config =
+        serde_json::from_str(r#"{"telegram":{"hashline_edit_enabled":true}}"#).unwrap();
+    assert!(!nested.hashline_edit_enabled);
+}
+
+#[test]
+fn fs_cache_flag_default_false_root_parse() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.fs_cache_enabled);
+    assert_eq!(default_cfg.fs_cache_max_bytes, 64 * 1024 * 1024);
+
+    let root: Config = serde_json::from_str(
+        r#"{
+            "fs_cache_enabled": true,
+            "fs_cache_max_bytes": 1048576
+        }"#,
+    )
+    .unwrap();
+    assert!(root.fs_cache_enabled);
+    assert_eq!(root.fs_cache_max_bytes, 1024 * 1024);
+
+    let nested: Config = serde_json::from_str(
+        r#"{
+            "telegram": {
+                "fs_cache_enabled": true,
+                "fs_cache_max_bytes": 1048576
+            }
+        }"#,
+    )
+    .unwrap();
+    assert!(!nested.fs_cache_enabled);
+    assert_eq!(nested.fs_cache_max_bytes, 64 * 1024 * 1024);
+}
+
+#[test]
+fn persistent_bash_flag_default_false_root_parse() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.persistent_bash_enabled);
+
+    let root: Config = serde_json::from_str(
+        r#"{
+            "persistent_bash_enabled": true
+        }"#,
+    )
+    .unwrap();
+    assert!(root.persistent_bash_enabled);
+
+    let nested: Config = serde_json::from_str(
+        r#"{
+            "telegram": {
+                "persistent_bash_enabled": true
+            }
+        }"#,
+    )
+    .unwrap();
+    assert!(!nested.persistent_bash_enabled);
+}
+
+#[test]
+fn fff_fast_flag_default_false_and_root_parse_only() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.fff_fast_index_enabled);
+    assert_eq!(default_cfg.fff_fast_index_max_workspaces, 4);
+    assert_eq!(
+        default_cfg.fff_fast_index_cache_max_bytes,
+        256 * 1024 * 1024
+    );
+
+    let root: Config = serde_json::from_str(
+        r#"{
+            "fff_fast_index_enabled": true,
+            "fff_fast_index_max_workspaces": 2,
+            "fff_fast_index_cache_max_bytes": 134217728
+        }"#,
+    )
+    .unwrap();
+    assert!(root.fff_fast_index_enabled);
+    assert_eq!(root.fff_fast_index_max_workspaces, 2);
+    assert_eq!(root.fff_fast_index_cache_max_bytes, 134217728);
+
+    let nested: Config = serde_json::from_str(
+        r#"{
+            "telegram": {
+                "fff_fast_index_enabled": true,
+                "fff_fast_index_max_workspaces": 2,
+                "fff_fast_index_cache_max_bytes": 134217728
+            }
+        }"#,
+    )
+    .unwrap();
+    assert!(!nested.fff_fast_index_enabled);
+    assert_eq!(nested.fff_fast_index_max_workspaces, 4);
+    assert_eq!(nested.fff_fast_index_cache_max_bytes, 256 * 1024 * 1024);
+}
+
+#[test]
+fn turn_deadline_backstop_flag_default_false_and_root_parse_only() {
+    let default_cfg = Config::default();
+    assert!(!default_cfg.turn_deadline_backstop_enabled);
+    assert_eq!(default_cfg.turn_deadline_secs, 900);
+
+    let root: Config = serde_json::from_str(
+        r#"{
+            "turn_deadline_backstop_enabled": true,
+            "turn_deadline_secs": 1200
+        }"#,
+    )
+    .unwrap();
+    assert!(root.turn_deadline_backstop_enabled);
+    assert_eq!(root.turn_deadline_secs, 1200);
+
+    let nested: Config = serde_json::from_str(
+        r#"{
+            "telegram": {
+                "turn_deadline_backstop_enabled": true,
+                "turn_deadline_secs": 1200
+            }
+        }"#,
+    )
+    .unwrap();
+    assert!(!nested.turn_deadline_backstop_enabled);
+    assert_eq!(nested.turn_deadline_secs, 900);
 }
 
 #[test]

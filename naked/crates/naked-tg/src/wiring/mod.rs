@@ -60,7 +60,14 @@ use invariants::{
 };
 
 pub(crate) async fn build() -> WiredBot {
-    let config = Config::load().expect("Failed to load config");
+    let (config, config_source) = Config::load_with_source_bytes().expect("Failed to load config");
+    let loaded_config_hash = naked_tg::config_hash::loaded_hash_from_source(config_source, &config);
+    tracing::info!(
+        hash = %loaded_config_hash.hash_hex,
+        source = %loaded_config_hash.source,
+        "loaded config hash"
+    );
+    let _ = crate::shared::CONFIG_LOADED_HASH.set(loaded_config_hash);
     let provider =
         naked_core::build_provider_from_config(&config).expect("Failed to build provider");
     let agent = Arc::new(AgentCore::new(config.clone(), provider));

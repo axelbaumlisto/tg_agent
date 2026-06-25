@@ -24,6 +24,11 @@ naked-core = { path = "../naked-core" }
 naked-tg = { path = "../naked-tg" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+# RATIONALE: `naked tui` ActiveTurn abort wiring stores AgentHandle CancellationToken directly.
+tokio-util = { workspace = true }
+# RATIONALE: `naked tui` ratatui terminal frontend (PLAN_NAKED_TUI_v1).
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
