@@ -109,6 +109,17 @@ pub(crate) struct StreamResponseOutcome {
     pub(crate) wall_timeout: bool,
 }
 
+/// B113: single definition of "the agent made progress".
+///
+/// Consumed by BOTH the run-registry silence warner and the UI stall detector.
+/// A keep-alive `Heartbeat` is explicitly NOT progress: it is emitted while a
+/// tool or provider call is blocked, so counting it as progress is what let a
+/// wedged turn look healthy to the user. Any future keep-alive variant is
+/// classified once, here.
+fn is_progress_event(event: &AgentEvent) -> bool {
+    !matches!(event, AgentEvent::Heartbeat)
+}
+
 /// B106: annotate the view when the provider the user picked did not actually
 /// serve the turn, so `render_final` can warn at the top of the answer.
 ///
@@ -312,10 +323,16 @@ pub(crate) async fn stream_response(
         };
 
         // FIX-3: Detect stalled agent (no events for 90s).
-        if event.is_some() {
+        // B113: "did the agent make progress?" must be ONE predicate. The
+        // run-registry gate below excluded `Heartbeat`; this reset did not, so
+        // an agent wedged inside a provider call kept its keep-alive pump
+        // running, `stall_level` never left 0, and the user never saw the 60s /
+        // 2min warnings — while `warn_silent_runs` DID fire in the journal.
+        // Ops saw a silent run, the user saw a healthy spinner.
+        if event.as_ref().is_some_and(is_progress_event) {
             last_event_at = tokio::time::Instant::now();
             stall_level = 0;
-        } else {
+        } else if event.is_none() {
             let elapsed = last_event_at.elapsed().as_secs();
             if stall_level == 0 && elapsed >= 60 {
                 stall_level = 1;
@@ -334,15 +351,21 @@ pub(crate) async fn stream_response(
 
         let has_event = event.is_some();
         if let Some(event) = event {
-            if !matches!(&event, AgentEvent::Heartbeat) {
+            if is_progress_event(&event) {
                 let _ = crate::shared::RUN_REGISTRY.mark_run_progress(&run_id);
             }
             match event {
+                // B113: `|=`, not `=`. Every other arm sets `dirty = true`;
+                // these two OVERWROTE it, so a delta whose handler reports
+                // `Clean` (a coalescing no-op) cleared a pending flush queued
+                // by an earlier `ToolEnd` \u2014 the tool result then sat in the view
+                // unrendered, and if the next event was `Idle` the live bubble
+                // never showed it at all.
                 AgentEvent::ThinkingDelta(t) => {
-                    dirty = handlers::handle_thinking_delta(&mut view, &t) != ViewAction::Clean;
+                    dirty |= handlers::handle_thinking_delta(&mut view, &t) != ViewAction::Clean;
                 }
                 AgentEvent::TextDelta(t) => {
-                    dirty = handlers::handle_text_delta(&mut view, &t) != ViewAction::Clean;
+                    dirty |= handlers::handle_text_delta(&mut view, &t) != ViewAction::Clean;
                 }
                 AgentEvent::ToolStart { name, input, .. } => {
                     let _ = handlers::handle_tool_start(&mut view, &name, &input);
@@ -583,7 +606,14 @@ pub(crate) async fn stream_response(
         }
     }
 
-    notify_if_agent_died_without_idle(&bot, ctx, got_idle).await;
+    // B113: a deliberate in-flight `/model` switch breaks out of the loop
+    // WITHOUT setting `got_idle`, so an unconditional call here told the user
+    // "\u{1f534} \u{412}\u{43d}\u{443}\u{442}\u{440}\u{435}\u{43d}\u{43d}\u{44f}\u{44f} \u{43e}\u{448}\u{438}\u{431}\u{43a}\u{430}" and logged `error!("agent task died
+    // without Idle \u{2014} likely panicked")` on a path the code itself calls
+    // "the turn was interrupted" \u2014 poisoning log-based crash alerting too.
+    if !aborted_for_switch {
+        notify_if_agent_died_without_idle(&bot, ctx, got_idle).await;
+    }
     typing_cancel.cancel();
 
     if aborted_for_switch {
@@ -941,5 +971,35 @@ async fn deliver_one_attachment(
             let safe = redact_for_log(&e);
             tracing::warn!(file = %att.file_name, error = %safe, "telegram_attach form build failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod b113_tests {
+    use super::*;
+
+    /// B113: the run-registry silence warner and the UI stall detector must
+    /// share one notion of progress. They did not: the registry excluded
+    /// `Heartbeat`, the stall timer counted it, so a wedged turn kept a healthy
+    /// spinner while ops saw a silent run.
+    #[test]
+    fn b113_heartbeat_is_not_progress() {
+        assert!(
+            !is_progress_event(&AgentEvent::Heartbeat),
+            "a keep-alive emitted while a call is blocked must not reset the \
+             stall timer — that is what hid wedged turns from the user"
+        );
+    }
+
+    #[test]
+    fn b113_real_events_are_progress() {
+        assert!(is_progress_event(&AgentEvent::TextDelta("hi".into())));
+        assert!(is_progress_event(&AgentEvent::ThinkingDelta("t".into())));
+        assert!(is_progress_event(&AgentEvent::Idle));
+        assert!(is_progress_event(&AgentEvent::ToolStart {
+            call_id: "c".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }));
     }
 }
