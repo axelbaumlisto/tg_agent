@@ -263,11 +263,21 @@ async fn code_agent_full_tooling_hotpath_e2e() {
     );
 
     // Optimization counters moved as designed.
-    let g_fast = FFF_GREP_FAST_INDEX_COUNT.load(Ordering::Relaxed) - g_fast0;
-    let g_fallback = FFF_GREP_FALLBACK_COUNT.load(Ordering::Relaxed) - g_fallback0;
-    let c_hit = FS_CACHE_HIT_COUNT.load(Ordering::Relaxed) - c_hit0;
-    let c_miss = FS_CACHE_MISS_COUNT.load(Ordering::Relaxed) - c_miss0;
-    let pb_ok = PERSISTENT_BASH_OK_COUNT.load(Ordering::Relaxed) - pb_ok0;
+    let g_fast = FFF_GREP_FAST_INDEX_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_sub(g_fast0);
+    let g_fallback = FFF_GREP_FALLBACK_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_sub(g_fallback0);
+    let c_hit = FS_CACHE_HIT_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_sub(c_hit0);
+    let c_miss = FS_CACHE_MISS_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_sub(c_miss0);
+    let pb_ok = PERSISTENT_BASH_OK_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_sub(pb_ok0);
 
     assert!(
         g_fast >= 1,

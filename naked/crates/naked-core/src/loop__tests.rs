@@ -3,7 +3,7 @@ use crate::provider::{ChatRequest, Provider};
 use crate::tool::Tool;
 use crate::types::{ContentBlock, Permission, Role, SteerMessage, ToolSpec, ToolState};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct MockProvider {
     responses: Vec<Vec<StreamChunk>>,
@@ -221,26 +221,24 @@ fn turn_bucket_delta_total(
     before: crate::metrics_hist::LatencySnapshot,
     after: crate::metrics_hist::LatencySnapshot,
 ) -> u64 {
-    (after.turn_under_1s - before.turn_under_1s)
-        + (after.turn_1s_to_10s - before.turn_1s_to_10s)
-        + (after.turn_10s_to_60s - before.turn_10s_to_60s)
-        + (after.turn_over_60s - before.turn_over_60s)
+    after.turn_under_1s.saturating_sub(before.turn_under_1s)
+        + after.turn_1s_to_10s.saturating_sub(before.turn_1s_to_10s)
+        + after.turn_10s_to_60s.saturating_sub(before.turn_10s_to_60s)
+        + after.turn_over_60s.saturating_sub(before.turn_over_60s)
 }
 
-fn observed_ttft_bucket_delta(
+fn ttft_bucket_delta_total(
     before: crate::metrics_hist::LatencySnapshot,
     after: crate::metrics_hist::LatencySnapshot,
-    observed_ms: u64,
 ) -> u64 {
-    if observed_ms < 500 {
-        after.ttft_under_500ms - before.ttft_under_500ms
-    } else if observed_ms < 2_000 {
-        after.ttft_500ms_to_2s - before.ttft_500ms_to_2s
-    } else if observed_ms < 10_000 {
-        after.ttft_2s_to_10s - before.ttft_2s_to_10s
-    } else {
-        after.ttft_over_10s - before.ttft_over_10s
-    }
+    after
+        .ttft_under_500ms
+        .saturating_sub(before.ttft_under_500ms)
+        + after
+            .ttft_500ms_to_2s
+            .saturating_sub(before.ttft_500ms_to_2s)
+        + after.ttft_2s_to_10s.saturating_sub(before.ttft_2s_to_10s)
+        + after.ttft_over_10s.saturating_sub(before.ttft_over_10s)
 }
 
 #[async_trait::async_trait]
@@ -306,6 +304,36 @@ impl Tool for EchoTool {
         let text = input["text"].as_str().unwrap_or("no text");
         crate::types::ToolResult {
             output: format!("echoed: {text}"),
+            is_error: false,
+        }
+    }
+}
+
+struct RecordingEchoTool {
+    executions: std::sync::Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for RecordingEchoTool {
+    fn spec(&self) -> ToolSpec {
+        // REGISTRY-WAIVE: exhaustive test struct ctor — ToolSpec has no Default; this fixture must pin permission/name explicitly.
+        ToolSpec {
+            name: "echo".into(),
+            description: "Recording echo input".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
+            permission: Permission::ReadOnly,
+        }
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _cwd: &std::path::Path,
+    ) -> crate::types::ToolResult {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        let text = input["text"].as_str().unwrap_or("no text");
+        crate::types::ToolResult {
+            output: format!("recorded: {text}"),
             is_error: false,
         }
     }
@@ -811,28 +839,25 @@ async fn agent_turn_duration_records_on_successful_text_turn() {
     assert!(saw_text_delta, "delayed text turn must emit TextDelta");
 
     let after = crate::metrics_hist::snapshot();
-    let turn_sum_delta = after.turn_sum_ms - before.turn_sum_ms;
-    // `async_test_guard` serialises the three metrics tests against EACH OTHER,
-    // but `record_turn_duration` is a process-global counter written by every
-    // one of the ~34 tests in this file that drives `AgentLoop::run` — none of
-    // which take the guard. Demanding an exact delta of 1 therefore races with
-    // any concurrently finishing turn (reproduced ~1 run in 3). Assert the
-    // sample landed instead of asserting nobody else existed.
+    let turn_sum_delta = after.turn_sum_ms.saturating_sub(before.turn_sum_ms);
+    let turn_count_delta = after.turn_count.saturating_sub(before.turn_count);
+    // `async_test_guard` serialises metrics tests that reset the process-global
+    // counters. Other AgentLoop tests may still record additional turn samples,
+    // so assert the sample landed instead of asserting nobody else existed.
     assert!(
-        after.turn_count - before.turn_count >= 1,
-        "this test's turn must be counted (delta {})",
-        after.turn_count - before.turn_count
+        turn_count_delta >= 1,
+        "this test's turn must be counted (delta {turn_count_delta})"
     );
     assert!(
         turn_sum_delta >= 600,
         "turn sum delta was {turn_sum_delta}ms"
     );
-    // Pick the bucket from THIS test's known duration (600ms provider delay,
-    // so the 1s..10s band at worst), not from `turn_sum_delta` — that delta is
-    // the sum over every turn recorded in the window, so a concurrent fast
-    // turn inflates it and selects a bucket this sample never landed in.
-    // Asserting the total covers "our sample was bucketed" without guessing
-    // which band a racing turn used.
+    // Do not pick the bucket from `turn_sum_delta`: that delta is the sum over
+    // every turn recorded in the window, so a concurrent turn can select a
+    // bucket this sample never landed in. This test's 600ms provider delay
+    // normally lands in `turn_under_1s` (the edge is 1000ms), but scheduler
+    // load can push the observed turn past that edge. Asserting the total
+    // covers "our sample was bucketed" without guessing which band was used.
     assert!(
         turn_bucket_delta_total(before, after) >= 1,
         "turn bucket total must include at least this test's sample"
@@ -854,9 +879,10 @@ async fn agent_ttft_records_first_text_delta_after_provider_delay() {
     assert!(result.is_ok());
 
     let after = crate::metrics_hist::snapshot();
-    let ttft_sum_delta = after.ttft_sum_ms - before.ttft_sum_ms;
+    let ttft_sum_delta = after.ttft_sum_ms.saturating_sub(before.ttft_sum_ms);
+    let ttft_count_delta = after.ttft_count.saturating_sub(before.ttft_count);
     assert!(
-        after.ttft_count > before.ttft_count,
+        ttft_count_delta >= 1,
         "ttft count must include at least this test's sample"
     );
     assert!(
@@ -864,11 +890,12 @@ async fn agent_ttft_records_first_text_delta_after_provider_delay() {
         "ttft sum delta was {ttft_sum_delta}ms"
     );
     assert!(
-        observed_ttft_bucket_delta(before, after, ttft_sum_delta) >= 1,
-        "observed ttft bucket must include at least this test's sample"
+        ttft_bucket_delta_total(before, after) >= 1,
+        "ttft bucket total must include at least this test's sample"
     );
+    let turn_count_delta = after.turn_count.saturating_sub(before.turn_count);
     assert!(
-        after.turn_count > before.turn_count,
+        turn_count_delta >= 1,
         "turn duration count should also increase during the successful turn"
     );
 }
@@ -897,8 +924,9 @@ async fn agent_turn_duration_records_on_provider_error() {
     ));
 
     let after = crate::metrics_hist::snapshot();
+    let turn_count_delta = after.turn_count.saturating_sub(before.turn_count);
     assert!(
-        after.turn_count > before.turn_count,
+        turn_count_delta >= 1,
         "provider error path must record at least one turn duration sample"
     );
     assert!(
@@ -1080,7 +1108,9 @@ async fn loop_permission_denied_skips_tool() {
         vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
     ]);
 
-    struct DangerTool;
+    struct DangerTool {
+        executed: std::sync::Arc<AtomicBool>,
+    }
     #[async_trait::async_trait]
     impl Tool for DangerTool {
         fn spec(&self) -> ToolSpec {
@@ -1097,6 +1127,7 @@ async fn loop_permission_denied_skips_tool() {
             _input: serde_json::Value,
             _cwd: &std::path::Path,
         ) -> crate::types::ToolResult {
+            self.executed.store(true, Ordering::SeqCst);
             crate::types::ToolResult {
                 output: "executed".into(),
                 is_error: false,
@@ -1104,7 +1135,10 @@ async fn loop_permission_denied_skips_tool() {
         }
     }
 
-    let tools: Vec<Box<dyn Tool>> = vec![Box::new(DangerTool)];
+    let executed = std::sync::Arc::new(AtomicBool::new(false));
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(DangerTool {
+        executed: std::sync::Arc::clone(&executed),
+    })];
     let agent_loop = make_loop(provider, tools);
     let mut history = ConversationHistory::new("sys".into());
     history.push_user("do it");
@@ -1115,12 +1149,15 @@ async fn loop_permission_denied_skips_tool() {
     let (perm_tx, perm_rx) = mpsc::channel(4);
 
     let loop_handle = tokio::spawn(async move {
-        agent_loop
+        let result = agent_loop
             .run(&mut history, tx, cancel, Some(perm_rx), None)
-            .await
+            .await;
+        (result, history)
     });
 
     let mut saw_permission_request = false;
+    let mut saw_success_tool_end = false;
+    let mut saw_denial_tool_end = false;
     while let Some(ev) = rx.recv().await {
         if let AgentEvent::PermissionRequest { call_id, .. } = &ev {
             saw_permission_request = true;
@@ -1131,14 +1168,61 @@ async fn loop_permission_denied_skips_tool() {
                 })
                 .await;
         }
+        if let AgentEvent::ToolEnd { output, state, .. } = &ev {
+            if *state == ToolState::Completed && output == "executed" {
+                saw_success_tool_end = true;
+            }
+            if *state == ToolState::Error && output == "Permission denied by user" {
+                saw_denial_tool_end = true;
+            }
+        }
         if matches!(ev, AgentEvent::Idle) {
             break;
         }
     }
 
     assert!(saw_permission_request);
-    let result = loop_handle.await.unwrap();
+    assert!(saw_denial_tool_end, "denial should be surfaced as ToolEnd");
+    assert!(
+        !saw_success_tool_end,
+        "denied tool must not emit a successful ToolEnd"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "denied tool executed despite explicit user refusal"
+    );
+    let (result, history) = loop_handle.await.unwrap();
     assert!(result.is_ok());
+    assert!(
+        history.messages().iter().any(|msg| {
+            msg.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        call_id,
+                        output,
+                        is_error: true,
+                    } if call_id == "call1" && output == "Permission denied by user"
+                )
+            })
+        }),
+        "history must record the denial as an error tool_result"
+    );
+    assert!(
+        !history.messages().iter().any(|msg| {
+            msg.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        output,
+                        is_error: false,
+                        ..
+                    } if output == "executed"
+                )
+            })
+        }),
+        "history must not record successful output for a denied tool"
+    );
 }
 
 #[tokio::test]
@@ -1231,9 +1315,12 @@ async fn loop_policy_deny_blocks_tool() {
         vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
     ]);
 
+    let executions = std::sync::Arc::new(AtomicUsize::new(0));
     let agent_loop = AgentLoop::with_policy(
         Box::new(provider),
-        crate::tool::registry::ToolRegistry::new(vec![Box::new(EchoTool)]),
+        crate::tool::registry::ToolRegistry::new(vec![Box::new(RecordingEchoTool {
+            executions: std::sync::Arc::clone(&executions),
+        })]),
         LoopConfig {
             max_iterations: 10,
             max_wall: None,
@@ -1250,19 +1337,186 @@ async fn loop_policy_deny_blocks_tool() {
     let mut history = ConversationHistory::new(String::new());
     history.push_user("test");
 
-    let _ = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(result.is_ok());
 
-    // Collect events
     let mut saw_deny = false;
+    let mut saw_success_tool_end = false;
     while let Ok(ev) = rx.try_recv() {
-        if let AgentEvent::ToolEnd { output, state, .. } = ev
-            && output.contains("denied by policy")
-            && state == ToolState::Error
+        if let AgentEvent::ToolEnd {
+            call_id,
+            name,
+            output,
+            state,
+        } = ev
         {
-            saw_deny = true;
+            if call_id == "c1"
+                && name == "echo"
+                && output.contains("denied by policy")
+                && state == ToolState::Error
+            {
+                saw_deny = true;
+            }
+            if call_id == "c1"
+                && name == "echo"
+                && output == "recorded: hello"
+                && state == ToolState::Completed
+            {
+                saw_success_tool_end = true;
+            }
         }
     }
     assert!(saw_deny, "policy denial should emit ToolEnd with error");
+    assert!(
+        !saw_success_tool_end,
+        "policy-denied tool must not emit a successful ToolEnd"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "policy-denied tool executed despite policy denial"
+    );
+    assert!(
+        history.messages().iter().any(|msg| {
+            msg.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        call_id,
+                        output,
+                        is_error: true,
+                    } if call_id == "c1" && output.contains("denied by policy")
+                )
+            })
+        }),
+        "history must record the policy denial as an error tool_result"
+    );
+    assert!(
+        !history.messages().iter().any(|msg| {
+            msg.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        call_id,
+                        output,
+                        is_error: false,
+                    } if call_id == "c1" && output == "recorded: hello"
+                )
+            })
+        }),
+        "history must not record successful output for a policy-denied tool"
+    );
+}
+
+#[tokio::test]
+async fn loop_guard_denial_skips_blocked_tool() {
+    let provider = MockProvider::new(vec![
+        vec![
+            StreamChunk::ToolUse {
+                id: "c1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "loop"}),
+            },
+            StreamChunk::ToolUse {
+                id: "c2".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "loop"}),
+            },
+            StreamChunk::ToolUse {
+                id: "c3".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "loop"}),
+            },
+            StreamChunk::Done,
+        ],
+        vec![StreamChunk::Text("ok".into()), StreamChunk::Done],
+    ]);
+
+    let executions = std::sync::Arc::new(AtomicUsize::new(0));
+    let agent_loop = make_loop(
+        provider,
+        vec![Box::new(RecordingEchoTool {
+            executions: std::sync::Arc::clone(&executions),
+        })],
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("test");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(result.is_ok());
+
+    let mut saw_guard_denial = false;
+    let mut saw_blocked_success_tool_end = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::ToolEnd {
+            call_id,
+            name,
+            output,
+            state,
+        } = ev
+        {
+            if call_id == "c3"
+                && name == "echo"
+                && output.contains("already ran 3 times")
+                && state == ToolState::Error
+            {
+                saw_guard_denial = true;
+            }
+            if call_id == "c3"
+                && name == "echo"
+                && output == "recorded: loop"
+                && state == ToolState::Completed
+            {
+                saw_blocked_success_tool_end = true;
+            }
+        }
+    }
+    assert!(
+        saw_guard_denial,
+        "loop guard denial should emit ToolEnd with error"
+    );
+    assert!(
+        !saw_blocked_success_tool_end,
+        "loop-guard-blocked tool must not emit a successful ToolEnd"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        2,
+        "loop guard should skip the third identical tool call"
+    );
+    assert!(
+        history.messages().iter().any(|msg| {
+            msg.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        call_id,
+                        output,
+                        is_error: true,
+                    } if call_id == "c3" && output.contains("already ran 3 times")
+                )
+            })
+        }),
+        "history must record the loop guard denial as an error tool_result"
+    );
+    assert!(
+        !history.messages().iter().any(|msg| {
+            msg.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        call_id,
+                        output,
+                        is_error: false,
+                    } if call_id == "c3" && output == "recorded: loop"
+                )
+            })
+        }),
+        "history must not record successful output for a loop-guard-blocked tool"
+    );
 }
 
 // ── Steer tests ──────────────────────────────────────────────────

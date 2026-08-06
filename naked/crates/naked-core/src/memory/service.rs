@@ -549,10 +549,15 @@ mod tests {
         }
 
         fn delta_since(self, before: Self) -> Self {
+            // Deltas over PROCESS-GLOBAL counters: another test finishing
+            // between the two snapshots can only ever raise them, but a future
+            // reset path would make a plain `-` panic in debug. Saturating is
+            // the same value in the normal case and a soft 0 in the pathological
+            // one.
             Self {
-                global: self.global - before.global,
-                project: self.project - before.project,
-                user: self.user - before.user,
+                global: self.global.saturating_sub(before.global),
+                project: self.project.saturating_sub(before.project),
+                user: self.user.saturating_sub(before.user),
             }
         }
     }

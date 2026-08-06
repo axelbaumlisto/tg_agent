@@ -227,13 +227,21 @@ mod tests {
         observed_ms: u64,
     ) -> u64 {
         if observed_ms < 500 {
-            after.provider_under_500ms - before.provider_under_500ms
+            after
+                .provider_under_500ms
+                .saturating_sub(before.provider_under_500ms)
         } else if observed_ms < 2_000 {
-            after.provider_500ms_to_2s - before.provider_500ms_to_2s
+            after
+                .provider_500ms_to_2s
+                .saturating_sub(before.provider_500ms_to_2s)
         } else if observed_ms < 10_000 {
-            after.provider_2s_to_10s - before.provider_2s_to_10s
+            after
+                .provider_2s_to_10s
+                .saturating_sub(before.provider_2s_to_10s)
         } else {
-            after.provider_over_10s - before.provider_over_10s
+            after
+                .provider_over_10s
+                .saturating_sub(before.provider_over_10s)
         }
     }
 
@@ -289,10 +297,16 @@ mod tests {
             Ok(_) => panic!("connect timeout must surface as Err"),
         }
         let after = crate::types::PROVIDER_CONNECT_TIMEOUT_COUNT.load(Ordering::Relaxed);
-        assert_eq!(after - before, 1, "connect timeout counter delta");
+        assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "connect timeout counter delta"
+        );
         let after_latency = crate::metrics_hist::snapshot();
         assert_eq!(
-            after_latency.provider_count - before_latency.provider_count,
+            after_latency
+                .provider_count
+                .saturating_sub(before_latency.provider_count),
             0,
             "connect-timeout failures are not successful stream-open samples"
         );
@@ -318,8 +332,15 @@ mod tests {
         assert!(matches!(first, StreamChunk::Text(t) if t == "hi"));
 
         let after_first = crate::metrics_hist::snapshot();
-        assert_eq!(after_first.provider_count - before.provider_count, 1);
-        let observed_delta = after_first.provider_sum_ms - before.provider_sum_ms;
+        assert_eq!(
+            after_first
+                .provider_count
+                .saturating_sub(before.provider_count),
+            1
+        );
+        let observed_delta = after_first
+            .provider_sum_ms
+            .saturating_sub(before.provider_sum_ms);
         assert!(
             observed_delta >= 600,
             "provider stream-open sum delta must include first-chunk delay"
@@ -366,8 +387,14 @@ mod tests {
         assert!(matches!(first, StreamChunk::Error(msg) if msg == "upstream failed before text"));
 
         let after = crate::metrics_hist::snapshot();
-        assert_eq!(after.provider_count - before.provider_count, 0);
-        assert_eq!(after.provider_sum_ms - before.provider_sum_ms, 0);
+        assert_eq!(
+            after.provider_count.saturating_sub(before.provider_count),
+            0
+        );
+        assert_eq!(
+            after.provider_sum_ms.saturating_sub(before.provider_sum_ms),
+            0
+        );
     }
 
     #[tokio::test]
@@ -391,8 +418,14 @@ mod tests {
         assert!(matches!(first, StreamChunk::Error(msg) if msg.contains("inter-chunk timeout")));
 
         let after = crate::metrics_hist::snapshot();
-        assert_eq!(after.provider_count - before.provider_count, 0);
-        assert_eq!(after.provider_sum_ms - before.provider_sum_ms, 0);
+        assert_eq!(
+            after.provider_count.saturating_sub(before.provider_count),
+            0
+        );
+        assert_eq!(
+            after.provider_sum_ms.saturating_sub(before.provider_sum_ms),
+            0
+        );
     }
 
     #[tokio::test]
@@ -437,7 +470,11 @@ mod tests {
             "inter-chunk timeout test must not hang; took {elapsed:?}"
         );
         let after = crate::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT.load(Ordering::Relaxed);
-        assert_eq!(after - before, 1, "inter-chunk timeout counter delta");
+        assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "inter-chunk timeout counter delta"
+        );
     }
 
     #[tokio::test]

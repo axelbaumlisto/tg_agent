@@ -301,19 +301,20 @@ fn bump(buckets: [&AtomicU64; 4], sum: &AtomicU64, count: &AtomicU64, ms: u64, e
 }
 
 #[cfg(test)]
-pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+pub(crate) struct MetricsHistTestGuard {
+    _inner: tokio::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
-pub(crate) async fn async_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn async_test_guard() -> MetricsHistTestGuard {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    LOCK.lock().await
+    MetricsHistTestGuard {
+        _inner: LOCK.lock().await,
+    }
 }
 
 #[cfg(test)]
-pub(crate) fn reset_for_test() {
+pub(crate) fn reset_for_test(_guard: &MetricsHistTestGuard) {
     for atomic in all_atomics() {
         atomic.store(0, Ordering::Relaxed);
     }
@@ -368,10 +369,10 @@ fn all_atomics() -> Vec<&'static AtomicU64> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn turn_duration_buckets_all_edges_and_sum_count() {
-        let _guard = test_guard();
-        reset_for_test();
+    #[tokio::test]
+    async fn turn_duration_buckets_all_edges_and_sum_count() {
+        let guard = async_test_guard().await;
+        reset_for_test(&guard);
 
         for ms in [
             999, 1000, 1001, 9999, 10_000, 10_001, 59_999, 60_000, 60_001,
@@ -388,10 +389,10 @@ mod tests {
         assert_eq!(snapshot.turn_count, 9);
     }
 
-    #[test]
-    fn ttft_buckets_all_edges_and_sum_count() {
-        let _guard = test_guard();
-        reset_for_test();
+    #[tokio::test]
+    async fn ttft_buckets_all_edges_and_sum_count() {
+        let guard = async_test_guard().await;
+        reset_for_test(&guard);
 
         for ms in [499, 500, 501, 1999, 2000, 2001, 9999, 10_000, 10_001] {
             record_ttft(ms);
@@ -406,10 +407,10 @@ mod tests {
         assert_eq!(snapshot.ttft_count, 9);
     }
 
-    #[test]
-    fn provider_stream_open_buckets_all_edges_and_sum_count() {
-        let _guard = test_guard();
-        reset_for_test();
+    #[tokio::test]
+    async fn provider_stream_open_buckets_all_edges_and_sum_count() {
+        let guard = async_test_guard().await;
+        reset_for_test(&guard);
 
         for ms in [499, 500, 501, 1999, 2000, 2001, 9999, 10_000, 10_001] {
             record_provider_stream_open(ms);
@@ -424,10 +425,10 @@ mod tests {
         assert_eq!(snapshot.provider_count, 9);
     }
 
-    #[test]
-    fn tool_duration_buckets_all_edges_and_sum_count() {
-        let _guard = test_guard();
-        reset_for_test();
+    #[tokio::test]
+    async fn tool_duration_buckets_all_edges_and_sum_count() {
+        let guard = async_test_guard().await;
+        reset_for_test(&guard);
 
         for ms in [9, 10, 11, 99, 100, 101, 999, 1000, 1001] {
             record_tool_duration("grep_search", ms);
@@ -442,10 +443,10 @@ mod tests {
         assert_eq!(hist.count, 9);
     }
 
-    #[test]
-    fn fff_cold_build_buckets_all_edges_and_sum_count() {
-        let _guard = test_guard();
-        reset_for_test();
+    #[tokio::test]
+    async fn fff_cold_build_buckets_all_edges_and_sum_count() {
+        let guard = async_test_guard().await;
+        reset_for_test(&guard);
 
         for ms in [9, 10, 99, 100, 999, 1000] {
             record_fff_cold_build_duration(ms);
@@ -460,14 +461,13 @@ mod tests {
         assert_eq!(hist.count, 6);
     }
 
-    #[test]
-    fn parent_fsync_buckets_all_edges_and_sum_count() {
-        // The other six bucket tests take this guard; this one did not, so it
-        // zeroed the process-global counters underneath whichever of them was
-        // running in parallel and then asserted exact totals. Rare but real
-        // (observed once in a full-suite run).
-        let _guard = test_guard();
-        reset_for_test();
+    #[tokio::test]
+    async fn parent_fsync_buckets_all_edges_and_sum_count() {
+        // Every bucket test and async metrics test must use the single metrics
+        // guard before zeroing process-global counters. Rare but real races have
+        // been observed when any reset path skipped that serialization.
+        let guard = async_test_guard().await;
+        reset_for_test(&guard);
 
         for ms in [0, 9, 10, 99, 100, 999, 1000, 1001] {
             record_parent_fsync_duration(ms);
