@@ -66,21 +66,7 @@ impl Provider for ModelOverrideProvider {
         self.inner.models()
     }
 
-    fn blacklisted_key_count(&self) -> usize {
-        self.inner.blacklisted_key_count()
-    }
-
-    fn total_key_count(&self) -> usize {
-        self.inner.total_key_count()
-    }
-
-    // B106: delegate so a fallback recorded by an inner chain stays visible.
-    fn last_fallback(&self) -> Option<super::FallbackInfo> {
-        self.inner.last_fallback()
-    }
-    fn key_hint(&self) -> Option<String> {
-        self.inner.key_hint()
-    }
+    super::delegate_optional_provider_methods!(self => self.inner);
 
     async fn audit_keys_on_boot(&self) {
         self.inner.audit_keys_on_boot().await;

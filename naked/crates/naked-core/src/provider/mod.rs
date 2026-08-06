@@ -134,7 +134,17 @@ pub(crate) fn build_streaming_http_client() -> reqwest::Client {
         .read_timeout(crate::provider::timeout::DEFAULT_INTER_CHUNK_TIMEOUT)
         .timeout(std::time::Duration::from_secs(300))
         .build()
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            // B112: `unwrap_or_default()` here silently substituted a client
+            // with NO connect timeout, NO read timeout and NO total deadline —
+            // the exact opposite of this function's purpose, and invisible.
+            // Subsequent hangs would be blamed on the provider.
+            tracing::error!(
+                error = %e,
+                "streaming HTTP client build failed; falling back to a client WITHOUT timeouts"
+            );
+            reqwest::Client::default()
+        })
 }
 
 /// B71 + B81: thinking-class models (Claude via airpx, native Anthropic
@@ -170,6 +180,40 @@ pub(crate) fn should_send_temperature(
     }
 }
 
+/// B112: forward every OPTIONAL `Provider` method to an inner provider.
+///
+/// Four wrappers must forward all of them (`Box<dyn Provider>`, `ArcProvider`,
+/// `TimeoutProvider`, `ModelOverrideProvider`). Each forward was hand-written,
+/// and because the trait supplies defaults a forgotten one COMPILES SILENTLY
+/// and reverts that method to its default — twice already the cause of a live
+/// issue. A test pins the behaviour, but the duplication itself is the hazard:
+/// adding a method still meant N remembered edits, and one wrapper lives in
+/// another module where the shared test cannot reach it.
+///
+/// Adding a SYNC optional method is now a single line here. `async` methods
+/// stay hand-written: `#[async_trait]` rewrites their signatures before it can
+/// see through a macro expansion, so `audit_keys_on_boot` is excluded and each
+/// wrapper still forwards it explicitly (the shared probe test covers that).
+macro_rules! delegate_optional_provider_methods {
+    // `$me` must be the caller's own `self` identifier: macro hygiene forbids
+    // the macro body from naming `self` itself.
+    ($me:ident => $($inner:tt)+) => {
+        fn blacklisted_key_count(&$me) -> usize {
+            $($inner)+.blacklisted_key_count()
+        }
+        fn total_key_count(&$me) -> usize {
+            $($inner)+.total_key_count()
+        }
+        fn key_hint(&$me) -> Option<String> {
+            $($inner)+.key_hint()
+        }
+        fn last_fallback(&$me) -> Option<$crate::provider::FallbackInfo> {
+            $($inner)+.last_fallback()
+        }
+    };
+}
+pub(crate) use delegate_optional_provider_methods;
+
 /// Pass-through impl so `Box<dyn Provider>` can stand in wherever
 /// `P: Provider` is required (notably as the inner of
 /// [`timeout::TimeoutProvider`]). R3 of `PLAN_NEXT_SESSION.md`.
@@ -181,20 +225,7 @@ impl Provider for Box<dyn Provider> {
     fn models(&self) -> Vec<ModelInfo> {
         (**self).models()
     }
-    fn blacklisted_key_count(&self) -> usize {
-        (**self).blacklisted_key_count()
-    }
-    fn total_key_count(&self) -> usize {
-        (**self).total_key_count()
-    }
-    fn key_hint(&self) -> Option<String> {
-        (**self).key_hint()
-    }
-    // B106: must delegate so the answer reaches the ResilientProvider at
-    // the bottom of the chain.
-    fn last_fallback(&self) -> Option<FallbackInfo> {
-        (**self).last_fallback()
-    }
+    delegate_optional_provider_methods!(self => (**self));
     async fn stream_chat(
         &self,
         request: ChatRequest,
@@ -230,18 +261,7 @@ impl Provider for ArcProvider {
     // provider was boxed for `AgentLoop` — `last_fallback()` always answered
     // None in production even though `ResilientProvider` had recorded a real
     // fallback, and key-health accessors under-reported the same way.
-    fn blacklisted_key_count(&self) -> usize {
-        self.0.blacklisted_key_count()
-    }
-    fn total_key_count(&self) -> usize {
-        self.0.total_key_count()
-    }
-    fn key_hint(&self) -> Option<String> {
-        self.0.key_hint()
-    }
-    fn last_fallback(&self) -> Option<FallbackInfo> {
-        self.0.last_fallback()
-    }
+    delegate_optional_provider_methods!(self => self.0);
     async fn audit_keys_on_boot(&self) {
         self.0.audit_keys_on_boot().await
     }

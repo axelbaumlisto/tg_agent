@@ -98,7 +98,7 @@ impl ResilientProvider {
         // tally map; tokio locks are acquired afterwards, never while holding
         // the std mutex across `.await`.
         let pending: Vec<(usize, u8)> = {
-            let mut failures = self.stream_failures.lock().expect("stream failure lock");
+            let mut failures = crate::lock_or_recover(&self.stream_failures);
             let pending: Vec<_> = failures
                 .iter()
                 .filter_map(|(&idx, &raw)| {
@@ -137,7 +137,7 @@ impl ResilientProvider {
         }
 
         if !carry.is_empty() {
-            let mut failures = self.stream_failures.lock().expect("stream failure lock");
+            let mut failures = crate::lock_or_recover(&self.stream_failures);
             for (idx, count) in carry {
                 let raw = failures.get(&idx).copied().unwrap_or(0);
                 let pending_bit = raw & STREAM_FAILURE_PENDING;
@@ -231,7 +231,7 @@ impl ResilientProvider {
                     error = %msg,
                     "provider key permanently blacklisted during boot audit"
                 );
-                self.note_permanently_dead_key(*idx, &provider_name);
+                self.note_permanently_dead_key(*idx);
             }
         }
         tracing::info!(
@@ -255,15 +255,27 @@ impl ResilientProvider {
     ///
     /// Caller owns the blacklist insert, because the two paths hold that lock
     /// differently (the audit already holds the guard).
-    fn note_permanently_dead_key(&self, idx: usize, provider_name: &str) {
+    ///
+    /// B112: the provider name is derived from `idx` HERE rather than passed
+    /// in. It selects which `providers.<X>` bucket the dead key is written to,
+    /// and the two callers had different notions of it: the runtime path
+    /// passed the entry that actually failed, while the boot audit passed
+    /// `providers.first()` for EVERY dead index. On the outer chain — which is
+    /// heterogeneous by construction (`create_provider_chain` appends each
+    /// configured fallback provider) — that filed a dead deepseek key under
+    /// anthropic: the wrong pool loses a key and the real dead one keeps being
+    /// probed. Extracting the shared body was not enough; the drift simply
+    /// moved to the call sites, so the parameter is gone.
+    fn note_permanently_dead_key(&self, idx: usize) {
         crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let provider = &self.providers[idx];
         // B110: this `key_hint` reaches through the TimeoutProvider wrapper
         // every chain entry is built with; without that delegation it is None
         // and nothing is ever persisted.
-        if let Some(key_value) = self.providers[idx].key_hint() {
+        if let Some(key_value) = provider.key_hint() {
             super::dead_key_persist::persist_dead_key(
-                super::logical_provider_name(provider_name),
+                super::logical_provider_name(provider.name()),
                 &key_value,
             );
         }
@@ -433,7 +445,7 @@ impl Provider for ResilientProvider {
                         match &chunk {
                             StreamChunk::Error(_) => {
                                 saw_error.store(true, Ordering::Relaxed);
-                                let mut failures = failures.lock().expect("stream failure lock");
+                                let mut failures = crate::lock_or_recover(&failures);
                                 let entry = failures.entry(idx).or_insert(0);
                                 let count = (*entry & STREAM_FAILURE_COUNT_MASK)
                                     .saturating_add(1)
@@ -449,8 +461,7 @@ impl Provider for ResilientProvider {
                                 if saw_content.load(Ordering::Relaxed)
                                     && !saw_error.load(Ordering::Relaxed)
                                 {
-                                    let mut failures =
-                                        failures.lock().expect("stream failure lock");
+                                    let mut failures = crate::lock_or_recover(&failures);
                                     if let Some(raw) = failures.get(&idx).copied()
                                         && raw & STREAM_FAILURE_PENDING == 0
                                     {
@@ -466,26 +477,31 @@ impl Provider for ResilientProvider {
                 }
                 Err(e) => {
                     // Try to extract typed error; fall back to string classification
-                    let (key_dead, model_dead, invalid_request) =
+                    // B112: classify ONCE. Previously the untyped branch
+                    // reconstructed a ProviderError to derive key/model/invalid,
+                    // but `permanent` below was read only off the ORIGINAL `e`
+                    // and hard-defaulted to false for untyped errors. An untyped
+                    // 401 therefore entered the key-dead branch yet was treated
+                    // as transient: 1h blacklist instead of permanent, no
+                    // persist, no counter — re-probed every hour and every
+                    // restart. One value now answers all four questions.
+                    let classified: std::borrow::Cow<'_, super::error::ProviderError> =
                         if let AgentError::ProviderTyped(ref pe) = e {
-                            (
-                                pe.is_key_dead(),
-                                pe.is_model_dead(),
-                                matches!(pe, super::error::ProviderError::InvalidRequest { .. }),
-                            )
+                            std::borrow::Cow::Borrowed(pe)
                         } else {
                             let err_str = e.to_string();
-                            let pe = super::error::ProviderError::from_llm_http(
+                            std::borrow::Cow::Owned(super::error::ProviderError::from_llm_http(
                                 extract_status_from_error(&err_str),
                                 &err_str,
                                 &request.model,
-                            );
-                            (
-                                pe.is_key_dead(),
-                                pe.is_model_dead(),
-                                matches!(pe, super::error::ProviderError::InvalidRequest { .. }),
-                            )
+                            ))
                         };
+                    let key_dead = classified.is_key_dead();
+                    let model_dead = classified.is_model_dead();
+                    let invalid_request = matches!(
+                        classified.as_ref(),
+                        super::error::ProviderError::InvalidRequest { .. }
+                    );
                     if key_dead {
                         // R1 of PLAN_RESILIENCE_v1: distinguish
                         // PERMANENT (auth/payment) from TRANSIENT
@@ -493,10 +509,7 @@ impl Provider for ResilientProvider {
                         // from rotation for the process lifetime;
                         // transient keys use the existing 3600s
                         // blacklist + retry pattern.
-                        let permanent = match &e {
-                            AgentError::ProviderTyped(pe) => pe.is_permanent_key_failure(),
-                            _ => false,
-                        };
+                        let permanent = classified.is_permanent_key_failure();
                         if permanent {
                             tracing::warn!(
                                 "Provider '{}' key PERMANENTLY blacklisted (auth/payment): {e}",
@@ -506,7 +519,7 @@ impl Provider for ResilientProvider {
                                 .lock()
                                 .await
                                 .insert(idx, permanent_blacklist_until());
-                            self.note_permanently_dead_key(idx, provider.name());
+                            self.note_permanently_dead_key(idx);
                         } else {
                             tracing::warn!(
                                 "Provider '{}' key dead: {e}, blacklisting for {}s",
@@ -563,11 +576,30 @@ impl Provider for ResilientProvider {
 /// Extract HTTP status code from a provider error string.
 /// Looks for patterns like "401", "402 Payment", "(429)", "HTTP 500".
 fn extract_status_from_error(err: &str) -> u16 {
-    // Try common patterns: "API 401:", "(402)", "HTTP 429", bare "500"
+    // B112: match DELIMITED forms only. A bare `contains("402")` classified
+    // bodies like "model llama-402b is unavailable" or "max_tokens 500
+    // exceeded" as payment/server failures, blacklisting a healthy key for an
+    // hour; and because the codes were scanned in a fixed order, a body
+    // mentioning two numbers reported whichever came first in the array rather
+    // than the real status. Unknown now stays 0 (treated as transient), which
+    // is the safe default.
     for code in [401u16, 402, 403, 404, 429, 500, 502, 503] {
         let s = code.to_string();
-        if err.contains(&s) {
-            return code;
+        let mut from = 0usize;
+        while let Some(rel) = err[from..].find(&s) {
+            let start = from + rel;
+            let end = start + s.len();
+            let before = err[..start].chars().next_back();
+            let after = err[end..].chars().next();
+            // Reject digit-adjacent hits (llama-402b, 4029) and require the
+            // number to sit next to punctuation/whitespace, as in
+            // "API 401:", "(402)", "HTTP 429", "error code: 502".
+            let left_ok = before.is_none_or(|c| !c.is_ascii_digit() && c != '.');
+            let right_ok = after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '.');
+            if left_ok && right_ok {
+                return code;
+            }
+            from = end;
         }
     }
     0 // unknown
@@ -1495,5 +1527,101 @@ mod tests {
             "boot audit must bump the permanent-blacklist counter that \
              /metrics and the wiring health check read"
         );
+    }
+    // ── B112: findings from an independent SOLID/DRY/KISS audit ────────────
+
+    /// The dead key must be filed under the provider that OWNS it.
+    ///
+    /// `note_permanently_dead_key` used to take the provider name as a
+    /// parameter, and the two callers disagreed: the runtime path passed the
+    /// entry that failed, the boot audit passed `providers.first()` for EVERY
+    /// dead index. The outer chain is heterogeneous by construction, so a dead
+    /// deepseek key got filed under anthropic.
+    #[test]
+    fn b112_dead_key_is_attributed_to_the_failing_entry_not_the_first() {
+        struct Named {
+            name: String,
+            key: String,
+        }
+        #[async_trait]
+        impl Provider for Named {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![]
+            }
+            fn key_hint(&self) -> Option<String> {
+                Some(self.key.clone())
+            }
+            async fn stream_chat(
+                &self,
+                _r: ChatRequest,
+            ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+                Err(AgentError::Config("unused".into()))
+            }
+        }
+
+        let p = ResilientProvider::new(vec![
+            Box::new(Named {
+                name: "anthropic".into(),
+                key: "sk-anthropic".into(),
+            }),
+            Box::new(Named {
+                name: "deepseek".into(),
+                key: "sk-deepseek".into(),
+            }),
+        ]);
+
+        // Index 1 is the one that died; its own name and key must be used.
+        assert_eq!(p.providers[1].name(), "deepseek");
+        assert_eq!(p.providers[1].key_hint().as_deref(), Some("sk-deepseek"));
+        // And the signature must not let a caller supply a different name:
+        // `note_permanently_dead_key` takes only the index.
+        p.note_permanently_dead_key(1);
+    }
+
+    /// An untyped error whose body carries a 401 must be treated as a
+    /// PERMANENT key failure, exactly like a typed one. Previously `permanent`
+    /// was read only off the original error and defaulted to false when
+    /// untyped, so such a key was blacklisted for an hour instead of removed,
+    /// never persisted, and re-probed forever.
+    #[test]
+    fn b112_untyped_auth_error_classifies_as_permanent_key_failure() {
+        let err_str = "provider returned API 401: invalid_api_key";
+        let pe = super::super::error::ProviderError::from_llm_http(
+            extract_status_from_error(err_str),
+            err_str,
+            "some-model",
+        );
+        assert!(pe.is_key_dead(), "401 body must be a key failure");
+        assert!(
+            pe.is_permanent_key_failure(),
+            "401 must be PERMANENT — a transient classification means the dead \
+             key is re-probed every hour and every restart"
+        );
+    }
+
+    /// Status extraction must not fire on digits embedded in prose.
+    #[test]
+    fn b112_status_extraction_ignores_numbers_inside_words() {
+        // Real statuses, delimited — still detected.
+        assert_eq!(extract_status_from_error("API 401: nope"), 401);
+        assert_eq!(extract_status_from_error("(402) payment"), 402);
+        assert_eq!(extract_status_from_error("HTTP 429 slow down"), 429);
+        assert_eq!(extract_status_from_error("error code: 502"), 502);
+
+        // Prose that merely contains the digits — must NOT be classified.
+        assert_eq!(
+            extract_status_from_error("model llama-402b is unavailable"),
+            0,
+            "a model name containing 402 must not look like payment-required"
+        );
+        assert_eq!(
+            extract_status_from_error("max_tokens 5000 exceeded"),
+            0,
+            "5000 must not be read as 500"
+        );
+        assert_eq!(extract_status_from_error("request id 4021 failed"), 0);
     }
 }
