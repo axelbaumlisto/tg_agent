@@ -91,13 +91,26 @@ fn byte_offset_after_line(text: &str, line_idx: usize, lines: &[&str]) -> usize 
 
 // ─── HTML chunk splitting ────────────────────────────────────────────────
 
+const MIN_SPLIT_BUDGET_BYTES: usize = 2;
+const TELEGRAM_HTML_TAGS: &[&str] = &["b", "i", "u", "s", "code", "pre", "a", "blockquote"];
+
 /// Split Telegram HTML into chunks of at most `max_bytes`, re-opening
 /// any tags that were split across the boundary.
 ///
 /// Prefers splitting at newlines (block boundaries).  Falls back to
 /// mid-line splits when a single line exceeds the budget.
 pub fn split_html(html: &str, max_bytes: usize) -> Vec<String> {
+    debug_assert!(
+        max_bytes >= MIN_SPLIT_BUDGET_BYTES,
+        "split_html budget must be at least {MIN_SPLIT_BUDGET_BYTES} bytes"
+    );
     if html.len() <= max_bytes {
+        return vec![html.to_string()];
+    }
+    if max_bytes < MIN_SPLIT_BUDGET_BYTES {
+        // A non-empty UTF-8 string cannot be represented as chunks of at most
+        // 0 bytes, and not all scalar values fit in 1 byte. Preserve content
+        // and terminate rather than silently clamping the caller's bad budget.
         return vec![html.to_string()];
     }
 
@@ -152,7 +165,7 @@ pub fn split_html(html: &str, max_bytes: usize) -> Vec<String> {
 
 /// Split a long line at spaces to produce parts ≤ `max` bytes.
 fn split_long_line(line: &str, max: usize) -> Vec<String> {
-    if line.len() <= max {
+    if max == 0 || line.len() <= max {
         return vec![line.to_string()];
     }
     let mut parts = Vec::new();
@@ -205,8 +218,7 @@ fn close_tag_for(open: &str) -> String {
     while let Some(start) = rest.find('<') {
         if let Some(end) = rest[start..].find('>') {
             let tag_content = &rest[start + 1..start + end];
-            let tag_name = tag_content.split_whitespace().next().unwrap_or("");
-            if !tag_name.starts_with('/') && !tag_name.is_empty() {
+            if let Some(tag_name) = telegram_open_tag_name(tag_content) {
                 closers.push(format!("</{tag_name}>"));
             }
             rest = &rest[start + end + 1..];
@@ -218,6 +230,43 @@ fn close_tag_for(open: &str) -> String {
     closers.join("")
 }
 
+fn canonical_telegram_html_tag(name: &str) -> Option<&'static str> {
+    TELEGRAM_HTML_TAGS
+        .iter()
+        .copied()
+        .find(|allowed| allowed.eq_ignore_ascii_case(name))
+}
+
+fn raw_tag_name(tag: &str) -> Option<&str> {
+    if tag.is_empty() || tag.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let name = tag
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .next()
+        .unwrap_or("");
+    (!name.is_empty()).then_some(name)
+}
+
+fn telegram_open_tag_name(tag: &str) -> Option<&'static str> {
+    if tag.starts_with('/') || tag.starts_with('!') || tag.ends_with('/') {
+        return None;
+    }
+    let name = raw_tag_name(tag)?;
+    canonical_telegram_html_tag(name)
+}
+
+fn telegram_close_tag_name(tag: &str) -> Option<&'static str> {
+    let rest = tag.strip_prefix('/')?;
+    let name = raw_tag_name(rest)?;
+    canonical_telegram_html_tag(name)
+}
+
+fn open_tag_name(open: &str) -> Option<&'static str> {
+    let inner = open.strip_prefix('<')?.strip_suffix('>')?;
+    telegram_open_tag_name(inner)
+}
+
 fn track_tags(text: &str, open_tags: &mut Vec<String>) {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -226,19 +275,14 @@ fn track_tags(text: &str, open_tags: &mut Vec<String>) {
             && let Some(end) = text[i..].find('>')
         {
             let tag = &text[i + 1..i + end];
-            let tag_name = tag.split_whitespace().next().unwrap_or("");
-            if let Some(name) = tag_name.strip_prefix('/') {
+            if let Some(name) = telegram_close_tag_name(tag) {
                 // Closing tag — pop matching open
-                if let Some(pos) = open_tags.iter().rposition(|t| {
-                    // Extract tag name: "<code class=\"...\">" → "code"
-                    t.strip_prefix('<')
-                        .and_then(|s| s.split(|c: char| c == '>' || c.is_whitespace()).next())
-                        .map(|n| n == name)
-                        .unwrap_or(false)
+                if let Some(pos) = open_tags.iter().rposition(|open| {
+                    open_tag_name(open).is_some_and(|open_name| open_name == name)
                 }) {
                     open_tags.remove(pos);
                 }
-            } else if !tag_name.is_empty() && !tag_name.starts_with('!') && !tag.ends_with('/') {
+            } else if telegram_open_tag_name(tag).is_some() {
                 open_tags.push(format!("<{tag}>"));
             }
             i += end + 1;
@@ -263,6 +307,129 @@ mod tests {
     #[test]
     fn close_tag_with_attr() {
         assert_eq!(close_tag_for("<a href=\"x\">"), "</a>");
+        assert_eq!(close_tag_for("<code class=\"language-rust\">"), "</code>");
+        assert_eq!(close_tag_for("<blockquote expandable>"), "</blockquote>");
+        assert_eq!(close_tag_for("<B>"), "</b>");
+        assert_eq!(close_tag_for("<Code Class=\"language-rust\">"), "</code>");
+    }
+
+    fn test_canonical_telegram_html_tag(name: &str) -> Option<&'static str> {
+        TELEGRAM_HTML_TAGS
+            .iter()
+            .copied()
+            .find(|allowed| allowed.eq_ignore_ascii_case(name))
+    }
+
+    fn test_telegram_open_tag_name(tag: &str) -> Option<&'static str> {
+        if tag.starts_with('/') || tag.starts_with('!') || tag.ends_with('/') {
+            return None;
+        }
+        let name = raw_tag_name(tag)?;
+        test_canonical_telegram_html_tag(name)
+    }
+
+    fn test_telegram_close_tag_name(tag: &str) -> Option<&'static str> {
+        let rest = tag.strip_prefix('/')?;
+        let name = raw_tag_name(rest)?;
+        test_canonical_telegram_html_tag(name)
+    }
+
+    fn strip_telegram_tags(html: &str) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < html.len() {
+            if html.as_bytes()[i] == b'<'
+                && let Some(end) = html[i..].find('>')
+            {
+                let tag = &html[i + 1..i + end];
+                if test_telegram_open_tag_name(tag).is_some()
+                    || test_telegram_close_tag_name(tag).is_some()
+                {
+                    i += end + 1;
+                    continue;
+                }
+            }
+            let ch = html[i..].chars().next().expect("valid char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    fn assert_telegram_tags_balanced(html: &str) {
+        let mut stack: Vec<&str> = Vec::new();
+        let mut i = 0;
+        while i < html.len() {
+            if html.as_bytes()[i] == b'<'
+                && let Some(end) = html[i..].find('>')
+            {
+                let tag = &html[i + 1..i + end];
+                if let Some(name) = test_telegram_close_tag_name(tag) {
+                    assert_eq!(stack.pop(), Some(name), "unbalanced close in {html:?}");
+                    i += end + 1;
+                    continue;
+                }
+                if let Some(name) = test_telegram_open_tag_name(tag) {
+                    stack.push(name);
+                    i += end + 1;
+                    continue;
+                }
+            }
+            let ch = html[i..].chars().next().expect("valid char boundary");
+            i += ch.len_utf8();
+        }
+        assert!(stack.is_empty(), "unclosed tags {stack:?} in {html:?}");
+    }
+
+    #[test]
+    fn split_html_adversarial_chunks_stay_budgeted_balanced_and_lossless() {
+        let bare_angles = "a < b and c > d ".repeat(1000);
+        let long_token = "x".repeat(5_000);
+        let cyrillic = "Привет мир ".repeat(320);
+        let uppercase_span = format!(
+            "<B>{}</B>",
+            "bold across a forced split boundary ".repeat(180)
+        );
+        let nested = format!(
+            "<blockquote expandable><pre><Code Class=\"language-rust\">{long_token}\n{cyrillic}</Code></pre></BlockQuote>"
+        );
+        let html = format!(
+            "{bare_angles}\n{long_token}\n{uppercase_span}\n{nested}\n{s}{u}",
+            s = "<s>strike</s>",
+            u = "<u>under</u>"
+        );
+        let budget = 3_996;
+
+        let chunks = split_html(&html, budget);
+
+        assert!(chunks.len() > 1, "adversarial fixture should split");
+        for chunk in &chunks {
+            assert!(
+                chunk.len() <= budget,
+                "chunk exceeded budget: {} > {budget}: {chunk:?}",
+                chunk.len()
+            );
+            assert_telegram_tags_balanced(chunk);
+        }
+        assert_eq!(
+            strip_telegram_tags(&chunks.join("")),
+            strip_telegram_tags(&html),
+            "tag-stripped visible text must be preserved"
+        );
+    }
+
+    #[test]
+    fn split_html_tiny_budgets_terminate_without_clamping() {
+        let html = "abc Привет";
+        for budget in [0, 1] {
+            #[cfg(debug_assertions)]
+            assert!(
+                std::panic::catch_unwind(|| split_html(html, budget)).is_err(),
+                "debug builds should surface invalid budget {budget}"
+            );
+            #[cfg(not(debug_assertions))]
+            assert_eq!(split_html(html, budget), vec![html.to_string()]);
+        }
     }
 
     // ── split_stable_unstable ────────────────────────────────────────

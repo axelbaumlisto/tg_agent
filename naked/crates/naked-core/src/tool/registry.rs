@@ -60,11 +60,21 @@ impl ToolRegistry {
             }
         };
 
-        // Large output routing: truncate oversized tool results.
-        result.output = super::large_output::route_large_output(
-            &result.output,
-            super::large_output::DEFAULT_THRESHOLD_CHARS,
-        );
+        // B104: NO truncation here. This layer used to clamp every tool
+        // result to the fixed `DEFAULT_THRESHOLD_CHARS` (12K, head 4K +
+        // tail 2K) BEFORE the model-aware router in `loop_::tools`
+        // (`route_large_output_aware`) ever saw the output. Because this
+        // ran first and truncation is not idempotent-recoverable, the
+        // model-aware limits (24K for >=100K windows, 180K for >=500K)
+        // were dead code for large results: a 16.6 KB skill body reaching
+        // a 200K-window model still lost its middle 10.6 KB.
+        //
+        // The single production execution path (`loop_::tools::
+        // push_tool_outcome`) applies `route_large_output_aware` with the
+        // live context window, and `ConversationHistory::push_tool_result`
+        // enforces its own hard 8K backstop, so dropping the clamp here
+        // cannot leave output unbounded in history. TG/TUI renderers cap
+        // their own display separately (`handle_tool_end`, `tail_trim`).
 
         // Post-edit validation: if a file-modifying tool succeeded,
         // run a language-specific check and append diagnostics.
@@ -232,5 +242,76 @@ mod tests {
         let mut names = reg.tool_names();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    // ── D-INV-TOOL-OUTPUT-WINDOW-AWARE (B104) ──────────────────────────
+    //
+    // The dispatch layer must NOT pre-truncate tool output: it has no
+    // access to the live context window, so any clamp here silently
+    // overrides the model-aware router in `loop_::tools`. Reinstating
+    // `route_large_output(&result.output, DEFAULT_THRESHOLD_CHARS)` makes
+    // both tests below fail.
+
+    /// A skill-body-sized result (16.6 KB, the real telegram-reader
+    /// payload size) must survive dispatch byte-identical.
+    #[tokio::test]
+    async fn b104_dispatch_does_not_truncate_skill_sized_output() {
+        let body = "## Section\nsome skill instructions line\n".repeat(450);
+        assert!(
+            body.len() > super::super::large_output::DEFAULT_THRESHOLD_CHARS,
+            "fixture must exceed the old 12K clamp to be meaningful"
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DummyTool {
+            name: "skill".into(),
+            output: body.clone(),
+        })];
+        let reg = ToolRegistry::new(tools);
+        let (tx, _rx) = mpsc::channel(64);
+        let result = reg
+            .execute_with_progress("skill", serde_json::json!({}), Path::new("/tmp"), tx)
+            .await;
+
+        assert_eq!(
+            result.output.len(),
+            body.len(),
+            "dispatch must not truncate; the model-aware router decides"
+        );
+        assert!(
+            !result.output.contains("omitted"),
+            "no truncation marker may be injected at dispatch time"
+        );
+    }
+
+    /// The middle of an oversized result must reach the caller intact —
+    /// this is the exact content class B104 destroyed (skill sections
+    /// living between the kept 4K head and 2K tail).
+    #[tokio::test]
+    async fn b104_dispatch_preserves_middle_of_large_output() {
+        // Must exceed DEFAULT_THRESHOLD_CHARS (12K) or the old clamp would
+        // pass this test by doing nothing — keep head/tail past 4K/2K too so
+        // the marker lands in the section the old router discarded.
+        let head = "HEAD\n".repeat(1_600); // 8K > HEAD_CHARS(4K)
+        let middle = "MIDDLE_MARKER_UNIQUE\n".to_string();
+        let tail = "TAIL\n".repeat(1_600); // 8K > TAIL_CHARS(2K)
+        let body = format!("{head}{middle}{tail}");
+        assert!(
+            body.len() > super::super::large_output::DEFAULT_THRESHOLD_CHARS,
+            "fixture must exceed the old 12K clamp to be meaningful"
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(DummyTool {
+            name: "skill".into(),
+            output: body.clone(),
+        })];
+        let reg = ToolRegistry::new(tools);
+        let (tx, _rx) = mpsc::channel(64);
+        let result = reg
+            .execute_with_progress("skill", serde_json::json!({}), Path::new("/tmp"), tx)
+            .await;
+
+        assert!(
+            result.output.contains("MIDDLE_MARKER_UNIQUE"),
+            "middle content must survive dispatch (B104 dropped exactly this)"
+        );
+        assert_eq!(result.output, body);
     }
 }

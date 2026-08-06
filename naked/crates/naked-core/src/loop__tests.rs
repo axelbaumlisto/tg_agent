@@ -227,19 +227,19 @@ fn turn_bucket_delta_total(
         + (after.turn_over_60s - before.turn_over_60s)
 }
 
-fn observed_turn_bucket_delta(
+fn observed_ttft_bucket_delta(
     before: crate::metrics_hist::LatencySnapshot,
     after: crate::metrics_hist::LatencySnapshot,
     observed_ms: u64,
 ) -> u64 {
-    if observed_ms < 1_000 {
-        after.turn_under_1s - before.turn_under_1s
+    if observed_ms < 500 {
+        after.ttft_under_500ms - before.ttft_under_500ms
+    } else if observed_ms < 2_000 {
+        after.ttft_500ms_to_2s - before.ttft_500ms_to_2s
     } else if observed_ms < 10_000 {
-        after.turn_1s_to_10s - before.turn_1s_to_10s
-    } else if observed_ms < 60_000 {
-        after.turn_10s_to_60s - before.turn_10s_to_60s
+        after.ttft_2s_to_10s - before.ttft_2s_to_10s
     } else {
-        after.turn_over_60s - before.turn_over_60s
+        after.ttft_over_10s - before.ttft_over_10s
     }
 }
 
@@ -790,6 +790,7 @@ async fn loop_max_iterations() {
 
 #[tokio::test]
 async fn agent_turn_duration_records_on_successful_text_turn() {
+    let _guard = crate::metrics_hist::async_test_guard().await;
     let before = crate::metrics_hist::snapshot();
     let agent_loop = make_delayed_text_loop(std::time::Duration::from_millis(600), "delayed hello");
     let mut history = ConversationHistory::new("sys".into());
@@ -811,17 +812,36 @@ async fn agent_turn_duration_records_on_successful_text_turn() {
 
     let after = crate::metrics_hist::snapshot();
     let turn_sum_delta = after.turn_sum_ms - before.turn_sum_ms;
-    assert_eq!(after.turn_count - before.turn_count, 1);
+    // `async_test_guard` serialises the three metrics tests against EACH OTHER,
+    // but `record_turn_duration` is a process-global counter written by every
+    // one of the ~34 tests in this file that drives `AgentLoop::run` — none of
+    // which take the guard. Demanding an exact delta of 1 therefore races with
+    // any concurrently finishing turn (reproduced ~1 run in 3). Assert the
+    // sample landed instead of asserting nobody else existed.
+    assert!(
+        after.turn_count - before.turn_count >= 1,
+        "this test's turn must be counted (delta {})",
+        after.turn_count - before.turn_count
+    );
     assert!(
         turn_sum_delta >= 600,
         "turn sum delta was {turn_sum_delta}ms"
     );
-    assert_eq!(observed_turn_bucket_delta(before, after, turn_sum_delta), 1);
-    assert_eq!(turn_bucket_delta_total(before, after), 1);
+    // Pick the bucket from THIS test's known duration (600ms provider delay,
+    // so the 1s..10s band at worst), not from `turn_sum_delta` — that delta is
+    // the sum over every turn recorded in the window, so a concurrent fast
+    // turn inflates it and selects a bucket this sample never landed in.
+    // Asserting the total covers "our sample was bucketed" without guessing
+    // which band a racing turn used.
+    assert!(
+        turn_bucket_delta_total(before, after) >= 1,
+        "turn bucket total must include at least this test's sample"
+    );
 }
 
 #[tokio::test]
 async fn agent_ttft_records_first_text_delta_after_provider_delay() {
+    let _guard = crate::metrics_hist::async_test_guard().await;
     let before = crate::metrics_hist::snapshot();
     let agent_loop = make_delayed_text_loop(std::time::Duration::from_millis(600), "delayed ttft");
     let mut history = ConversationHistory::new("sys".into());
@@ -835,17 +855,27 @@ async fn agent_ttft_records_first_text_delta_after_provider_delay() {
 
     let after = crate::metrics_hist::snapshot();
     let ttft_sum_delta = after.ttft_sum_ms - before.ttft_sum_ms;
-    assert_eq!(after.ttft_count - before.ttft_count, 1);
+    assert!(
+        after.ttft_count > before.ttft_count,
+        "ttft count must include at least this test's sample"
+    );
     assert!(
         ttft_sum_delta >= 600,
         "ttft sum delta was {ttft_sum_delta}ms"
     );
-    assert_eq!(after.ttft_500ms_to_2s - before.ttft_500ms_to_2s, 1);
-    assert_eq!(after.turn_count - before.turn_count, 1);
+    assert!(
+        observed_ttft_bucket_delta(before, after, ttft_sum_delta) >= 1,
+        "observed ttft bucket must include at least this test's sample"
+    );
+    assert!(
+        after.turn_count > before.turn_count,
+        "turn duration count should also increase during the successful turn"
+    );
 }
 
 #[tokio::test]
 async fn agent_turn_duration_records_on_provider_error() {
+    let _guard = crate::metrics_hist::async_test_guard().await;
     let before = crate::metrics_hist::snapshot();
     let provider = MockProvider::new(vec![
         vec![StreamChunk::Error("API overloaded".into())],
@@ -867,8 +897,14 @@ async fn agent_turn_duration_records_on_provider_error() {
     ));
 
     let after = crate::metrics_hist::snapshot();
-    assert_eq!(after.turn_count - before.turn_count, 1);
-    assert_eq!(turn_bucket_delta_total(before, after), 1);
+    assert!(
+        after.turn_count > before.turn_count,
+        "provider error path must record at least one turn duration sample"
+    );
+    assert!(
+        turn_bucket_delta_total(before, after) >= 1,
+        "turn bucket total must include at least this test's sample"
+    );
 }
 
 #[tokio::test]

@@ -74,6 +74,10 @@ impl Provider for ModelOverrideProvider {
         self.inner.total_key_count()
     }
 
+    // B106: delegate so a fallback recorded by an inner chain stays visible.
+    fn last_fallback(&self) -> Option<super::FallbackInfo> {
+        self.inner.last_fallback()
+    }
     fn key_hint(&self) -> Option<String> {
         self.inner.key_hint()
     }

@@ -606,6 +606,77 @@ pub(crate) async fn lookup_last_run_on_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+
+    use async_trait::async_trait;
+    use naked_core::config::{Config, ResearchConfig};
+    use naked_core::provider::{ChatRequest, Provider};
+    use naked_core::types::{ModelInfo, StreamChunk};
+    use tempfile::TempDir;
+    use tokio_stream::Stream;
+
+    struct UnreachableProvider;
+
+    #[async_trait]
+    impl Provider for UnreachableProvider {
+        fn name(&self) -> &str {
+            "unreachable"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![]
+        }
+
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> naked_core::error::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+            Err(naked_core::error::AgentError::Provider(
+                "UnreachableProvider invoked — synthetic dispatch path was bypassed".into(),
+            ))
+        }
+    }
+
+    fn make_core(tmp: &TempDir) -> Arc<AgentCore> {
+        let cfg = Config {
+            workspace: tmp.path().to_path_buf(),
+            session_dir: tmp.path().join("sessions"),
+            research: ResearchConfig {
+                enabled: true,
+                storage_dir: Some(tmp.path().join("research")),
+                auto_first_run: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let agent = Arc::new(AgentCore::new(cfg, Box::new(UnreachableProvider)));
+        agent.init_self_ref();
+        agent
+    }
+
+    fn spec_with_chat(id: &str, chat_id: Option<i64>, thread_id: Option<i32>) -> ResearchSpec {
+        ResearchSpec {
+            id: id.to_string(),
+            topic: format!("topic for {id}"),
+            chat_id,
+            thread_id,
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_captures(
+        mock: &crate::synthetic::MockDispatcher,
+        expected: usize,
+    ) -> Vec<crate::synthetic::SyntheticMessage> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let captured = mock.snapshot().await;
+            if captured.len() >= expected || tokio::time::Instant::now() >= deadline {
+                return captured;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     fn cfg_with_thresholds(alert: u32, auto_pause: u32) -> SchedulerConfig {
         SchedulerConfig {
@@ -666,6 +737,191 @@ mod tests {
         record_scheduler_dispatch_skipped();
         let after = naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT.load(Ordering::Relaxed);
         assert_eq!(after - before, 1);
+    }
+
+    // ── effective chat gate dispatch boundary ────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effective_chat_gate_dispatches_operator_chat_without_mutating_spec() {
+        let tmp = TempDir::new().expect("tempdir");
+        let core = make_core(&tmp);
+        let spec = spec_with_chat("operator-null", None, None);
+        core.research_store()
+            .create_spec(&spec)
+            .await
+            .expect("create spec");
+
+        let state = Arc::new(Mutex::new(SchedulerState::default()));
+        let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
+        let mock = crate::synthetic::MockDispatcher::new();
+        let cfg = SchedulerConfig {
+            dispatch_fn: Some(mock.as_fn()),
+            task_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+
+        spawn_task(
+            &core,
+            &state,
+            &notifier,
+            &cfg,
+            &spec,
+            1,
+            Some(OperatorContext {
+                chat_id: 321_654,
+                thread_id: Some(77),
+                session_id: "research-operator-null".to_string(),
+                prompt: "/research run operator-null".to_string(),
+            }),
+        )
+        .await;
+
+        let captured = wait_for_captures(&mock, 1).await;
+        assert_eq!(captured.len(), 1, "synthetic=true branch must dispatch");
+        let msg = &captured[0];
+        assert_eq!(
+            msg.chat_id, 321_654,
+            "inflight chat wins when spec chat is null"
+        );
+        assert_eq!(msg.thread_id, Some(77), "inflight thread is preserved");
+        assert_eq!(msg.text, "/research run operator-null");
+        assert_eq!(msg.source.spec_id(), Some("operator-null"));
+
+        let stored = core
+            .research_store()
+            .load_spec("operator-null")
+            .await
+            .expect("load stored spec");
+        assert_eq!(
+            stored.chat_id, None,
+            "ResearchSpec.chat_id must not be mutated"
+        );
+        assert_eq!(
+            stored.thread_id, None,
+            "ResearchSpec.thread_id must not be mutated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effective_chat_gate_prefers_inflight_over_stale_spec_chat() {
+        let tmp = TempDir::new().expect("tempdir");
+        let core = make_core(&tmp);
+        let spec = spec_with_chat("operator-stale", Some(999_000), Some(9));
+        core.research_store()
+            .create_spec(&spec)
+            .await
+            .expect("create spec");
+
+        let state = Arc::new(Mutex::new(SchedulerState::default()));
+        let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
+        let mock = crate::synthetic::MockDispatcher::new();
+        let cfg = SchedulerConfig {
+            dispatch_fn: Some(mock.as_fn()),
+            task_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+
+        spawn_task(
+            &core,
+            &state,
+            &notifier,
+            &cfg,
+            &spec,
+            1,
+            Some(OperatorContext {
+                chat_id: 111_222,
+                thread_id: Some(33),
+                session_id: "research-operator-stale".to_string(),
+                prompt: "/research run operator-stale".to_string(),
+            }),
+        )
+        .await;
+
+        let captured = wait_for_captures(&mock, 1).await;
+        assert_eq!(captured.len(), 1, "synthetic=true branch must dispatch");
+        let msg = &captured[0];
+        assert_eq!(
+            msg.chat_id, 111_222,
+            "attempt-scoped inflight chat must win over persisted spec chat"
+        );
+        assert_eq!(
+            msg.thread_id,
+            Some(33),
+            "attempt-scoped inflight thread must win over persisted spec thread"
+        );
+
+        let stored = core
+            .research_store()
+            .load_spec("operator-stale")
+            .await
+            .expect("load stored spec");
+        assert_eq!(
+            stored.chat_id,
+            Some(999_000),
+            "ResearchSpec.chat_id must not be mutated"
+        );
+        assert_eq!(
+            stored.thread_id,
+            Some(9),
+            "ResearchSpec.thread_id must not be mutated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effective_chat_gate_falls_back_to_spec_chat_for_scheduled_run() {
+        let tmp = TempDir::new().expect("tempdir");
+        let core = make_core(&tmp);
+        let spec = spec_with_chat("cron-spec", Some(444_555), Some(12));
+        core.research_store()
+            .create_spec(&spec)
+            .await
+            .expect("create spec");
+
+        let state = Arc::new(Mutex::new(SchedulerState::default()));
+        let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
+        let mock = crate::synthetic::MockDispatcher::new();
+        let cfg = SchedulerConfig {
+            dispatch_fn: Some(mock.as_fn()),
+            task_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+
+        spawn_task(&core, &state, &notifier, &cfg, &spec, 1, None).await;
+
+        let captured = wait_for_captures(&mock, 1).await;
+        assert_eq!(
+            captured.len(),
+            1,
+            "scheduled run with spec chat must dispatch"
+        );
+        let msg = &captured[0];
+        assert_eq!(
+            msg.chat_id, 444_555,
+            "spec chat is the no-inflight fallback"
+        );
+        assert_eq!(
+            msg.thread_id,
+            Some(12),
+            "spec thread is the no-inflight fallback"
+        );
+        assert_eq!(msg.text, "/research run cron-spec");
+        assert_eq!(msg.source.spec_id(), Some("cron-spec"));
+
+        let stored = core
+            .research_store()
+            .load_spec("cron-spec")
+            .await
+            .expect("load stored spec");
+        assert_eq!(
+            stored.chat_id,
+            Some(444_555),
+            "ResearchSpec.chat_id must not be mutated"
+        );
+        assert_eq!(
+            stored.thread_id,
+            Some(12),
+            "ResearchSpec.thread_id must not be mutated"
+        );
     }
 
     // ── evaluate_outcome ─────────────────────────────────────────────

@@ -5,6 +5,7 @@ use teloxide::prelude::*;
 use teloxide::types::BotCommand;
 
 use naked_core::config::Config;
+use naked_core::research::tool::redact::redact_for_log;
 
 pub(crate) struct TelegramClientBundle {
     pub(crate) bot: Bot,
@@ -88,15 +89,17 @@ async fn resolve_bot_identity(
                 Arc::new(naked_tg::bot_identity::BotIdentity { id, username })
             }
             Err(e) => {
+                let safe = redact_for_log(&e);
                 tracing::error!(
-                    "getMe parse error: {e} — using zero identity (group filter will reject everything)"
+                    "getMe parse error: {safe} — using zero identity (group filter will reject everything)"
                 );
                 zero_bot_identity()
             }
         },
         Err(e) => {
+            let safe = redact_for_log(&e);
             tracing::error!(
-                "getMe request failed: {e} — using zero identity (group filter will reject everything)"
+                "getMe request failed: {safe} — using zero identity (group filter will reject everything)"
             );
             zero_bot_identity()
         }
@@ -135,7 +138,10 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("mcp", "List MCP servers"),
         BotCommand::new("refresh", "Reload skills & MCP"),
         BotCommand::new("reasoning", "Set thinking/reasoning level"),
-        BotCommand::new("yolo", "Auto-approve ALL tools in this topic"),
+        BotCommand::new(
+            "yolo",
+            "Auto-approve tools (2nd distinct enable in chat = permanent; /yolo off to reset)",
+        ),
         BotCommand::new("allow", "Manage tool allow-list for this topic"),
         BotCommand::new("memory", "Memory: rules / dreams / drafts / stats"),
         BotCommand::new("research", "Run, list, pause or resume research"),
@@ -145,7 +151,8 @@ async fn register_commands(bot: &Bot) {
         BotCommand::new("help", "Show all commands"),
     ];
     if let Err(e) = bot.set_my_commands(commands).await {
-        tracing::warn!("Failed to set bot commands: {e}");
+        let safe = redact_for_log(&e);
+        tracing::warn!("Failed to set bot commands: {safe}");
     }
 }
 

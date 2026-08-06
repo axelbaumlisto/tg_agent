@@ -9,6 +9,7 @@
 //! On 429: the limiter parks ALL edits for that chat for the full
 //! `Retry-After` duration. No retry loops, no cascading bans.
 
+use naked_core::research::tool::redact::redact_for_log;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -167,6 +168,7 @@ impl RateLimiter {
             }
             Err(e) => {
                 let err_str = e.to_string();
+                let safe = redact_for_log(&e);
                 // Parse "Retry after Xs" or "retry after Xs"
                 if let Some(secs) = parse_retry_after(&err_str) {
                     tracing::warn!(
@@ -179,7 +181,7 @@ impl RateLimiter {
                     // Non-rate-limit error (message not modified, chat not found, etc).
                     // Still count as an edit attempt for window purposes.
                     cs.record_edit();
-                    tracing::debug!(chat = cid, err = %err_str, "rate_limit: edit failed (non-429)");
+                    tracing::debug!(chat = cid, err = %safe, "rate_limit: edit failed (non-429)");
                 }
                 false
             }
@@ -414,5 +416,54 @@ mod tests {
             cs.record_429(30);
         }
         assert!(rl.is_blocked(123).await);
+    }
+
+    /// RATE-LONG-BACKOFF-DROP regression guard.
+    ///
+    /// When `time_until_allowed()` exceeds the 30s long-backoff threshold,
+    /// `edit()` must DROP the edit (return `false`) WITHOUT sleeping or
+    /// touching Telegram. This guards the early-drop branch in `edit()`
+    /// (`if wait > Duration::from_secs(30) { return false; }`): if that
+    /// branch is removed, the edit falls through to sleep+send and the
+    /// mock server would receive a request.
+    ///
+    /// State is forced via the public 429 path (`record_429` with a
+    /// retry-after well above 30s), the same mechanism the `backoff_429`
+    /// test uses, so the >30s wait is deterministic (not timing-flaky).
+    #[tokio::test]
+    async fn long_backoff_drops_edit_without_hitting_telegram() {
+        use teloxide::types::{ChatId, MessageId};
+        use wiremock::MockServer;
+
+        // MockServer with NO mounted routes: any request would be visible
+        // in received_requests(), and the drop path must send none.
+        let server = MockServer::start().await;
+        let bot = Bot::new("0:TEST_TOKEN").set_api_url(reqwest::Url::parse(&server.uri()).unwrap());
+
+        let chat = ChatId(999);
+        let rl = RateLimiter::new();
+
+        // Force a >30s wait via the public 429 backoff path (retry-after = 90s,
+        // below MAX_GAP=120s so it is not clamped away).
+        {
+            let mut state = rl.inner.lock().await;
+            let cs = state.chats.entry(chat.0).or_insert_with(ChatState::new);
+            cs.record_429(90);
+        }
+
+        let ok = rl
+            .edit(&bot, chat, MessageId(1), "stale update", false)
+            .await;
+
+        // (a) the edit is dropped
+        assert!(!ok, "long-backoff edit must be dropped (return false)");
+        // (b) the drop path never touched Telegram
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            0,
+            "long-backoff drop must not send any Telegram request, got {} requests",
+            received.len()
+        );
     }
 }

@@ -1625,7 +1625,6 @@ async fn t92_heartbeat_during_tool_execution() {
 async fn t99_classifier_user_scope_via_attribution_prefix() {
     use naked_core::memory::classifier;
 
-    need_naked_home!();
     need_provider!(_config, provider, model);
     pace().await;
 

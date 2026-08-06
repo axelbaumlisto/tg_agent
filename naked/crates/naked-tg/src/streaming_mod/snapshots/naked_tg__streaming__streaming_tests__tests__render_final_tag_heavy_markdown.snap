@@ -1,0 +1,14 @@
+---
+source: crates/naked-tg/src/streaming_mod/tests.rs
+expression: v.render_final()
+---
+<b>Heading &lt;raw&gt;</b>
+
+<blockquote>Quote with <b>bold</b> &amp; symbols</blockquote>
+
+• item with <i>italic</i>
+• item with <code>inline &lt;code&gt;</code>
+
+<pre><code class="language-rust">fn main() { println!(&quot;&lt;hi&gt;&amp;&quot;); }</code></pre>
+
+See <a href="https://example.com/path?a=1&amp;b=2">docs</a>.

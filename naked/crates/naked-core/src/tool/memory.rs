@@ -104,7 +104,16 @@ impl Tool for MemoryTool {
                 },
                 "required": ["action"]
             }),
-            permission: Permission::ReadOnly,
+            // `memory` contains write actions; `effective_permission` keeps read actions
+            // auto-approved and gates only store/delete like bash.rs gates by command risk.
+            permission: Permission::WorkspaceWrite,
+        }
+    }
+
+    fn effective_permission(&self, input: &serde_json::Value, _cwd: &Path) -> Permission {
+        match input.get("action").and_then(|v| v.as_str()) {
+            Some("store" | "delete") => Permission::WorkspaceWrite,
+            _ => Permission::ReadOnly,
         }
     }
 
@@ -398,6 +407,7 @@ impl MemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::policy::{ToolDecision, ToolPolicy, default_pipeline};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -479,5 +489,66 @@ mod tests {
             )
             .await;
         assert!(!res.is_error);
+    }
+
+    #[test]
+    fn s7_memory_tool_spec_is_write_class_because_it_can_mutate() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        assert_eq!(tool.spec().permission, Permission::WorkspaceWrite);
+    }
+
+    #[test]
+    fn s7_memory_schema_has_no_legacy_facts_category() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let schema = tool.spec().parameters.to_string();
+        assert!(
+            !schema.contains("Facts"),
+            "legacy remember/Facts category must not be advertised: {schema}"
+        );
+        assert!(
+            schema.contains("project_knowledge"),
+            "persistent factual knowledge must use MemoryType::ProjectKnowledge: {schema}"
+        );
+    }
+
+    #[test]
+    fn s7_memory_write_actions_require_approval_but_reads_stay_auto() {
+        let tmp = tempdir().unwrap();
+        let tool = make_tool(tmp.path());
+        let policy = default_pipeline(None);
+
+        for input in [
+            serde_json::json!({"action": "store", "content": "prefer rust", "memory_type": "preference", "scope": "global"}),
+            serde_json::json!({"action": "delete", "id": "abc123", "scope": "global"}),
+        ] {
+            let permission = tool.effective_permission(&input, tmp.path());
+            assert_ne!(
+                permission,
+                Permission::ReadOnly,
+                "write action stayed read-only: {input}"
+            );
+            assert_eq!(
+                policy.classify("memory", &input, tmp.path(), permission),
+                ToolDecision::AskUser(Permission::WorkspaceWrite),
+                "memory write action must not be auto-approved: {input}"
+            );
+        }
+
+        for action in ["search", "list", "dreams", "daily_drafts", "stats"] {
+            let input = serde_json::json!({"action": action, "content": "rust"});
+            let permission = tool.effective_permission(&input, tmp.path());
+            assert_eq!(
+                permission,
+                Permission::ReadOnly,
+                "read action was gated: {action}"
+            );
+            assert_eq!(
+                policy.classify("memory", &input, tmp.path(), permission),
+                ToolDecision::Execute,
+                "memory read action must remain auto-approved: {action}"
+            );
+        }
     }
 }

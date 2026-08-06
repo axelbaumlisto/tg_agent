@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "test-hooks"))]
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -8,23 +10,79 @@ pub const MAX_ENTRIES_PER_FILE: usize = 100;
 pub const MAX_ENTRY_CHARS: usize = 500;
 pub const MAX_INJECTION_CHARS: usize = 4000;
 
-/// Compute a stable, case/whitespace-insensitive hash of memory content.
-/// Used by `append_dedup` to detect duplicates without depending on the
-/// exact UUID of an existing entry. Collisions are extremely unlikely
-/// for short markdown lines and the dedup is best-effort anyway —
-/// false positives only suppress an identical line.
+/// Compute a case/whitespace-insensitive dedup identity hash of memory content.
+///
+/// This is a best-effort dedup heuristic, not a security primitive. It uses
+/// [`std::collections::hash_map::DefaultHasher`], whose algorithm is explicitly
+/// unspecified and may change across Rust releases, so the returned value must
+/// never be persisted as a long-lived key.
 pub fn content_hash(content: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    content
-        .trim()
-        .to_lowercase()
+    normalized_dedup_text(content).hash(&mut h);
+    h.finish()
+}
+
+fn normalized_dedup_text(content: &str) -> String {
+    let lowered = content.trim().to_lowercase();
+    lowered
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .hash(&mut h);
-    h.finish()
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static NAKED_HOME_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Root resolver for all markdown memory paths.
+pub struct MemoryPaths;
+
+impl MemoryPaths {
+    pub fn naked_home() -> PathBuf {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(root) = Self::test_root() {
+            return root;
+        }
+        if let Ok(v) = std::env::var("NAKED_HOME") {
+            return PathBuf::from(v);
+        }
+        dirs_home().join(".naked")
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_root() -> Option<PathBuf> {
+        NAKED_HOME_OVERRIDE.with(|root| root.borrow().clone())
+    }
+
+    /// Temporarily override the markdown memory root for hermetic tests.
+    ///
+    /// This is available in unit tests and `test-hooks` builds so integration
+    /// tests can isolate memory paths without mutating `NAKED_HOME` (which
+    /// requires unsafe env mutation in Rust 2024 and is forbidden by the
+    /// workspace lint policy).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_test_root(root: impl Into<PathBuf>) -> MemoryRootOverrideGuard {
+        let previous = NAKED_HOME_OVERRIDE.with(|cell| cell.replace(Some(root.into())));
+        MemoryRootOverrideGuard { previous }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct MemoryRootOverrideGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for MemoryRootOverrideGuard {
+    fn drop(&mut self) {
+        NAKED_HOME_OVERRIDE.with(|cell| {
+            cell.replace(self.previous.take());
+        });
+    }
 }
 
 /// Reads and writes MEMORY.md files in a structured markdown format.
@@ -43,10 +101,7 @@ impl MarkdownMemoryStore {
     }
 
     pub fn naked_home() -> PathBuf {
-        if let Ok(v) = std::env::var("NAKED_HOME") {
-            return PathBuf::from(v);
-        }
-        dirs_home().join(".naked")
+        MemoryPaths::naked_home()
     }
 
     pub fn global_memory_path() -> PathBuf {
@@ -103,6 +158,8 @@ impl MarkdownMemoryStore {
     /// `content_hash` matches an existing one is skipped — but the
     /// existing entry's `created_at` is **refreshed to today** so
     /// repeated mentions keep the rule "young" in retention metrics.
+    /// The matched entry also records the re-observation in the existing
+    /// recall metadata (`recall:N` / `last_recall:YYYY-MM-DD`).
     /// Returns `false` if dedup hit, `true` if a new entry was written.
     ///
     /// When `dedup=false`, the entry is always appended (useful for
@@ -117,10 +174,15 @@ impl MarkdownMemoryStore {
                 .find(|e| content_hash(&e.content) == new_hash)
             {
                 // Refresh the timestamp so repeated drafts keep the
-                // rule fresh in retention/scoring windows. We
-                // deliberately do not bump the `id` so external
-                // references stay valid.
-                existing.created_at = Utc::now();
+                // rule fresh in retention/scoring windows, and record
+                // the re-observation on the matched entry. Keeping this
+                // mutation local to the matched entry means a later
+                // identity-hygiene fix only changes which entry matches,
+                // not the persistence format.
+                let now = Utc::now();
+                existing.created_at = now;
+                existing.recall_count = existing.recall_count.saturating_add(1);
+                existing.last_recalled_at = Some(now);
                 Self::save(path, &entries)?;
                 return Ok(false);
             }
@@ -426,66 +488,3 @@ pub fn scope_memory_dir(workspace: &Path, scope: &MemoryScope) -> PathBuf {
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;
-
-/// Semantic fingerprint — more aggressive than `content_hash`.
-/// Strips filler ("in turn N", "on turn N"), common suffixes,
-/// punctuation, and normalizes synonyms. Two entries with the same
-/// fingerprint are semantically the same rule.
-pub fn content_fingerprint(content: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let normalized = content.trim().to_lowercase();
-
-    // Strip trailing punctuation:
-    let normalized = normalized.trim_end_matches(|c: char| c.is_ascii_punctuation());
-
-    // Remove filler phrases:
-    let cleaned = normalized
-        .replace("in turn ", "")
-        .replace("on turn ", "")
-        .replace("briefly in ", "briefly ")
-        .replace("briefly on ", "briefly ");
-
-    // Remove all digits (turn numbers, etc.):
-    let cleaned: String = cleaned.chars().filter(|c| !c.is_ascii_digit()).collect();
-
-    // Normalize to sorted word set (order-independent matching):
-    let mut words: Vec<&str> = cleaned.split_whitespace().collect();
-    // Remove very short filler words:
-    words.retain(|w| w.len() > 2 || *w == "do" || *w == "no");
-    words.sort_unstable();
-    words.dedup();
-
-    let mut h = DefaultHasher::new();
-    words.join(" ").hash(&mut h);
-    h.finish()
-}
-
-#[cfg(test)]
-mod fingerprint_tests {
-    use super::*;
-
-    #[test]
-    fn fingerprint_matches_turn_variants() {
-        let base = content_fingerprint("greet the user briefly");
-        let with_turn7 = content_fingerprint("Greet the user briefly in Turn 7.");
-        let with_turn5 = content_fingerprint("greet the user briefly on turn 5");
-        assert_eq!(base, with_turn7, "should match despite 'in Turn 7'");
-        assert_eq!(base, with_turn5, "should match despite 'on turn 5'");
-    }
-
-    #[test]
-    fn fingerprint_ignores_punctuation_and_case() {
-        let with_dot = content_fingerprint("User prefers brief greetings.");
-        let without = content_fingerprint("User prefers brief greetings");
-        assert_eq!(with_dot, without);
-    }
-
-    #[test]
-    fn fingerprint_differs_for_different_rules() {
-        let greet = content_fingerprint("greet the user briefly");
-        let code = content_fingerprint("never share code with anyone");
-        assert_ne!(greet, code);
-    }
-}

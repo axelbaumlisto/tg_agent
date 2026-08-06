@@ -85,7 +85,7 @@ impl super::AgentLoop {
                 let msg = crate::error::WALL_TIMEOUT_MESSAGE.to_string();
                 let _ = tx.send(AgentEvent::Error(msg.clone())).await;
                 let _ = tx.send(AgentEvent::Idle).await;
-                self.config.record_health(
+                self.record_health_effective(
                     crate::model_catalog::HealthEventKind::Error,
                     None,
                     Some("turn wall timeout".into()),
@@ -123,7 +123,7 @@ impl super::AgentLoop {
                     let msg = crate::error::WALL_TIMEOUT_MESSAGE.to_string();
                     let _ = tx.send(AgentEvent::Error(msg)).await;
                     let _ = tx.send(AgentEvent::Idle).await;
-                    self.config.record_health(
+                    self.record_health_effective(
                         crate::model_catalog::HealthEventKind::Error,
                         None,
                         Some("turn provider/stream backstop timeout".into()),
@@ -188,7 +188,7 @@ impl super::AgentLoop {
                 self.config.observer.on_giveup(&msg);
                 let _ = tx.send(AgentEvent::Error(msg.clone())).await;
                 let _ = tx.send(AgentEvent::Idle).await;
-                self.config.record_health(
+                self.record_health_effective(
                     crate::model_catalog::HealthEventKind::Empty,
                     None,
                     Some(msg.clone()),
@@ -235,7 +235,7 @@ impl super::AgentLoop {
                     continue 'outer;
                 }
                 let _ = tx.send(AgentEvent::Idle).await;
-                self.config.record_health(
+                self.record_health_effective(
                     crate::model_catalog::HealthEventKind::Success,
                     None,
                     None,
@@ -380,7 +380,7 @@ impl super::AgentLoop {
                         let msg = crate::error::WALL_TIMEOUT_MESSAGE.to_string();
                         let _ = tx.send(AgentEvent::Error(msg)).await;
                         let _ = tx.send(AgentEvent::Idle).await;
-                        self.config.record_health(
+                        self.record_health_effective(
                             crate::model_catalog::HealthEventKind::Error,
                             None,
                             Some("tool wall timeout".into()),

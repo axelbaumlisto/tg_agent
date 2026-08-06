@@ -238,8 +238,9 @@ pub(crate) async fn process_media_items(items: &[MediaItem], ctx: &MediaCtx<'_>)
                 native_images.extend(out.native_images);
             }
             Err(e) => {
-                tracing::warn!(kind = item.kind.as_str(), error = %e, "media processing failed");
-                text_blocks.push(format!("[\u{26A0} {} error: {}]", item.kind.as_str(), e));
+                let safe = redact_for_log(&e);
+                tracing::warn!(kind = item.kind.as_str(), error = %safe, "media processing failed");
+                text_blocks.push(format!("[\u{26A0} {} error: {}]", item.kind.as_str(), safe));
             }
         }
     }
@@ -395,8 +396,9 @@ pub(crate) async fn process_one_media(
                     {
                         Ok(text) => format!("{header}\nTranscript:\n{text}"),
                         Err(e) => {
-                            tracing::warn!(error = %e, "transcription failed, falling back to path");
-                            format!("{header}\n[\u{26A0} transcription failed: {e}]")
+                            let safe = redact_for_log(&e);
+                            tracing::warn!(error = %safe, "transcription failed, falling back to path");
+                            format!("{header}\n[\u{26A0} transcription failed: {safe}]")
                         }
                     }
                 }
@@ -516,13 +518,14 @@ pub(crate) async fn process_one_media(
                                     }
                                     _ => "",
                                 };
+                                let safe = redact_for_log(&e);
                                 tracing::warn!(
-                                    error = %e,
+                                    error = %safe,
                                     reason,
                                     classified = %hint,
                                     "vision describer failed"
                                 );
-                                let msg = e.to_string();
+                                let msg = safe;
                                 let tail = msg.chars().take(180).collect::<String>();
                                 format!(
                                     "{header}\n[\u{26A0} vision describer failed{hint}: {tail}]"

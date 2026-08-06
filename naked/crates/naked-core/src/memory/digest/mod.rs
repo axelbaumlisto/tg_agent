@@ -8,13 +8,13 @@
 //!    (`memory/YYYY-MM-DD.md`).
 //! 2. Compute deterministic scoring hints per draft entry:
 //!    `repeat_days` (how many distinct daily files contain a matching
-//!    `content_hash`), `recall_count` (best-effort, reserved for
-//!    future instrumentation — currently always 0), `age_days`,
-//!    `source_diversity` (number of distinct `source` strings).
+//!    `content_hash`), `recall_count` (persisted re-observations
+//!    from draft metadata), `age_days`, `source_diversity` (number of
+//!    distinct `source` strings), and `reinforcements` (raw occurrences).
 //! 3. Optionally call the LLM with the draft list + scores asking for
 //!    a one-paragraph human summary. Falls back to a deterministic
 //!    summary on LLM failure — the digest must never silently break.
-//! 4. Decide promotions (`scoring_promote`) using config gates
+//! 4. Decide promotions (`partition_candidates`) using config gates
 //!    (`promote_min_repeat_days`, `promote_min_recall_count`).
 //! 5. Build a `DigestPlan` and apply it: append a `DreamEntry`,
 //!    optionally append promoted entries to `MEMORY.md` (when
@@ -30,7 +30,10 @@ pub use extract::{
     collect_window, extract_and_append, flush_recall_to_disk, pre_compaction_flush, session_close,
 };
 pub use format::{apply_plan, deterministic_summary, last_digest_summary, summarize_with_llm};
-pub use score::{effective_recall, partition_candidates, pick_compaction_victims};
+pub use score::{
+    CounterfactualStats, effective_recall, partition_candidates, pick_compaction_victims,
+    promoted_road_counts,
+};
 
 use std::path::Path;
 
@@ -74,22 +77,22 @@ pub struct ScoringHints {
     pub source_diversity: u32,
     /// Days since the entry was first seen.
     pub age_days: u32,
-    /// Best-effort recall count. Reserved for future instrumentation;
-    /// always 0 today.
+    /// Persisted re-observations recorded on draft entries.
     pub recall_count: u32,
-    /// How many raw occurrences (including wording variants) mapped
-    /// to this fingerprint. Higher = user keeps repeating this rule.
+    /// How many raw occurrences mapped to this dedup identity. Persisted
+    /// re-observations are carried separately in `recall_count` and are
+    /// combined by `partition_candidates` only when the rollout flag is enabled.
     pub reinforcements: u32,
 }
 
-/// One promotion candidate emitted by `scoring_promote`.
+/// One promotion candidate emitted by `partition_candidates`.
 #[derive(Debug, Clone)]
 pub struct PromoteEntry {
     pub entry: MemoryEntry,
     pub hints: ScoringHints,
 }
 
-/// One rejected candidate emitted by `scoring_promote`.
+/// One rejected candidate emitted by `partition_candidates`.
 #[derive(Debug, Clone)]
 pub struct RejectedEntry {
     pub entry: MemoryEntry,
@@ -105,6 +108,9 @@ pub struct DigestPlan {
     /// Human-readable summary (LLM-generated when available, otherwise
     /// a deterministic fallback).
     pub summary: String,
+    /// Counterfactual road counts computed before feature-flagged scorer
+    /// mutations, so the re-observation road is visible while flag-off.
+    pub counterfactual: CounterfactualStats,
     pub promoted: Vec<PromoteEntry>,
     pub rejected: Vec<RejectedEntry>,
 }
@@ -161,6 +167,7 @@ pub async fn build_plan(
     llm: Option<(&dyn Provider, &str)>,
 ) -> DigestPlan {
     let candidates = collect_window(workspace, scope, today, cfg.recent_shift_days.max(1));
+    let counterfactual = score::counterfactual_stats(&candidates, cfg);
     let (promoted, rejected) = partition_candidates(candidates, cfg);
 
     let summary = match llm {
@@ -182,6 +189,7 @@ pub async fn build_plan(
         scope: scope.clone(),
         mode: DigestMode::from_str_or_default(&cfg.daily_mode),
         summary,
+        counterfactual,
         promoted,
         rejected,
     }

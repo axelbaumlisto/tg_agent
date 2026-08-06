@@ -135,4 +135,68 @@ mod tests {
         let filtered = filter_models_by_scope(&models, &["a/*".into(), "c/*".into()]);
         assert_eq!(filtered.len(), 2);
     }
+
+    // ── glob_match `*` backtracking (D-MODEL-GLOB-BACKTRACK-STAR) ─────
+    //
+    // A `*` that is NOT the trailing token must retry the rest of the
+    // pattern at every text position, i.e. backtrack after consuming
+    // 1+ chars. A naive matcher that only tries the zero-length match
+    // (no advance / no retry loop) gets every case below wrong.
+
+    #[test]
+    fn glob_star_backtracks_mid_pattern() {
+        // `*` consumes "c", then the trailing `b` matches.
+        // Naive (zero-length only): tries "a" vs "a" ok, then `b` vs "c"
+        // fails and never retries → returns false. Backtracking → true.
+        assert!(glob_match("a*b", "acb"));
+        // Multiple chars consumed by the star.
+        assert!(glob_match("a*b", "acccb"));
+    }
+
+    #[test]
+    fn glob_star_matches_empty_span() {
+        // `*` matches the empty span; the surrounding literals abut.
+        assert!(glob_match("a*b", "ab"));
+    }
+
+    #[test]
+    fn glob_star_must_anchor_pattern_tail() {
+        // The star is greedy-with-backtrack but the pattern must still
+        // be fully consumed: trailing text after the final `b` fails.
+        assert!(!glob_match("a*b", "acbX"));
+        // No `b` at all after the `a` → no position satisfies the tail.
+        assert!(!glob_match("a*b", "acc"));
+    }
+
+    #[test]
+    fn glob_leading_star_suffix_match() {
+        // `*x` — star must skip a prefix before the suffix `x` matches.
+        assert!(glob_match("*x", "aax"));
+        assert!(glob_match("*x", "x"));
+        // Suffix not at the end → false (naive first-position match would
+        // wrongly accept by matching `x` early and ignoring the tail).
+        assert!(!glob_match("*x", "axy"));
+    }
+
+    #[test]
+    fn glob_multiple_stars_backtrack() {
+        // Two separated stars: each must independently find its anchor.
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(glob_match("a*b*c", "abc"));
+        // Missing the final `c` anchor → false even though a*b* matches.
+        assert!(!glob_match("a*b*c", "aXbY"));
+    }
+
+    #[test]
+    fn scope_star_backtracks_over_slash() {
+        // Scope-level: `*/gpt*` requires the star to backtrack across the
+        // `provider/model` join to anchor the `gpt` literal.
+        let models = vec![
+            ("openai".into(), "gpt-4o".into()),
+            ("anthropic".into(), "claude-3".into()),
+        ];
+        let filtered = filter_models_by_scope(&models, &["*/gpt*".into()]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, "gpt-4o");
+    }
 }

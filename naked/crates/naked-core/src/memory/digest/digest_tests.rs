@@ -38,10 +38,11 @@ fn partition_uses_repeat_days_gate() {
 }
 
 #[test]
-fn partition_uses_recall_count_gate() {
+fn partition_uses_recall_count_gate_when_reobservation_flag_enabled() {
     let cfg = MemoryConfig {
         promote_min_repeat_days: 1,
         promote_min_recall_count: 2,
+        memory_reobservation_promote_enabled: true,
         ..MemoryConfig::default()
     };
     let mut a = entry("rule A", "user", 3);
@@ -97,26 +98,19 @@ fn collect_window_dedups_by_content_hash() {
     let today = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
     let yesterday = today - ChronoDuration::days(1);
 
-    // Stand up the same path layout `read_daily` expects:
-    // <scope_memory_dir>/YYYY-MM-DD.md. We can't redirect
-    // `MarkdownMemoryStore::project_memory_path` (uses NAKED_HOME)
-    // without `unsafe`, so write the files directly to a fake
-    // workspace and call `MarkdownMemoryStore::load` ourselves —
-    // exercising the dedup logic in `collect_window` requires
-    // reading via `read_daily`, so we shim by writing to the
-    // expected location.
-    let dummy_workspace = dir.path().to_path_buf();
+    // Stand up the same path layout `read_daily` expects under a
+    // temp naked-home root, so `collect_window` exercises the real
+    // path-resolution and `read_daily` plumbing without touching the
+    // operator's `~/.naked` tree.
+    let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+    let dummy_workspace = dir.path().join("workspace");
     let mem_dir = crate::memory::store::scope_memory_dir(&dummy_workspace, &scope);
+    assert!(
+        mem_dir.starts_with(dir.path()),
+        "memory dir must stay inside temp root: {}",
+        mem_dir.display()
+    );
     std::fs::create_dir_all(&mem_dir).unwrap();
-    // We cannot point `scope_memory_dir` at the tempdir without
-    // env mutation, so this test instead exercises the pure
-    // dedup math via `collect_window`'s public surface — skip
-    // when the resolved path is outside the tempdir to avoid
-    // touching the real `~/.naked/projects/...` tree.
-    if !mem_dir.starts_with(dir.path()) {
-        // Real NAKED_HOME — skip to keep the test sandboxed.
-        return;
-    }
     let p_today = mem_dir.join(format!("{}.md", today));
     let p_yest = mem_dir.join(format!("{}.md", yesterday));
     let mut e_old = MemoryEntry::new(
@@ -139,6 +133,255 @@ fn collect_window_dedups_by_content_hash() {
     assert_eq!(collected.len(), 1, "must dedup by content hash");
     assert_eq!(collected[0].1.repeat_days, 2);
     assert_eq!(collected[0].1.source_diversity, 2);
+}
+
+#[test]
+fn collect_window_keeps_order_sensitive_rules_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = proj();
+    let today = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+    let workspace = dir.path().join("workspace");
+    let entries = [
+        MemoryEntry::new(
+            MemoryType::Preference,
+            "prefer anthropic over qwen".into(),
+            "user",
+            scope.clone(),
+        ),
+        MemoryEntry::new(
+            MemoryType::Preference,
+            "prefer qwen over anthropic".into(),
+            "auto",
+            scope.clone(),
+        ),
+    ];
+    save_daily_entries_under_temp_root(dir.path(), &workspace, &scope, today, &entries);
+
+    let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+    let collected = collect_window(&workspace, &scope, today, 1);
+    assert_eq!(
+        collected.len(),
+        2,
+        "digest collection must use the same order-preserving identity as append_dedup"
+    );
+}
+
+fn save_daily_entries_under_temp_root(
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    scope: &MemoryScope,
+    today: NaiveDate,
+    entries: &[MemoryEntry],
+) {
+    save_daily_entries_for_date(root, workspace, scope, today, entries);
+}
+
+fn save_daily_entries_for_date(
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    scope: &MemoryScope,
+    date: NaiveDate,
+    entries: &[MemoryEntry],
+) {
+    let _root = crate::memory::store::MemoryPaths::set_test_root(root);
+    let mem_dir = crate::memory::store::scope_memory_dir(workspace, scope);
+    assert!(
+        mem_dir.starts_with(root),
+        "memory dir must stay inside temp root: {}",
+        mem_dir.display()
+    );
+    std::fs::create_dir_all(&mem_dir).unwrap();
+    MarkdownMemoryStore::save(&mem_dir.join(format!("{date}.md")), entries).unwrap();
+}
+
+fn draft_entry_with_recall(content: &str, recall_count: u32) -> MemoryEntry {
+    let mut entry = MemoryEntry::new(MemoryType::Preference, content.into(), "user", proj());
+    entry.recall_count = recall_count;
+    if recall_count > 0 {
+        entry.last_recalled_at = Some(Utc::now());
+    }
+    entry
+}
+
+#[test]
+fn collect_window_surfaces_persisted_recall_count_in_scoring_hints() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = proj();
+    let today = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+    let workspace = dir.path().join("workspace");
+    let entry = draft_entry_with_recall("prefer durable evidence", 4);
+    save_daily_entries_under_temp_root(dir.path(), &workspace, &scope, today, &[entry]);
+
+    let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+    let collected = collect_window(&workspace, &scope, today, 1);
+    assert_eq!(collected.len(), 1);
+    let hints = &collected[0].1;
+    assert_eq!(hints.recall_count, 4);
+    assert_eq!(hints.reinforcements, 1);
+}
+
+#[test]
+fn reobservation_flag_off_matches_legacy_partition() {
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        memory_reobservation_promote_enabled: false,
+        ..MemoryConfig::default()
+    };
+
+    let legacy = entry("prefer durable evidence", "user", 1);
+    let mut with_persisted_reobservations = entry("prefer durable evidence", "user", 1);
+    with_persisted_reobservations.1.recall_count = 2;
+    with_persisted_reobservations.1.reinforcements = 1;
+
+    let (legacy_promoted, legacy_rejected) = partition_candidates(vec![legacy], &cfg);
+    let (new_promoted, new_rejected) =
+        partition_candidates(vec![with_persisted_reobservations], &cfg);
+
+    assert!(legacy_promoted.is_empty());
+    assert!(new_promoted.is_empty());
+    assert_eq!(legacy_rejected.len(), 1);
+    assert_eq!(new_rejected.len(), 1);
+    assert_eq!(new_rejected[0].reason, legacy_rejected[0].reason);
+    assert_eq!(new_rejected[0].hints.recall_count, 0);
+}
+
+#[test]
+fn counterfactual_roads_count_repeat_days_and_reobs_independently() {
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        memory_reobservation_promote_enabled: false,
+        promote_min_reobservations: 2,
+        ..MemoryConfig::default()
+    };
+    let mut both_roads = entry("prefer overlap visibility", "user", 1);
+    both_roads.1.repeat_days = 2;
+    both_roads.1.recall_count = 2;
+    both_roads.1.reinforcements = 1;
+
+    let stats = score::counterfactual_stats(&[both_roads], &cfg);
+
+    assert_eq!(stats.candidates, 1);
+    assert_eq!(stats.would_promote.repeat_days, 1);
+    assert_eq!(stats.would_promote.reinforce, 0);
+    assert_eq!(stats.would_promote.reobs, 1);
+}
+
+#[tokio::test]
+async fn reobservation_flag_off_preserves_legacy_recall_gate_with_persisted_recall() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = proj();
+    let today = NaiveDate::from_ymd_opt(2026, 4, 23).unwrap();
+    let workspace = dir.path().join("workspace");
+    let entry = draft_entry_with_recall("prefer evidence before promotion", 3);
+    save_daily_entries_under_temp_root(dir.path(), &workspace, &scope, today, &[entry]);
+
+    let cfg = MemoryConfig {
+        recent_shift_days: 1,
+        promote_min_repeat_days: 1,
+        promote_min_recall_count: 2,
+        memory_reobservation_promote_enabled: false,
+        ..MemoryConfig::default()
+    };
+    let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+    let plan = build_plan(&workspace, &scope, &cfg, today, None).await;
+
+    assert!(plan.promoted.is_empty());
+    assert_eq!(plan.rejected.len(), 1);
+    assert_eq!(
+        plan.rejected[0].entry.content,
+        "prefer evidence before promotion"
+    );
+    assert_eq!(plan.rejected[0].hints.recall_count, 0);
+    assert_eq!(plan.rejected[0].hints.reinforcements, 1);
+    assert!(plan.rejected[0].reason.contains("recalled only 0 time(s)"));
+}
+
+#[tokio::test]
+async fn counterfactual_digest_fixture_reports_roads_zeros_and_flag_off_reobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = proj();
+    let today = NaiveDate::from_ymd_opt(2026, 4, 24).unwrap();
+    let yesterday = today - ChronoDuration::days(1);
+    let workspace = dir.path().join("workspace");
+
+    let repeat_today = draft_entry_with_recall("prefer stable metrics", 0);
+    let repeat_yesterday = draft_entry_with_recall("prefer stable metrics", 0);
+    let reobs = draft_entry_with_recall("prefer reobserved memory", 2);
+    let plain = draft_entry_with_recall("prefer one-off draft", 0);
+    save_daily_entries_for_date(
+        dir.path(),
+        &workspace,
+        &scope,
+        today,
+        &[repeat_today, reobs, plain],
+    );
+    save_daily_entries_for_date(
+        dir.path(),
+        &workspace,
+        &scope,
+        yesterday,
+        &[repeat_yesterday],
+    );
+
+    let cfg = MemoryConfig {
+        recent_shift_days: 2,
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        memory_reobservation_promote_enabled: false,
+        promote_min_reobservations: 2,
+        ..MemoryConfig::default()
+    };
+    let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+    let plan = build_plan(&workspace, &scope, &cfg, today, None).await;
+
+    assert_eq!(plan.counterfactual.candidates, 3);
+    assert_eq!(plan.counterfactual.would_promote.repeat_days, 1);
+    assert_eq!(plan.counterfactual.would_promote.reinforce, 0);
+    assert_eq!(plan.counterfactual.would_promote.reobs, 1);
+    assert_eq!(plan.promoted.len(), 1, "flag-off reobs must not promote");
+    assert_eq!(plan.rejected.len(), 2);
+    assert_eq!(
+        crate::memory::daily::counterfactual_log_line(&scope, &plan),
+        "memory digest counterfactual scope=project road_counts=independent_may_overlap candidates=3 would_promote_repeat_days=1 would_promote_reinforce=0 would_promote_reobs=1 promoted=1 rejected=2"
+    );
+}
+
+#[tokio::test]
+async fn reobservation_promotion_flag_on_requires_two_recorded_reobservations() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = proj();
+    let today = NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+    let workspace = dir.path().join("workspace");
+    let promote = draft_entry_with_recall("prefer anthropic over qwen", 2);
+    let boundary = draft_entry_with_recall("prefer moonshot over groq", 1);
+    save_daily_entries_under_temp_root(dir.path(), &workspace, &scope, today, &[promote, boundary]);
+
+    let cfg = MemoryConfig {
+        recent_shift_days: 1,
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        memory_reobservation_promote_enabled: true,
+        promote_min_reobservations: 2,
+        ..MemoryConfig::default()
+    };
+    let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+    let plan = build_plan(&workspace, &scope, &cfg, today, None).await;
+
+    let promoted: Vec<_> = plan
+        .promoted
+        .iter()
+        .map(|item| item.entry.content.as_str())
+        .collect();
+    let rejected: Vec<_> = plan
+        .rejected
+        .iter()
+        .map(|item| item.entry.content.as_str())
+        .collect();
+    assert_eq!(promoted, vec!["prefer anthropic over qwen"]);
+    assert_eq!(rejected, vec!["prefer moonshot over groq"]);
+    assert!(plan.rejected[0].reason.contains("only 1 day"));
 }
 
 fn entry_aged(content: &str, age_days: i64, recall: u32) -> MemoryEntry {

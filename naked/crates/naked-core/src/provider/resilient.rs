@@ -52,6 +52,13 @@ pub struct ResilientProvider {
     /// because stream combinator closures are synchronous and cannot await
     /// the existing tokio locks; the guard is never held across `.await`.
     stream_failures: Arc<StdMutex<HashMap<usize, u8>>>,
+    /// B106: identity of the last silent fallback, so the turn layer can
+    /// re-label its span/health/UI with who ACTUALLY answered. Written on
+    /// every successful `stream_chat`: `Some(..)` when a fallback occurred,
+    /// `None` when the requested provider served it, so a later clean turn
+    /// cannot inherit a stale banner. `std::sync::Mutex` (never held across
+    /// `.await`) so the sync `last_fallback()` accessor can read it.
+    last_fallback: Arc<StdMutex<Option<super::FallbackInfo>>>,
 }
 
 impl ResilientProvider {
@@ -66,6 +73,7 @@ impl ResilientProvider {
             order: Mutex::new(order),
             blacklist: Mutex::new(HashMap::new()),
             stream_failures: Arc::new(StdMutex::new(HashMap::new())),
+            last_fallback: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -217,14 +225,13 @@ impl ResilientProvider {
                 && *permanent
             {
                 bl.insert(*idx, permanent_blacklist_until());
-                crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     provider = %provider_name,
                     key_index = *idx,
                     error = %msg,
                     "provider key permanently blacklisted during boot audit"
                 );
+                self.note_permanently_dead_key(*idx, &provider_name);
             }
         }
         tracing::info!(
@@ -237,6 +244,61 @@ impl ResilientProvider {
             self.providers.len()
         );
     }
+    /// Record that `providers[idx]`'s key is permanently dead: bump the
+    /// counter and hand the literal key to B46 persistence.
+    ///
+    /// Both discovery paths (boot audit and runtime `stream_chat`) must do the
+    /// SAME thing here. They did not: the runtime path persisted, the boot
+    /// audit only blacklisted, so the path that finds most dead keys wrote
+    /// nothing and B46 was a no-op (B111). Keeping the two in sync by hand is
+    /// what failed — hence one method.
+    ///
+    /// Caller owns the blacklist insert, because the two paths hold that lock
+    /// differently (the audit already holds the guard).
+    fn note_permanently_dead_key(&self, idx: usize, provider_name: &str) {
+        crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // B110: this `key_hint` reaches through the TimeoutProvider wrapper
+        // every chain entry is built with; without that delegation it is None
+        // and nothing is ever persisted.
+        if let Some(key_value) = self.providers[idx].key_hint() {
+            super::dead_key_persist::persist_dead_key(
+                super::logical_provider_name(provider_name),
+                &key_value,
+            );
+        }
+    }
+
+    /// B106: remember who actually served the last `stream_chat`.
+    ///
+    /// Called on EVERY success — `clean = true` clears the slot, so a stale
+    /// banner from an earlier fallback cannot leak into a later good turn.
+    fn note_fallback(
+        &self,
+        clean: bool,
+        requested: &str,
+        served_by: &str,
+        last_err: Option<&AgentError>,
+    ) {
+        // Poison-recovering lock helper used throughout the crate. Dropping
+        // the write on poison would make every later turn look clean and
+        // quietly re-hide the fallback B106 exists to surface.
+        let mut slot = crate::lock_or_recover(&self.last_fallback);
+        *slot = if clean {
+            None
+        } else {
+            Some(super::FallbackInfo {
+                requested: super::logical_provider_name(requested).to_string(),
+                served_by: super::logical_provider_name(served_by).to_string(),
+                reason: last_err
+                    .map(|e| {
+                        let red = crate::research::tool::redact::redact_for_log(e);
+                        crate::util::head_truncate(&red, 160).to_string()
+                    })
+                    .unwrap_or_else(|| "provider error".to_string()),
+            })
+        };
+    }
 }
 
 #[async_trait]
@@ -248,6 +310,11 @@ impl Provider for ResilientProvider {
             return self.providers[idx].name();
         }
         self.providers[0].name()
+    }
+
+    /// B106: expose the last silent fallback to the turn layer.
+    fn last_fallback(&self) -> Option<super::FallbackInfo> {
+        crate::lock_or_recover(&self.last_fallback).clone()
     }
 
     fn models(&self) -> Vec<ModelInfo> {
@@ -332,6 +399,12 @@ impl Provider for ResilientProvider {
 
             match provider.stream_chat(request.clone()).await {
                 Ok(stream) => {
+                    self.note_fallback(
+                        failed_indices.is_empty(),
+                        self.providers[snapshot[0]].name(),
+                        provider.name(),
+                        last_err.as_ref(),
+                    );
                     if !failed_indices.is_empty() {
                         tracing::info!(
                             "Provider '{}' failed, fell back to '{}' ({} demoted)",
@@ -429,21 +502,11 @@ impl Provider for ResilientProvider {
                                 "Provider '{}' key PERMANENTLY blacklisted (auth/payment): {e}",
                                 provider.name(),
                             );
-                            crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             self.blacklist
                                 .lock()
                                 .await
                                 .insert(idx, permanent_blacklist_until());
-                            // B46 / PLAN_PROVIDER_HEALTH_v1: auto-persist
-                            // dead key to state/naked.json so the next bot
-                            // restart doesn't re-probe it. Gated by
-                            // NAKED_AUTO_PERSIST_DEAD_KEYS=1 env (off by
-                            // default — see dead_key_persist module docs).
-                            if let Some(key_value) = self.providers[idx].key_hint() {
-                                let logical = super::logical_provider_name(provider.name());
-                                super::dead_key_persist::persist_dead_key(logical, &key_value);
-                            }
+                            self.note_permanently_dead_key(idx, provider.name());
                         } else {
                             tracing::warn!(
                                 "Provider '{}' key dead: {e}, blacklisting for {}s",
@@ -1176,5 +1239,261 @@ mod tests {
     #[test]
     fn extract_status_empty() {
         assert_eq!(extract_status_from_error(""), 0);
+    }
+    // ── D-INV-FALLBACK-VISIBLE (B106) ──────────────────────────────────────
+    //
+    // A silent fallback used to leave the caller labelling the turn with the
+    // provider the user picked, so the tracing span, model_health.jsonl and
+    // the chat bubble all credited a provider that had actually refused the
+    // request (observed live: groq 413 -> deepseek answered, recorded as
+    // "groq: success"). `last_fallback()` is what lets the turn layer tell
+    // the truth. Removing the write in `stream_chat` fails these tests.
+
+    /// The production shape B106 was found in: the requested provider (groq)
+    /// rejects the request, the next one (deepseek) serves it. Shared so a
+    /// change to the fixture cannot make some of these tests exercise a
+    /// different chain than the others.
+    fn groq_then_deepseek() -> ResilientProvider {
+        ResilientProvider::new(vec![
+            Box::new(FailProvider {
+                name: "groq".into(),
+            }),
+            Box::new(SuccessProvider {
+                name: "deepseek".into(),
+            }),
+        ])
+    }
+
+    #[tokio::test]
+    async fn b106_last_fallback_reports_who_actually_served() {
+        let p = groq_then_deepseek();
+        assert!(
+            p.last_fallback().is_none(),
+            "no fallback should be reported before any call"
+        );
+
+        let _stream = p.stream_chat(test_request()).await.unwrap();
+
+        let info = p.last_fallback().expect("fallback must be recorded");
+        assert_eq!(info.requested, "groq");
+        assert_eq!(info.served_by, "deepseek");
+        assert!(
+            !info.reason.is_empty(),
+            "a reason is required so the user learns WHY"
+        );
+    }
+
+    #[tokio::test]
+    async fn b106_no_fallback_reported_on_clean_turn() {
+        let p = ResilientProvider::new(vec![Box::new(SuccessProvider {
+            name: "deepseek".into(),
+        })]);
+        let _stream = p.stream_chat(test_request()).await.unwrap();
+        assert!(
+            p.last_fallback().is_none(),
+            "a clean turn must not claim a fallback"
+        );
+    }
+
+    /// The banner must not persist: once a later turn is served by the
+    /// requested provider, `last_fallback()` has to go back to None or every
+    /// subsequent answer would carry a stale warning.
+    #[tokio::test]
+    async fn b106_stale_fallback_is_cleared_by_next_clean_turn() {
+        let p = groq_then_deepseek();
+        let _ = p.stream_chat(test_request()).await.unwrap();
+        assert!(p.last_fallback().is_some());
+
+        // After the failure the order is rotated so deepseek is now front and
+        // serves directly — no fallback on this call.
+        let _ = p.stream_chat(test_request()).await.unwrap();
+        assert!(
+            p.last_fallback().is_none(),
+            "stale fallback leaked into a clean turn"
+        );
+    }
+
+    /// Decorators must delegate, otherwise the fallback is invisible in prod
+    /// (every provider is wrapped in TimeoutProvider + Box<dyn Provider>).
+    #[tokio::test]
+    async fn b106_boxed_provider_delegates_last_fallback() {
+        let inner = groq_then_deepseek();
+        let boxed: Box<dyn Provider> = Box::new(inner);
+        let _ = boxed.stream_chat(test_request()).await.unwrap();
+        let info = boxed
+            .last_fallback()
+            .expect("Box<dyn Provider> must delegate last_fallback");
+        assert_eq!(info.served_by, "deepseek");
+    }
+    /// The live miss that made the first B106 attempt fail end-to-end:
+    /// `session_ops::turn` wraps the resolved `Arc<dyn Provider>` in
+    /// `provider_to_box` (`ArcProvider`) before handing it to `AgentLoop`.
+    /// That wrapper forwarded only name/models/stream_chat, so every optional
+    /// trait method — including `last_fallback()` — silently reverted to its
+    /// default. A real groq 413 -> deepseek fallback was therefore invisible
+    /// in production while all unit tests passed.
+    #[tokio::test]
+    async fn b106_arc_provider_wrapper_delegates_last_fallback() {
+        let inner: std::sync::Arc<dyn Provider> = std::sync::Arc::new(groq_then_deepseek());
+        let boxed = crate::provider::provider_to_box(&inner);
+        let _ = boxed.stream_chat(test_request()).await.unwrap();
+        let info = boxed
+            .last_fallback()
+            .expect("provider_to_box must delegate last_fallback (prod path)");
+        assert_eq!(info.requested, "groq");
+        assert_eq!(info.served_by, "deepseek");
+    }
+    /// B110, production wiring: `ResilientProvider` must be able to read
+    /// `key_hint` from an entry wrapped exactly the way
+    /// `create_provider_chain` wraps it (`TimeoutProvider`).
+    ///
+    /// The delegation unit tests check each wrapper in isolation; this pins the
+    /// composed shape that was actually broken — B46 dead-key persistence reads
+    /// `self.providers[idx].key_hint()`, and with the wrapper answering `None`
+    /// the persist branch was unreachable no matter what the config said.
+    /// (The persist call itself is env-gated and its file logic is covered by
+    /// `dead_key_persist::tests`; what was broken, and what this guards, is the
+    /// value reaching that branch at all.)
+    #[test]
+    fn b110_resilient_reads_key_hint_through_timeout_wrapper() {
+        struct Keyed;
+        #[async_trait]
+        impl Provider for Keyed {
+            fn name(&self) -> &str {
+                "deepseek"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![]
+            }
+            fn key_hint(&self) -> Option<String> {
+                Some("dead-key-1".into())
+            }
+            async fn stream_chat(
+                &self,
+                _r: ChatRequest,
+            ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+                Err(AgentError::Config("unused".into()))
+            }
+        }
+
+        let wrapped: Box<dyn Provider> =
+            Box::new(crate::provider::timeout::TimeoutProvider::with_defaults(
+                Box::new(Keyed) as Box<dyn Provider>,
+            ));
+        let p = ResilientProvider::new(vec![wrapped]);
+
+        assert_eq!(
+            p.providers[0].key_hint().as_deref(),
+            Some("dead-key-1"),
+            "ResilientProvider must see the key through TimeoutProvider, \
+             otherwise B46 dead-key persistence can never fire"
+        );
+    }
+    /// B111: the BOOT AUDIT must persist dead keys, not only blacklist them.
+    ///
+    /// The runtime `stream_chat` path already called `persist_dead_key`, but the
+    /// boot audit is what actually DISCOVERS most dead keys (it probes every
+    /// key on every start) and it only wrote to the in-memory blacklist. So the
+    /// keys B46 exists to stop re-probing were re-probed on every restart
+    /// forever — the feature looked wired up and did nothing.
+    ///
+    /// Asserts the key VALUE reaches the persist branch through the production
+    /// `TimeoutProvider` wrapping; the file-writing half is covered by
+    /// `dead_key_persist::tests` and is env-gated.
+    #[tokio::test]
+    async fn b111_boot_audit_blacklists_and_can_reach_persist() {
+        struct DeadKeyed;
+        #[async_trait]
+        impl Provider for DeadKeyed {
+            fn name(&self) -> &str {
+                "groq"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![]
+            }
+            fn key_hint(&self) -> Option<String> {
+                Some("gsk_dead".into())
+            }
+            async fn stream_chat(
+                &self,
+                _r: ChatRequest,
+            ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+                Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::AuthFailed {
+                        status: 401,
+                        body: "Invalid API Key".into(),
+                    },
+                ))
+            }
+        }
+
+        let wrapped: Box<dyn Provider> =
+            Box::new(crate::provider::timeout::TimeoutProvider::with_defaults(
+                Box::new(DeadKeyed) as Box<dyn Provider>,
+            ));
+        let p = ResilientProvider::new(vec![wrapped]);
+
+        p.audit_keys_on_boot_with_model("probe-model").await;
+
+        assert_eq!(
+            p.blacklisted_count().await,
+            1,
+            "a 401 during boot audit must permanently blacklist the key"
+        );
+        assert_eq!(
+            p.providers[0].key_hint().as_deref(),
+            Some("gsk_dead"),
+            "the boot-audit persist branch needs the key value to survive the \
+             TimeoutProvider wrapper (B110); without it B46 can never fire"
+        );
+    }
+    /// B111 follow-up: both dead-key discovery paths must record the SAME
+    /// facts. They are now one method (`note_permanently_dead_key`); this pins
+    /// the shared side effects so a future split cannot silently drop one.
+    ///
+    /// The counter matters beyond bookkeeping: it is exported as
+    /// `naked_core_provider_permanent_blacklist_total` and read by the wiring
+    /// health check, so a path that blacklists without counting makes dead keys
+    /// invisible to monitoring.
+    #[tokio::test]
+    async fn b111_boot_audit_counts_permanent_blacklist_like_runtime_does() {
+        struct DeadKeyed;
+        #[async_trait]
+        impl Provider for DeadKeyed {
+            fn name(&self) -> &str {
+                "groq"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![]
+            }
+            fn key_hint(&self) -> Option<String> {
+                Some("gsk_dead".into())
+            }
+            async fn stream_chat(
+                &self,
+                _r: ChatRequest,
+            ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+                Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::AuthFailed {
+                        status: 401,
+                        body: "Invalid API Key".into(),
+                    },
+                ))
+            }
+        }
+
+        let before = crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let p = ResilientProvider::new(vec![Box::new(DeadKeyed) as Box<dyn Provider>]);
+        p.audit_keys_on_boot_with_model("probe-model").await;
+
+        let after = crate::types::PROVIDER_PERMANENT_BLACKLIST_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "boot audit must bump the permanent-blacklist counter that \
+             /metrics and the wiring health check read"
+        );
     }
 }

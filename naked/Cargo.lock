@@ -2055,6 +2055,7 @@ dependencies = [
  "glob",
  "ignore",
  "insta",
+ "naked-core",
  "parking_lot",
  "proptest",
  "regex",

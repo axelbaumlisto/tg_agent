@@ -35,6 +35,11 @@ pub struct TelegramConfig {
     /// `0` disables text coalescing (safe default; operators opt in).
     #[serde(default = "default_coalesce_text_ms")]
     pub coalesce_text_ms: u64,
+    /// PLAN_TG_LONG_ANSWERS_v2 S7 rollout flag. Because TelegramConfig is
+    /// flattened into [`Config`], this key must live at the root of
+    /// `naked.json`/`state/naked.json`; a nested `.telegram` object is ignored.
+    #[serde(default)]
+    pub tg_long_answer_fix_enabled: bool,
 }
 
 /// Top-level agent configuration. Loaded from JSON, env vars override.
@@ -42,6 +47,33 @@ pub struct TelegramConfig {
 pub struct Config {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// B105 — retired-provider aliases: `old_name → live_name` or
+    /// `old_name → live_name/live_model`.
+    ///
+    /// Sessions persist their provider/model pin in
+    /// `sessions/<id>/config.json`, and that pin OUTLIVES the removal of a
+    /// provider from `providers`. Before this existed, such a session
+    /// resolved to the default provider via a silent fallback while its
+    /// span, `/model` output, and `model_health.jsonl` all kept reporting
+    /// the dead pair — e.g. 229 sessions pinned to `qwen` still logged
+    /// `provider=qwen model=qwen3.6-plus kind=success` months after the
+    /// DashScope account was retired, so health data could not be trusted.
+    ///
+    /// An alias makes the redirect explicit and self-documenting instead of
+    /// requiring a migration pass over session files: the retired name is
+    /// rewritten to a live one at merge time, so every downstream consumer
+    /// (provider resolution, health records, tracing spans, `/model`) sees
+    /// the same truthful pair. Aliases are chased transitively with a small
+    /// bound and are ignored when the name still exists in `providers`, so
+    /// restoring a provider automatically wins over its alias.
+    ///
+    /// Model handling: the `provider/model` form pins BOTH, which is the
+    /// normal case for a retirement (the old model does not exist upstream
+    /// anymore). The bare `provider` form keeps the session's model string,
+    /// which only makes sense when the target provider serves that same
+    /// model id.
+    #[serde(default)]
+    pub provider_aliases: HashMap<String, String>,
     #[serde(default)]
     pub default_provider: String,
     #[serde(default)]
@@ -338,6 +370,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             providers: HashMap::new(),
+            provider_aliases: HashMap::new(),
             default_provider: String::new(),
             default_model: String::new(),
             workspace: default_workspace(),
@@ -379,7 +412,88 @@ impl Default for Config {
     }
 }
 
+/// Split one `provider_aliases` value into `(provider, optional model)`.
+///
+/// Accepts `"live"` (redirect only) and `"live/model"` (pin both). Returns
+/// `None` for shapes that name no provider (`""`, `"/model"`), so the caller
+/// stops instead of chasing an empty name — a malformed alias must be a
+/// bounded no-op, never a hang or a jump to a blank provider.
+fn parse_alias_target(target: &str) -> Option<(String, Option<String>)> {
+    match target.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => {
+            Some((p.to_string(), Some(m.to_string())))
+        }
+        Some((p, _)) if !p.is_empty() => Some((p.to_string(), None)),
+        Some(_) => None,
+        None if !target.is_empty() => Some((target.to_string(), None)),
+        None => None,
+    }
+}
+
+/// Max alias hops chased by [`Config::resolve_provider_alias`] before the
+/// chain is declared broken. Small on purpose: legitimate retirement chains
+/// are 1-2 hops (`ali_cp -> qwen -> anthropic`), and a low bound turns a
+/// mis-edited config into a bounded no-op instead of a hang.
+const MAX_PROVIDER_ALIAS_HOPS: usize = 8;
+
 impl Config {
+    /// B105 — resolve a possibly-retired provider name (and optional model)
+    /// through `provider_aliases`.
+    ///
+    /// Returns `(provider, model_override)`. `model_override` is `Some` only
+    /// when an alias pinned a model via the `live_provider/live_model` form;
+    /// callers keep the session's own model when it is `None`.
+    ///
+    /// Rules, in order:
+    /// 1. A name that still exists in `providers` is returned untouched —
+    ///    restoring a retired provider silently disables its alias, so
+    ///    reviving one is a pure config edit with no code change.
+    /// 2. Otherwise the alias chain is followed until it lands on a live
+    ///    provider, runs out, or trips the hop/cycle guard.
+    /// 3. A chain that cannot reach a live provider returns the LAST name it
+    ///    reached rather than the original, so the WARN downstream names the
+    ///    end of the broken chain. A cycle logs once and stops.
+    ///
+    /// The first pinned model wins: in `a -> b/m1` then `b -> c/m2` the
+    /// result is `(c, Some(m1))`, because the alias closest to what the user
+    /// actually pinned is the most specific intent.
+    pub fn resolve_provider_alias(&self, name: &str) -> (String, Option<String>) {
+        if name.is_empty() || self.providers.contains_key(name) {
+            return (name.to_string(), None);
+        }
+
+        let mut current = name.to_string();
+        let mut model_override: Option<String> = None;
+        let mut seen: Vec<String> = vec![current.clone()];
+
+        for _ in 0..MAX_PROVIDER_ALIAS_HOPS {
+            let Some(target) = self.provider_aliases.get(&current) else {
+                break;
+            };
+            let Some((next_provider, next_model)) = parse_alias_target(target) else {
+                break;
+            };
+            // First pinned model wins — closest to the user's own pin.
+            if model_override.is_none() {
+                model_override = next_model;
+            }
+            if seen.iter().any(|s| s == &next_provider) {
+                tracing::warn!(
+                    "provider_aliases cycle detected: {} -> {next_provider}; stopping",
+                    seen.join(" -> ")
+                );
+                return (current, model_override);
+            }
+            current = next_provider.clone();
+            seen.push(next_provider);
+            if self.providers.contains_key(&current) {
+                return (current, model_override);
+            }
+        }
+
+        (current, model_override)
+    }
+
     /// Load config: JSON file -> env var overrides.
     ///
     /// Search order for JSON:

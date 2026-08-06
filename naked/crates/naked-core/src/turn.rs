@@ -3,6 +3,8 @@
 //! Each phase is a standalone async function that takes TurnContext
 //! and modifies it. Phases are testable in isolation.
 
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -77,13 +79,58 @@ pub async fn inject_session_prompt(history: &mut History, prompt_path: &std::pat
     }
 }
 
+#[cfg(test)]
+static PANIC_NEXT_MEMORY_INJECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn panic_next_memory_injection_for_test() {
+    PANIC_NEXT_MEMORY_INJECTION.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn maybe_panic_for_s8_test() {
+    if PANIC_NEXT_MEMORY_INJECTION.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        panic!("S8 test panic inside memory injection block");
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_panic_for_s8_test() {}
+
+fn panic_payload_summary(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// Phase: inject MEMORY.md rules + per-user rules into system context.
 pub fn inject_memory_rules(
     history: &mut History,
     workspace: &std::path::Path,
     sender: Option<&str>,
+    config: &crate::config::MemoryConfig,
 ) {
-    let rules = memory::service::MemoryService::load_rules_for(workspace, sender);
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+        inject_memory_rules_inner(history, workspace, sender, config);
+    })) {
+        memory::record_injection_failed("rules", panic_payload_summary(payload.as_ref()));
+    }
+}
+
+fn inject_memory_rules_inner(
+    history: &mut History,
+    workspace: &std::path::Path,
+    sender: Option<&str>,
+    config: &crate::config::MemoryConfig,
+) {
+    maybe_panic_for_s8_test();
+    let rules =
+        memory::service::MemoryService::load_rules_for_with_config(workspace, sender, config);
     if !rules.is_empty() {
         history.inject_system_context(&format!("\n\n{rules}"));
     }
@@ -96,27 +143,47 @@ pub fn inject_memory_shift(
     sender: Option<&str>,
     config: &crate::config::MemoryConfig,
 ) {
+    match catch_unwind(AssertUnwindSafe(|| {
+        inject_memory_shift_inner(history, workspace, sender, config)
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => memory::record_injection_failed("shift", e),
+        Err(payload) => {
+            memory::record_injection_failed("shift", panic_payload_summary(payload.as_ref()))
+        }
+    }
+}
+
+fn inject_memory_shift_inner(
+    history: &mut History,
+    workspace: &std::path::Path,
+    sender: Option<&str>,
+    config: &crate::config::MemoryConfig,
+) -> Result<(), memory::daily::RecallCounterError> {
     if !config.daily_enabled {
-        return;
+        return Ok(());
     }
     let mut blocks: Vec<String> = Vec::new();
-    if let Some(b) =
-        memory::daily::recent_shift_block(workspace, &memory::types::MemoryScope::Project, config)
-    {
+    if let Some(b) = memory::daily::try_recent_shift_block(
+        workspace,
+        &memory::types::MemoryScope::Project,
+        config,
+    )? {
         blocks.push(b);
     }
     if let Some(s) = sender
-        && let Some(b) = memory::daily::recent_shift_block(
+        && let Some(b) = memory::daily::try_recent_shift_block(
             workspace,
             &memory::types::MemoryScope::User(s.to_string()),
             config,
-        )
+        )?
     {
         blocks.push(b);
     }
     if !blocks.is_empty() {
         history.inject_system_context(&format!("\n\n{}", blocks.join("\n\n")));
     }
+    Ok(())
 }
 
 /// Phase: inject file tracker context (modified/read files this session).
@@ -147,14 +214,27 @@ mod phase_tests {
 
     #[test]
     fn inject_memory_rules_empty_project_only() {
+        let _lock = crate::memory::MEMORY_INJECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before =
+            crate::types::MEMORY_INJECTION_FAILED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
+        let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
         let mut h = History::new("sys".into());
-        inject_memory_rules(&mut h, dir.path(), None);
-        // No project MEMORY.md in tempdir. Global rules may exist
-        // (from ~/.naked/memory/MEMORY.md) — that's OK, we just
-        // verify the function doesn't panic and the system prompt
-        // still starts with the original content.
-        assert!(h.system_prompt().starts_with("sys"));
+        inject_memory_rules(
+            &mut h,
+            dir.path(),
+            None,
+            &crate::config::MemoryConfig::default(),
+        );
+        let after =
+            crate::types::MEMORY_INJECTION_FAILED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(h.system_prompt(), "sys");
+        assert_eq!(
+            after, before,
+            "empty healthy memory must not count as failure"
+        );
     }
 
     #[test]
@@ -199,6 +279,53 @@ mod phase_tests {
         inject_session_prompt(&mut h, std::path::Path::new("/nonexistent/prompt.md")).await;
         assert_eq!(h.system_prompt(), before);
     }
+
+    #[test]
+    fn s8_memory_panic_does_not_propagate_out_of_prepare_history() {
+        let _lock = crate::memory::MEMORY_INJECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before =
+            crate::types::MEMORY_INJECTION_FAILED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let dir = tempfile::tempdir().unwrap();
+        let _root = crate::memory::store::MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        let session = crate::session::Session::new(
+            workspace,
+            "sys".into(),
+            crate::session::SessionMetadata {
+                name: None,
+                provider: "test".into(),
+                model: "test".into(),
+                channel: String::new(),
+                channel_id: None,
+            },
+        );
+        let effective = crate::config::Config::default().default_effective();
+
+        panic_next_memory_injection_for_test();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (history, original_system_prompt) = runtime.block_on(prepare_history(
+            &session,
+            dir.path(),
+            &effective,
+            None,
+            &crate::config::MemoryConfig::default(),
+        ));
+        let after =
+            crate::types::MEMORY_INJECTION_FAILED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(original_system_prompt, "sys");
+        assert!(history.system_prompt().starts_with("sys"));
+        assert_eq!(
+            after,
+            before + 1,
+            "caught memory panic must be counted once"
+        );
+    }
 }
 
 /// Phase: validate that the model exists on the provider.
@@ -209,10 +336,7 @@ pub fn validate_model(
     model: &str,
 ) -> Option<String> {
     let pc = config.providers.get(provider_name)?;
-    let valid = pc.models.iter().any(|x| x == model)
-        || pc.model_aliases.contains_key(model)
-        || pc.model_aliases.values().any(|v| v == model);
-    if valid {
+    if pc.serves_model(model) {
         return None;
     }
     let available: Vec<_> = pc
@@ -677,7 +801,7 @@ pub async fn prepare_history(
     inject_session_prompt(&mut history, &prompt_path).await;
 
     // Memory rules + per-user rules
-    inject_memory_rules(&mut history, &session.workspace, sender_id);
+    inject_memory_rules(&mut history, &session.workspace, sender_id, memory_config);
 
     // Recent memory drafts
     inject_memory_shift(&mut history, &session.workspace, sender_id, memory_config);

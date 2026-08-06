@@ -36,8 +36,8 @@ pub(crate) async fn send_stream_placeholder(
     {
         Ok(m) => return Some(m.id),
         Err(e) => {
-            last_err = format!("{e}");
-            tracing::warn!("placeholder send failed, will retry: {e}");
+            last_err = redact_for_log(&e);
+            tracing::warn!("placeholder send failed, will retry: {last_err}");
         }
     }
     // Retries
@@ -55,8 +55,8 @@ pub(crate) async fn send_stream_placeholder(
                 return Some(m.id);
             }
             Err(e) => {
-                last_err = format!("{e}");
-                tracing::warn!("placeholder retry after {delay}s failed: {e}");
+                last_err = redact_for_log(&e);
+                tracing::warn!("placeholder retry after {delay}s failed: {last_err}");
             }
         }
     }
@@ -107,6 +107,33 @@ pub(crate) struct StreamResponseOutcome {
     pub(crate) got_idle: bool,
     /// True if the turn emitted B73's wall-clock timeout error before Idle.
     pub(crate) wall_timeout: bool,
+}
+
+/// B106: annotate the view when the provider the user picked did not actually
+/// serve the turn, so `render_final` can warn at the top of the answer.
+///
+/// Extracted from `stream_response` (already ~500 lines): "decide whether a
+/// fallback happened" is its own concern, and keeping it here makes it
+/// testable without driving a whole stream.
+async fn attach_fallback_notice(view: &mut CompositeView, deps: &crate::message_handler::BotDeps) {
+    let Some(requested) = view.model_tag.split('/').next().filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let Some(info) = deps.agent.last_fallback_for(requested).await else {
+        return;
+    };
+    if info.served_by == info.requested {
+        return;
+    }
+    tracing::info!(
+        requested = %info.requested,
+        served_by = %info.served_by,
+        "B106: surfacing provider fallback to user"
+    );
+    view.fallback_notice = Some(format!(
+        "Отвечал {} — {} не смог: {}",
+        info.served_by, info.requested, info.reason
+    ));
 }
 
 /// T3 (PLAN_v13_SOLID_AUDIT): takes `&BotDeps` for shared infra
@@ -174,7 +201,8 @@ pub(crate) async fn stream_response(
                     .maybe_thread(ctx.thread_id)
                     .await;
             }
-            tracing::warn!(chat_id = chat_id_raw, ?tid, error = ?err, "run registry rejected stream start");
+            let safe = redact_for_log(format!("{err:?}"));
+            tracing::warn!(chat_id = chat_id_raw, ?tid, error = %safe, "run registry rejected stream start");
             abort_for_reject.cancel();
             drain_rejected_stream(events, permissions).await;
             return StreamResponseOutcome::default();
@@ -457,10 +485,11 @@ pub(crate) async fn stream_response(
                     };
                     for (chat, ack_id) in to_delete {
                         if let Err(e) = bot.delete_message(chat, ack_id).await {
+                            let safe = redact_for_log(&e);
                             tracing::debug!(
                                 chat = chat.0,
                                 msg = ack_id.0,
-                                "steer ack delete failed (likely already gone): {e}"
+                                "steer ack delete failed (likely already gone): {safe}"
                             );
                         }
                     }
@@ -481,11 +510,12 @@ pub(crate) async fn stream_response(
                     for mid in &msg_ids {
                         let tg_mid = teloxide::types::MessageId(*mid);
                         if let Err(e) = bot.delete_message(ctx.chat_id, tg_mid).await {
+                            let safe = redact_for_log(&e);
                             tracing::debug!(
                                 chat = ctx.chat_id.0,
                                 msg = *mid,
                                 "steer user-msg delete skipped \
-                                 (not admin / >48h / private chat / already gone): {e}"
+                                 (not admin / >48h / private chat / already gone): {safe}"
                             );
                         }
                     }
@@ -575,10 +605,21 @@ pub(crate) async fn stream_response(
         };
     }
 
-    let final_html = view.render_final();
+    attach_fallback_notice(&mut view, deps).await;
+
+    let tg_long_answer_fix_enabled = deps.config.telegram.tg_long_answer_fix_enabled;
+    let final_html = view.render_final_with_long_answer_fix(tg_long_answer_fix_enabled);
     update_cached_run_state(&run_id, &view, Some(final_html.clone()));
     let primary = primary_sink_or_fallback(&run_id, ctx, placeholder);
-    send_final_to_all_sinks(bot.clone(), &run_id, primary, &final_html, &view).await;
+    send_final_to_all_sinks(
+        bot.clone(),
+        &run_id,
+        primary,
+        &final_html,
+        &view,
+        tg_long_answer_fix_enabled,
+    )
+    .await;
     cleanup_stream_registries(&bot, &run_id, final_reply_markup).await;
     send_provider_error_card_if_needed(&bot, primary.ctx, &view).await;
     deliver_queued_attachments(http_client, base_url, primary.ctx, tg_attach_queue, &run_id).await;
@@ -663,6 +704,7 @@ async fn send_final_to_all_sinks(
     primary: PrimaryRunSink,
     final_html: &str,
     view: &CompositeView,
+    tg_long_answer_fix_enabled: bool,
 ) {
     send_final(
         bot.clone(),
@@ -670,6 +712,7 @@ async fn send_final_to_all_sinks(
         primary.message_id,
         final_html,
         view,
+        tg_long_answer_fix_enabled,
     )
     .await;
     for sink in crate::shared::RUN_REGISTRY.mirror_sinks(run_id) {
@@ -686,6 +729,7 @@ async fn send_final_to_all_sinks(
             teloxide::types::MessageId(sink.message_id),
             final_html,
             view,
+            tg_long_answer_fix_enabled,
         )
         .await;
     }
@@ -776,10 +820,11 @@ async fn cleanup_stream_registries(
             bot.edit_message_reply_markup(chat, mid).await
         };
         if let Err(e) = result {
+            let safe = redact_for_log(&e);
             tracing::debug!(
                 chat = chat.0,
                 msg = mid.0,
-                "control card cleanup failed (likely already cleared): {e}"
+                "control card cleanup failed (likely already cleared): {safe}"
             );
         }
     }
@@ -811,10 +856,11 @@ async fn cleanup_stale_steer_acks(bot: &Bot, run_id: &str) {
     };
     for (chat, ack_id) in stale {
         if let Err(e) = bot.delete_message(chat, ack_id).await {
+            let safe = redact_for_log(&e);
             tracing::debug!(
                 chat = chat.0,
                 msg = ack_id.0,
-                "end-of-turn steer ack cleanup failed: {e}"
+                "end-of-turn steer ack cleanup failed: {safe}"
             );
         }
     }
@@ -886,12 +932,14 @@ async fn deliver_one_attachment(
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(file = %att.file_name, error = %e, "telegram_attach send error");
+                    let safe = redact_for_log(&e);
+                    tracing::warn!(file = %att.file_name, error = %safe, "telegram_attach send error");
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(file = %att.file_name, error = %e, "telegram_attach form build failed");
+            let safe = redact_for_log(&e);
+            tracing::warn!(file = %att.file_name, error = %safe, "telegram_attach form build failed");
         }
     }
 }

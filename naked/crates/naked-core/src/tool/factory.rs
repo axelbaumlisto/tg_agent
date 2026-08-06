@@ -125,10 +125,6 @@ pub(crate) async fn core_tools(ctx: &CoreToolCtx<'_>) -> Vec<Box<dyn Tool>> {
             ctx.workspace.to_path_buf(),
             memory_ctx,
         )),
-        Box::new(super::remember::RememberTool::new(
-            &std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".naked/memory"),
-        )),
         Box::new(super::test_runner::RunTestsTool),
         Box::new(super::git_tools::GitLogTool),
         Box::new(super::git_tools::GitDiffTool),
@@ -310,6 +306,37 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "research_launch"),
             "research_launch must NOT be in the list (removed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn s7_remember_tool_is_not_registered() {
+        let tc = TestCore::build();
+        let core = &tc.core;
+        let workspace = tc.workspace();
+        std::fs::create_dir_all(&workspace).expect("test workspace dir");
+        let session_id = core.create_session(&workspace).await;
+        let config = core.config();
+        let effective = config.default_effective();
+        let provider = core.provider_for(&config.default_provider).await;
+        let names = core
+            .build_tool_registry_for(
+                &session_id,
+                &effective,
+                &provider,
+                &effective.model,
+                &workspace,
+            )
+            .await
+            .tool_names();
+
+        assert!(
+            names.iter().any(|name| name == "memory"),
+            "memory remains the single persistent-memory writer; got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "remember"),
+            "remember must not be registered because it bypassed MarkdownMemoryStore; got: {names:?}"
         );
     }
 

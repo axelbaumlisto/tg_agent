@@ -463,6 +463,113 @@ mod tests {
         });
     }
 
+    // ── BUG_REGISTRY D-CB-EXPIRED ──────────────────────────────────
+    //
+    // `handle_stream_action` has an EXPIRED branch: when
+    // `resolve_callback_run` returns None (no moved notice, unregistered
+    // run) it (a) bumps `record_run_registry_callback_expired()`,
+    // (b) answers the callback query with exactly "control expired", and
+    // (c) returns BEFORE any abort/sendnow action. The existing tests
+    // cover the resolved and moved-toast branches but nothing exercised
+    // this expired branch. Mutation probe confirmed the gap: changing the
+    // answer text ("control expired" → "x") OR deleting the
+    // `record_run_registry_callback_expired()` bump left all 26 callback
+    // tests green. This behavioral test closes that gap by driving the
+    // real `handle_stream_action` with an UNREGISTERED run id (so
+    // `resolve_callback_run` returns None) and NO moved notice, then
+    // asserting: the expired counter increments (DELTA >= 1 on the
+    // process-global atomic), and the single `answerCallbackQuery` JSON
+    // body's `text` field EQUALS exactly "control expired" (parsed with
+    // serde_json — not a loose contains). The exact expired text plus
+    // exactly one answer proves the resolved/abort/sendnow path was NOT
+    // taken (no toast, no action side-effect).
+    #[test]
+    fn stream_control_unregistered_run_answers_expired_and_bumps_counter() {
+        let _guard = stream_static_test_lock();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let unique = format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            // An unregistered run id: `resolve_callback_run` returns None
+            // (Some(run_id) branch → `control_for_run` miss), driving the
+            // expired branch.
+            let unknown_run = format!("expired-nonexistent-{unique}");
+            assert!(
+                crate::shared::RUN_REGISTRY
+                    .control_for_run(&unknown_run)
+                    .is_none(),
+                "test precondition: run id must be unregistered so resolve returns None"
+            );
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .mount(&server)
+                .await;
+            let bot =
+                Bot::new("0:TEST_TOKEN").set_api_url(reqwest::Url::parse(&server.uri()).unwrap());
+            let agent = test_agent();
+            let channel_map = Arc::new(ChannelSessionMap::new());
+
+            // Process-global atomic — compare a DELTA, not the absolute.
+            let before = crate::metrics::snapshot().run_registry_callback_expired;
+
+            // `message: None` → `moved_notice_text` returns None (no moved
+            // notice); `encoded_run_id = Some(unknown_run)` → resolve None →
+            // expired branch.
+            let q = callback_query(&format!("s:abort:{unknown_run}"));
+            handle_stream_action(&bot, &agent, &channel_map, &q, "abort", Some(&unknown_run))
+                .await
+                .expect("expired stream callback still returns Ok");
+
+            let after = crate::metrics::snapshot().run_registry_callback_expired;
+            assert!(
+                after > before,
+                "expired counter must bump on unresolved run (before={before}, after={after})"
+            );
+
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(
+                received.len(),
+                1,
+                "expired callback must answer exactly one callback query (no toast/action), got {}",
+                received.len()
+            );
+            assert!(
+                received[0]
+                    .url
+                    .path()
+                    .to_ascii_lowercase()
+                    .ends_with("answercallbackquery"),
+                "expected an answerCallbackQuery call, got path {}",
+                received[0].url.path()
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&received[0].body).unwrap_or_else(|e| {
+                    panic!(
+                        "answerCallbackQuery body must be valid JSON: {e}; body: {}",
+                        String::from_utf8_lossy(&received[0].body)
+                    )
+                });
+            assert_eq!(
+                body.get("text").and_then(|v| v.as_str()),
+                Some("control expired"),
+                "expired branch must answer exactly 'control expired'; body={body}"
+            );
+        });
+    }
+
     #[test]
     fn stream_callbacks_route_through_typed_action() {
         assert_eq!(

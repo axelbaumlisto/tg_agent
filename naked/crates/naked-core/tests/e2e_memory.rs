@@ -4,12 +4,25 @@
 mod common;
 use common::*;
 
+use naked_core::memory::store::MemoryPaths;
+
+fn isolate_memory_root(tmp: &tempfile::TempDir) -> impl Drop {
+    let memory_root = tmp.path().join("naked-home");
+    let guard = MemoryPaths::set_test_root(&memory_root);
+    assert_eq!(
+        MarkdownMemoryStore::naked_home(),
+        memory_root,
+        "e2e memory tests must use their per-test temporary root"
+    );
+    guard
+}
+
 #[tokio::test]
 async fn t93_memory_tool_store_and_list() {
-    need_naked_home!();
     need_provider!(config, provider, model);
     pace().await;
     let tmp = tempfile::tempdir().unwrap();
+    let _root = isolate_memory_root(&tmp);
 
     eprintln!(">>> t93_memory_tool_store_and_list [model={model}]");
 
@@ -81,10 +94,10 @@ async fn t93_memory_tool_store_and_list() {
 
 #[tokio::test]
 async fn t94_memory_tool_search_and_delete() {
-    need_naked_home!();
     need_provider!(config, provider, model);
     pace().await;
     let tmp = tempfile::tempdir().unwrap();
+    let _root = isolate_memory_root(&tmp);
 
     eprintln!(">>> t94_memory_tool_search_and_delete [model={model}]");
 
@@ -166,10 +179,10 @@ async fn t94_memory_tool_search_and_delete() {
 
 #[tokio::test]
 async fn t95_memory_global_scope() {
-    need_naked_home!();
     need_provider!(_config, provider, model);
     pace().await;
     let tmp = tempfile::tempdir().unwrap();
+    let _root = isolate_memory_root(&tmp);
 
     // Clean global memory before test
     let _ = MemoryService::clear(&tmp.path().join("dummy"), MemoryScope::Global);
@@ -235,10 +248,10 @@ async fn t95_memory_global_scope() {
 
 #[tokio::test]
 async fn t96_memory_auto_classification() {
-    need_naked_home!();
     need_provider!(config, _provider, model);
     pace().await;
     let tmp = tempfile::tempdir().unwrap();
+    let _root = isolate_memory_root(&tmp);
 
     eprintln!(">>> t96_memory_auto_classification [model={model}]");
 
@@ -335,10 +348,10 @@ async fn t96_memory_auto_classification() {
 
 #[tokio::test]
 async fn t97_memory_rules_injection() {
-    need_naked_home!();
     need_provider!(config, _provider, model);
     pace().await;
     let tmp = tempfile::tempdir().unwrap();
+    let _root = isolate_memory_root(&tmp);
 
     // Clean any stale global memory
     let _ = MemoryService::clear(&tmp.path().join("dummy"), MemoryScope::Global);
@@ -432,11 +445,10 @@ async fn t97_memory_rules_injection() {
 
 #[tokio::test]
 async fn t98_memory_user_scope_roundtrip() {
-    need_naked_home!();
-
     eprintln!(">>> t98_memory_user_scope_roundtrip");
 
     let tmp = tempfile::tempdir().unwrap();
+    let _root = isolate_memory_root(&tmp);
     let workspace = tmp.path().join("project98");
     std::fs::create_dir_all(&workspace).unwrap();
 

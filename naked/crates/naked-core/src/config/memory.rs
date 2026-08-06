@@ -139,6 +139,23 @@ pub struct MemoryConfig {
     /// on a rarely-instrumented signal.
     #[serde(default = "default_promote_min_recall_count")]
     pub promote_min_recall_count: u32,
+    /// Default-off rollout flag for the S3 re-observation promotion road.
+    /// When disabled, persisted re-observation counts are surfaced in
+    /// `ScoringHints` but do not affect the reinforcement gate.
+    #[serde(default)]
+    pub memory_reobservation_promote_enabled: bool,
+    /// Default-off rollout flag for S5 scope-priority prompt injection.
+    /// When disabled, injection preserves the legacy Global → Project → User
+    /// renderer exactly; when enabled, User → Project → Global gets the fixed
+    /// budget first and truncation is logged/counted.
+    #[serde(default)]
+    pub memory_scope_priority_injection_enabled: bool,
+    /// Minimum persisted re-observations before they are allowed to
+    /// influence promotion. Default is deliberately 2 (not 1): the
+    /// re-observation road is intentionally conservative even after S6
+    /// made the shared dedup identity order-preserving.
+    #[serde(default = "default_promote_min_reobservations")]
+    pub promote_min_reobservations: u32,
 }
 
 impl Default for MemoryConfig {
@@ -166,6 +183,9 @@ impl Default for MemoryConfig {
             compact_recall_half_life_days: default_compact_recall_half_life_days(),
             promote_min_repeat_days: default_promote_min_repeat_days(),
             promote_min_recall_count: default_promote_min_recall_count(),
+            memory_reobservation_promote_enabled: false,
+            memory_scope_priority_injection_enabled: false,
+            promote_min_reobservations: default_promote_min_reobservations(),
         }
     }
 }
@@ -200,6 +220,9 @@ fn default_promote_min_repeat_days() -> u32 {
 fn default_promote_min_recall_count() -> u32 {
     0
 }
+fn default_promote_min_reobservations() -> u32 {
+    2
+}
 fn default_compact_threshold() -> u32 {
     12
 }
@@ -232,19 +255,36 @@ mod tests {
         let cfg = MemoryConfig::default();
         assert!(cfg.daily_enabled);
         assert!(cfg.digest_max_chars > 0);
+        assert!(!cfg.memory_reobservation_promote_enabled);
+        assert!(!cfg.memory_scope_priority_injection_enabled);
+        assert_eq!(cfg.promote_min_reobservations, 2);
     }
 
     #[test]
     fn deserialize_empty_json() {
         let cfg: MemoryConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.daily_enabled);
+        assert!(!cfg.memory_reobservation_promote_enabled);
+        assert!(!cfg.memory_scope_priority_injection_enabled);
+        assert_eq!(cfg.promote_min_reobservations, 2);
     }
 
     #[test]
     fn deserialize_override() {
-        let cfg: MemoryConfig =
-            serde_json::from_str(r#"{"daily_enabled": false, "digest_max_chars": 10}"#).unwrap();
+        let cfg: MemoryConfig = serde_json::from_str(
+            r#"{"daily_enabled": false, "digest_max_chars": 10, "memory_reobservation_promote_enabled": true, "memory_scope_priority_injection_enabled": true, "promote_min_reobservations": 3}"#,
+        )
+        .unwrap();
         assert!(!cfg.daily_enabled);
         assert_eq!(cfg.digest_max_chars, 10);
+        assert!(cfg.memory_reobservation_promote_enabled);
+        assert!(cfg.memory_scope_priority_injection_enabled);
+        assert_eq!(cfg.promote_min_reobservations, 3);
+
+        let encoded = serde_json::to_string(&cfg).unwrap();
+        let roundtrip: MemoryConfig = serde_json::from_str(&encoded).unwrap();
+        assert!(roundtrip.memory_reobservation_promote_enabled);
+        assert!(roundtrip.memory_scope_priority_injection_enabled);
+        assert_eq!(roundtrip.promote_min_reobservations, 3);
     }
 }

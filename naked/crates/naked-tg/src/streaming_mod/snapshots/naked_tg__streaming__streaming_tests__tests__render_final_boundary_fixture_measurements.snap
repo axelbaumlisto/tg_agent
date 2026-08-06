@@ -1,0 +1,8 @@
+---
+source: crates/naked-tg/src/streaming_mod/tests.rs
+expression: "rows.join(\"\\n\")"
+---
+astral_utf16_at_current_response_budget: bytes=7992 chars=1998 utf16=3996
+astral_utf16_over_current_response_budget: bytes=7996 chars=1999 utf16=3998
+cyrillic_bytes_at_current_response_budget: bytes=3996 chars=1998 utf16=1998
+cyrillic_bytes_over_current_response_budget: bytes=3998 chars=1999 utf16=1999

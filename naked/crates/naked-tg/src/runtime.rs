@@ -17,7 +17,8 @@ use crate::album;
 use crate::callbacks::handle_callback;
 use crate::message_handler::BotDeps;
 use crate::shared::{
-    ChatCtx, HashMap, PendingPermissions, RwLock, STEER_SENDERS, is_allowed, run_health_server,
+    ChatCtx, HashMap, PendingPermissions, RwLock, STEER_SENDERS, is_allowed, redact_for_log,
+    run_health_server,
 };
 use crate::wiring::WiredBot;
 
@@ -136,7 +137,8 @@ pub(crate) async fn run_event_loop(wb: WiredBot) {
             ) => match outcome {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
-                    tracing::error!("getUpdates error: {e}");
+                    let safe = redact_for_log(&e);
+                    tracing::error!("getUpdates error: {safe}");
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
@@ -221,7 +223,8 @@ impl UpdateDispatcher {
         let msg: Message = match serde_json::from_value(msg_val.clone()) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Failed to parse message: {e}");
+                let safe = redact_for_log(&e);
+                tracing::warn!("Failed to parse message: {safe}");
                 return;
             }
         };
@@ -266,11 +269,13 @@ impl UpdateDispatcher {
                             }
                             let joined = join_text_messages(&primary, &msgs);
                             if let Err(e) = overwrite_message_text(&mut primary, joined) {
-                                tracing::error!("text burst synthesis failed: {e}");
+                                let safe = redact_for_log(&e);
+                                tracing::error!("text burst synthesis failed: {safe}");
                                 return;
                             }
                             if let Err(e) = deps_for_flush.handle(primary, Vec::new()).await {
-                                tracing::error!("handle_message (text burst) error: {e}");
+                                let safe = redact_for_log(&e);
+                                tracing::error!("handle_message (text burst) error: {safe}");
                             }
                         })
                         .await
@@ -283,7 +288,8 @@ impl UpdateDispatcher {
                             msgs.sort_by_key(|m| m.id.0);
                             let primary = msgs.remove(0);
                             if let Err(e) = deps_for_flush.handle(primary, msgs).await {
-                                tracing::error!("handle_message (album) error: {e}");
+                                let safe = redact_for_log(&e);
+                                tracing::error!("handle_message (album) error: {safe}");
                             }
                         })
                         .await
@@ -291,7 +297,8 @@ impl UpdateDispatcher {
                 if let album::Decision::Solo(msg) = outcome {
                     let _permit = permit.acquire().await;
                     if let Err(e) = deps.handle(*msg, Vec::new()).await {
-                        tracing::error!("handle_message error: {e}");
+                        let safe = redact_for_log(&e);
+                        tracing::error!("handle_message error: {safe}");
                     }
                 }
             },
@@ -305,7 +312,8 @@ impl UpdateDispatcher {
         let msg: Message = match serde_json::from_value(msg_val.clone()) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Failed to parse edited_message: {e}");
+                let safe = redact_for_log(&e);
+                tracing::warn!("Failed to parse edited_message: {safe}");
                 return;
             }
         };
@@ -371,7 +379,8 @@ impl UpdateDispatcher {
             async move {
                 let _permit = permit.acquire().await;
                 if let Err(e) = deps.handle(msg, Vec::new()).await {
-                    tracing::error!("handle edited_message error: {e}");
+                    let safe = redact_for_log(&e);
+                    tracing::error!("handle edited_message error: {safe}");
                 }
             },
         );
@@ -382,7 +391,8 @@ impl UpdateDispatcher {
         let q: CallbackQuery = match serde_json::from_value(cb_val.clone()) {
             Ok(q) => q,
             Err(e) => {
-                tracing::warn!("Failed to parse callback: {e}");
+                let safe = redact_for_log(&e);
+                tracing::warn!("Failed to parse callback: {safe}");
                 return;
             }
         };
@@ -402,7 +412,8 @@ impl UpdateDispatcher {
             async move {
                 let _permit = permit.acquire().await;
                 if let Err(e) = handle_callback(cb_deps, q, cb_pending).await {
-                    tracing::error!("handle_callback error: {e}");
+                    let safe = redact_for_log(&e);
+                    tracing::error!("handle_callback error: {safe}");
                 }
             },
         );
@@ -627,10 +638,11 @@ async fn notify_interrupted_sessions(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
+                let safe = redact_for_log(&e);
                 tracing::info!(
                     chat = chat_id,
                     session = %session_id,
-                    "crash recovery notify failed (chat blocked / not found?): {e}"
+                    "crash recovery notify failed (chat blocked / not found?): {safe}"
                 );
             }
         }

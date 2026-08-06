@@ -78,6 +78,34 @@ pub trait Provider: Send + Sync {
     fn key_hint(&self) -> Option<String> {
         None
     }
+
+    /// B106: identity of the provider that actually served the LAST
+    /// `stream_chat` call, when it differs from the one that was requested.
+    ///
+    /// `ResilientProvider` silently falls back across providers/keys on
+    /// 429/413/5xx, but the caller keeps labelling the turn with the name the
+    /// user picked — so the tracing span, `model_health.jsonl` and the chat
+    /// UI all reported e.g. `groq` success for a turn groq rejected with 413
+    /// and deepseek actually answered. This accessor lets the turn layer
+    /// re-label itself with the truth.
+    ///
+    /// Returns `None` when no fallback happened (the common case) or when the
+    /// implementation does not track it. Decorators MUST delegate so the
+    /// answer reaches the `ResilientProvider` at the bottom of the chain.
+    fn last_fallback(&self) -> Option<FallbackInfo> {
+        None
+    }
+}
+
+/// B106: who actually answered, versus who was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackInfo {
+    /// Provider name the caller requested (front of the order at call time).
+    pub requested: String,
+    /// Provider name that actually produced the stream.
+    pub served_by: String,
+    /// Short reason from the first failure (already redacted/truncated).
+    pub reason: String,
 }
 
 /// Strip `[key-N]` suffix from a tagged provider name to recover the
@@ -162,6 +190,11 @@ impl Provider for Box<dyn Provider> {
     fn key_hint(&self) -> Option<String> {
         (**self).key_hint()
     }
+    // B106: must delegate so the answer reaches the ResilientProvider at
+    // the bottom of the chain.
+    fn last_fallback(&self) -> Option<FallbackInfo> {
+        (**self).last_fallback()
+    }
     async fn stream_chat(
         &self,
         request: ChatRequest,
@@ -191,6 +224,26 @@ impl Provider for ArcProvider {
     }
     fn models(&self) -> Vec<crate::types::ModelInfo> {
         self.0.models()
+    }
+    // B106: this wrapper previously forwarded ONLY name/models/stream_chat, so
+    // every optional trait method silently fell back to its default once a
+    // provider was boxed for `AgentLoop` — `last_fallback()` always answered
+    // None in production even though `ResilientProvider` had recorded a real
+    // fallback, and key-health accessors under-reported the same way.
+    fn blacklisted_key_count(&self) -> usize {
+        self.0.blacklisted_key_count()
+    }
+    fn total_key_count(&self) -> usize {
+        self.0.total_key_count()
+    }
+    fn key_hint(&self) -> Option<String> {
+        self.0.key_hint()
+    }
+    fn last_fallback(&self) -> Option<FallbackInfo> {
+        self.0.last_fallback()
+    }
+    async fn audit_keys_on_boot(&self) {
+        self.0.audit_keys_on_boot().await
     }
     async fn stream_chat(
         &self,
@@ -226,25 +279,67 @@ mod tests {
 
     #[test]
     fn should_send_temperature_matches_b71_b81_truth_table() {
-        // No temperature requested -> never send.
-        assert!(!should_send_temperature(None, false, false));
-        // reasoning_on -> never send (any model).
-        assert!(!should_send_temperature(Some(0.5), true, false));
-        assert!(!should_send_temperature(Some(0.5), true, true));
-        // Non-thinking model, reasoning off: send finite temp in [0,1].
-        assert!(should_send_temperature(Some(0.5), false, false));
-        assert!(should_send_temperature(Some(1.0), false, false));
-        assert!(!should_send_temperature(Some(-0.1), false, false));
-        assert!(!should_send_temperature(Some(1.5), false, false));
-        assert!(!should_send_temperature(Some(f32::NAN), false, false));
-        // B81: thinking-capable model (adaptive mode) -> NEVER send an
-        // explicit temperature, regardless of value or reasoning flag.
-        assert!(!should_send_temperature(Some(0.0), false, true));
-        assert!(!should_send_temperature(Some(0.5), false, true));
-        assert!(!should_send_temperature(Some(1.0), false, true));
-        assert!(!should_send_temperature(Some(-0.1), false, true));
-        assert!(!should_send_temperature(Some(1.5), false, true));
-        assert!(!should_send_temperature(Some(f32::NAN), false, true));
+        // D-INV-THINKING-TEMP: FULL truth table over
+        // (temp) x (reasoning_on) x (model_supports_thinking).
+        // Expected values are literal (not derived from the impl) per the
+        // documented B71 + B81 contract:
+        //   - temp None                      -> never send
+        //   - reasoning_on                   -> never send (any model)
+        //   - model_supports_thinking (B81)  -> never send (adaptive mode
+        //     rejects any explicit temperature != 1, even with reasoning off)
+        //   - plain model, reasoning off     -> send iff finite and in [0,1]
+        let cells: &[(Option<f32>, bool, bool, bool)] = &[
+            // (temp, reasoning_on, model_supports_thinking, expected)
+            // -- reasoning off, plain (non-thinking) model: the ONLY rows
+            //    where an explicit temperature may be serialized.
+            (None, false, false, false),
+            (Some(0.0), false, false, true),
+            (Some(0.5), false, false, true),
+            (Some(1.0), false, false, true),
+            (Some(-0.1), false, false, false),
+            (Some(1.5), false, false, false),
+            (Some(f32::NAN), false, false, false),
+            (Some(f32::INFINITY), false, false, false),
+            (Some(f32::NEG_INFINITY), false, false, false),
+            // -- reasoning off, thinking-capable model (B81): never send.
+            (None, false, true, false),
+            (Some(0.0), false, true, false),
+            (Some(0.5), false, true, false),
+            (Some(1.0), false, true, false),
+            (Some(-0.1), false, true, false),
+            (Some(1.5), false, true, false),
+            (Some(f32::NAN), false, true, false),
+            (Some(f32::INFINITY), false, true, false),
+            (Some(f32::NEG_INFINITY), false, true, false),
+            // -- reasoning on, plain model: never send.
+            (None, true, false, false),
+            (Some(0.0), true, false, false),
+            (Some(0.5), true, false, false),
+            (Some(1.0), true, false, false),
+            (Some(-0.1), true, false, false),
+            (Some(1.5), true, false, false),
+            (Some(f32::NAN), true, false, false),
+            (Some(f32::INFINITY), true, false, false),
+            (Some(f32::NEG_INFINITY), true, false, false),
+            // -- reasoning on, thinking-capable model: never send.
+            (None, true, true, false),
+            (Some(0.0), true, true, false),
+            (Some(0.5), true, true, false),
+            (Some(1.0), true, true, false),
+            (Some(-0.1), true, true, false),
+            (Some(1.5), true, true, false),
+            (Some(f32::NAN), true, true, false),
+            (Some(f32::INFINITY), true, true, false),
+            (Some(f32::NEG_INFINITY), true, true, false),
+        ];
+        for &(temp, reasoning_on, thinking, expected) in cells {
+            assert_eq!(
+                should_send_temperature(temp, reasoning_on, thinking),
+                expected,
+                "cell (temp={temp:?}, reasoning_on={reasoning_on}, \
+                 model_supports_thinking={thinking}) must be {expected}"
+            );
+        }
     }
 
     #[test]
@@ -260,5 +355,87 @@ mod tests {
         };
         let debug = format!("{req:?}");
         assert!(debug.contains("claude-sonnet-4"));
+    }
+    // ── D-INV-PROVIDER-DECORATOR-DELEGATES (B110) ──────────────────────────
+    //
+    // `Provider` has five OPTIONAL methods with defaults. Four wrappers must
+    // forward all of them: `Box<dyn Provider>`, `ArcProvider`,
+    // `TimeoutProvider`, `ModelOverrideProvider`. A forgotten forward compiles
+    // silently and reverts that method to its default — which is how B106
+    // (`last_fallback` lost through `ArcProvider`) and B110 (`key_hint` lost
+    // through `TimeoutProvider`, disabling B46 dead-key persistence) both
+    // happened. This test drives every wrapper through the SAME probe so a new
+    // optional method only has to be added here once.
+
+    struct ProbeProvider;
+
+    #[async_trait]
+    impl Provider for ProbeProvider {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![]
+        }
+        fn blacklisted_key_count(&self) -> usize {
+            3
+        }
+        fn total_key_count(&self) -> usize {
+            5
+        }
+        fn key_hint(&self) -> Option<String> {
+            Some("probe-key".into())
+        }
+        fn last_fallback(&self) -> Option<FallbackInfo> {
+            Some(FallbackInfo {
+                requested: "req".into(),
+                served_by: "srv".into(),
+                reason: "why".into(),
+            })
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::types::StreamChunk> + Send>>>
+        {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                crate::types::StreamChunk::Done,
+            ])))
+        }
+    }
+
+    /// Assert a wrapper forwards every optional method to `ProbeProvider`.
+    fn assert_delegates(label: &str, w: &dyn Provider) {
+        assert_eq!(
+            w.blacklisted_key_count(),
+            3,
+            "{label}: blacklisted_key_count"
+        );
+        assert_eq!(w.total_key_count(), 5, "{label}: total_key_count");
+        assert_eq!(
+            w.key_hint().as_deref(),
+            Some("probe-key"),
+            "{label}: key_hint (B46 dead-key persistence depends on it)"
+        );
+        assert_eq!(
+            w.last_fallback().map(|f| f.served_by).as_deref(),
+            Some("srv"),
+            "{label}: last_fallback (B106 fallback banner depends on it)"
+        );
+    }
+
+    #[test]
+    fn b110_every_provider_wrapper_delegates_optional_methods() {
+        let boxed: Box<dyn Provider> = Box::new(ProbeProvider);
+        assert_delegates("Box<dyn Provider>", &boxed);
+
+        let arc: std::sync::Arc<dyn Provider> = std::sync::Arc::new(ProbeProvider);
+        let via_arc = provider_to_box(&arc);
+        assert_delegates("ArcProvider (provider_to_box)", &via_arc);
+
+        let timed = super::timeout::TimeoutProvider::with_defaults(
+            Box::new(ProbeProvider) as Box<dyn Provider>
+        );
+        assert_delegates("TimeoutProvider", &timed);
     }
 }

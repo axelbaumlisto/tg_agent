@@ -187,13 +187,9 @@ impl<'a> ModelSelector<'a> {
         };
         // Resolve model aliases so "kimi-k2.6" routes to the caps block
         // keyed by "kimi-for-coding".
-        let real = pc.resolve_model_alias(model);
-        // `models` is the declared upstream list. Alias keys are
-        // appended via `models_with_aliases`, which is what the menu
-        // uses — we accept either.
-        let known = pc.models.iter().any(|m| m == model || m == real)
-            || pc.model_aliases.contains_key(model);
-        if !known {
+        // Shared predicate (see `ProviderConfig::serves_model`): accepts the
+        // literal id, an alias key (what the menu shows), or an alias target.
+        if !pc.serves_model(model) {
             return Err(CapError::UnknownModel {
                 provider: provider.to_string(),
                 model: model.to_string(),

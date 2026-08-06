@@ -95,6 +95,50 @@ fn provider_image_cap_respects_global_below_provider_limit() {
     );
 }
 
+/// Guards the URL-substring arms that the `_per_provider_floors` test never
+/// touched: OpenRouter (required), plus xAI and Google for good measure.
+/// Global is set to 64 MB — strictly larger than every provider ceiling here —
+/// so `cap_for(min)` returns the provider-specific value, NOT the global floor.
+/// If the `openrouter.ai` arm is removed, the call falls through to `_ => global`
+/// (64 MB) and the 20 MB assert fails: this test therefore pins the arm.
+#[test]
+fn provider_image_cap_url_arms_distinct_from_global() {
+    let global = 64 * 1024 * 1024;
+    let cfg = TgMediaConfig {
+        native_image_max_bytes: global,
+        ..TgMediaConfig::default()
+    };
+    // Sanity: the OpenRouter ceiling must be strictly below global, otherwise
+    // this test could not distinguish the arm from the `_ => global` fallback.
+    assert!(
+        20 * 1024 * 1024 < global,
+        "openrouter ceiling must be < global to distinguish the arm"
+    );
+    // Required: OpenRouter → 20 MB (distinct from the 64 MB global floor).
+    assert_eq!(
+        cfg.provider_image_cap("openai_compat", Some("https://openrouter.ai/api/v1")),
+        20 * 1024 * 1024
+    );
+    // xAI Grok → 10 MB.
+    assert_eq!(
+        cfg.provider_image_cap("openai_compat", Some("https://api.x.ai/v1")),
+        10 * 1024 * 1024
+    );
+    // Gemini (googleapis / generativelanguage) → 7 MB.
+    assert_eq!(
+        cfg.provider_image_cap(
+            "openai_compat",
+            Some("https://generativelanguage.googleapis.com/v1beta")
+        ),
+        7 * 1024 * 1024
+    );
+    // Contrast: a truly-unknown URL falls back to the global floor.
+    assert_eq!(
+        cfg.provider_image_cap("openai_compat", Some("https://unknown.example/v1")),
+        global
+    );
+}
+
 #[test]
 fn provider_supports_vision_none_falls_back_to_needles() {
     let cfg = TgMediaConfig::default();
@@ -346,6 +390,7 @@ fn default_config_empty() {
     assert!(!cfg.fs_cache_enabled);
     assert!(!cfg.persistent_bash_enabled);
     assert!(!cfg.snapshots_enabled);
+    assert!(!cfg.memory.memory_scope_priority_injection_enabled);
     assert_eq!(cfg.fs_cache_max_bytes, 64 * 1024 * 1024);
     assert!(!cfg.fff_fast_index_enabled);
     assert_eq!(cfg.fff_fast_index_max_workspaces, 4);
@@ -1354,12 +1399,14 @@ fn telegram_config_defaults() {
     assert!(tc.allowed_chat_ids.is_empty());
     assert!(!tc.tg_sender_attribution); // derive(Default) gives false; serde default gives true
     assert_eq!(tc.coalesce_text_ms, 0);
+    assert!(!tc.tg_long_answer_fix_enabled);
 }
 
 #[test]
 fn telegram_config_coalesce_text_ms_defaults_and_roundtrips() {
     let absent: TelegramConfig = serde_json::from_str(r#"{}"#).unwrap();
     assert_eq!(absent.coalesce_text_ms, 0);
+    assert!(!absent.tg_long_answer_fix_enabled);
 
     let present: TelegramConfig = serde_json::from_str(r#"{"coalesce_text_ms":250}"#).unwrap();
     assert_eq!(present.coalesce_text_ms, 250);
@@ -1375,6 +1422,7 @@ fn telegram_config_serde_roundtrip() {
         allowed_chat_ids: vec![123, 456],
         tg_sender_attribution: false,
         coalesce_text_ms: 0,
+        tg_long_answer_fix_enabled: false,
     };
     let json = serde_json::to_string(&tc).unwrap();
     let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -1382,6 +1430,27 @@ fn telegram_config_serde_roundtrip() {
     assert_eq!(parsed.allowed_chat_ids, vec![123, 456]);
     assert!(!parsed.tg_sender_attribution);
     assert_eq!(parsed.coalesce_text_ms, 0);
+    assert!(!parsed.tg_long_answer_fix_enabled);
+}
+
+#[test]
+fn tg_long_answer_fix_enabled_defaults_and_parses_at_root_not_nested() {
+    let absent: Config = serde_json::from_str(r#"{}"#).unwrap();
+    assert!(!absent.telegram.tg_long_answer_fix_enabled);
+    let absent_json = serde_json::to_string(&absent).unwrap();
+    let absent_reparsed: Config = serde_json::from_str(&absent_json).unwrap();
+    assert!(!absent_reparsed.telegram.tg_long_answer_fix_enabled);
+
+    let root: Config = serde_json::from_str(r#"{"tg_long_answer_fix_enabled":true}"#).unwrap();
+    assert!(root.telegram.tg_long_answer_fix_enabled);
+    let root_json = serde_json::to_string(&root).unwrap();
+    assert!(root_json.contains("\"tg_long_answer_fix_enabled\":true"));
+    let root_reparsed: Config = serde_json::from_str(&root_json).unwrap();
+    assert!(root_reparsed.telegram.tg_long_answer_fix_enabled);
+
+    let nested: Config =
+        serde_json::from_str(r#"{"telegram":{"tg_long_answer_fix_enabled":true}}"#).unwrap();
+    assert!(!nested.telegram.tg_long_answer_fix_enabled);
 }
 
 #[test]
@@ -1491,6 +1560,46 @@ fn snapshots_enabled_flag_default_false_root_parse() {
     let encoded = serde_json::to_string(&root).unwrap();
     let roundtrip: Config = serde_json::from_str(&encoded).unwrap();
     assert!(roundtrip.snapshots_enabled);
+}
+
+#[test]
+fn memory_reobservation_promotion_config_is_nested_under_memory() {
+    let empty: Config = serde_json::from_str("{}").unwrap();
+    assert!(!empty.memory.memory_reobservation_promote_enabled);
+    assert!(!empty.memory.memory_scope_priority_injection_enabled);
+    assert_eq!(empty.memory.promote_min_reobservations, 2);
+
+    let nested: Config = serde_json::from_str(
+        r#"{
+            "memory": {
+                "memory_reobservation_promote_enabled": true,
+                "memory_scope_priority_injection_enabled": true,
+                "promote_min_reobservations": 3
+            }
+        }"#,
+    )
+    .unwrap();
+    assert!(nested.memory.memory_reobservation_promote_enabled);
+    assert!(nested.memory.memory_scope_priority_injection_enabled);
+    assert_eq!(nested.memory.promote_min_reobservations, 3);
+
+    let root_level: Config = serde_json::from_str(
+        r#"{
+            "memory_reobservation_promote_enabled": true,
+            "memory_scope_priority_injection_enabled": true,
+            "promote_min_reobservations": 3
+        }"#,
+    )
+    .unwrap();
+    assert!(!root_level.memory.memory_reobservation_promote_enabled);
+    assert!(!root_level.memory.memory_scope_priority_injection_enabled);
+    assert_eq!(root_level.memory.promote_min_reobservations, 2);
+
+    let encoded = serde_json::to_string(&nested).unwrap();
+    let roundtrip: Config = serde_json::from_str(&encoded).unwrap();
+    assert!(roundtrip.memory.memory_reobservation_promote_enabled);
+    assert!(roundtrip.memory.memory_scope_priority_injection_enabled);
+    assert_eq!(roundtrip.memory.promote_min_reobservations, 3);
 }
 
 #[test]

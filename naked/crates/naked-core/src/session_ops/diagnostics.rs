@@ -28,6 +28,21 @@ impl AgentCore {
         self.provider_svc.resolve(provider_name).await
     }
 
+    /// B106: did the named provider silently fall back on its last call?
+    ///
+    /// The bot asks this after a turn so it can tell the user that the answer
+    /// came from someone other than the model they picked. Returns `None`
+    /// when the requested provider served the turn itself.
+    pub async fn last_fallback_for(
+        &self,
+        provider_name: &str,
+    ) -> Option<crate::provider::FallbackInfo> {
+        self.provider_svc
+            .resolve(provider_name)
+            .await
+            .last_fallback()
+    }
+
     pub async fn is_session_active(&self, session_id: &str) -> bool {
         self.ss.is_session_active(session_id).await
     }

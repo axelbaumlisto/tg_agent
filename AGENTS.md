@@ -60,6 +60,13 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p naked-core --lib                # ~40s, must be green
 cargo test -p naked-tg --lib                  # ~1s, must be green
+cargo test -p naked-tg --bins                 # ~7s, must be green
+                                              # `streaming_mod` (CompositeView,
+                                              # render_final, delta/flush) is
+                                              # wired into main.rs via #[path],
+                                              # NOT lib.rs — `--lib` silently
+                                              # skips ~361 tests incl. all
+                                              # final-answer rendering.
 cargo test -p naked-core --test loop_golden   # 8 golden tests, must be green
 cargo build --release           # produces target/release/{naked,naked-tg}
 ```
@@ -121,6 +128,29 @@ detection layer would catch a re-occurrence.
 
 **Before any new audit, run** `naked/scripts/audit_all.sh` to get
 the current baseline. Compare deltas on follow-up runs.
+
+## Calling scripts from bash (top error class)
+
+`json.loads("")` → `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`
+is the #1 recurring failure. Empty stdout is normal when a command fails,
+times out, or writes only to stderr.
+
+```bash
+# ❌ never
+cmd | python3 -c 'import sys,json; json.load(sys.stdin)'
+# ✅ always
+out=$(timeout 120 cmd 2>/tmp/x.err); rc=$?
+[ $rc -eq 0 ] && [ -n "$out" ] && printf '%s\n' "$out" | python3 -m json.tool \
+  || echo "FAILED rc=$rc $(head -c 300 /tmp/x.err)"
+```
+
+Triage order: `echo $?` → stderr → `--help` → `pwd` → only then stdout.
+Other recurring classes: guessed CLI flags (run `--help` first); cwd/path
+(`SKILL.toml` paths resolve from `naked/`, `.env` is at repo root via the
+`naked/.env` symlink); cron must export `NAKED_CONFIG` (B96); shell foot-guns
+(`tail -n 2`, `grep -- "$negative"`, `pkill -f "[p]attern"`).
+Full taxonomy with fixes: [`naked/skills/README.md`](naked/skills/README.md)
+§ "Error taxonomy".
 
 ## Conventions
 

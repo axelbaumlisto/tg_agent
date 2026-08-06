@@ -75,6 +75,33 @@ pub(crate) async fn build() -> WiredBot {
             "snapshots disabled: per-turn rollback safety net OFF; set snapshots_enabled=true to re-enable"
         );
     }
+    if config.telegram.tg_long_answer_fix_enabled {
+        tracing::info!(
+            "tg long-answer fix enabled: UTF-16 budget + no response pre-truncation active"
+        );
+    } else {
+        tracing::info!(
+            "tg long-answer fix disabled: legacy byte budget + response pre-truncation active; set tg_long_answer_fix_enabled=true to enable"
+        );
+    }
+    if config.memory.memory_reobservation_promote_enabled {
+        tracing::info!(
+            promote_min_reobservations = config.memory.promote_min_reobservations,
+            "memory re-observation promotion enabled"
+        );
+    } else {
+        tracing::info!(
+            promote_min_reobservations = config.memory.promote_min_reobservations,
+            "memory re-observation promotion disabled; set memory.memory_reobservation_promote_enabled=true to enable"
+        );
+    }
+    if config.memory.memory_scope_priority_injection_enabled {
+        tracing::info!("memory scope-priority injection enabled");
+    } else {
+        tracing::info!(
+            "memory scope-priority injection disabled; set memory.memory_scope_priority_injection_enabled=true to enable"
+        );
+    }
     let provider =
         naked_core::build_provider_from_config(&config).expect("Failed to build provider");
     let agent = Arc::new(AgentCore::new(config.clone(), provider));
@@ -271,6 +298,7 @@ pub(crate) async fn build() -> WiredBot {
     // for the project + every on-disk user scope at the configured
     // cron time. Idempotent — safe to spawn unconditionally; the loop
     // honors `memory.daily_enabled`.
+    crate::metrics::set_memory_metrics_workspace(config.workspace.clone());
     let _memory_scheduler = memory_scheduler::spawn(
         agent.clone(),
         config.workspace.clone(),

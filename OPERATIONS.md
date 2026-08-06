@@ -57,6 +57,27 @@ not managed here, such as:
 
 - Telegram Bot API.
 - Optional browser/VNC infrastructure for manual login flows.
+
+### Browser stack (single-browser invariant, 2026-07-24)
+
+Three `systemd --user` units (installed copies in `naked/ops/systemd/`):
+
+| Unit | What | Display/Port |
+|---|---|---|
+| `vnc-x1.service` | TigerVNC + xfce desktop | `:1` / 5901 (localhost) |
+| `novnc.service` | websockify noVNC bridge | 6081 (Caddy → `/vnc/*`) |
+| `chrome-cdp.service` | Chrome, profile `~/.config/chrome-vnc` | `DISPLAY=:1`, CDP 9222 |
+
+**Invariant: exactly ONE Chrome.** The browser visible in noVNC is the
+same one cron token-health scripts dump cookies from (CDP 9222). The
+pre-2026-07-24 setup had a second Chrome on headless Xvfb `:99` —
+operators re-logged-in via VNC into the *wrong* browser and tokens
+“kept getting lost”. `xvfb.service` is disabled; do not resurrect it.
+
+Re-login flow: open `https://clipshot.cc/vnc` → log in on the site in
+the visible Chrome → next cron tick picks the fresh cookies up
+automatically. Chrome must NOT be started from `~/.vnc/xstartup` or
+`~/no-vnc/*.sh` (both deprecated to thin wrappers).
 - Optional LLM/search provider APIs.
 
 Configure those services via `.env`, not by committing host-specific

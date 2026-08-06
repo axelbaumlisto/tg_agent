@@ -85,6 +85,32 @@ fn production_fallback_provider_names_exist() {
     );
 }
 
+/// Shared driver for the production-config sweeps below.
+///
+/// Every sweep repeats the same three steps: locate the live `naked.json`
+/// (skipping cleanly in a CI checkout without `state/`), collect human-readable
+/// violation strings, and fail with all of them at once. Five copies of that
+/// scaffolding had accumulated, so a new sweep meant re-deriving the skip
+/// semantics by hand — easy to get subtly wrong (an early `return` that skips
+/// instead of failing hides a real regression). `check` only has to describe
+/// what is wrong.
+fn sweep_prod_config(inv: &str, check: impl FnOnce(&Config, &mut Vec<String>)) {
+    let Some(path) = locate_prod_config() else {
+        eprintln!("skipped: no prod naked.json reachable (CI without state/)");
+        return;
+    };
+    let cfg = Config::from_json_file(&path).expect("Config::from_json_file");
+
+    let mut violations: Vec<String> = Vec::new();
+    check(&cfg, &mut violations);
+
+    assert!(
+        violations.is_empty(),
+        "{inv} violated:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// INV-1 + INV-2: every model in the production config whose
 /// `capabilities[model].supports_vision = Some(true)` MUST be routable
 /// through `is_vision_capable_with_provider`. Closes a class of
@@ -179,4 +205,130 @@ fn production_vision_named_models_either_route_or_explicit_deny() {
         "BUG_REGISTRY INV-2 violated: vision-named models that don't route:\n  {}",
         violations.join("\n  ")
     );
+}
+
+/// D-INV-PROVIDER-ALIAS (B105), production half: every `provider_aliases`
+/// entry must be *useful* and *reachable*.
+///
+/// A retirement alias exists so 352 session configs pinned to a removed
+/// provider stop silently reporting a dead provider/model as healthy. That
+/// only holds if each alias (a) names a provider that is actually gone,
+/// (b) lands on a provider that IS in the catalog, and (c) pins a model that
+/// the target provider really serves — otherwise the redirect just moves the
+/// lie one hop. This sweeps the live config on every run, so editing
+/// `state/naked.json` badly fails before deploy instead of at runtime.
+#[test]
+fn b105_production_provider_aliases_resolve_to_live_pairs() {
+    sweep_prod_config("B105 provider_aliases", |cfg, violations| {
+        for from in cfg.provider_aliases.keys() {
+            if cfg.providers.contains_key(from) {
+                violations.push(format!(
+                    "{from}: still LIVE in providers — the alias is dead weight and \
+                 the live entry silently wins"
+                ));
+                continue;
+            }
+            let (prov, model) = cfg.resolve_provider_alias(from);
+            let Some(pc) = cfg.providers.get(&prov) else {
+                violations.push(format!(
+                    "{from} -> {prov}: target provider is NOT in the catalog"
+                ));
+                continue;
+            };
+            let Some(m) = model else {
+                // Bare form is legal, but then the session's own (dead) model
+                // string survives — for a retirement that is almost never right.
+                violations.push(format!(
+                    "{from} -> {prov}: bare alias keeps the session's model; a retired \
+                 provider needs the `provider/model` form"
+                ));
+                continue;
+            };
+            let serves = pc.models.contains(&m) || pc.capabilities.contains_key(&m);
+            if !serves {
+                violations.push(format!(
+                    "{from} -> {prov}/{m}: provider does not serve that model"
+                ));
+            }
+        }
+    });
+}
+
+/// D-INV-PROVIDER-OWNS-ITS-MODELS (B107): a provider's `models` list must not
+/// advertise another provider's models.
+///
+/// Observed 2026-08-05: `moonshot`, `kimi-code` and `openai` all listed
+/// `deepseek-v4-flash`/`deepseek-v4-pro` in `models` while their
+/// `capabilities` still described kimi / gpt models. Because `/model` and the
+/// selector read `models`, picking "moonshot" silently served deepseek — with
+/// no fallback and no warning, since the config itself said so. The upstream
+/// proxy *does* serve the real kimi ids, so this was pure config drift (most
+/// likely a bulk edit during the 2026-07-25 provider purge).
+///
+/// Heuristic, not a hardcoded map: every entry in `models` should either be
+/// described in that provider's own `capabilities`, or at least not be a model
+/// that ONLY some other provider declares capabilities for. That keeps the
+/// check useful for shared proxy ids while catching wholesale substitution.
+#[test]
+fn b107_provider_models_are_not_another_providers() {
+    sweep_prod_config("B107 provider/model ownership", |cfg, violations| {
+        for (name, pc) in &cfg.providers {
+            for m in &pc.models {
+                if pc.capabilities.contains_key(m) {
+                    continue; // provider describes it itself — fine
+                }
+                // Who DOES declare capabilities for this model id?
+                let owners: Vec<&String> = cfg
+                    .providers
+                    .iter()
+                    .filter(|(other, opc)| *other != name && opc.capabilities.contains_key(m))
+                    .map(|(other, _)| other)
+                    .collect();
+                if !owners.is_empty() {
+                    violations.push(format!(
+                    "{name}.models lists '{m}', but only {owners:?} declare capabilities for it \
+                     — picking {name} would silently serve another provider's model"
+                ));
+                }
+            }
+        }
+    });
+}
+
+/// D-INV-ACTIVE-CAPS-ARE-SERVABLE (B108): a model may not be advertised as
+/// `status: active` in `capabilities` unless its provider actually lists it in
+/// `models`.
+///
+/// `ModelSelector::rank_for` filters on `status`, and `skills/model-catalog/
+/// SKILL.md` is generated from the same data — so an `active` capability for a
+/// model the provider cannot serve becomes a FIRST-CHOICE recommendation that
+/// always fails. Observed 2026-08-05: eight moonshot ids
+/// (`kimi-k2-thinking-turbo`, `moonshot-v1-*`, …) stayed `active` after B107
+/// trimmed `models` to what the upstream really answers, and the catalog kept
+/// recommending `moonshot / kimi-k2-thinking-turbo` for coding, research and
+/// chat — every one of them a live 404/502.
+///
+/// Deprecating a dead model is therefore the *required* companion to removing
+/// it from `models`; this test refuses to let the two drift apart again.
+#[test]
+fn b108_active_capabilities_must_be_in_provider_models() {
+    sweep_prod_config("B108 active-but-unservable models", |cfg, violations| {
+        for (name, pc) in &cfg.providers {
+            for (model, caps) in &pc.capabilities {
+                let active = matches!(
+                    caps.status,
+                    naked_core::model_catalog::ModelStatus::Active
+                        | naked_core::model_catalog::ModelStatus::Degraded
+                );
+                if active && !pc.models.contains(model) {
+                    violations.push(format!(
+                        "{name}/{model}: capabilities say {:?} but it is not in {name}.models — \
+                     the selector and the generated catalog will recommend a model that \
+                     cannot be served",
+                        caps.status
+                    ));
+                }
+            }
+        }
+    });
 }

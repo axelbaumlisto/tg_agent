@@ -12,6 +12,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,8 +52,58 @@ impl Provider for UnreachableProvider {
     }
 }
 
+/// Provider that reports its whole key/provider pool as blacklisted
+/// (`blacklisted == total == 2`), so `should_skip_dispatch` returns true.
+/// B75 (D-INV-DISPATCH-SKIP-METRIC): drives the REAL scheduler skip path so
+/// the dispatch-skip → counter wiring is guarded end-to-end. `stream_chat`
+/// errors because it must never be reached on the skip path.
+struct ExhaustedProvider;
+
+#[async_trait]
+impl Provider for ExhaustedProvider {
+    fn name(&self) -> &str {
+        "exhausted"
+    }
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![]
+    }
+    fn blacklisted_key_count(&self) -> usize {
+        2
+    }
+    fn total_key_count(&self) -> usize {
+        2
+    }
+    async fn stream_chat(
+        &self,
+        _request: ChatRequest,
+    ) -> naked_core::error::Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+        Err(naked_core::error::AgentError::Provider(
+            "ExhaustedProvider::stream_chat invoked — dispatch should have been skipped".into(),
+        ))
+    }
+}
+
 fn make_core(tmp: &TempDir) -> Arc<AgentCore> {
     make_core_with_auto_first_run(tmp, true)
+}
+
+/// Build an AgentCore whose default provider reports a fully-exhausted key
+/// pool. `auto_first_run = true` so the spec is immediately due on tick 1.
+fn make_exhausted_core(tmp: &TempDir) -> Arc<AgentCore> {
+    let cfg = Config {
+        workspace: tmp.path().to_path_buf(),
+        session_dir: tmp.path().join("sessions"),
+        research: ResearchConfig {
+            enabled: true,
+            storage_dir: Some(tmp.path().join("research")),
+            auto_first_run: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Arc::new(AgentCore::new(cfg, Box::new(ExhaustedProvider)));
+    agent.init_self_ref();
+    agent
 }
 
 fn make_core_with_auto_first_run(tmp: &TempDir, auto_first_run: bool) -> Arc<AgentCore> {
@@ -282,6 +333,75 @@ async fn t_scheduler_skips_mock_when_chat_id_missing() {
         captured.len(),
         0,
         "mock must NOT receive messages for specs without chat_id (T6.4 fallback gate)"
+    );
+}
+
+/// B75 (D-INV-DISPATCH-SKIP-METRIC): the REAL dispatch-skip path must bump
+/// `SCHEDULER_DISPATCH_SKIPPED_COUNT` **and** skip the dispatch closure.
+///
+/// The pre-existing unit tests only exercise `record_scheduler_dispatch_skipped()`
+/// and `should_skip_dispatch()` in ISOLATION — neither guards that the
+/// `spawn_task` skip branch actually calls the counter. A mutation probe
+/// (deleting the `record_scheduler_dispatch_skipped();` call-site) leaves all
+/// unit tests green. This end-to-end test closes that gap:
+///
+///   * default provider reports `blacklisted == total == 2`
+///     → `should_skip_dispatch(2, 2) == true`
+///   * scheduler tick → `spawn_task` → skip branch fires
+///     → counter increments AND the dispatch_fn closure is never invoked.
+///
+/// We assert the DELTA on the process-wide atomic (>= 1, never an absolute
+/// value) because other concurrently-running tests may also bump it, and we
+/// assert the MockDispatcher stayed empty — the behavioural fingerprint that
+/// fails if the skip branch is bypassed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_scheduler_skip_path_bumps_dispatch_skipped_counter() {
+    let tmp = TempDir::new().expect("tempdir");
+    let agent = make_exhausted_core(&tmp);
+
+    // Spec WITH chat_id + auto_first_run → due immediately on tick 1.
+    let spec = make_spec_with_chat("exhausted-delta", 999_777);
+    agent
+        .research_store()
+        .create_spec(&spec)
+        .await
+        .expect("create_spec");
+
+    // dispatch_fn installed so the ONLY reason the mock stays empty is the
+    // skip branch short-circuiting before the dispatch closure.
+    let mock = MockDispatcher::new();
+    let cfg = SchedulerConfig {
+        tick_interval: Duration::from_millis(50),
+        max_concurrent_runs: 1,
+        task_timeout: Duration::from_secs(5),
+        dispatch_fn: Some(mock.as_fn()),
+        ..Default::default()
+    };
+
+    // Capture the counter immediately before triggering the run.
+    let before = naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT.load(Ordering::Relaxed);
+
+    let (sched, hook) = ResearchScheduler::start(Arc::downgrade(&agent), cfg);
+    agent.set_scheduler_hook(hook);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    sched.shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let after = naked_core::types::SCHEDULER_DISPATCH_SKIPPED_COUNT.load(Ordering::Relaxed);
+    assert!(
+        after.wrapping_sub(before) >= 1,
+        "skip path must bump SCHEDULER_DISPATCH_SKIPPED_COUNT at least once \
+         (before={before}, after={after}) — the record_scheduler_dispatch_skipped() \
+         call-site wiring on the should_skip_dispatch branch is missing"
+    );
+
+    let captured = mock.snapshot().await;
+    assert!(
+        captured.is_empty(),
+        "dispatch was skipped → the dispatch_fn closure must never run \
+         (mock captured {} message(s))",
+        captured.len()
     );
 }
 

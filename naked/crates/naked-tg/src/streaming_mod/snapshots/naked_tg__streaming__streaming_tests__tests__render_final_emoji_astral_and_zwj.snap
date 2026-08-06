@@ -1,0 +1,5 @@
+---
+source: crates/naked-tg/src/streaming_mod/tests.rs
+expression: v.render_final()
+---
+Emoji pressure: 💭 thinking, 🤖 bot, family 👨‍👩‍👧, and plain text.

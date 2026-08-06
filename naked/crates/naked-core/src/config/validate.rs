@@ -94,7 +94,7 @@ impl Config {
         if let Some(pc) = self.providers.get(&self.default_provider)
             && !self.default_model.is_empty()
             && !pc.models.is_empty()
-            && !pc.models.iter().any(|m| m == &self.default_model)
+            && !pc.serves_model(&self.default_model)
         {
             tracing::warn!(
                 model = %self.default_model,
@@ -134,7 +134,7 @@ impl Config {
                 && let Some(m) = self.research.model.as_deref()
                 && !m.is_empty()
                 && !pc.models.is_empty()
-                && !pc.models.iter().any(|model| model == m)
+                && !pc.serves_model(m)
             {
                 tracing::warn!(
                     research_model = %m,

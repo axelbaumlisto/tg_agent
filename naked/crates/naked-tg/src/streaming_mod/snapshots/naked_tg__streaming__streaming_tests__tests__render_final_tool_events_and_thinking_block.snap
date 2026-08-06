@@ -1,0 +1,16 @@
+---
+source: crates/naked-tg/src/streaming_mod/tests.rs
+expression: v.render_final()
+---
+<blockquote expandable>💭 <b>thinking</b>
+Need to inspect &amp; compare &lt;paths&gt;. Final thought keeps 💭 marker context.</blockquote>
+<pre><code class="language-bash">$ bash printf '&lt;x&gt;&amp;'</code></pre>
+<blockquote>✅ <i>ok &amp; &lt;done&gt;
+line two</i></blockquote>
+<pre><code class="language-python">$ python3 script.py --flag</code></pre>
+<pre><code>❌ Traceback &lt;bad&gt; &amp; fail
+second
+third
+fourth
+fifth</code></pre>
+Chronological answer with <b>bold</b> after tools.

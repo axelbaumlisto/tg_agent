@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::store::{MAX_ENTRY_CHARS, MAX_INJECTION_CHARS, MarkdownMemoryStore};
 use super::types::{MemoryEntry, MemoryScope, MemoryType};
+use crate::config::MemoryConfig;
 
 /// High-level API for the memory system.
 pub struct MemoryService;
@@ -86,6 +87,26 @@ impl MemoryService {
         }
 
         out
+    }
+
+    /// Load active rules with memory config available to the per-turn hot path.
+    /// Default-off `memory_scope_priority_injection_enabled=false` calls the
+    /// legacy renderer above directly. When enabled, all Corrections from all
+    /// scopes render first (User → Project → Global, newest first), then the
+    /// remaining types render by User → Project → Global and by type.
+    pub fn load_rules_for_with_config(
+        workspace: &Path,
+        sender_id: Option<&str>,
+        config: &MemoryConfig,
+    ) -> String {
+        if !config.memory_scope_priority_injection_enabled {
+            return Self::load_rules_for(workspace, sender_id);
+        }
+
+        let loaded = LoadedMemories::load(workspace, sender_id);
+        let (rendered, dropped) = render_scope_priority(&loaded, sender_id);
+        record_injection_dropped(dropped);
+        rendered
     }
 
     /// Store a new memory entry. Truncates content to MAX_ENTRY_CHARS.
@@ -215,6 +236,278 @@ impl MemoryService {
     }
 }
 
+#[derive(Debug, Default)]
+struct LoadedMemories {
+    global: Vec<MemoryEntry>,
+    project: Vec<MemoryEntry>,
+    user: Vec<MemoryEntry>,
+}
+
+impl LoadedMemories {
+    fn load(workspace: &Path, sender_id: Option<&str>) -> Self {
+        let global = MarkdownMemoryStore::load(
+            &MarkdownMemoryStore::global_memory_path(),
+            MemoryScope::Global,
+        );
+        let project = MarkdownMemoryStore::load(
+            &MarkdownMemoryStore::project_memory_path(workspace),
+            MemoryScope::Project,
+        );
+        let user = sender_id
+            .filter(|s| !s.is_empty())
+            .map(|id| {
+                MarkdownMemoryStore::load(
+                    &MarkdownMemoryStore::user_memory_path(id),
+                    MemoryScope::User(id.to_string()),
+                )
+            })
+            .unwrap_or_default();
+        Self {
+            global,
+            project,
+            user,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.global.is_empty() && self.project.is_empty() && self.user.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DroppedByScope {
+    global: usize,
+    project: usize,
+    user: usize,
+}
+
+impl DroppedByScope {
+    fn add(&mut self, scope: ScopeBucket, count: usize) {
+        match scope {
+            ScopeBucket::Global => self.global += count,
+            ScopeBucket::Project => self.project += count,
+            ScopeBucket::User => self.user += count,
+        }
+    }
+
+    fn total(self) -> usize {
+        self.global + self.project + self.user
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeBucket {
+    Global,
+    Project,
+    User,
+}
+
+const NON_CORRECTION_TYPES: [MemoryType; 3] = [
+    MemoryType::Preference,
+    MemoryType::ProjectKnowledge,
+    MemoryType::Failure,
+];
+
+#[derive(Debug)]
+struct PriorityGroup<'a> {
+    scope: ScopeBucket,
+    label: String,
+    memory_type: MemoryType,
+    entries: Vec<&'a MemoryEntry>,
+}
+
+fn render_scope_priority(
+    loaded: &LoadedMemories,
+    sender_id: Option<&str>,
+) -> (String, DroppedByScope) {
+    if loaded.is_empty() {
+        return (String::new(), DroppedByScope::default());
+    }
+
+    let mut groups = Vec::new();
+    let user_label = sender_id
+        .filter(|s| !s.is_empty())
+        .map(|id| format!("User ({id})"));
+
+    if let Some(label) = &user_label {
+        push_priority_group(
+            &mut groups,
+            &loaded.user,
+            label.clone(),
+            ScopeBucket::User,
+            MemoryType::Correction,
+        );
+    }
+    push_priority_group(
+        &mut groups,
+        &loaded.project,
+        "Project".to_string(),
+        ScopeBucket::Project,
+        MemoryType::Correction,
+    );
+    push_priority_group(
+        &mut groups,
+        &loaded.global,
+        "Global".to_string(),
+        ScopeBucket::Global,
+        MemoryType::Correction,
+    );
+
+    if let Some(label) = &user_label {
+        for memory_type in NON_CORRECTION_TYPES {
+            push_priority_group(
+                &mut groups,
+                &loaded.user,
+                label.clone(),
+                ScopeBucket::User,
+                memory_type,
+            );
+        }
+    }
+    for memory_type in NON_CORRECTION_TYPES {
+        push_priority_group(
+            &mut groups,
+            &loaded.project,
+            "Project".to_string(),
+            ScopeBucket::Project,
+            memory_type,
+        );
+    }
+    for memory_type in NON_CORRECTION_TYPES {
+        push_priority_group(
+            &mut groups,
+            &loaded.global,
+            "Global".to_string(),
+            ScopeBucket::Global,
+            memory_type,
+        );
+    }
+
+    append_priority_groups(&groups)
+}
+
+fn push_priority_group<'a>(
+    groups: &mut Vec<PriorityGroup<'a>>,
+    entries: &'a [MemoryEntry],
+    label: String,
+    scope: ScopeBucket,
+    memory_type: MemoryType,
+) {
+    let mut items: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|entry| entry.memory_type == memory_type)
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    items.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    groups.push(PriorityGroup {
+        scope,
+        label,
+        memory_type,
+        entries: items,
+    });
+}
+
+fn append_priority_groups(groups: &[PriorityGroup<'_>]) -> (String, DroppedByScope) {
+    let mut out = String::from(
+        "[Memory — active rules]
+",
+    );
+    let mut remaining = MAX_INJECTION_CHARS - out.len();
+    let mut dropped = DroppedByScope::default();
+
+    for (group_idx, group) in groups.iter().enumerate() {
+        let header = format!(
+            "
+{}:
+",
+            group.label
+        );
+        if header.len() >= remaining {
+            count_remaining_groups(groups, group_idx, 0, &mut dropped);
+            return (out, dropped);
+        }
+        out.push_str(&header);
+        remaining -= header.len();
+
+        let sub = format!(
+            "  {}:
+",
+            group.memory_type.section_heading()
+        );
+        if sub.len() >= remaining {
+            count_remaining_groups(groups, group_idx, 0, &mut dropped);
+            return (out, dropped);
+        }
+        out.push_str(&sub);
+        remaining -= sub.len();
+
+        for (entry_idx, entry) in group.entries.iter().enumerate() {
+            let line = format!(
+                "  - {}
+",
+                entry.content
+            );
+            if line.len() >= remaining {
+                count_remaining_groups(groups, group_idx, entry_idx, &mut dropped);
+                return (out, dropped);
+            }
+            out.push_str(&line);
+            remaining -= line.len();
+        }
+    }
+
+    (out, dropped)
+}
+
+fn count_remaining_groups(
+    groups: &[PriorityGroup<'_>],
+    group_idx: usize,
+    entry_idx: usize,
+    dropped: &mut DroppedByScope,
+) {
+    for (idx, group) in groups.iter().enumerate().skip(group_idx) {
+        let start = if idx == group_idx { entry_idx } else { 0 };
+        if start < group.entries.len() {
+            dropped.add(group.scope, group.entries.len() - start);
+        }
+    }
+}
+
+fn record_injection_dropped(dropped: DroppedByScope) {
+    if dropped.total() == 0 {
+        return;
+    }
+
+    use std::sync::atomic::Ordering;
+
+    if dropped.global > 0 {
+        crate::types::MEMORY_INJECTION_DROPPED_GLOBAL_COUNT
+            .fetch_add(dropped.global as u64, Ordering::Relaxed);
+    }
+    if dropped.project > 0 {
+        crate::types::MEMORY_INJECTION_DROPPED_PROJECT_COUNT
+            .fetch_add(dropped.project as u64, Ordering::Relaxed);
+    }
+    if dropped.user > 0 {
+        crate::types::MEMORY_INJECTION_DROPPED_USER_COUNT
+            .fetch_add(dropped.user as u64, Ordering::Relaxed);
+    }
+
+    tracing::warn!(
+        global = dropped.global,
+        project = dropped.project,
+        user = dropped.user,
+        max_chars = MAX_INJECTION_CHARS,
+        "memory injection truncated: dropped entries due to prompt budget"
+    );
+}
+
 fn scope_path(workspace: &Path, scope: &MemoryScope) -> std::path::PathBuf {
     match scope {
         MemoryScope::Global => MarkdownMemoryStore::global_memory_path(),
@@ -227,7 +520,104 @@ fn scope_path(workspace: &Path, scope: &MemoryScope) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
-    use crate::memory::store::MarkdownMemoryStore;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use chrono::TimeZone;
+
+    use crate::memory::store::{MarkdownMemoryStore, MemoryPaths};
+
+    static S5_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct DroppedSnapshot {
+        global: u64,
+        project: u64,
+        user: u64,
+    }
+
+    impl DroppedSnapshot {
+        fn current() -> Self {
+            use std::sync::atomic::Ordering;
+
+            Self {
+                global: crate::types::MEMORY_INJECTION_DROPPED_GLOBAL_COUNT.load(Ordering::Relaxed),
+                project: crate::types::MEMORY_INJECTION_DROPPED_PROJECT_COUNT
+                    .load(Ordering::Relaxed),
+                user: crate::types::MEMORY_INJECTION_DROPPED_USER_COUNT.load(Ordering::Relaxed),
+            }
+        }
+
+        fn delta_since(self, before: Self) -> Self {
+            Self {
+                global: self.global - before.global,
+                project: self.project - before.project,
+                user: self.user - before.user,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_warn_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let log_bytes = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let log_bytes = log_bytes.clone();
+            move || SharedLog(log_bytes.clone())
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let result = f();
+        let logs = String::from_utf8(log_bytes.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    fn priority_cfg(enabled: bool) -> MemoryConfig {
+        MemoryConfig {
+            memory_scope_priority_injection_enabled: enabled,
+            ..Default::default()
+        }
+    }
+
+    fn fixed_entry(
+        scope: MemoryScope,
+        memory_type: MemoryType,
+        content: impl Into<String>,
+        day: u32,
+    ) -> MemoryEntry {
+        let content = content.into();
+        let mut entry = MemoryEntry::new(memory_type, content.clone(), "test", scope);
+        entry.id = format!("id{day:02}{:016x}", content.len());
+        entry.created_at = chrono::Utc
+            .with_ymd_and_hms(2026, 8, day, 12, 0, 0)
+            .unwrap();
+        entry
+    }
+
+    fn save_scope(workspace: &Path, scope: MemoryScope, entries: &[MemoryEntry]) {
+        let path = scope_path(workspace, &scope);
+        MarkdownMemoryStore::save(&path, entries).unwrap();
+    }
+
+    fn long_content(prefix: &str, width: usize) -> String {
+        format!("{prefix}_{}", "x".repeat(width))
+    }
 
     /// Low-level service tests using MarkdownMemoryStore directly
     /// (avoids env var mutation issues with Rust 2024 edition).
@@ -375,6 +765,343 @@ mod tests {
         // Must be safe UTF-8 and respect the char budget (not byte budget).
         assert_eq!(truncated.chars().count(), MAX_ENTRY_CHARS);
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn s5_flag_off_matches_pre_s5_golden_on_overflowing_corpus() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        let user_id = "alice";
+
+        let globals: Vec<MemoryEntry> = (0..8)
+            .map(|i| {
+                fixed_entry(
+                    MemoryScope::Global,
+                    MemoryType::Preference,
+                    long_content(&format!("GLOBAL_LEGACY_{i:02}"), 520),
+                    i + 1,
+                )
+            })
+            .collect();
+        save_scope(&workspace, MemoryScope::Global, &globals);
+        save_scope(
+            &workspace,
+            MemoryScope::Project,
+            &[fixed_entry(
+                MemoryScope::Project,
+                MemoryType::Preference,
+                "PROJECT_WOULD_BE_DROPPED_LEGACY",
+                20,
+            )],
+        );
+        save_scope(
+            &workspace,
+            MemoryScope::User(user_id.to_string()),
+            &[fixed_entry(
+                MemoryScope::User(user_id.to_string()),
+                MemoryType::Preference,
+                "USER_WOULD_BE_DROPPED_LEGACY",
+                21,
+            )],
+        );
+
+        // Frozen from `git show 0df6425~1:./crates/naked-core/src/memory/service.rs`:
+        // Global → Project → User, type order from `MemoryType::ALL`, stop before
+        // the first line that would exceed `MAX_INJECTION_CHARS`.
+        let expected = r#"[Memory — active rules]
+
+Global:
+  Preferences:
+  - GLOBAL_LEGACY_00_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - GLOBAL_LEGACY_01_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - GLOBAL_LEGACY_02_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - GLOBAL_LEGACY_03_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - GLOBAL_LEGACY_04_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - GLOBAL_LEGACY_05_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - GLOBAL_LEGACY_06_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+Project:
+  Preferences:
+  - PROJECT_WOULD_BE_DROPPED_LEGACY
+
+User (alice):
+  Preferences:
+  - USER_WOULD_BE_DROPPED_LEGACY
+"#;
+        let flag_off = MemoryService::load_rules_for_with_config(
+            &workspace,
+            Some(user_id),
+            &priority_cfg(false),
+        );
+
+        assert_eq!(flag_off, expected);
+        assert!(flag_off.len() <= MAX_INJECTION_CHARS);
+        assert!(flag_off.contains("GLOBAL_LEGACY_06"));
+        assert!(!flag_off.contains("GLOBAL_LEGACY_07"));
+        assert!(flag_off.contains("PROJECT_WOULD_BE_DROPPED_LEGACY"));
+        assert!(flag_off.contains("USER_WOULD_BE_DROPPED_LEGACY"));
+    }
+
+    #[test]
+    fn s5_flag_on_prioritizes_user_project_and_counts_exact_global_drops() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        let user_id = "alice";
+        let global_count = 14usize;
+
+        let globals: Vec<MemoryEntry> = (0..global_count)
+            .map(|i| {
+                fixed_entry(
+                    MemoryScope::Global,
+                    MemoryType::Preference,
+                    long_content(&format!("GLOBAL_OVERFLOW_{i:02}"), 420),
+                    (i + 1) as u32,
+                )
+            })
+            .collect();
+        save_scope(&workspace, MemoryScope::Global, &globals);
+        save_scope(
+            &workspace,
+            MemoryScope::Project,
+            &[fixed_entry(
+                MemoryScope::Project,
+                MemoryType::Correction,
+                "PROJECT_KEEP_CORRECTION",
+                20,
+            )],
+        );
+        save_scope(
+            &workspace,
+            MemoryScope::User(user_id.to_string()),
+            &[fixed_entry(
+                MemoryScope::User(user_id.to_string()),
+                MemoryType::Preference,
+                "USER_KEEP_PREFERENCE",
+                21,
+            )],
+        );
+
+        let before = DroppedSnapshot::current();
+        let rules = MemoryService::load_rules_for_with_config(
+            &workspace,
+            Some(user_id),
+            &priority_cfg(true),
+        );
+        let delta = DroppedSnapshot::current().delta_since(before);
+        let rendered_globals = (0..global_count)
+            .filter(|i| rules.contains(&format!("GLOBAL_OVERFLOW_{i:02}")))
+            .count();
+        let expected_global_drops = (global_count - rendered_globals) as u64;
+
+        assert!(rules.contains("USER_KEEP_PREFERENCE"));
+        assert!(rules.contains("PROJECT_KEEP_CORRECTION"));
+        assert!(
+            expected_global_drops > 0,
+            "fixture must overflow global scope"
+        );
+        assert_eq!(delta.global, expected_global_drops);
+        assert_eq!(delta.project, 0);
+        assert_eq!(delta.user, 0);
+        assert!(rules.len() <= MAX_INJECTION_CHARS);
+    }
+
+    #[test]
+    fn s5_flag_on_renders_corrections_before_other_types_and_newest_first() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        save_scope(
+            &workspace,
+            MemoryScope::Project,
+            &[
+                fixed_entry(
+                    MemoryScope::Project,
+                    MemoryType::Preference,
+                    "PREFERENCE_NEWER_THAN_CORRECTIONS",
+                    25,
+                ),
+                fixed_entry(
+                    MemoryScope::Project,
+                    MemoryType::Correction,
+                    "CORRECTION_OLDER",
+                    10,
+                ),
+                fixed_entry(
+                    MemoryScope::Project,
+                    MemoryType::Correction,
+                    "CORRECTION_NEWER",
+                    20,
+                ),
+            ],
+        );
+
+        let rules =
+            MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(true));
+        let corrections_heading = rules.find("  Corrections:").unwrap();
+        let preferences_heading = rules.find("  Preferences:").unwrap();
+        let newer = rules.find("CORRECTION_NEWER").unwrap();
+        let older = rules.find("CORRECTION_OLDER").unwrap();
+
+        assert!(corrections_heading < preferences_heading);
+        assert!(
+            newer < older,
+            "newer correction must render before older correction"
+        );
+        assert!(older < preferences_heading);
+    }
+
+    #[test]
+    fn s5_flag_on_keeps_global_correction_when_project_overflows_live_shape() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        const GLOBAL_CORRECTION: &str = "Never share code or secrets outside the repo.";
+
+        save_scope(
+            &workspace,
+            MemoryScope::Global,
+            &[
+                fixed_entry(
+                    MemoryScope::Global,
+                    MemoryType::Correction,
+                    GLOBAL_CORRECTION,
+                    1,
+                ),
+                fixed_entry(
+                    MemoryScope::Global,
+                    MemoryType::Preference,
+                    "GLOBAL_PREFERENCE_CAN_BE_DROPPED_AFTER_PROJECT_OVERFLOW",
+                    2,
+                ),
+            ],
+        );
+        let project_entries: Vec<MemoryEntry> = (0..48)
+            .map(|i| {
+                fixed_entry(
+                    MemoryScope::Project,
+                    MemoryType::Preference,
+                    long_content(&format!("PROJECT_LIVE_OVERFLOW_{i:02}"), 180),
+                    (i % 28) as u32 + 1,
+                )
+            })
+            .collect();
+        save_scope(&workspace, MemoryScope::Project, &project_entries);
+
+        let before = DroppedSnapshot::current();
+        let rules =
+            MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(true));
+        let delta = DroppedSnapshot::current().delta_since(before);
+
+        assert!(
+            rules.contains(GLOBAL_CORRECTION),
+            "global Correction must survive even when Project overflows: {rules}"
+        );
+        assert!(
+            delta.project > 0,
+            "live-shaped fixture must drop some project entries"
+        );
+        assert_eq!(delta.user, 0);
+        assert!(rules.len() <= MAX_INJECTION_CHARS);
+    }
+
+    #[test]
+    fn s5_rendered_block_never_exceeds_budget_in_either_mode() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        let globals: Vec<MemoryEntry> = (0..30)
+            .map(|i| {
+                fixed_entry(
+                    MemoryScope::Global,
+                    MemoryType::Preference,
+                    long_content(&format!("BUDGET_GLOBAL_{i:02}"), 420),
+                    (i % 28) as u32 + 1,
+                )
+            })
+            .collect();
+        save_scope(&workspace, MemoryScope::Global, &globals);
+
+        let off = MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(false));
+        let on = MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(true));
+
+        assert!(off.len() <= MAX_INJECTION_CHARS);
+        assert!(on.len() <= MAX_INJECTION_CHARS);
+    }
+
+    #[test]
+    fn s5_small_corpus_identical_and_no_warn_or_counter() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        save_scope(
+            &workspace,
+            MemoryScope::Global,
+            &[fixed_entry(
+                MemoryScope::Global,
+                MemoryType::Preference,
+                "SMALL_GLOBAL_ONLY",
+                1,
+            )],
+        );
+
+        let before = DroppedSnapshot::current();
+        let ((legacy, priority), logs) = capture_warn_logs(|| {
+            (
+                MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(false)),
+                MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(true)),
+            )
+        });
+        let delta = DroppedSnapshot::current().delta_since(before);
+
+        assert_eq!(priority, legacy);
+        assert_eq!(delta, DroppedSnapshot::default());
+        assert!(!logs.contains("memory injection truncated"));
+    }
+
+    #[test]
+    fn s5_warns_once_per_load_not_once_per_dropped_entry() {
+        let _lock = S5_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(dir.path());
+        let workspace = dir.path().join("workspace");
+        let globals: Vec<MemoryEntry> = (0..48)
+            .map(|i| {
+                fixed_entry(
+                    MemoryScope::Global,
+                    MemoryType::Preference,
+                    long_content(&format!("WARN_DROP_{i:02}"), 480),
+                    (i % 28) as u32 + 1,
+                )
+            })
+            .collect();
+        save_scope(&workspace, MemoryScope::Global, &globals);
+
+        let (rules, logs) = capture_warn_logs(|| {
+            MemoryService::load_rules_for_with_config(&workspace, None, &priority_cfg(true))
+        });
+
+        assert!(rules.len() <= MAX_INJECTION_CHARS);
+        assert_eq!(logs.matches("memory injection truncated").count(), 1);
+        assert!(
+            logs.contains("global="),
+            "warn must include per-scope breakdown: {logs}"
+        );
+        assert!(
+            logs.contains("project=0"),
+            "warn must include project scope: {logs}"
+        );
+        assert!(
+            logs.contains("user=0"),
+            "warn must include user scope: {logs}"
+        );
     }
 
     #[test]

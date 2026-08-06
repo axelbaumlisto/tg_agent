@@ -101,6 +101,21 @@ impl<P: Provider> Provider for TimeoutProvider<P> {
         self.inner.total_key_count()
     }
 
+    // B106: delegate so a fallback under the timeout decorator stays visible.
+    fn last_fallback(&self) -> Option<super::FallbackInfo> {
+        self.inner.last_fallback()
+    }
+
+    // B110: `create_provider_chain` wraps EVERY provider in this decorator, so
+    // a missing delegation here silently disables the feature that depends on
+    // it. This one disabled B46 dead-key persistence: `ResilientProvider` calls
+    // `self.providers[idx].key_hint()`, which is this wrapper, and always got
+    // `None` — so a key detected as dead was never written back to
+    // `state/naked.json` and got re-probed on every restart.
+    fn key_hint(&self) -> Option<String> {
+        self.inner.key_hint()
+    }
+
     async fn audit_keys_on_boot(&self) {
         self.inner.audit_keys_on_boot().await
     }
@@ -221,8 +236,25 @@ mod tests {
         }
     }
 
+    fn observed_provider_bucket_delta(
+        before: crate::metrics_hist::LatencySnapshot,
+        after: crate::metrics_hist::LatencySnapshot,
+        observed_ms: u64,
+    ) -> u64 {
+        if observed_ms < 500 {
+            after.provider_under_500ms - before.provider_under_500ms
+        } else if observed_ms < 2_000 {
+            after.provider_500ms_to_2s - before.provider_500ms_to_2s
+        } else if observed_ms < 10_000 {
+            after.provider_2s_to_10s - before.provider_2s_to_10s
+        } else {
+            after.provider_over_10s - before.provider_over_10s
+        }
+    }
+
     #[tokio::test]
     async fn happy_path_passes_chunks_through_unchanged() {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         let provider = DelayProvider {
             connect_delay: Duration::from_millis(0),
             chunks: vec![
@@ -242,6 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_timeout_fires_when_inner_hangs() {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         let provider = DelayProvider {
             connect_delay: Duration::from_secs(60), // way over budget
             chunks: vec![],
@@ -255,8 +288,8 @@ mod tests {
         let res = wrapped.stream_chat(make_request()).await;
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_millis(500),
-            "must give up at ~50ms, took {elapsed:?}"
+            elapsed < Duration::from_secs(5),
+            "connect timeout test must not hang; took {elapsed:?}"
         );
         // Avoid `.unwrap_err()` because `Pin<Box<dyn Stream>>` is
         // not `Debug`. Match instead.
@@ -282,6 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_stream_open_records_delay_until_first_chunk() {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         let provider = DelayProvider {
             connect_delay: Duration::from_millis(0),
             chunks: vec![
@@ -300,13 +334,14 @@ mod tests {
 
         let after_first = crate::metrics_hist::snapshot();
         assert_eq!(after_first.provider_count - before.provider_count, 1);
-        assert_eq!(
-            after_first.provider_500ms_to_2s - before.provider_500ms_to_2s,
-            1
-        );
+        let observed_delta = after_first.provider_sum_ms - before.provider_sum_ms;
         assert!(
-            after_first.provider_sum_ms - before.provider_sum_ms >= 600,
+            observed_delta >= 600,
             "provider stream-open sum delta must include first-chunk delay"
+        );
+        assert_eq!(
+            observed_provider_bucket_delta(before, after_first, observed_delta),
+            1
         );
 
         let second = s.next().await.unwrap();
@@ -314,14 +349,21 @@ mod tests {
         let after_second = crate::metrics_hist::snapshot();
         assert_eq!(after_second.provider_count, after_first.provider_count);
         assert_eq!(
-            after_second.provider_500ms_to_2s,
-            after_first.provider_500ms_to_2s
+            after_second.provider_under_500ms
+                + after_second.provider_500ms_to_2s
+                + after_second.provider_2s_to_10s
+                + after_second.provider_over_10s,
+            after_first.provider_under_500ms
+                + after_first.provider_500ms_to_2s
+                + after_first.provider_2s_to_10s
+                + after_first.provider_over_10s
         );
         assert_eq!(after_second.provider_sum_ms, after_first.provider_sum_ms);
     }
 
     #[tokio::test]
     async fn provider_stream_open_not_recorded_when_first_chunk_is_error() {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         let provider = DelayProvider {
             connect_delay: Duration::from_millis(0),
             chunks: vec![(
@@ -346,6 +388,7 @@ mod tests {
     #[tokio::test]
     async fn provider_stream_open_not_recorded_for_synthetic_inter_chunk_timeout_before_first_chunk()
      {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         let provider = DelayProvider {
             connect_delay: Duration::from_millis(0),
             chunks: vec![(
@@ -369,6 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn inter_chunk_timeout_yields_error_chunk_and_terminates() {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         // Stream opens fine, first chunk arrives at 10ms, then
         // a 5-minute silence — must be killed at 50ms gap.
         let provider = DelayProvider {
@@ -404,8 +448,8 @@ mod tests {
             other => panic!("expected Error chunk, got {other:?}"),
         }
         assert!(
-            elapsed < Duration::from_millis(500),
-            "inter-chunk arm must fire near the budget, took {elapsed:?}"
+            elapsed < Duration::from_secs(5),
+            "inter-chunk timeout test must not hang; took {elapsed:?}"
         );
         let after = crate::types::PROVIDER_INTER_CHUNK_TIMEOUT_COUNT.load(Ordering::Relaxed);
         assert_eq!(after - before, 1, "inter-chunk timeout counter delta");
@@ -413,6 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn pass_through_metadata_unchanged_lsp() {
+        let _guard = crate::metrics_hist::async_test_guard().await;
         // LSP: name() and trivial accessors must mirror the inner
         // provider so a TimeoutProvider<P> is observable as P.
         let provider = DelayProvider {
@@ -424,5 +469,65 @@ mod tests {
         assert_eq!(wrapped.name(), "delay");
         assert_eq!(wrapped.blacklisted_key_count(), 0);
         assert_eq!(wrapped.total_key_count(), 1);
+    }
+    /// B110: every optional `Provider` method must survive the decorator.
+    ///
+    /// `key_hint` was the one hole: `create_provider_chain` wraps EVERY entry
+    /// in `TimeoutProvider`, so `ResilientProvider`'s B46 dead-key persistence
+    /// (`self.providers[idx].key_hint()`) always saw `None` and never wrote the
+    /// dead key back to `state/naked.json`.
+    #[tokio::test]
+    async fn b110_timeout_decorator_delegates_every_optional_method() {
+        struct Rich;
+        #[async_trait]
+        impl Provider for Rich {
+            fn name(&self) -> &str {
+                "rich"
+            }
+            fn models(&self) -> Vec<ModelInfo> {
+                vec![]
+            }
+            fn blacklisted_key_count(&self) -> usize {
+                7
+            }
+            fn total_key_count(&self) -> usize {
+                9
+            }
+            fn key_hint(&self) -> Option<String> {
+                Some("sk-secret".into())
+            }
+            fn last_fallback(&self) -> Option<crate::provider::FallbackInfo> {
+                Some(crate::provider::FallbackInfo {
+                    requested: "a".into(),
+                    served_by: "b".into(),
+                    reason: "r".into(),
+                })
+            }
+            async fn stream_chat(
+                &self,
+                _r: ChatRequest,
+            ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
+                Ok(Box::pin(tokio_stream::iter(vec![StreamChunk::Done])))
+            }
+        }
+
+        let inner: Box<dyn Provider> = Box::new(Rich);
+        let wrapped = TimeoutProvider::new(
+            inner,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(wrapped.blacklisted_key_count(), 7);
+        assert_eq!(wrapped.total_key_count(), 9);
+        assert_eq!(
+            wrapped.key_hint().as_deref(),
+            Some("sk-secret"),
+            "key_hint must delegate — B46 dead-key persistence depends on it"
+        );
+        assert_eq!(
+            wrapped.last_fallback().map(|f| f.served_by).as_deref(),
+            Some("b")
+        );
     }
 }

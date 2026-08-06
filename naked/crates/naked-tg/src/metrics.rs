@@ -7,9 +7,12 @@
 //! configure. When we promote multimodal routing to production we can swap
 //! these to `metrics::counter!` calls without changing call-sites.
 
+use naked_core::memory::daily::DigestStalenessSnapshot;
 use naked_core::metrics_hist::{
     DurationHistogramSnapshot, LatencySnapshot, ToolClass, tool_snapshot,
 };
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Photos that took the **native** path (raw bytes attached to the chat
@@ -49,10 +52,35 @@ static TEXT_COALESCED: AtomicU64 = AtomicU64::new(0);
 /// B62 / Q4: SessionBusy follow-ups that could not be steered and got a soft Busy ack.
 static SESSION_BUSY_ACK: AtomicU64 = AtomicU64::new(0);
 
+// ── PLAN_TG_LONG_ANSWERS_v2 S5 / BUG_REGISTRY B101+B102 ─────────────
+// Final-answer observability. Histogram buckets are stored as exclusive
+// atomics here, then rendered as cumulative Prometheus `_bucket{le=...}`
+// series so `histogram_quantile` sees a real histogram.
+static FINAL_ANSWER_UTF16_LE_1024: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_1025_TO_2048: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_2049_TO_4096: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_4097_TO_8192: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_8193_TO_16384: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_16385_TO_32768: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_OVER_32768: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_SUM: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_UTF16_COUNT: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_DELIVERY_OK: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_DELIVERY_PARTIAL: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_DELIVERY_FAILED: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_TRUNCATED: AtomicU64 = AtomicU64::new(0);
+static FINAL_ANSWER_ATTACHMENT_SEND_FAILED: AtomicU64 = AtomicU64::new(0);
+
 /// B05: current boot-time config health for multimodal fallback.
 /// State gauge: 1 when the default model is not vision-capable AND no
 /// `tg_media.vision` describer fallback is configured, otherwise 0.
 static CONFIG_DESCRIBER_MISSING: AtomicU64 = AtomicU64::new(0);
+
+static MEMORY_METRICS_WORKSPACE: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_memory_metrics_workspace(workspace: PathBuf) {
+    let _ = MEMORY_METRICS_WORKSPACE.set(workspace);
+}
 
 pub fn set_config_describer_missing(missing: bool) {
     CONFIG_DESCRIBER_MISSING.store(u64::from(missing), Ordering::Relaxed);
@@ -68,6 +96,88 @@ pub fn record_text_coalesced() {
 
 pub fn record_session_busy_ack() {
     SESSION_BUSY_ACK.fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalAnswerDeliveryOutcome {
+    Ok,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FinalAnswerUtf16HistogramSnapshot {
+    /// Exclusive bucket counts in `FINAL_ANSWER_UTF16_BUCKET_LABELS` order.
+    buckets: [u64; FINAL_ANSWER_UTF16_BUCKET_LABELS.len()],
+    sum: u64,
+    count: u64,
+}
+
+const FINAL_ANSWER_UTF16_BUCKET_LABELS: [&str; 7] =
+    ["1024", "2048", "4096", "8192", "16384", "32768", "+Inf"];
+const FINAL_ANSWER_UTF16_BUCKET_EDGES: [u64; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
+
+pub(crate) fn record_final_answer_utf16_from_html(html: &str) -> u64 {
+    let utf16_units = naked_tg::markup::telegram_html_text_utf16_units(html);
+    record_final_answer_utf16_units(utf16_units);
+    utf16_units
+}
+
+pub(crate) fn record_final_answer_delivery(outcome: FinalAnswerDeliveryOutcome) {
+    match outcome {
+        FinalAnswerDeliveryOutcome::Ok => FINAL_ANSWER_DELIVERY_OK.fetch_add(1, Ordering::Relaxed),
+        FinalAnswerDeliveryOutcome::Partial => {
+            FINAL_ANSWER_DELIVERY_PARTIAL.fetch_add(1, Ordering::Relaxed)
+        }
+        FinalAnswerDeliveryOutcome::Failed => {
+            FINAL_ANSWER_DELIVERY_FAILED.fetch_add(1, Ordering::Relaxed)
+        }
+    };
+}
+
+pub(crate) fn record_final_answer_truncated() {
+    FINAL_ANSWER_TRUNCATED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_final_answer_attachment_send_failed() {
+    FINAL_ANSWER_ATTACHMENT_SEND_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_final_answer_utf16_units(utf16_units: u64) {
+    let bucket = if utf16_units <= FINAL_ANSWER_UTF16_BUCKET_EDGES[0] {
+        &FINAL_ANSWER_UTF16_LE_1024
+    } else if utf16_units <= FINAL_ANSWER_UTF16_BUCKET_EDGES[1] {
+        &FINAL_ANSWER_UTF16_1025_TO_2048
+    } else if utf16_units <= FINAL_ANSWER_UTF16_BUCKET_EDGES[2] {
+        &FINAL_ANSWER_UTF16_2049_TO_4096
+    } else if utf16_units <= FINAL_ANSWER_UTF16_BUCKET_EDGES[3] {
+        &FINAL_ANSWER_UTF16_4097_TO_8192
+    } else if utf16_units <= FINAL_ANSWER_UTF16_BUCKET_EDGES[4] {
+        &FINAL_ANSWER_UTF16_8193_TO_16384
+    } else if utf16_units <= FINAL_ANSWER_UTF16_BUCKET_EDGES[5] {
+        &FINAL_ANSWER_UTF16_16385_TO_32768
+    } else {
+        &FINAL_ANSWER_UTF16_OVER_32768
+    };
+    bucket.fetch_add(1, Ordering::Relaxed);
+    FINAL_ANSWER_UTF16_SUM.fetch_add(utf16_units, Ordering::Relaxed);
+    FINAL_ANSWER_UTF16_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn final_answer_utf16_snapshot() -> FinalAnswerUtf16HistogramSnapshot {
+    FinalAnswerUtf16HistogramSnapshot {
+        buckets: [
+            FINAL_ANSWER_UTF16_LE_1024.load(Ordering::Relaxed),
+            FINAL_ANSWER_UTF16_1025_TO_2048.load(Ordering::Relaxed),
+            FINAL_ANSWER_UTF16_2049_TO_4096.load(Ordering::Relaxed),
+            FINAL_ANSWER_UTF16_4097_TO_8192.load(Ordering::Relaxed),
+            FINAL_ANSWER_UTF16_8193_TO_16384.load(Ordering::Relaxed),
+            FINAL_ANSWER_UTF16_16385_TO_32768.load(Ordering::Relaxed),
+            FINAL_ANSWER_UTF16_OVER_32768.load(Ordering::Relaxed),
+        ],
+        sum: FINAL_ANSWER_UTF16_SUM.load(Ordering::Relaxed),
+        count: FINAL_ANSWER_UTF16_COUNT.load(Ordering::Relaxed),
+    }
 }
 
 pub fn record_redaction_applied() {
@@ -148,6 +258,10 @@ pub fn record_research_cancel_propagation(elapsed_ms: u64) {
     tracing::info!(elapsed_ms, "metrics: research cancel propagated");
 }
 static MEDIA_TRANSCRIPTION_FAIL_OTHER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static TRANSCRIPTION_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Public bump for transcription outcome. `outcome` is "ok" or "fail";
 /// `reason` is `Some(_)` only when `outcome == "fail"`. Counter labels
@@ -265,6 +379,13 @@ pub fn snapshot() -> MediaRoutingSnapshot {
         concurrent_same_key_turns: CONCURRENT_SAME_KEY_TURNS.load(Ordering::Relaxed),
         text_coalesced: TEXT_COALESCED.load(Ordering::Relaxed),
         session_busy_ack: SESSION_BUSY_ACK.load(Ordering::Relaxed),
+        final_answer_utf16: final_answer_utf16_snapshot(),
+        final_answer_delivery_ok: FINAL_ANSWER_DELIVERY_OK.load(Ordering::Relaxed),
+        final_answer_delivery_partial: FINAL_ANSWER_DELIVERY_PARTIAL.load(Ordering::Relaxed),
+        final_answer_delivery_failed: FINAL_ANSWER_DELIVERY_FAILED.load(Ordering::Relaxed),
+        final_answer_truncated: FINAL_ANSWER_TRUNCATED.load(Ordering::Relaxed),
+        final_answer_attachment_send_failed: FINAL_ANSWER_ATTACHMENT_SEND_FAILED
+            .load(Ordering::Relaxed),
         config_describer_missing: CONFIG_DESCRIBER_MISSING.load(Ordering::Relaxed),
         research_cancel_propagation_under_3s: RESEARCH_CANCEL_PROPAGATION_UNDER_3S
             .load(Ordering::Relaxed),
@@ -310,6 +431,13 @@ pub struct MediaRoutingSnapshot {
     pub text_coalesced: u64,
     /// B62/Q4: SessionBusy follow-ups that got a soft Busy ack.
     pub session_busy_ack: u64,
+    /// PLAN_TG_LONG_ANSWERS_v2 S5: final-answer UTF-16 length histogram.
+    pub(crate) final_answer_utf16: FinalAnswerUtf16HistogramSnapshot,
+    pub final_answer_delivery_ok: u64,
+    pub final_answer_delivery_partial: u64,
+    pub final_answer_delivery_failed: u64,
+    pub final_answer_truncated: u64,
+    pub final_answer_attachment_send_failed: u64,
     /// B05: 0/1 state gauge for missing multimodal describer fallback.
     pub config_describer_missing: u64,
     // T11 PLAN_RESEARCH_AGENT_FLOW_v1: cancel propagation latency.
@@ -374,6 +502,15 @@ struct PrometheusInputs {
     research_store_files_healed: u64,
     research_store_heal_failed: u64,
     research_store_file_lock_wait: u64,
+    memory_candidates: u64,
+    memory_promoted_repeat_days: u64,
+    memory_promoted_reinforce: u64,
+    memory_promoted_reobs: u64,
+    memory_injection_dropped_global: u64,
+    memory_injection_dropped_project: u64,
+    memory_injection_dropped_user: u64,
+    memory_injection_failed: u64,
+    memory_digest_staleness: DigestStalenessSnapshot,
     concurrent_same_key_turns: u64,
     text_coalesced: u64,
     session_busy_ack: u64,
@@ -466,6 +603,15 @@ impl Default for PrometheusInputs {
             research_store_files_healed: 0,
             research_store_heal_failed: 0,
             research_store_file_lock_wait: 0,
+            memory_candidates: 0,
+            memory_promoted_repeat_days: 0,
+            memory_promoted_reinforce: 0,
+            memory_promoted_reobs: 0,
+            memory_injection_dropped_global: 0,
+            memory_injection_dropped_project: 0,
+            memory_injection_dropped_user: 0,
+            memory_injection_failed: 0,
+            memory_digest_staleness: DigestStalenessSnapshot::default(),
             concurrent_same_key_turns: 0,
             text_coalesced: 0,
             session_busy_ack: 0,
@@ -613,6 +759,22 @@ impl MediaRoutingSnapshot {
                 .load(Ordering::Relaxed),
             research_store_file_lock_wait: naked_core::types::RESEARCH_STORE_FILE_LOCK_WAIT_COUNT
                 .load(Ordering::Relaxed),
+            memory_candidates: naked_core::types::MEMORY_CANDIDATES_COUNT.load(Ordering::Relaxed),
+            memory_promoted_repeat_days: naked_core::types::MEMORY_PROMOTED_REPEAT_DAYS_COUNT
+                .load(Ordering::Relaxed),
+            memory_promoted_reinforce: naked_core::types::MEMORY_PROMOTED_REINFORCE_COUNT
+                .load(Ordering::Relaxed),
+            memory_promoted_reobs: naked_core::types::MEMORY_PROMOTED_REOBS_COUNT
+                .load(Ordering::Relaxed),
+            memory_injection_dropped_global:
+                naked_core::types::MEMORY_INJECTION_DROPPED_GLOBAL_COUNT.load(Ordering::Relaxed),
+            memory_injection_dropped_project:
+                naked_core::types::MEMORY_INJECTION_DROPPED_PROJECT_COUNT.load(Ordering::Relaxed),
+            memory_injection_dropped_user: naked_core::types::MEMORY_INJECTION_DROPPED_USER_COUNT
+                .load(Ordering::Relaxed),
+            memory_injection_failed: naked_core::types::MEMORY_INJECTION_FAILED_COUNT
+                .load(Ordering::Relaxed),
+            memory_digest_staleness: memory_digest_staleness_snapshot(),
             concurrent_same_key_turns: self.concurrent_same_key_turns,
             text_coalesced: self.text_coalesced,
             session_busy_ack: self.session_busy_ack,
@@ -628,8 +790,18 @@ impl MediaRoutingSnapshot {
     }
 }
 
+fn memory_digest_staleness_snapshot() -> DigestStalenessSnapshot {
+    let workspace = MEMORY_METRICS_WORKSPACE
+        .get()
+        .cloned()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    naked_core::memory::daily::digest_staleness_snapshot(&workspace)
+}
+
 fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
     let latency_extra_metrics = render_latency_extra_metrics(&inputs.latency);
+    let final_answer_metrics = render_final_answer_metrics(&inputs.media);
     let config_loaded_hash_metric = inputs
         .config_loaded_hash
         .as_deref()
@@ -793,6 +965,27 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_core_research_store_file_lock_wait_total (B59) findings.jsonl write-lock acquisitions that had to wait on contention.\n\
              # TYPE naked_core_research_store_file_lock_wait_total counter\n\
              naked_core_research_store_file_lock_wait_total {research_store_file_lock_wait}\n\
+             # HELP naked_core_memory_candidates_total Memory digest candidates scored by the daily promotion pass.\n\
+             # TYPE naked_core_memory_candidates_total counter\n\
+             naked_core_memory_candidates_total {memory_candidates}\n\
+             # HELP naked_core_memory_promoted_total Memory digest actual promotions by independent eligibility road; road series may overlap and sum may exceed promoted outcomes.\n\
+             # TYPE naked_core_memory_promoted_total counter\n\
+             naked_core_memory_promoted_total{{road=\"repeat_days\"}} {memory_promoted_repeat_days}\n\
+             naked_core_memory_promoted_total{{road=\"reinforce\"}} {memory_promoted_reinforce}\n\
+             naked_core_memory_promoted_total{{road=\"reobs\"}} {memory_promoted_reobs}\n\
+             # HELP naked_core_memory_injection_dropped_total Memory entries dropped from prompt injection because MAX_INJECTION_CHARS was exhausted.\n\
+             # TYPE naked_core_memory_injection_dropped_total counter\n\
+             naked_core_memory_injection_dropped_total{{scope=\"global\"}} {memory_injection_dropped_global}\n\
+             naked_core_memory_injection_dropped_total{{scope=\"project\"}} {memory_injection_dropped_project}\n\
+             naked_core_memory_injection_dropped_total{{scope=\"user\"}} {memory_injection_dropped_user}\n\
+             # HELP naked_core_memory_injection_failed_total Memory prompt injection failures degraded to no injected memory so turns can continue.\n\
+             # TYPE naked_core_memory_injection_failed_total counter\n\
+             naked_core_memory_injection_failed_total {memory_injection_failed}\n\
+             # HELP naked_core_memory_days_since_last_digest Days since the persisted .last_digest marker by memory scope; 9999 means missing/invalid marker.\n\
+             # TYPE naked_core_memory_days_since_last_digest gauge\n\
+             naked_core_memory_days_since_last_digest{{scope=\"global\"}} {memory_days_since_last_digest_global}\n\
+             naked_core_memory_days_since_last_digest{{scope=\"project\"}} {memory_days_since_last_digest_project}\n\
+             naked_core_memory_days_since_last_digest{{scope=\"user\"}} {memory_days_since_last_digest_user}\n\
              # HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n\
              # TYPE naked_memory_pollution_count gauge\n\
              naked_memory_pollution_count {memory_pollution}\n\
@@ -820,6 +1013,7 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_tg_session_busy_ack_total (B62) SessionBusy follow-ups that got a soft busy ack (no steer sender / full channel); measures the F1/B3 drop window.\n\
              # TYPE naked_tg_session_busy_ack_total counter\n\
              naked_tg_session_busy_ack_total {session_busy_ack}\n\
+             {final_answer_metrics}\
              # HELP naked_tg_config_describer_missing (B05) Set to 1 when the default model is not vision-capable AND no tg_media.vision describer fallback is configured.\n\
              # TYPE naked_tg_config_describer_missing gauge\n\
              naked_tg_config_describer_missing {config_describer_missing}\n\
@@ -938,6 +1132,17 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         research_store_files_healed = inputs.research_store_files_healed,
         research_store_heal_failed = inputs.research_store_heal_failed,
         research_store_file_lock_wait = inputs.research_store_file_lock_wait,
+        memory_candidates = inputs.memory_candidates,
+        memory_promoted_repeat_days = inputs.memory_promoted_repeat_days,
+        memory_promoted_reinforce = inputs.memory_promoted_reinforce,
+        memory_promoted_reobs = inputs.memory_promoted_reobs,
+        memory_injection_dropped_global = inputs.memory_injection_dropped_global,
+        memory_injection_dropped_project = inputs.memory_injection_dropped_project,
+        memory_injection_dropped_user = inputs.memory_injection_dropped_user,
+        memory_injection_failed = inputs.memory_injection_failed,
+        memory_days_since_last_digest_global = inputs.memory_digest_staleness.global,
+        memory_days_since_last_digest_project = inputs.memory_digest_staleness.project,
+        memory_days_since_last_digest_user = inputs.memory_digest_staleness.user,
         memory_pollution = inputs.memory_pollution,
         tr_ok = inputs.media.transcription_ok,
         tr_fail = inputs.media.transcription_fail,
@@ -951,6 +1156,7 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         concurrent_same_key_turns = inputs.concurrent_same_key_turns,
         text_coalesced = inputs.text_coalesced,
         session_busy_ack = inputs.session_busy_ack,
+        final_answer_metrics = final_answer_metrics,
         config_describer_missing = inputs.media.config_describer_missing,
         active_run_max_silent_seconds = inputs.active_run_max_silent_seconds,
         cancel_u3s = inputs.media.research_cancel_propagation_under_3s,
@@ -979,6 +1185,51 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         latency_extra_metrics = latency_extra_metrics,
         model_health_body = inputs.model_health_body,
     )
+}
+
+fn render_final_answer_metrics(media: &MediaRoutingSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str("# HELP naked_tg_final_answer_utf16 Final answer visible text length in Telegram-enforced UTF-16 code units.\n");
+    out.push_str("# TYPE naked_tg_final_answer_utf16 histogram\n");
+    let mut cumulative = 0u64;
+    for (label, count) in FINAL_ANSWER_UTF16_BUCKET_LABELS
+        .iter()
+        .zip(media.final_answer_utf16.buckets)
+    {
+        cumulative = cumulative.saturating_add(count);
+        out.push_str(&format!(
+            "naked_tg_final_answer_utf16_bucket{{le=\"{}\"}} {}\n",
+            label, cumulative
+        ));
+    }
+    out.push_str(&format!(
+        "naked_tg_final_answer_utf16_sum {}\n\
+         naked_tg_final_answer_utf16_count {}\n",
+        media.final_answer_utf16.sum, media.final_answer_utf16.count
+    ));
+    out.push_str("# HELP naked_tg_final_answer_delivery_total Final answer delivery outcomes.\n");
+    out.push_str("# TYPE naked_tg_final_answer_delivery_total counter\n");
+    out.push_str(&format!(
+        "naked_tg_final_answer_delivery_total{{outcome=\"ok\"}} {}\n\
+         naked_tg_final_answer_delivery_total{{outcome=\"partial\"}} {}\n\
+         naked_tg_final_answer_delivery_total{{outcome=\"failed\"}} {}\n",
+        media.final_answer_delivery_ok,
+        media.final_answer_delivery_partial,
+        media.final_answer_delivery_failed
+    ));
+    out.push_str("# HELP naked_tg_final_answer_truncated_total Final answers rendered with inline truncation.\n");
+    out.push_str("# TYPE naked_tg_final_answer_truncated_total counter\n");
+    out.push_str(&format!(
+        "naked_tg_final_answer_truncated_total {}\n",
+        media.final_answer_truncated
+    ));
+    out.push_str("# HELP naked_tg_final_answer_attachment_send_failed_total Final-answer HTML attachment send failures.\n");
+    out.push_str("# TYPE naked_tg_final_answer_attachment_send_failed_total counter\n");
+    out.push_str(&format!(
+        "naked_tg_final_answer_attachment_send_failed_total {}\n",
+        media.final_answer_attachment_send_failed
+    ));
+    out
 }
 
 fn render_latency_extra_metrics(latency: &LatencySnapshot) -> String {
@@ -1190,6 +1441,16 @@ mod tests {
                 concurrent_same_key_turns: 916,
                 text_coalesced: 917,
                 session_busy_ack: 918,
+                final_answer_utf16: FinalAnswerUtf16HistogramSnapshot {
+                    buckets: [1, 2, 3, 4, 5, 6, 7],
+                    sum: 1234,
+                    count: 28,
+                },
+                final_answer_delivery_ok: 24,
+                final_answer_delivery_partial: 25,
+                final_answer_delivery_failed: 26,
+                final_answer_truncated: 27,
+                final_answer_attachment_send_failed: 28,
                 config_describer_missing: 1,
                 research_cancel_propagation_under_3s: 19,
                 research_cancel_propagation_3s_to_30s: 20,
@@ -1339,6 +1600,19 @@ mod tests {
             research_store_files_healed: 43,
             research_store_heal_failed: 44,
             research_store_file_lock_wait: 45,
+            memory_candidates: 424,
+            memory_promoted_repeat_days: 425,
+            memory_promoted_reinforce: 426,
+            memory_promoted_reobs: 427,
+            memory_injection_dropped_global: 428,
+            memory_injection_dropped_project: 429,
+            memory_injection_dropped_user: 430,
+            memory_injection_failed: 431,
+            memory_digest_staleness: DigestStalenessSnapshot {
+                global: 2,
+                project: 3,
+                user: 4,
+            },
             concurrent_same_key_turns: 46,
             text_coalesced: 47,
             session_busy_ack: 48,
@@ -1498,6 +1772,27 @@ mod tests {
             "# HELP naked_core_research_store_file_lock_wait_total (B59) findings.jsonl write-lock acquisitions that had to wait on contention.\n",
             "# TYPE naked_core_research_store_file_lock_wait_total counter\n",
             "naked_core_research_store_file_lock_wait_total 45\n",
+            "# HELP naked_core_memory_candidates_total Memory digest candidates scored by the daily promotion pass.\n",
+            "# TYPE naked_core_memory_candidates_total counter\n",
+            "naked_core_memory_candidates_total 424\n",
+            "# HELP naked_core_memory_promoted_total Memory digest actual promotions by independent eligibility road; road series may overlap and sum may exceed promoted outcomes.\n",
+            "# TYPE naked_core_memory_promoted_total counter\n",
+            "naked_core_memory_promoted_total{road=\"repeat_days\"} 425\n",
+            "naked_core_memory_promoted_total{road=\"reinforce\"} 426\n",
+            "naked_core_memory_promoted_total{road=\"reobs\"} 427\n",
+            "# HELP naked_core_memory_injection_dropped_total Memory entries dropped from prompt injection because MAX_INJECTION_CHARS was exhausted.\n",
+            "# TYPE naked_core_memory_injection_dropped_total counter\n",
+            "naked_core_memory_injection_dropped_total{scope=\"global\"} 428\n",
+            "naked_core_memory_injection_dropped_total{scope=\"project\"} 429\n",
+            "naked_core_memory_injection_dropped_total{scope=\"user\"} 430\n",
+            "# HELP naked_core_memory_injection_failed_total Memory prompt injection failures degraded to no injected memory so turns can continue.\n",
+            "# TYPE naked_core_memory_injection_failed_total counter\n",
+            "naked_core_memory_injection_failed_total 431\n",
+            "# HELP naked_core_memory_days_since_last_digest Days since the persisted .last_digest marker by memory scope; 9999 means missing/invalid marker.\n",
+            "# TYPE naked_core_memory_days_since_last_digest gauge\n",
+            "naked_core_memory_days_since_last_digest{scope=\"global\"} 2\n",
+            "naked_core_memory_days_since_last_digest{scope=\"project\"} 3\n",
+            "naked_core_memory_days_since_last_digest{scope=\"user\"} 4\n",
             "# HELP naked_memory_pollution_count research:* lines found in global MEMORY.md by the daily housekeep sweep (should stay 0).\n",
             "# TYPE naked_memory_pollution_count gauge\n",
             "naked_memory_pollution_count 0\n",
@@ -1525,6 +1820,28 @@ mod tests {
             "# HELP naked_tg_session_busy_ack_total (B62) SessionBusy follow-ups that got a soft busy ack (no steer sender / full channel); measures the F1/B3 drop window.\n",
             "# TYPE naked_tg_session_busy_ack_total counter\n",
             "naked_tg_session_busy_ack_total 48\n",
+            "# HELP naked_tg_final_answer_utf16 Final answer visible text length in Telegram-enforced UTF-16 code units.\n",
+            "# TYPE naked_tg_final_answer_utf16 histogram\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"1024\"} 1\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"2048\"} 3\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"4096\"} 6\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"8192\"} 10\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"16384\"} 15\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"32768\"} 21\n",
+            "naked_tg_final_answer_utf16_bucket{le=\"+Inf\"} 28\n",
+            "naked_tg_final_answer_utf16_sum 1234\n",
+            "naked_tg_final_answer_utf16_count 28\n",
+            "# HELP naked_tg_final_answer_delivery_total Final answer delivery outcomes.\n",
+            "# TYPE naked_tg_final_answer_delivery_total counter\n",
+            "naked_tg_final_answer_delivery_total{outcome=\"ok\"} 24\n",
+            "naked_tg_final_answer_delivery_total{outcome=\"partial\"} 25\n",
+            "naked_tg_final_answer_delivery_total{outcome=\"failed\"} 26\n",
+            "# HELP naked_tg_final_answer_truncated_total Final answers rendered with inline truncation.\n",
+            "# TYPE naked_tg_final_answer_truncated_total counter\n",
+            "naked_tg_final_answer_truncated_total 27\n",
+            "# HELP naked_tg_final_answer_attachment_send_failed_total Final-answer HTML attachment send failures.\n",
+            "# TYPE naked_tg_final_answer_attachment_send_failed_total counter\n",
+            "naked_tg_final_answer_attachment_send_failed_total 28\n",
             "# HELP naked_tg_config_describer_missing (B05) Set to 1 when the default model is not vision-capable AND no tg_media.vision describer fallback is configured.\n",
             "# TYPE naked_tg_config_describer_missing gauge\n",
             "naked_tg_config_describer_missing 1\n",
@@ -1823,6 +2140,36 @@ mod tests {
     }
 
     #[test]
+    fn render_prometheus_includes_memory_digest_metrics_with_zero_roads() {
+        let inputs = PrometheusInputs {
+            memory_candidates: 7,
+            memory_digest_staleness: DigestStalenessSnapshot {
+                global: 5,
+                project: 6,
+                user: 0,
+            },
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# HELP naked_core_memory_candidates_total"));
+        assert!(rendered.contains("# TYPE naked_core_memory_candidates_total counter"));
+        assert!(rendered.contains("naked_core_memory_candidates_total 7"));
+        assert!(rendered.contains("# HELP naked_core_memory_promoted_total"));
+        assert!(rendered.contains("# TYPE naked_core_memory_promoted_total counter"));
+        assert!(rendered.contains("naked_core_memory_promoted_total{road=\"repeat_days\"} 0"));
+        assert!(rendered.contains("naked_core_memory_promoted_total{road=\"reinforce\"} 0"));
+        assert!(rendered.contains("naked_core_memory_promoted_total{road=\"reobs\"} 0"));
+        assert!(rendered.contains("# HELP naked_core_memory_injection_failed_total"));
+        assert!(rendered.contains("# TYPE naked_core_memory_injection_failed_total counter"));
+        assert!(rendered.contains("naked_core_memory_injection_failed_total 0"));
+        assert!(rendered.contains("# HELP naked_core_memory_days_since_last_digest"));
+        assert!(rendered.contains("# TYPE naked_core_memory_days_since_last_digest gauge"));
+        assert!(rendered.contains("naked_core_memory_days_since_last_digest{scope=\"global\"} 5"));
+        assert!(rendered.contains("naked_core_memory_days_since_last_digest{scope=\"project\"} 6"));
+        assert!(rendered.contains("naked_core_memory_days_since_last_digest{scope=\"user\"} 0"));
+    }
+
+    #[test]
     fn render_prometheus_includes_provider_timeout_labels() {
         let inputs = PrometheusInputs {
             provider_connect_timeout: 11,
@@ -1978,6 +2325,77 @@ mod tests {
             value >= 3_600,
             "production render path must read shared RUN_REGISTRY silence age; got {value}"
         );
+    }
+
+    fn final_answer_bucket_value(rendered: &str, le: &str) -> u64 {
+        metric_value(
+            rendered,
+            &format!("naked_tg_final_answer_utf16_bucket{{le=\"{le}\"}} "),
+        )
+    }
+
+    #[test]
+    fn final_answer_histogram_renders_cumulative_prometheus_buckets() {
+        let inputs = PrometheusInputs {
+            media: MediaRoutingSnapshot {
+                final_answer_utf16: FinalAnswerUtf16HistogramSnapshot {
+                    buckets: [2, 3, 5, 7, 11, 13, 17],
+                    sum: 123_456,
+                    count: 58,
+                },
+                ..MediaRoutingSnapshot::default()
+            },
+            ..PrometheusInputs::default()
+        };
+        let rendered = render_prometheus_from(&inputs);
+        assert!(rendered.contains("# TYPE naked_tg_final_answer_utf16 histogram"));
+
+        let mut prev = 0;
+        for (le, expected) in [
+            ("1024", 2),
+            ("2048", 5),
+            ("4096", 10),
+            ("8192", 17),
+            ("16384", 28),
+            ("32768", 41),
+            ("+Inf", 58),
+        ] {
+            let got = final_answer_bucket_value(&rendered, le);
+            assert_eq!(got, expected, "unexpected cumulative bucket le={le}");
+            assert!(
+                got >= prev,
+                "histogram buckets must be monotonic at le={le}"
+            );
+            prev = got;
+        }
+        assert_eq!(
+            metric_value(&rendered, "naked_tg_final_answer_utf16_count "),
+            58
+        );
+        assert_eq!(final_answer_bucket_value(&rendered, "+Inf"), 58);
+        assert_eq!(
+            metric_value(&rendered, "naked_tg_final_answer_utf16_sum "),
+            123_456
+        );
+    }
+
+    #[test]
+    fn final_answer_metrics_zero_case_renders_every_series() {
+        let rendered = render_prometheus_from(&PrometheusInputs::default());
+        for le in FINAL_ANSWER_UTF16_BUCKET_LABELS {
+            assert_eq!(final_answer_bucket_value(&rendered, le), 0);
+        }
+        for line in [
+            "naked_tg_final_answer_utf16_sum 0",
+            "naked_tg_final_answer_utf16_count 0",
+            "naked_tg_final_answer_delivery_total{outcome=\"ok\"} 0",
+            "naked_tg_final_answer_delivery_total{outcome=\"partial\"} 0",
+            "naked_tg_final_answer_delivery_total{outcome=\"failed\"} 0",
+            "naked_tg_final_answer_truncated_total 0",
+            "naked_tg_final_answer_attachment_send_failed_total 0",
+        ] {
+            assert!(rendered.contains(line), "missing zero-series line `{line}`");
+        }
     }
 
     #[test]

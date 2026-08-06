@@ -39,8 +39,27 @@ impl ProviderService {
     }
 
     /// Resolve a provider by name. Returns default if name is empty or not configured.
+    ///
+    /// B105: a retired name listed in `provider_aliases` is redirected to its
+    /// live target instead of silently landing on the default. `merge_session`
+    /// already rewrites session pins, so this is the backstop for callers that
+    /// resolve a raw name (sub-agents, research, session-close digests).
     pub async fn resolve(&self, name: &str) -> Arc<dyn Provider> {
         if name.is_empty() || name == self.config.default_provider {
+            return self.default.clone();
+        }
+
+        // `resolve_provider_alias` is already a no-op for names present in
+        // `providers`, so there is no need to branch on that here. The model
+        // half of the alias is irrelevant to provider construction — only
+        // `merge_session` acts on it.
+        let (resolved, _) = self.config.resolve_provider_alias(name);
+        if resolved != name {
+            tracing::info!("provider alias applied (B105): {name} -> {resolved}");
+        }
+        let name = resolved.as_str();
+
+        if name == self.config.default_provider {
             return self.default.clone();
         }
 
@@ -55,7 +74,9 @@ impl ProviderService {
         {
             Arc::from(crate::create_provider_chain(&self.config, name, resolved))
         } else {
-            tracing::warn!("session requests provider '{name}' not in catalog, using default");
+            tracing::warn!(
+                "session requests provider '{name}' not in catalog and no provider_aliases entry resolves it, using default"
+            );
             return self.default.clone();
         };
 
@@ -246,5 +267,55 @@ mod tests {
 
         assert_eq!(p.name(), "fireworks");
         assert_eq!(p.total_key_count(), 2);
+    }
+
+    // ── D-INV-PROVIDER-ALIAS (B105), resolver half ────────────────────────
+
+    fn alias_svc(aliases: &[(&str, &str)]) -> ProviderService {
+        let mut cfg = Config {
+            default_provider: "anthropic".into(),
+            default_model: "claude-sonnet-4-6".into(),
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "deepseek".into(),
+            crate::config::ProviderConfig {
+                api_key: "ds-test".into(),
+                models: vec!["deepseek-v4-pro".into()],
+                ..Default::default()
+            },
+        );
+        for (from, to) in aliases {
+            cfg.provider_aliases
+                .insert((*from).to_string(), (*to).to_string());
+        }
+        ProviderService::new(
+            Arc::new(MockProvider {
+                name: "default".into(),
+            }),
+            Arc::new(ModelHealth::new(Default::default())),
+            Arc::new(cfg),
+        )
+    }
+
+    /// A retired name must reach the aliased LIVE provider, not the default.
+    #[tokio::test]
+    async fn b105_resolver_follows_alias_to_live_provider() {
+        let svc = alias_svc(&[("qwen", "deepseek/deepseek-v4-pro")]);
+        let p = svc.resolve("qwen").await;
+        assert_eq!(
+            p.name(),
+            "deepseek",
+            "alias must route to the live provider instead of silently \
+             falling back to default"
+        );
+    }
+
+    /// Without a matching alias the legacy default-fallback is unchanged.
+    #[tokio::test]
+    async fn b105_resolver_unaliased_unknown_still_defaults() {
+        let svc = alias_svc(&[]);
+        let p = svc.resolve("qwen").await;
+        assert_eq!(p.name(), "default");
     }
 }

@@ -508,6 +508,56 @@ fn b81_openai_compat_airpx_thinking_route_omits_temperature_zero_no_reasoning() 
 }
 
 #[test]
+fn d_inv_thinking_temp_openai_compat_thinking_route_never_serializes_temperature() {
+    // D-INV-THINKING-TEMP (B71+B81): on a thinking-class route the serialized
+    // body must NEVER contain a `temperature` key, for ANY requested value
+    // and ANY reasoning state.
+    let temps = [0.0_f32, 0.5, 1.0, -0.1, 1.5, f32::NAN];
+    let reasonings: [Option<&str>; 3] = [None, Some("off"), Some("medium")];
+    for temp in temps {
+        for reasoning in reasonings {
+            let request = b71_request("claude-sonnet-4", Some(temp), reasoning);
+            let body = build_openai_request_body(
+                &request,
+                request.max_tokens,
+                build_openai_messages(&request),
+                "claude-sonnet-4-6",
+                "https://airpx.cc/v1",
+                true,
+            );
+            assert!(
+                body.get("temperature").is_none(),
+                "thinking route must omit temperature for temp={temp:?}, \
+                 reasoning={reasoning:?}; got {:?}",
+                body.get("temperature")
+            );
+        }
+    }
+}
+
+#[test]
+fn d_inv_thinking_temp_openai_compat_airpx_route_flag_alone_blocks_temperature() {
+    // D-INV-THINKING-TEMP: even when model capabilities do NOT declare
+    // thinking support, the airpx route itself is a known adaptive-mode
+    // thinking proxy (`route_is_known_thinking_proxy`) and must still
+    // suppress the explicit temperature.
+    let request = b71_request("claude-sonnet-4", Some(0.5), None);
+    let body = build_openai_request_body(
+        &request,
+        request.max_tokens,
+        build_openai_messages(&request),
+        "claude-sonnet-4-6",
+        "https://airpx.cc/v1",
+        false,
+    );
+    assert!(
+        body.get("temperature").is_none(),
+        "airpx route flag alone must block temperature; got {:?}",
+        body.get("temperature")
+    );
+}
+
+#[test]
 fn b71_openai_compat_plain_route_allows_temperature() {
     let request = b71_request("gpt-4o", Some(0.7), None);
     let body = build_openai_request_body(

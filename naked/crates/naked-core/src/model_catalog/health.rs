@@ -550,6 +550,19 @@ impl ModelHealth {
         if let Some(p) = &config.log_path {
             return Some(p.clone());
         }
+        // B109: never fall back to the REAL `~/.naked/model_health.jsonl` from a
+        // test binary. `AgentCore::new` builds the tracker from
+        // `config.model_health`, whose default `log_path` is `None`, so any test
+        // that drove a turn appended to the production ledger: measured 71 rows
+        // of `provider=blocking model=blocking-model` accumulated over 3 days,
+        // 5 more per `cargo test -p naked-core --lib` run. That ledger is what
+        // the metrics exporter reads and housekeep compacts, so the health
+        // history used to judge providers was mixed with fixture noise.
+        // Tests that genuinely exercise logging pass an explicit `log_path`
+        // (see `health_tests.rs`), so suppressing the default here is safe.
+        if cfg!(test) {
+            return None;
+        }
         // Default: ~/.naked/model_health.jsonl. Use `HOME` env for
         // cross-platform; falls back to current dir if unset.
         let home = std::env::var_os("HOME")?;

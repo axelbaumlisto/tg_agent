@@ -25,7 +25,6 @@ pub mod plan_tool;
 pub mod policy;
 pub mod recall_archive;
 pub mod registry;
-pub mod remember;
 pub mod remote;
 pub mod research_run;
 pub mod revert_turn;

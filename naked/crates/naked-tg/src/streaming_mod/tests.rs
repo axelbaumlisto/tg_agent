@@ -142,6 +142,433 @@ mod tests {
         );
     }
 
+    // ── PLAN_TG_LONG_ANSWERS_v2 S3 render_final golden corpus ────────────
+
+    const CURRENT_RESPONSE_BRANCH_BUDGET: usize = MAX_TG_MSG - 100;
+
+    #[derive(Debug)]
+    struct UnitMeasurements {
+        bytes: usize,
+        chars: usize,
+        utf16: usize,
+    }
+
+    fn measure_units(s: &str) -> UnitMeasurements {
+        UnitMeasurements {
+            bytes: s.len(),
+            chars: s.chars().count(),
+            utf16: s.encode_utf16().count(),
+        }
+    }
+
+    fn measurements_line(name: &str, s: &str) -> String {
+        let units = measure_units(s);
+        format!(
+            "{name}: bytes={} chars={} utf16={}",
+            units.bytes, units.chars, units.utf16
+        )
+    }
+
+    fn astral_at_utf16_budget_fixture() -> String {
+        "💭".repeat(CURRENT_RESPONSE_BRANCH_BUDGET / 2)
+    }
+
+    fn astral_over_utf16_budget_fixture() -> String {
+        "💭".repeat(CURRENT_RESPONSE_BRANCH_BUDGET / 2 + 1)
+    }
+
+    fn cyrillic_at_byte_budget_fixture() -> String {
+        "Ж".repeat(CURRENT_RESPONSE_BRANCH_BUDGET / "Ж".len())
+    }
+
+    fn cyrillic_over_byte_budget_fixture() -> String {
+        "Ж".repeat(CURRENT_RESPONSE_BRANCH_BUDGET / "Ж".len() + 1)
+    }
+
+    fn assert_render_final_branch(out: &str, response: &str, should_truncate_today: bool) {
+        assert_eq!(
+            out.ends_with('…'),
+            should_truncate_today,
+            "current byte-accounting branch changed for measurements {:?}",
+            measure_units(response)
+        );
+    }
+
+    fn assert_long_answer_fix_preserves_response(out: &str, response: &str) {
+        assert!(
+            !out.ends_with('…'),
+            "flag-on render must not pre-truncate measurements {:?}",
+            measure_units(response)
+        );
+        assert_eq!(naked_tg::markup::telegram_html_visible_text(out), response);
+    }
+
+    fn assert_astral_fixture_discriminates_chars_from_utf16(response: &str, over_utf16: bool) {
+        let units = measure_units(response);
+        assert!(
+            units.chars < CURRENT_RESPONSE_BRANCH_BUDGET,
+            "astral fixture must fit under chars() so chars-vs-UTF-16 differs: {units:?}"
+        );
+        assert_eq!(
+            units.utf16 > CURRENT_RESPONSE_BRANCH_BUDGET,
+            over_utf16,
+            "astral fixture must sit on the UTF-16 boundary: {units:?}"
+        );
+        assert!(
+            units.bytes > CURRENT_RESPONSE_BRANCH_BUDGET,
+            "current byte gate must still truncate this no-behaviour-change golden: {units:?}"
+        );
+    }
+
+    fn assert_cyrillic_fixture_discriminates_bytes(response: &str, over_bytes: bool) {
+        let units = measure_units(response);
+        assert!(
+            units.chars < CURRENT_RESPONSE_BRANCH_BUDGET,
+            "Cyrillic fixture must fit under chars(): {units:?}"
+        );
+        assert_eq!(
+            units.utf16, units.chars,
+            "BMP Cyrillic should be one UTF-16 unit per scalar: {units:?}"
+        );
+        assert_eq!(
+            units.bytes > CURRENT_RESPONSE_BRANCH_BUDGET,
+            over_bytes,
+            "Cyrillic fixture must sit on the byte boundary: {units:?}"
+        );
+    }
+
+    fn view_with_response_branch(response: &str) -> CompositeView {
+        let mut v = CompositeView::new("test-model".into());
+        // Any chronological event switches render_final onto the current
+        // response_text-priority branch, where over-budget answers are
+        // pre-truncated before send_final sees them. The note is not
+        // rendered in that branch; it only selects the branch under test.
+        v.events.push(TurnEvent::Note("branch marker".into()));
+        v.response_text = response.to_string();
+        v
+    }
+
+    fn view_with_chrono_events(events: Vec<TurnEvent>) -> CompositeView {
+        let mut v = CompositeView::new("test-model".into());
+        v.events = events;
+        v
+    }
+
+    fn assert_only_supported_telegram_tags(html: &str) {
+        let mut rest = html;
+        while let Some(start) = rest.find('<') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('>') else {
+                panic!("unterminated tag in render output: {html}");
+            };
+            let raw_tag = rest[..end].trim();
+            let tag = raw_tag
+                .trim_start_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            assert!(
+                matches!(tag, "a" | "b" | "blockquote" | "code" | "i" | "pre"),
+                "unsupported Telegram HTML tag <{raw_tag}> in: {html}"
+            );
+            rest = &rest[end + 1..];
+        }
+    }
+
+    #[test]
+    fn render_final_golden_short_markdown() {
+        let v = view_with_response_branch("Short **bold** and `code` answer.");
+        insta::assert_snapshot!("render_final_short_markdown", v.render_final());
+    }
+
+    #[test]
+    fn render_final_golden_entity_heavy_text() {
+        let v = view_with_response_branch(
+            "Entity-heavy: literal & plus <angle> and > sign; pre-escaped &lt; must round-trip.",
+        );
+        insta::assert_snapshot!("render_final_entity_heavy_text", v.render_final());
+    }
+
+    #[test]
+    fn render_final_golden_emoji_astral_and_zwj() {
+        // M8 guard fixture: bytes, chars(), and UTF-16 units disagree for
+        // astral-plane emoji and ZWJ families (💭/🤖/👨‍👩‍👧).
+        let v = view_with_response_branch(
+            "Emoji pressure: 💭 thinking, 🤖 bot, family 👨‍👩‍👧, and plain text.",
+        );
+        insta::assert_snapshot!("render_final_emoji_astral_and_zwj", v.render_final());
+    }
+
+    #[test]
+    fn render_final_golden_cyrillic() {
+        let v = view_with_response_branch(
+            "Кириллица: проверяем, что текущий рендерер сохраняет русский текст и **жирный** фрагмент.",
+        );
+        insta::assert_snapshot!("render_final_cyrillic", v.render_final());
+    }
+
+    #[test]
+    fn render_final_golden_tag_heavy_markdown() {
+        let md = r#"# Heading <raw>
+
+> Quote with **bold** & symbols
+
+- item with *italic*
+- item with `inline <code>`
+
+```rust
+fn main() { println!("<hi>&"); }
+```
+
+See [docs](https://example.com/path?a=1&b=2)."#;
+        let v = view_with_response_branch(md);
+        insta::assert_snapshot!("render_final_tag_heavy_markdown", v.render_final());
+    }
+
+    #[test]
+    fn render_final_golden_exactly_at_current_response_budget() {
+        let response = "x".repeat(CURRENT_RESPONSE_BRANCH_BUDGET);
+        let out = view_with_response_branch(&response).render_final();
+        assert_eq!(out.len(), CURRENT_RESPONSE_BRANCH_BUDGET);
+        assert!(!out.ends_with('…'));
+        insta::assert_snapshot!("render_final_exactly_at_current_response_budget", out);
+    }
+
+    #[test]
+    fn render_final_golden_over_current_response_budget() {
+        let response = format!("{}TAIL", "x".repeat(CURRENT_RESPONSE_BRANCH_BUDGET));
+        let out = view_with_response_branch(&response).render_final();
+        assert!(out.ends_with('…'));
+        assert!(out.len() <= MAX_TG_MSG);
+        insta::assert_snapshot!("render_final_over_current_response_budget", out);
+    }
+
+    // These boundary goldens intentionally pin CURRENT behaviour, not the
+    // desired Telegram behaviour. S7 will change the budget unit from bytes to
+    // UTF-16 and should update these snapshots deliberately. Today the code
+    // truncates by bytes, so Cyrillic at ~2k chars / ~4k bytes is truncated even
+    // though it is safely under Telegram's UTF-16 limit.
+    #[test]
+    fn render_final_boundary_fixture_measurements() {
+        let rows = [
+            measurements_line(
+                "astral_utf16_at_current_response_budget",
+                &astral_at_utf16_budget_fixture(),
+            ),
+            measurements_line(
+                "astral_utf16_over_current_response_budget",
+                &astral_over_utf16_budget_fixture(),
+            ),
+            measurements_line(
+                "cyrillic_bytes_at_current_response_budget",
+                &cyrillic_at_byte_budget_fixture(),
+            ),
+            measurements_line(
+                "cyrillic_bytes_over_current_response_budget",
+                &cyrillic_over_byte_budget_fixture(),
+            ),
+        ];
+        insta::assert_snapshot!(
+            "render_final_boundary_fixture_measurements",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn render_final_golden_astral_utf16_at_current_response_budget() {
+        let response = astral_at_utf16_budget_fixture();
+        assert_astral_fixture_discriminates_chars_from_utf16(&response, false);
+        let out = view_with_response_branch(&response).render_final();
+        insta::assert_snapshot!(
+            "render_final_astral_utf16_at_current_response_budget",
+            out.as_str()
+        );
+        assert_render_final_branch(&out, &response, true);
+    }
+
+    #[test]
+    fn render_final_golden_astral_utf16_over_current_response_budget() {
+        let response = astral_over_utf16_budget_fixture();
+        assert_astral_fixture_discriminates_chars_from_utf16(&response, true);
+        let out = view_with_response_branch(&response).render_final();
+        insta::assert_snapshot!(
+            "render_final_astral_utf16_over_current_response_budget",
+            out.as_str()
+        );
+        assert_render_final_branch(&out, &response, true);
+    }
+
+    #[test]
+    fn render_final_golden_cyrillic_bytes_at_current_response_budget() {
+        let response = cyrillic_at_byte_budget_fixture();
+        assert_cyrillic_fixture_discriminates_bytes(&response, false);
+        let out = view_with_response_branch(&response).render_final();
+        insta::assert_snapshot!(
+            "render_final_cyrillic_bytes_at_current_response_budget",
+            out.as_str()
+        );
+        assert_render_final_branch(&out, &response, false);
+    }
+
+    #[test]
+    fn render_final_golden_cyrillic_bytes_over_current_response_budget() {
+        let response = cyrillic_over_byte_budget_fixture();
+        assert_cyrillic_fixture_discriminates_bytes(&response, true);
+        let out = view_with_response_branch(&response).render_final();
+        insta::assert_snapshot!(
+            "render_final_cyrillic_bytes_over_current_response_budget",
+            out.as_str()
+        );
+        assert_render_final_branch(&out, &response, true);
+    }
+
+    #[test]
+    fn render_final_flag_on_golden_astral_utf16_at_current_response_budget() {
+        let response = astral_at_utf16_budget_fixture();
+        assert_astral_fixture_discriminates_chars_from_utf16(&response, false);
+        let out = view_with_response_branch(&response).render_final_with_long_answer_fix(true);
+        insta::assert_snapshot!(
+            "render_final_flag_on_astral_utf16_at_current_response_budget",
+            out.as_str()
+        );
+        assert_long_answer_fix_preserves_response(&out, &response);
+    }
+
+    #[test]
+    fn render_final_flag_on_golden_cyrillic_bytes_over_current_response_budget() {
+        let response = cyrillic_over_byte_budget_fixture();
+        assert_cyrillic_fixture_discriminates_bytes(&response, true);
+        let out = view_with_response_branch(&response).render_final_with_long_answer_fix(true);
+        insta::assert_snapshot!(
+            "render_final_flag_on_cyrillic_bytes_over_current_response_budget",
+            out.as_str()
+        );
+        assert_long_answer_fix_preserves_response(&out, &response);
+    }
+
+    #[test]
+    fn render_final_flag_on_no_truncation_counter_for_long_response_branch() {
+        let response = cyrillic_over_byte_budget_fixture();
+        let v = view_with_response_branch(&response);
+        let out = v.render_final_with_long_answer_fix(true);
+        assert_long_answer_fix_preserves_response(&out, &response);
+        assert!(
+            !v.last_final_answer_truncated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "flag-on response branch must stop marking long text as inline-truncated"
+        );
+    }
+
+    #[test]
+    fn render_final_golden_tool_events_and_thinking_block() {
+        let v = view_with_chrono_events(vec![
+            TurnEvent::ReasoningDelta("Need to inspect & compare <paths>. ".into()),
+            TurnEvent::ReasoningDelta("Final thought keeps 💭 marker context.".into()),
+            TurnEvent::ToolStart {
+                name: "bash".into(),
+                args_preview: "printf '<x>&'".into(),
+                idx: 0,
+            },
+            TurnEvent::ToolResult {
+                idx: 0,
+                ok: true,
+                output: "ok & <done>\nline two".into(),
+            },
+            TurnEvent::ToolStart {
+                name: "python3".into(),
+                args_preview: "script.py --flag".into(),
+                idx: 1,
+            },
+            TurnEvent::ToolResult {
+                idx: 1,
+                ok: false,
+                output: "Traceback <bad> & fail\nsecond\nthird\nfourth\nfifth\nsixth".into(),
+            },
+            TurnEvent::TextDelta("Chronological answer with **bold** after tools.".into()),
+        ]);
+        insta::assert_snapshot!(
+            "render_final_tool_events_and_thinking_block",
+            v.render_final()
+        );
+    }
+
+    #[test]
+    fn render_live_structural_invariants_not_byte_golden() {
+        // render_live is intentionally not byte-goldened in S3. Its output
+        // includes CompositeView::spinner() (tick-dependent), elapsed wall
+        // time from an Instant created in CompositeView::new(), per-tool
+        // timers from another Instant, and optional context-pressure text
+        // from a model-table lookup. There is no time/tick injection seam
+        // today, and this step is a pure baseline with no behaviour change.
+        let mut view = view_with_chrono_events(vec![
+            TurnEvent::ReasoningDelta("live reasoning with 💭".into()),
+            TurnEvent::TextDelta("Live **answer** with & and <tag> plus 🤖.".into()),
+        ]);
+        view.phase = "tools";
+        view.tick = 2;
+        view.active_tool = Some("bash".into());
+        view.tool_started_at = Some(std::time::Instant::now());
+        view.tool_output = Some("first line\nraw & <tag>\nthird line\nfourth line".into());
+
+        let html = view.render_live();
+        assert!(html.contains("<i>tools · 🕐"), "status missing: {html}");
+        assert!(
+            ["⏳", "⌛"].iter().any(|frame| html.starts_with(frame)),
+            "spinner frame missing: {html}"
+        );
+        assert!(
+            html.contains("💭 <b>thinking</b>"),
+            "thinking marker missing: {html}"
+        );
+        assert!(
+            html.contains("Live <b>answer</b>"),
+            "text block missing: {html}"
+        );
+        assert!(html.contains("&amp;"), "entity escaping missing: {html}");
+        assert!(
+            html.contains("&lt;tag&gt;"),
+            "angle escaping missing: {html}"
+        );
+        assert!(
+            html.contains("🔧 <b>bash</b> ⏱"),
+            "active tool marker missing: {html}"
+        );
+        assert!(
+            !html.contains("class="),
+            "live render must strip code classes: {html}"
+        );
+        assert_only_supported_telegram_tags(&html);
+    }
+
+    #[test]
+    fn render_live_trims_known_oversized_chronology() {
+        let mut view = view_with_chrono_events(vec![
+            TurnEvent::TextDelta(format!("OLD_SHOULD_DROP {}", "x".repeat(MAX_TG_MSG * 2))),
+            TurnEvent::ReasoningDelta("RECENT_SHOULD_STAY".into()),
+        ]);
+        view.phase = "streaming";
+        view.tick = 1;
+
+        let html = view.render_live();
+        assert!(
+            html.len() <= MAX_TG_MSG,
+            "trimmed live render should stay within the Telegram byte cap: {}",
+            html.len()
+        );
+        assert!(
+            html.contains("earlier event truncated"),
+            "known oversized chronology should take the trimming branch: {html}"
+        );
+        assert!(
+            !html.contains("OLD_SHOULD_DROP"),
+            "old oversized chronology block should be dropped: {html}"
+        );
+        assert!(
+            html.contains("RECENT_SHOULD_STAY"),
+            "recent chronology should survive trimming: {html}"
+        );
+    }
+
     // ── is_allowed ──────────────────────────────────────────────────────
 
     #[test]
@@ -939,7 +1366,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use wiremock::matchers::method;
+    use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn unique_test_id() -> u64 {
@@ -952,6 +1379,68 @@ mod tests {
     fn mock_bot(mock_url: &str) -> Bot {
         let url = reqwest::Url::parse(mock_url).unwrap();
         Bot::new("0:TEST_TOKEN").set_api_url(url)
+    }
+
+    fn ok_message_response(text: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 42,
+                "date": 0,
+                "chat": {"id": 1, "type": "private", "first_name": "u"},
+                "text": text,
+            }
+        }))
+    }
+
+    fn ok_document_response() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 43,
+                "date": 0,
+                "chat": {"id": 1, "type": "private", "first_name": "u"},
+                "document": {
+                    "file_id": "doc",
+                    "file_unique_id": "uniq",
+                    "file_name": "response.html"
+                }
+            }
+        }))
+    }
+
+    fn medium_final_fixture() -> (String, CompositeView) {
+        let body = format!("HEAD-{}-TAIL", "x".repeat(MAX_TG_MSG + 500));
+        assert!(body.len() > MAX_TG_MSG && body.len() <= MAX_TG_MSG * 2);
+        let mut view = CompositeView::new("test-model".into());
+        view.response_text = body.clone();
+        (body, view)
+    }
+
+    fn request_method_names(received: &[wiremock::Request]) -> Vec<String> {
+        received
+            .iter()
+            .map(|req| {
+                req.url
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+            })
+            .collect()
+    }
+
+    fn request_text_payload(req: &wiremock::Request) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).ok()?;
+        body.get("text")?.as_str().map(ToOwned::to_owned)
+    }
+
+    fn ordered_text_payloads(received: &[wiremock::Request]) -> Vec<String> {
+        received
+            .iter()
+            .filter_map(request_text_payload)
+            .collect::<Vec<_>>()
     }
 
     struct NoopProvider;
@@ -1027,6 +1516,447 @@ mod tests {
         > {
             Ok(Box::pin(tokio_stream::empty()))
         }
+    }
+
+    #[test]
+    fn send_final_consumes_edit_must_deliver_results_at_all_sites() {
+        let src = include_str!("flush.rs");
+        for consumed in [
+            "if !edit_must_deliver(&bot, chat_id, msg_id, html, true).await",
+            "!edit_must_deliver(&bot, chat_id, msg_id, first, true).await",
+            "let summary_delivered = if tg_payload_within_utf16_budget(&summary, \"final summary edit\")",
+        ] {
+            assert!(
+                src.contains(consumed),
+                "send_final must consume this edit_must_deliver result: {consumed}"
+            );
+        }
+        for discarded in [
+            "edit_must_deliver(&bot, chat_id, msg_id, html, true).await;",
+            "edit_must_deliver(&bot, chat_id, msg_id, first, true).await;",
+            "edit_must_deliver(&bot, chat_id, msg_id, &summary, true).await;",
+        ] {
+            assert!(
+                !src.contains(discarded),
+                "send_final must not discard edit_must_deliver result: {discarded}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_final_part1_non429_falls_back_to_attachment_without_orphan_chunks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/editmessagetext$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message to edit not found"
+            })))
+            .up_to_n_times(2)
+            .expect(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/senddocument$"))
+            .respond_with(ok_document_response())
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let (html, view) = medium_final_fixture();
+        let bot = mock_bot(&server.uri());
+        crate::streaming::flush::send_final(
+            bot,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(990_000 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(123),
+            &html,
+            &view,
+            false,
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap();
+        let methods = request_method_names(&received);
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "sendmessage")
+                .count(),
+            0,
+            "part-1 failure must not send orphan chunks 2..n; methods={methods:?}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "senddocument")
+                .count(),
+            1,
+            "part-1 failure must preserve content via attachment; methods={methods:?}"
+        );
+        assert!(
+            methods.starts_with(&["editmessagetext".to_string(), "editmessagetext".to_string(),]),
+            "HTML and plain first-part edits should fail before fallback; methods={methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_final_flag_on_part1_non429_falls_back_to_attachment_without_orphan_chunks() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/editmessagetext$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message to edit not found"
+            })))
+            .up_to_n_times(2)
+            .expect(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/senddocument$"))
+            .respond_with(ok_document_response())
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let source = "Ж".repeat(12_000);
+        let view = view_with_response_branch(&source);
+        let html = view.render_final_with_long_answer_fix(true);
+        assert!(
+            naked_tg::markup::telegram_html_text_utf16_units(&html) > MAX_TG_MSG as u64,
+            "fixture must route through flag-on split delivery"
+        );
+        let bot = mock_bot(&server.uri());
+        crate::streaming::flush::send_final(
+            bot,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(990_500 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(123),
+            &html,
+            &view,
+            true,
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap();
+        let methods = request_method_names(&received);
+        assert_eq!(
+            methods,
+            vec![
+                "editmessagetext".to_string(),
+                "editmessagetext".to_string(),
+                "editmessagetext".to_string(),
+                "senddocument".to_string(),
+            ],
+            "part-1 failure must do HTML edit, plain edit, summary edit, attachment — and no orphan chunk sends"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[derive(Clone)]
+    struct SharedFlushLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(not(debug_assertions))]
+    impl std::io::Write for SharedFlushLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_final_release_over_budget_payload_degrades_to_attachment_without_panic() {
+        let log_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = {
+            let log_bytes = log_bytes.clone();
+            move || SharedFlushLog(log_bytes.clone())
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/senddocument$"))
+            .respond_with(ok_document_response())
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let html = "A".repeat(MAX_TG_MSG + 1);
+        let view = view_with_response_branch(&html);
+        let before = crate::metrics::snapshot();
+        let bot = mock_bot(&server.uri());
+        crate::streaming::flush::send_final_with_budget_for_test(
+            bot,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(990_600 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(123),
+            &html,
+            &view,
+            crate::streaming::flush::FinalDeliveryBudget {
+                dropped: 0,
+                utf16_units: 1,
+                long_answer_fix_enabled: true,
+            },
+        )
+        .await;
+        let after = crate::metrics::snapshot();
+        assert!(
+            after.final_answer_delivery_partial >= before.final_answer_delivery_partial + 1,
+            "over-budget release degradation must bump delivery_total{{outcome=\"partial\"}}"
+        );
+
+        let received = server.received_requests().await.unwrap();
+        let methods = request_method_names(&received);
+        assert_eq!(
+            methods,
+            vec!["editmessagetext".to_string(), "senddocument".to_string()],
+            "over-budget payload must skip the unsafe final send and preserve content by attachment"
+        );
+        let logs = String::from_utf8(log_bytes.lock().expect("log lock").clone()).unwrap();
+        assert!(
+            logs.contains("final answer payload exceeds Telegram UTF-16 budget"),
+            "release degrade path must WARN with lengths-only context; logs={logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_final_part1_429_retries_without_attachment_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/editmessagetext$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": {"retry_after": 1}
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/editmessagetext$"))
+            .respond_with(ok_message_response("edited"))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let (html, view) = medium_final_fixture();
+        let bot = mock_bot(&server.uri());
+        crate::streaming::flush::send_final(
+            bot,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(991_000 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(124),
+            &html,
+            &view,
+            false,
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap();
+        let methods = request_method_names(&received);
+        assert!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "editmessagetext")
+                .count()
+                >= 2,
+            "429 must be retried by edit_must_deliver; methods={methods:?}"
+        );
+        assert!(
+            methods.iter().any(|m| m == "sendmessage"),
+            "after 429 retry succeeds, normal chunk delivery must continue; methods={methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "senddocument"),
+            "429 must not trigger premature attachment fallback; methods={methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_final_flag_on_cyrillic_4000_edits_whole_without_truncation_delta() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let source = "Ж".repeat(4_000);
+        let view = view_with_response_branch(&source);
+        let html = view.render_final_with_long_answer_fix(true);
+        assert_eq!(naked_tg::markup::telegram_html_visible_text(&html), source);
+        assert!(
+            naked_tg::markup::telegram_html_text_utf16_units(&html) <= MAX_TG_MSG as u64,
+            "4000 Cyrillic scalars are under Telegram's UTF-16 limit"
+        );
+        let before_truncated = crate::metrics::snapshot().final_answer_truncated;
+        let bot = mock_bot(&server.uri());
+        crate::streaming::flush::send_final(
+            bot,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(992_000 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(125),
+            &html,
+            &view,
+            true,
+        )
+        .await;
+        let after_truncated = crate::metrics::snapshot().final_answer_truncated;
+        assert_eq!(
+            after_truncated - before_truncated,
+            0,
+            "flag-on long Cyrillic delivery must not increment truncation counter"
+        );
+
+        let received = server.received_requests().await.unwrap();
+        let methods = request_method_names(&received);
+        assert_eq!(methods, vec!["editmessagetext".to_string()]);
+        let texts = ordered_text_payloads(&received);
+        assert_eq!(texts.len(), 1, "expected one edited payload");
+        assert_eq!(
+            naked_tg::markup::telegram_html_visible_text(&texts[0]),
+            source
+        );
+    }
+
+    #[tokio::test]
+    async fn send_final_flag_on_12000_char_answer_sends_ordered_visible_parts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let source = "Ж".repeat(12_000);
+        let view = view_with_response_branch(&source);
+        let html = view.render_final_with_long_answer_fix(true);
+        assert_eq!(naked_tg::markup::telegram_html_visible_text(&html), source);
+        assert!(
+            naked_tg::markup::telegram_html_text_utf16_units(&html) > MAX_TG_MSG as u64,
+            "12000 UTF-16 units must route away from the single edit path"
+        );
+        let before_truncated = crate::metrics::snapshot().final_answer_truncated;
+        let bot = mock_bot(&server.uri());
+        crate::streaming::flush::send_final(
+            bot,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(993_000 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(126),
+            &html,
+            &view,
+            true,
+        )
+        .await;
+        let after_truncated = crate::metrics::snapshot().final_answer_truncated;
+        assert_eq!(
+            after_truncated - before_truncated,
+            0,
+            "ordered split delivery must not increment truncation counter"
+        );
+
+        let received = server.received_requests().await.unwrap();
+        let methods = request_method_names(&received);
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "editmessagetext")
+                .count(),
+            1,
+            "first part edits the stream placeholder; methods={methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "sendmessage")
+                .count()
+                >= 2,
+            "remaining ordered parts must be sent as messages; methods={methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "senddocument"),
+            "12000-char answer should split, not fall back to attachment; methods={methods:?}"
+        );
+        let texts = ordered_text_payloads(&received);
+        assert!(
+            texts.len() >= 3,
+            "expected multi-part payloads; methods={methods:?}"
+        );
+        for text in &texts {
+            let units = naked_tg::markup::telegram_html_text_utf16_units(text);
+            assert!(
+                units <= MAX_TG_MSG as u64,
+                "pre-send budget invariant violated in captured payload: {units}"
+            );
+        }
+        let visible_joined = texts
+            .iter()
+            .map(|text| naked_tg::markup::telegram_html_visible_text(text))
+            .collect::<String>();
+        assert_eq!(visible_joined, source);
     }
 
     // ─── BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard) ───
@@ -1716,6 +2646,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_start_pipeline_bounds_send_message_count() {
+        // BUG_REGISTRY B02 / D-INV-STREAM-BUBBLE-COUNT (INV-4):
+        // at stream-start the pipeline must send AT MOST 2 new bubbles
+        // (media-ack + placeholder). B02 was "stream-start sends 3 messages
+        // where 1 suffices". Unlike stream_start_sends_exactly_one_message_
+        // with_inline_kbd (which exercises the send_stream_placeholder HELPER
+        // in isolation), this drives the REAL crate::streaming::pipeline::
+        // stream_response pipeline and counts /sendMessage API calls.
+        //
+        // ASSERTION BOUND RATIONALE: this scenario has NO media, so the
+        // media-ack bubble is never sent and the correct baseline is exactly
+        // ONE /sendMessage (the placeholder). The issue's "<= 2" bound would
+        // NOT catch a single injected extra bubble (1 -> 2 still satisfies
+        // <= 2). Therefore we bound the no-media stream-start at <= 1, which
+        // (a) passes on current code and (b) FAILS the moment an extra
+        // stream-start send is injected. The <= 2 media-ack allowance is
+        // documented but does not apply here (no media in this run).
+        use naked_core::types::{AgentEvent, AgentHandle};
+        use naked_tg::run_registry::RunKind;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 1, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let run_id = format!("b02-bubble-count-{unique}");
+        let chat_id = 970_000 + unique as i64;
+
+        let bot = mock_bot(&server.uri());
+        let deps = test_bot_deps(
+            bot,
+            test_config(),
+            std::sync::Arc::new(ChannelSessionMap::new()),
+            server.uri(),
+        );
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (perm_tx, _perm_rx) = mpsc::channel(1);
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        let session_id = format!("{run_id}-sid");
+        events_tx
+            .send(AgentEvent::TextDelta("hello".to_string()))
+            .await
+            .unwrap();
+        events_tx.send(AgentEvent::Idle).await.unwrap();
+
+        let _outcome = crate::streaming::pipeline::stream_response(
+            &deps,
+            crate::shared::ChatCtx {
+                chat_id: ChatId(chat_id),
+                thread_id: None,
+                reply_to: None,
+            },
+            AgentHandle {
+                events: events_rx,
+                permissions: perm_tx,
+                steer: steer_tx,
+                abort: CancellationToken::new(),
+            },
+            "test-model".to_string(),
+            crate::streaming::pipeline::StreamRunContext {
+                requested_run_id: Some(run_id.clone()),
+                session_id,
+                kind: RunKind::Research {
+                    spec_id: format!("{run_id}-spec"),
+                },
+                source_ref: Some(format!("{run_id}-spec")),
+                final_reply_markup: None,
+            },
+        )
+        .await;
+        let _ = crate::shared::RUN_REGISTRY.remove_run(&run_id);
+
+        let received = server.received_requests().await.unwrap();
+        // teloxide renders the method segment as `SendMessage`; match
+        // case-insensitively so we count new-bubble sends (NOT
+        // editMessageText / editMessageReplyMarkup / sendChatAction /
+        // sendDocument, which are edits/typing/attachments).
+        let send_message_count = received
+            .iter()
+            .filter(|req| {
+                let path = req.url.path().to_ascii_lowercase();
+                path.ends_with("/sendmessage")
+            })
+            .count();
+
+        // No-media baseline is EXACTLY 1 (placeholder). media-ack would make it
+        // 2 but there is no media here. Asserting == 1 (not <= 1) catches BOTH a
+        // missing placeholder (0) AND an extra stream-start bubble (2+, B02
+        // regression).
+        assert_eq!(
+            send_message_count, 1,
+            "B02/INV-4: no-media stream-start must send EXACTLY the placeholder \
+             bubble (media-ack would make it 2 but there is no media here, so \
+             exactly 1); got {send_message_count} /sendMessage calls"
+        );
+    }
+
+    #[tokio::test]
     async fn scheduled_completion_attaches_controls_only_for_recurring() {
         use naked_core::types::{AgentEvent, AgentHandle};
         use naked_tg::run_registry::RunKind;
@@ -2168,6 +3208,256 @@ mod tests {
         assert!(
             body.contains("%D0%9F%D1%80%D0%B8") || body.contains("Привет"),
             "cyrillic/emoji must survive serialisation: {body}"
+        );
+    }
+
+    // ── BUG_REGISTRY D-CB-GATE-REJECT ───────────────────────────────────
+    //
+    // `handle_callback` (callbacks/mod.rs) rejects callback queries from
+    // chats not in `allowed_chat_ids`: it answers "not allowed" and MUST
+    // `return` early *before* the `match action` dispatch. The existing
+    // `callback_allowed_chat_gate_before_registry_action` test only asserts
+    // the *source ordering* (`is_allowed(` appears before `match action`) —
+    // a purely textual proxy. Mutation probe confirmed: deleting only the
+    // early `return Ok(())` (keeping the gate check + "not allowed" answer)
+    // lets non-allowed callbacks fall through and dispatch, yet all 25
+    // callback tests stay green. This behavioral test closes that gap by
+    // driving the real `handle_callback` entry point and asserting the
+    // strongest downstream side-effect is ABSENT: a registered run's abort
+    // token stays uncancelled (the `s:abort:<run>` action never runs).
+    #[tokio::test]
+    async fn non_allowed_chat_callback_rejected_without_dispatch() {
+        use teloxide::types::CallbackQuery;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let chat = 950_000 + unique as i64;
+        // Configure a non-empty allow-list containing only a DIFFERENT chat
+        // id, so `chat` is not a member and gets rejected. Using a populated
+        // list (rather than an empty one) isolates the "configured allow-list,
+        // requesting chat not a member" path: `is_allowed` also denies on an
+        // empty list, so an empty list would reject too but for an ambiguous
+        // reason.
+        let mut config = test_config();
+        config.telegram.allowed_chat_ids = vec![chat + 1];
+
+        // A live run owned by `chat`, whose abort token is our tripwire:
+        // dispatching `s:abort:<run_id>` would cancel it. Ownership matches
+        // `chat`, so ONLY the allowed-chat gate can prevent the abort.
+        let run_id = format!("cb-gate-run-{unique}");
+        let sid = format!("cb-gate-sid-{unique}");
+        let abort = CancellationToken::new();
+        let (steer_tx, _steer_rx) = mpsc::channel(1);
+        crate::shared::RUN_REGISTRY
+            .register_run(
+                naked_tg::run_registry::RegisterRunInput {
+                    requested_run_id: Some(run_id.clone()),
+                    session_id: sid.clone(),
+                    origin: naked_tg::run_registry::RunOrigin::new(chat, None),
+                    kind: naked_tg::run_registry::RunKind::ChatTurn,
+                    source_ref: None,
+                    steer: steer_tx,
+                    abort: abort.clone(),
+                },
+                naked_tg::run_registry::RegisterRunOptions::cap_three(),
+            )
+            .expect("register run for gate-reject test");
+
+        let bot = mock_bot(&server.uri());
+        let channel_map = std::sync::Arc::new(ChannelSessionMap::new());
+        let deps = test_bot_deps(bot, config, channel_map, server.uri());
+        let pending_perms: crate::shared::PendingPermissions =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // Callback from the non-allowed `chat` carrying an action that WOULD
+        // abort the run if it reached the dispatcher.
+        let q: CallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": format!("cb-gate-{unique}"),
+            "from": {"id": 42, "is_bot": false, "first_name": "tester"},
+            "chat_instance": "chat-instance",
+            "data": format!("s:abort:{run_id}"),
+            "message": {
+                "message_id": 7,
+                "date": 1_700_000_000,
+                "chat": {"id": chat, "type": "private", "first_name": "u"},
+                "text": "button"
+            }
+        }))
+        .expect("valid callback query");
+
+        crate::callbacks::handle_callback(deps, q, pending_perms)
+            .await
+            .expect("handle_callback");
+
+        // (a) The downstream action MUST NOT have run: abort token untouched.
+        assert!(
+            !abort.is_cancelled(),
+            "non-allowed callback fell through to dispatch and aborted the run"
+        );
+
+        // (b) Exactly one API call — the "not allowed" answerCallbackQuery —
+        // and no second answer from a dispatched action handler.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "expected exactly one answerCallbackQuery (the rejection), got {}",
+            received.len()
+        );
+        let body = std::str::from_utf8(&received[0].body).unwrap();
+        assert!(
+            body.contains("not+allowed") || body.contains("not allowed"),
+            "rejection answer must carry the 'not allowed' text: {body}"
+        );
+
+        crate::shared::RUN_REGISTRY.remove_run(&run_id);
+    }
+
+    // ── BUG_REGISTRY B87 / D-INV-YOLO-OFF-DRAINS-PENDING ───────────────
+    //
+    // Revocation completeness: `/yolo off` clears the in-memory yolo state
+    // (`clear_yolo_chat`) + persisted grants, but before B87 it left every
+    // outstanding permission card alive in `pending_perms`. Every card
+    // carries a live "⚡ YOLO" button, and revocation resets the per-chat
+    // escalation count — so a stale card tapped AFTER `/yolo off` (by any
+    // chat member) would re-enable YOLO: post-revocation re-escalation
+    // bypass. This boundary test drives the REAL `/yolo off` command path
+    // (`cmd_yolo`) and the REAL callback handler (`handle_callback`) and
+    // asserts:
+    //   (a) the revoking chat's pending card is denied + removed,
+    //   (b) a DIFFERENT chat's pending card survives (drain is per-chat),
+    //   (c) the stale ⚡ tap does NOT re-enable/escalate YOLO.
+    // Mutation: drop the `deny_pending_perms` call in `cmd_yolo`'s off
+    // branch → (a) and (c) fail.
+    #[tokio::test]
+    async fn yolo_off_drains_pending_cards_blocking_stale_reescalation() {
+        use teloxide::types::CallbackQuery;
+        use wiremock::matchers::path_regex;
+
+        let server = MockServer::start().await;
+        // sendMessage must round-trip a full Message (the `/yolo off` reply);
+        // everything else (answerCallbackQuery) is happy with `result: true`.
+        // wiremock evaluates mocks in mount order — specific one first.
+        Mock::given(method("POST"))
+            .and(path_regex(r"(?i)/sendmessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 42,
+                    "date": 0,
+                    "chat": {"id": 1, "type": "private", "first_name": "u"},
+                    "text": "ok"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        let unique = unique_test_id();
+        let chat = 980_000 + unique as i64;
+        let other_chat = chat + 500_000;
+        let mut config = test_config();
+        config.telegram.allowed_chat_ids = vec![chat, other_chat];
+
+        let bot = mock_bot(&server.uri());
+        let channel_map = std::sync::Arc::new(ChannelSessionMap::new());
+        let deps = test_bot_deps(bot, config, channel_map.clone(), server.uri());
+        let pending_perms: crate::shared::PendingPermissions =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // Two live permission cards: one in the revoking chat, one in ANOTHER
+        // allowed chat. Both are yolo-capable (every card has the ⚡ button).
+        let stale_id = format!("b87-stale-{unique}");
+        let other_id = format!("b87-other-{unique}");
+        let (tx_stale, mut rx_stale) = tokio::sync::oneshot::channel::<bool>();
+        let (tx_other, mut rx_other) = tokio::sync::oneshot::channel::<bool>();
+        {
+            let mut p = pending_perms.write().await;
+            p.insert(stale_id.clone(), (tx_stale, chat, None));
+            p.insert(other_id.clone(), (tx_other, other_chat, None));
+        }
+
+        // Real `/yolo off` command path (revocation).
+        let ctx = crate::shared::ChatCtx {
+            chat_id: ChatId(chat),
+            thread_id: None,
+            reply_to: None,
+        };
+        crate::commands::tools::cmd_yolo(
+            &deps.bot,
+            &deps.agent,
+            &channel_map,
+            &deps.config,
+            &ctx,
+            "/yolo off",
+            &pending_perms,
+        )
+        .await
+        .expect("cmd_yolo off");
+
+        // (a) The revoking chat's card is resolved as DENIED (fail-closed —
+        // the parked ask_permission returns false immediately, no 120s idle)
+        // and removed from the pending map.
+        assert!(
+            matches!(rx_stale.try_recv(), Ok(false)),
+            "/yolo off must deny the chat's pending permission card"
+        );
+        assert!(
+            !pending_perms.read().await.contains_key(&stale_id),
+            "/yolo off must remove the chat's pending card from pending_perms"
+        );
+        // (b) The OTHER chat's card is untouched: still pending, nothing sent.
+        assert!(
+            pending_perms.read().await.contains_key(&other_id),
+            "another chat's pending card must survive /yolo off (per-chat drain)"
+        );
+        assert!(
+            rx_other.try_recv().is_err(),
+            "another chat's pending card must not receive any verdict"
+        );
+
+        // (c) Stale ⚡ YOLO tap via the REAL callback handler must NOT
+        // re-enable or escalate — the bypass this test exists to block.
+        let q: CallbackQuery = serde_json::from_value(serde_json::json!({
+            "id": format!("b87-cb-{unique}"),
+            "from": {"id": 42, "is_bot": false, "first_name": "tester"},
+            "chat_instance": "chat-instance",
+            "data": format!("p:{stale_id}:yolo"),
+            "message": {
+                "message_id": 7,
+                "date": 1_700_000_000,
+                "chat": {"id": chat, "type": "private", "first_name": "u"},
+                "text": "card"
+            }
+        }))
+        .expect("valid callback query");
+        crate::callbacks::handle_callback(deps, q, pending_perms.clone())
+            .await
+            .expect("handle_callback");
+
+        assert!(
+            !channel_map.is_yolo(chat, None).await,
+            "post-revocation stale-card ⚡ tap must NOT re-enable YOLO"
+        );
+        assert!(
+            !channel_map.is_yolo(chat, Some(999)).await,
+            "post-revocation stale-card ⚡ tap must NOT escalate chat-wide"
         );
     }
 }

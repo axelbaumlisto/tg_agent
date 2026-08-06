@@ -416,7 +416,41 @@ impl CompositeView {
     /// older events are dropped first with a `… N earlier events
     /// truncated` marker. Language tags on `<pre><code>` are PRESERVED
     /// (this is `sendMessage` not `editMessageText`, so they're accepted).
+    #[cfg(test)]
     pub(crate) fn render_final(&self) -> String {
+        self.render_final_with_long_answer_fix(false)
+    }
+
+    /// B106: one-line banner naming who actually answered, prepended to the
+    /// final message. Empty when the requested provider served the turn.
+    fn fallback_banner(&self) -> String {
+        match &self.fallback_notice {
+            Some(n) if !n.trim().is_empty() => {
+                format!("<i>\u{26a0}\u{fe0f} {}</i>\n\n", escape_html(n))
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// B106: prepend the fallback banner exactly once, then delegate.
+    ///
+    /// The body below has four exit points; prepending at each of them was
+    /// duplication waiting to rot (a fifth branch would silently ship without
+    /// the warning). Composing here keeps "who answered" a single concern.
+    pub(crate) fn render_final_with_long_answer_fix(
+        &self,
+        tg_long_answer_fix_enabled: bool,
+    ) -> String {
+        let body = self.render_final_body(tg_long_answer_fix_enabled);
+        match self.fallback_banner() {
+            b if b.is_empty() => body,
+            b => b + &body,
+        }
+    }
+
+    fn render_final_body(&self, tg_long_answer_fix_enabled: bool) -> String {
+        self.last_final_answer_truncated
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // Empty-turn guard: no events AND no accumulated body → existing
         // terse error message (preserves B25 contract).
         if self.events.is_empty()
@@ -463,11 +497,18 @@ impl CompositeView {
                     .saturating_sub(WRAPPER_OVERHEAD)
                     .min(MAX_FINAL_THINKING_BYTES);
                 let payload = tail_trim(thinking, payload_cap);
+                if payload.starts_with('…') || payload.len() < thinking.len() {
+                    self.last_final_answer_truncated
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 out.push_str("\n\n");
                 out.push_str(&format!(
                     "<blockquote expandable>💭 <b>thinking</b>\n{}</blockquote>",
                     escape_html(&payload)
                 ));
+            } else if !thinking.is_empty() {
+                self.last_final_answer_truncated
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             out.push_str(&footer_rendered);
             return out;
@@ -483,9 +524,11 @@ impl CompositeView {
         let text = self.response_text.trim();
         if !text.is_empty() {
             let body = md_to_tg_html(text);
-            let body = if body.len() <= budget {
+            let body = if tg_long_answer_fix_enabled || body.len() <= budget {
                 body
             } else {
+                self.last_final_answer_truncated
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 // Truncate to budget on a char boundary and add ellipsis.
                 let trunc = head_truncate(&body, budget.saturating_sub(1));
                 format!("{trunc}…")
@@ -517,6 +560,10 @@ impl CompositeView {
         // see complete timeline when inline was truncated).
         self.last_dropped_events
             .store(dropped, std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            self.last_final_answer_truncated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let mut out = String::with_capacity(chrono.len() + footer_rendered.len() + 8);
         out.push_str(&chrono);
@@ -818,5 +865,63 @@ mod tests {
         let html = String::from_utf8_lossy(&bytes);
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("test-model") || html.contains("<!DOCTYPE"));
+    }
+    // ── D-INV-FALLBACK-VISIBLE (B106), UI half ─────────────────────────────
+    //
+    // When the picked provider did not serve the turn, the user must be told
+    // at the TOP of the answer — not left to infer it from a journal line.
+
+    #[test]
+    fn b106_fallback_banner_is_first_in_final_answer() {
+        let mut v = make_view();
+        v.response_text = "тело ответа".into();
+        v.fallback_notice = Some("Отвечал deepseek — groq не смог: 413".into());
+        let html = v.render_final();
+        assert!(html.contains("deepseek"), "banner missing: {html}");
+        let banner_at = html.find("deepseek").unwrap();
+        let body_at = html.find("тело").unwrap();
+        assert!(
+            banner_at < body_at,
+            "banner must precede the answer body:\n{html}"
+        );
+    }
+
+    #[test]
+    fn b106_no_banner_without_fallback() {
+        let mut v = make_view();
+        v.response_text = "тело ответа".into();
+        let html = v.render_final();
+        assert!(!html.contains("не смог"), "unexpected banner: {html}");
+    }
+
+    /// A tool-only turn renders through the chrono path — the banner must
+    /// survive there too, otherwise the warning silently disappears for
+    /// exactly the long agentic turns most likely to hit a 413.
+    #[test]
+    fn b106_banner_present_on_tool_only_turn() {
+        let mut v = make_view();
+        v.events.push(TurnEvent::ToolStart {
+            idx: 0,
+            name: "bash".into(),
+            args_preview: "ls".into(),
+        });
+        v.fallback_notice = Some("Отвечал deepseek — groq не смог: 413".into());
+        let html = v.render_final();
+        assert!(
+            html.contains("deepseek"),
+            "banner lost on chrono path: {html}"
+        );
+    }
+
+    /// The notice is user/provider-derived text: it must be HTML-escaped or a
+    /// stray '<' would break the Telegram parse and drop the whole message.
+    #[test]
+    fn b106_banner_is_html_escaped() {
+        let mut v = make_view();
+        v.response_text = "body".into();
+        v.fallback_notice = Some("groq <broke> & died".into());
+        let html = v.render_final();
+        assert!(html.contains("&lt;broke&gt;"), "not escaped: {html}");
+        assert!(html.contains("&amp;"), "ampersand not escaped: {html}");
     }
 }

@@ -12,9 +12,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::memory::store::{MarkdownMemoryStore, content_fingerprint};
+use crate::memory::store::{MarkdownMemoryStore, content_hash};
 use crate::memory::types::{MemoryEntry, MemoryScope, MemoryType};
 use crate::provider::Provider;
 
@@ -25,6 +25,67 @@ const FLUSH_PROMPT: &str = "From the conversation excerpt below, extract up to 5
      Skip narrative summary, skip personal asides. \
      Output one rule per line, plain text, no numbering, no bullets, no markdown. \
      If nothing rule-worthy stands out, output exactly: NONE";
+
+struct CandidateBucket {
+    entry: MemoryEntry,
+    dates: Vec<NaiveDate>,
+    sources: Vec<String>,
+    appended_occurrences: u32,
+    persisted_recall_count: u32,
+    last_recalled_at: Option<DateTime<Utc>>,
+}
+
+impl CandidateBucket {
+    fn new(entry: MemoryEntry) -> Self {
+        Self {
+            entry,
+            dates: Vec::new(),
+            sources: Vec::new(),
+            appended_occurrences: 0,
+            persisted_recall_count: 0,
+            last_recalled_at: None,
+        }
+    }
+
+    fn observe(&mut self, entry: MemoryEntry, date: NaiveDate) {
+        // Keep the shortest/cleanest content as canonical.
+        if entry.content.len() < self.entry.content.len() {
+            self.entry.content.clone_from(&entry.content);
+        }
+        // Keep the oldest timestamp.
+        if entry.created_at < self.entry.created_at {
+            self.entry.created_at = entry.created_at;
+        }
+        if !self.dates.contains(&date) {
+            self.dates.push(date);
+        }
+        if !self.sources.contains(&entry.source) {
+            self.sources.push(entry.source.clone());
+        }
+        self.appended_occurrences = self.appended_occurrences.saturating_add(1);
+        self.persisted_recall_count = self
+            .persisted_recall_count
+            .saturating_add(entry.recall_count);
+        if let Some(when) = entry.last_recalled_at
+            && self.last_recalled_at.is_none_or(|current| when > current)
+        {
+            self.last_recalled_at = Some(when);
+        }
+    }
+
+    fn into_scored_entry(mut self, now: DateTime<Utc>) -> (MemoryEntry, ScoringHints) {
+        self.entry.recall_count = self.persisted_recall_count;
+        self.entry.last_recalled_at = self.last_recalled_at;
+        let hints = ScoringHints {
+            repeat_days: self.dates.len() as u32,
+            source_diversity: self.sources.len() as u32,
+            age_days: (now - self.entry.created_at).num_days().max(0) as u32,
+            recall_count: self.persisted_recall_count,
+            reinforcements: self.appended_occurrences,
+        };
+        (self.entry, hints)
+    }
+}
 
 /// Aggregate every draft entry in the window into one flat vector,
 /// computing scoring hints in the same pass. Called by `run_daily`.
@@ -40,51 +101,24 @@ pub fn collect_window(
     today: NaiveDate,
     lookback_days: u32,
 ) -> Vec<(MemoryEntry, ScoringHints)> {
-    // Group by semantic fingerprint (more aggressive than content_hash).
-    // This merges "greet the user briefly" and "Greet the user briefly in Turn 7."
-    // into one candidate with repeat_days counting both.
-    let mut by_fp: HashMap<u64, (MemoryEntry, Vec<NaiveDate>, Vec<String>, u32)> = HashMap::new();
+    let mut by_hash: HashMap<u64, CandidateBucket> = HashMap::new();
     let max_back = lookback_days.max(1);
 
     for delta in 0..max_back {
         let date = today - chrono::Duration::days(delta as i64);
         for entry in MarkdownMemoryStore::read_daily(workspace, scope, date) {
-            let fp = content_fingerprint(&entry.content);
-            let bucket = by_fp
-                .entry(fp)
-                .or_insert_with(|| (entry.clone(), Vec::new(), Vec::new(), 0));
-            // Keep the shortest/cleanest content as canonical.
-            if entry.content.len() < bucket.0.content.len() {
-                bucket.0.content.clone_from(&entry.content);
-            }
-            // Keep the oldest timestamp.
-            if entry.created_at < bucket.0.created_at {
-                bucket.0.created_at = entry.created_at;
-            }
-            if !bucket.1.contains(&date) {
-                bucket.1.push(date);
-            }
-            if !bucket.2.contains(&entry.source) {
-                bucket.2.push(entry.source.clone());
-            }
-            // Reinforcement: every occurrence strengthens the memory.
-            bucket.3 += 1;
+            let hash = content_hash(&entry.content);
+            let bucket = by_hash
+                .entry(hash)
+                .or_insert_with(|| CandidateBucket::new(entry.clone()));
+            bucket.observe(entry, date);
         }
     }
 
     let now = Utc::now();
-    by_fp
+    by_hash
         .into_values()
-        .map(|(entry, dates, sources, reinforcements)| {
-            let hints = ScoringHints {
-                repeat_days: dates.len() as u32,
-                source_diversity: sources.len() as u32,
-                age_days: (now - entry.created_at).num_days().max(0) as u32,
-                recall_count: 0,
-                reinforcements,
-            };
-            (entry, hints)
-        })
+        .map(|bucket| bucket.into_scored_entry(now))
         .collect()
 }
 

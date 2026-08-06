@@ -1,0 +1,5 @@
+---
+source: crates/naked-tg/src/streaming_mod/tests.rs
+expression: v.render_final()
+---
+Entity-heavy: literal &amp; plus &lt;angle&gt; and &gt; sign; pre-escaped &amp;lt; must round-trip.

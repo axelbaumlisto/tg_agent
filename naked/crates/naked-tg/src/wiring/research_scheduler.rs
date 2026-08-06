@@ -11,7 +11,7 @@ use naked_tg::synthetic::SyntheticDispatchOutcome;
 use teloxide::prelude::*;
 use tokio::sync::RwLock;
 
-use crate::shared::{self, ChatCtx, research_scheduler};
+use crate::shared::{self, ChatCtx, redact_for_log, research_scheduler};
 
 /// Additional deps needed by `stream_response()` that are available at
 /// `wiring::build()` time but not part of the scheduler's own config.
@@ -133,9 +133,10 @@ fn synthetic_dispatch_fn(
                         Ok(outcome)
                     }
                     Err(e) => {
+                        let safe = redact_for_log(&e);
                         tracing::warn!(
                             spec_id = %spec_id_owned,
-                            error = %e,
+                            error = %safe,
                             "synthetic dispatch failed"
                         );
                         Err(e)
@@ -209,9 +210,10 @@ async fn stream_research_turn(
     let final_markup = match agent.load_research(spec_id).await {
         Ok(spec) => Some(final_markup_for_research_spec(&spec)),
         Err(e) => {
+            let safe = redact_for_log(&e);
             tracing::debug!(
                 spec_id = %spec_id,
-                error = %e,
+                error = %safe,
                 "research final keyboard skipped: spec load failed"
             );
             None

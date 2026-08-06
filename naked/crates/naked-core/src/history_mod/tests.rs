@@ -1146,6 +1146,95 @@ mod seam_tests {
     }
 }
 
+// ── D-INV-TOOL-OUTPUT-WINDOW-AWARE (B104) ─────────────────────────────────
+//
+// `push_tool_result` is the ingest backstop for tool output. It used to be a
+// hard 8000 bytes, which bound TIGHTER than the model-aware router in
+// `loop_::tools` (24K for >=100K windows, 180K for >=500K) — so a 16.6 KB
+// skill body still lost 8.6 KB on a 200K-window model even after the router
+// decided it fit. The ceiling must now come from the same limits table.
+// Restoring `const MAX_TOOL_OUTPUT: usize = 8000;` fails the first two tests.
+
+fn tool_output_of(h: &ConversationHistory) -> String {
+    let msg = h.messages().iter().find(|m| m.role == Role::Tool).unwrap();
+    match &msg.blocks[0] {
+        ContentBlock::ToolResult { output, .. } => output.clone(),
+        _ => panic!("expected ToolResult"),
+    }
+}
+
+#[test]
+fn b104_skill_sized_output_survives_ingest_on_large_window() {
+    let mut h = ConversationHistory::new("sys".into());
+    h.set_context_window_tokens(200_000);
+    // Real telegram-reader skill payload size (~16.6 KB): under the 24K
+    // limit for a 200K window, so it must arrive intact.
+    let body = "x".repeat(16_639);
+    h.push_tool_result("c1", &body, false);
+
+    let out = tool_output_of(&h);
+    assert_eq!(
+        out.len(),
+        body.len(),
+        "16.6 KB tool output must not be clamped on a 200K-token window"
+    );
+    assert!(!out.contains("truncated"));
+}
+
+#[test]
+fn b104_ingest_ceiling_follows_context_window() {
+    // 1M window -> 180K limit: a 100 KB result fits.
+    let mut big = ConversationHistory::new("sys".into());
+    big.set_context_window_tokens(1_000_000);
+    let body = "y".repeat(100_000);
+    big.push_tool_result("c1", &body, false);
+    assert_eq!(
+        tool_output_of(&big).len(),
+        body.len(),
+        "100 KB must survive a 1M-token window (180K limit)"
+    );
+
+    // Small window -> 12K limit: the SAME body is still clamped.
+    let mut small = ConversationHistory::new("sys".into());
+    small.set_context_window_tokens(32_000);
+    small.push_tool_result("c1", &body, false);
+    let clamped = tool_output_of(&small);
+    assert!(
+        clamped.len() < body.len(),
+        "small windows must still clamp; got {} bytes",
+        clamped.len()
+    );
+    assert!(clamped.contains("truncated"));
+}
+
+#[test]
+fn b104_ingest_still_bounds_absurd_output() {
+    // The backstop must remain a real bound, not become unlimited.
+    let mut h = ConversationHistory::new("sys".into());
+    h.set_context_window_tokens(1_000_000);
+    let body = "z".repeat(400_000);
+    h.push_tool_result("c1", &body, false);
+    let out = tool_output_of(&h);
+    assert!(
+        out.len() < body.len(),
+        "400 KB must still be clamped even on a 1M window"
+    );
+    assert!(out.contains("truncated"));
+}
+
+#[test]
+fn b104_ingest_clamp_is_utf8_safe() {
+    // Cyrillic is 2 bytes/char — the clamp must not split a char.
+    let mut h = ConversationHistory::new("sys".into());
+    h.set_context_window_tokens(32_000); // 12K limit
+    let body = "Привет ".repeat(4_000);
+    h.push_tool_result("c1", &body, false);
+    let out = tool_output_of(&h);
+    assert!(out.contains("truncated"));
+    // Reaching here without a panic proves the boundary math held.
+    assert!(out.is_char_boundary(0));
+}
+
 mod proptest_history {
     use crate::history::ConversationHistory;
     use proptest::prelude::*;

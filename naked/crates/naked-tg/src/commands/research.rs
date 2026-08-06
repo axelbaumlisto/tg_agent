@@ -436,8 +436,10 @@ async fn dispatch_research(
         return "Research scheduler not running".into();
     };
     let session_id = super::get_or_create_session(*ctx, agent, channel_map, config).await;
+    // Automated research runs get auto-approve for the run but must NOT count
+    // as an explicit user escalation toward permanent yolo.
     channel_map
-        .enable_yolo(ctx.chat_id.0, ctx.raw_thread_id())
+        .grant_temporary_yolo(ctx.chat_id.0, ctx.raw_thread_id())
         .await;
     let prompt = format!(
         "Run research spec_id={spec_id}. Call research_run(spec_id=\"{spec_id}\") directly."
@@ -676,21 +678,23 @@ pub(crate) async fn move_live_run_here(
                 .reply_markup(crate::streaming::streaming_control_kb_for_run(&plan.run_id))
                 .await
             {
+                let safe = redact_for_log(&e);
                 tracing::warn!(
                     run_id = %plan.run_id,
                     chat = ctx.chat_id.0,
                     message_id = sent.id.0,
-                    error = %e,
+                    error = %safe,
                     "move re-home: failed to attach controls to destination bubble after bind"
                 );
             }
         }
         Err(e) => {
+            let safe = redact_for_log(format!("{e:?}"));
             tracing::warn!(
                 run_id = %plan.run_id,
                 chat = ctx.chat_id.0,
                 message_id = sent.id.0,
-                error = ?e,
+                error = %safe,
                 "move re-home: bind_message failed after successful registry move; destination bubble left without controls"
             );
         }

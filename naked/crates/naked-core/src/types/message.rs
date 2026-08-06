@@ -222,6 +222,37 @@ pub static STALE_EDIT_REJECT_COUNT: std::sync::atomic::AtomicU64 =
 pub static GIT_HISTORY_GUARD_BLOCK_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// PLAN_MEMORY_v05_UNFREEZE S4 / B97: memory digest candidates observed by
+/// the daily scorer. Rendered as `naked_core_memory_candidates_total`.
+pub static MEMORY_CANDIDATES_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_MEMORY_v05_UNFREEZE S4 / B97: promoted digest candidates by the road
+/// that made them eligible. Rendered as `naked_core_memory_promoted_total{road}`.
+pub static MEMORY_PROMOTED_REPEAT_DAYS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MEMORY_PROMOTED_REINFORCE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MEMORY_PROMOTED_REOBS_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_MEMORY_v05_UNFREEZE S5 / B100: memory entries omitted from prompt
+/// injection because the fixed prompt budget was exhausted. Rendered as
+/// `naked_core_memory_injection_dropped_total{scope}` with bounded scope
+/// labels: global/project/user.
+pub static MEMORY_INJECTION_DROPPED_GLOBAL_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MEMORY_INJECTION_DROPPED_PROJECT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MEMORY_INJECTION_DROPPED_USER_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PLAN_MEMORY_v05_UNFREEZE S8 / F12: memory prompt injection failures that
+/// were degraded to "inject nothing" so a memory bug cannot take down a turn.
+/// Rendered as `naked_core_memory_injection_failed_total`.
+pub static MEMORY_INJECTION_FAILED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// PLAN_FAST_BACKEND_v2 Step C: hashline edit outcomes. Intended Prometheus
 /// shape: `naked_core_hashline_edit_total{outcome=...}` (rendering deferred).
 pub static HASHLINE_EDIT_APPLIED_COUNT: std::sync::atomic::AtomicU64 =

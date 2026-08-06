@@ -94,6 +94,15 @@ impl RenderedSections {
         out = splice_region(&out, &FAILURE_MODES, &self.failure_modes)?;
         Ok(out)
     }
+
+    /// A transiently empty/unreachable catalog renders syntactically valid
+    /// markdown placeholders. Treat it as unsafe to write unless there is at
+    /// least one generated model row that would preserve real catalog data.
+    fn has_usable_model_rows(&self) -> bool {
+        self.provider_details
+            .lines()
+            .any(|line| line.trim_start().starts_with("- `"))
+    }
 }
 
 fn splice_region(src: &str, region: &Region, body: &str) -> Result<String, String> {
@@ -361,6 +370,13 @@ pub fn export_to_file(config: &Config, skill_path: &Path) -> std::io::Result<boo
     let new_body = rendered
         .apply(&src)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if !rendered.has_usable_model_rows() {
+        tracing::warn!(
+            path = %skill_path.display(),
+            "model catalog export produced zero usable models; preserving existing generated sections"
+        );
+        return Ok(false);
+    }
     if new_body == src {
         return Ok(false);
     }

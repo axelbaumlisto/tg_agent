@@ -53,6 +53,58 @@ fn project_slug_conversion() {
 }
 
 #[test]
+fn temp_root_override_is_honoured_for_all_memory_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let _root = MemoryPaths::set_test_root(dir.path());
+    let workspace = Path::new("/tmp/example project");
+
+    assert_eq!(
+        MarkdownMemoryStore::global_memory_path(),
+        dir.path().join("memory/MEMORY.md")
+    );
+    assert_eq!(
+        MarkdownMemoryStore::project_memory_path(workspace),
+        dir.path()
+            .join("projects")
+            .join("-tmp-example project")
+            .join("memory/MEMORY.md")
+    );
+    assert_eq!(
+        MarkdownMemoryStore::user_memory_path("user:42"),
+        dir.path().join("users/user_42/memory/MEMORY.md")
+    );
+}
+
+#[test]
+fn temp_root_override_is_thread_local() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = tempfile::tempdir().unwrap();
+    let _parent_root = MemoryPaths::set_test_root(parent.path());
+
+    let parent_root = parent.path().to_path_buf();
+    let child_root = child.path().to_path_buf();
+    std::thread::spawn(move || {
+        assert_ne!(
+            MarkdownMemoryStore::global_memory_path(),
+            parent_root.join("memory/MEMORY.md"),
+            "child thread must not inherit parent thread's test root"
+        );
+        let _child_root = MemoryPaths::set_test_root(&child_root);
+        assert_eq!(
+            MarkdownMemoryStore::global_memory_path(),
+            child_root.join("memory/MEMORY.md")
+        );
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(
+        MarkdownMemoryStore::global_memory_path(),
+        parent.path().join("memory/MEMORY.md")
+    );
+}
+
+#[test]
 fn save_and_load_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("MEMORY.md");
@@ -95,6 +147,132 @@ fn append_deduplicates() {
 
     let loaded = MarkdownMemoryStore::load(&path, MemoryScope::Project);
     assert_eq!(loaded.len(), 1);
+}
+
+#[test]
+fn dedup_hit_records_reobservation_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let _root = MemoryPaths::set_test_root(dir.path());
+    let path = MarkdownMemoryStore::project_memory_path(Path::new("/tmp/s2-memory"));
+
+    let entry = MemoryEntry::new(
+        MemoryType::Preference,
+        "Use tabs".into(),
+        "user",
+        MemoryScope::Project,
+    );
+    assert!(MarkdownMemoryStore::append(&path, &entry).unwrap());
+
+    let duplicate = MemoryEntry::new(
+        MemoryType::Preference,
+        "  USE   tabs  ".into(),
+        "auto",
+        MemoryScope::Project,
+    );
+    assert!(!MarkdownMemoryStore::append(&path, &duplicate).unwrap());
+
+    let loaded = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].recall_count, 1);
+    let recalled_date = loaded[0]
+        .last_recalled_at
+        .expect("dedup hit should set last_recalled_at")
+        .date_naive();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("recall:1"));
+    assert!(raw.contains(&format!("last_recall:{}", recalled_date.format("%Y-%m-%d"))));
+}
+
+#[test]
+fn dedup_reobservation_count_increments_monotonically_across_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let _root = MemoryPaths::set_test_root(dir.path());
+    let path = MarkdownMemoryStore::project_memory_path(Path::new("/tmp/s2-memory"));
+
+    let entry = MemoryEntry::new(
+        MemoryType::Preference,
+        "Prefer anthropic over qwen".into(),
+        "user",
+        MemoryScope::Project,
+    );
+    assert!(MarkdownMemoryStore::append(&path, &entry).unwrap());
+    assert!(!MarkdownMemoryStore::append(&path, &entry).unwrap());
+
+    let loaded_once = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(loaded_once[0].recall_count, 1);
+
+    assert!(!MarkdownMemoryStore::append(&path, &entry).unwrap());
+    let loaded_twice = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(
+        loaded_twice[0].recall_count,
+        loaded_once[0].recall_count + 1
+    );
+
+    assert!(!MarkdownMemoryStore::append(&path, &entry).unwrap());
+    let loaded_thrice = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(
+        loaded_thrice[0].recall_count,
+        loaded_once[0].recall_count + 2
+    );
+    assert_eq!(loaded_thrice[0].recall_count, 3);
+}
+
+#[test]
+fn brand_new_entry_keeps_default_reobservation_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let _root = MemoryPaths::set_test_root(dir.path());
+    let path = MarkdownMemoryStore::project_memory_path(Path::new("/tmp/s2-memory"));
+
+    let entry = MemoryEntry::new(
+        MemoryType::Preference,
+        "Brand new rule".into(),
+        "user",
+        MemoryScope::Project,
+    );
+    assert!(MarkdownMemoryStore::append(&path, &entry).unwrap());
+
+    let loaded = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].recall_count, 0);
+    assert!(loaded[0].last_recalled_at.is_none());
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("recall:"));
+    assert!(!raw.contains("last_recall:"));
+}
+
+#[test]
+fn old_format_entry_without_recall_suffix_increments_on_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let _root = MemoryPaths::set_test_root(dir.path());
+    let path = MarkdownMemoryStore::project_memory_path(Path::new("/tmp/s2-memory"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "# Memory\n\n## Preferences\n- Use tabs <!-- id:old1 created:2026-04-08 source:user -->\n",
+    )
+    .unwrap();
+
+    let loaded_old = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(loaded_old.len(), 1);
+    assert_eq!(loaded_old[0].id, "old1");
+    assert_eq!(loaded_old[0].recall_count, 0);
+    assert!(loaded_old[0].last_recalled_at.is_none());
+
+    let duplicate = MemoryEntry::new(
+        MemoryType::Preference,
+        "use tabs".into(),
+        "auto",
+        MemoryScope::Project,
+    );
+    assert!(!MarkdownMemoryStore::append_dedup(&path, &duplicate, true).unwrap());
+
+    let loaded_new = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(loaded_new.len(), 1);
+    assert_eq!(loaded_new[0].id, "old1");
+    assert_eq!(loaded_new[0].recall_count, 1);
+    assert!(loaded_new[0].last_recalled_at.is_some());
 }
 
 #[test]
@@ -180,9 +358,89 @@ fn parse_entry_without_metadata() {
 }
 
 #[test]
-fn content_hash_is_normalized() {
-    assert_eq!(content_hash("Use Tabs"), content_hash("  use   tabs  "));
+fn content_hash_normalization_is_pinned() {
+    assert_eq!(
+        normalized_dedup_text("  Use\tRELEASE   build not DEBUG!!!  "),
+        "use release build not debug"
+    );
+    assert_eq!(
+        content_hash("Use Tabs."),
+        content_hash("  use   tabs  "),
+        "trim/case/whitespace/trailing-punctuation normalization must dedup identical rules"
+    );
     assert_ne!(content_hash("Use tabs"), content_hash("Use spaces"));
+}
+
+#[test]
+fn content_hash_is_order_preserving_for_verified_collision_pairs() {
+    let pairs = [
+        ("prefer anthropic over qwen", "prefer qwen over anthropic"),
+        (
+            "push code to github not forgejo",
+            "push code to forgejo not github",
+        ),
+        ("use release build not debug", "use debug build not release"),
+        (
+            "chrome runs on display 1 not 99",
+            "chrome runs on display 99 not 1",
+        ),
+    ];
+
+    for (left, right) in pairs {
+        assert_ne!(
+            content_hash(left),
+            content_hash(right),
+            "order-sensitive memory identities must not collide for {left:?} vs {right:?}"
+        );
+    }
+}
+
+#[test]
+fn content_hash_keeps_digits_distinct() {
+    assert_ne!(content_hash("port 9222"), content_hash("port 9223"));
+    assert_ne!(
+        content_hash("threshold >= 2"),
+        content_hash("threshold >= 3")
+    );
+}
+
+#[test]
+fn append_dedup_keeps_identical_normalized_rules_but_not_order_variants() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("MEMORY.md");
+
+    let first = MemoryEntry::new(
+        MemoryType::Preference,
+        "Chrome runs on display 1 not 99.".into(),
+        "user",
+        MemoryScope::Project,
+    );
+    assert!(MarkdownMemoryStore::append(&path, &first).unwrap());
+
+    let duplicate = MemoryEntry::new(
+        MemoryType::Preference,
+        "  chrome   runs on DISPLAY 1 not 99  ".into(),
+        "auto",
+        MemoryScope::Project,
+    );
+    assert!(
+        !MarkdownMemoryStore::append(&path, &duplicate).unwrap(),
+        "normalized identical content should still dedup"
+    );
+
+    let contradiction = MemoryEntry::new(
+        MemoryType::Preference,
+        "Chrome runs on display 99 not 1".into(),
+        "auto",
+        MemoryScope::Project,
+    );
+    assert!(
+        MarkdownMemoryStore::append(&path, &contradiction).unwrap(),
+        "word-order/digit variants must remain distinct real-shaped entries"
+    );
+
+    let loaded = MarkdownMemoryStore::load(&path, MemoryScope::Project);
+    assert_eq!(loaded.len(), 2);
 }
 
 #[test]

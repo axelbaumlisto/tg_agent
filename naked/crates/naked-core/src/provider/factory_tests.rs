@@ -429,3 +429,68 @@ async fn fallback_model_override_rewrites_request_model() {
         Some("fallback-model")
     );
 }
+
+/// D-INV-PROVIDER-DECORATOR-DELEGATES (B110), fourth wrapper.
+///
+/// `ModelOverrideProvider` is private to `factory.rs`, so it cannot join the
+/// shared wrapper sweep in `provider/mod.rs` — same contract, checked here:
+/// a forgotten forward compiles fine and silently reverts the method to its
+/// trait default (that is exactly how B106 and B110 shipped).
+#[tokio::test]
+async fn b110_model_override_provider_delegates_optional_methods() {
+    struct Probe;
+
+    #[async_trait::async_trait]
+    impl Provider for Probe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn models(&self) -> Vec<crate::types::ModelInfo> {
+            vec![]
+        }
+        fn blacklisted_key_count(&self) -> usize {
+            3
+        }
+        fn total_key_count(&self) -> usize {
+            5
+        }
+        fn key_hint(&self) -> Option<String> {
+            Some("probe-key".into())
+        }
+        fn last_fallback(&self) -> Option<crate::provider::FallbackInfo> {
+            Some(crate::provider::FallbackInfo {
+                requested: "req".into(),
+                served_by: "srv".into(),
+                reason: "why".into(),
+            })
+        }
+        async fn stream_chat(
+            &self,
+            _r: crate::provider::ChatRequest,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures_util::Stream<Item = crate::types::StreamChunk> + Send>>,
+        > {
+            Ok(Box::pin(tokio_stream::iter(vec![
+                crate::types::StreamChunk::Done,
+            ])))
+        }
+    }
+
+    let w = ModelOverrideProvider {
+        inner: Box::new(Probe),
+        model: "whatever".into(),
+    };
+
+    assert_eq!(w.blacklisted_key_count(), 3);
+    assert_eq!(w.total_key_count(), 5);
+    assert_eq!(
+        w.key_hint().as_deref(),
+        Some("probe-key"),
+        "key_hint must delegate (B46 dead-key persistence)"
+    );
+    assert_eq!(
+        w.last_fallback().map(|f| f.served_by).as_deref(),
+        Some("srv"),
+        "last_fallback must delegate (B106 banner)"
+    );
+}

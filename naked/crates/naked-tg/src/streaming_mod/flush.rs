@@ -3,7 +3,34 @@
 use super::*;
 
 const FILE_THRESHOLD: usize = MAX_TG_MSG * 2;
+const LONG_ANSWER_SPLIT_UTF16_THRESHOLD: u64 = 32_768;
 const SUMMARY_CHARS: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SummaryAttachmentResult {
+    summary_delivered: bool,
+    attachment_delivered: bool,
+}
+
+impl SummaryAttachmentResult {
+    fn outcome_for_full_answer(self) -> crate::metrics::FinalAnswerDeliveryOutcome {
+        if !self.attachment_delivered {
+            crate::metrics::FinalAnswerDeliveryOutcome::Failed
+        } else if self.summary_delivered {
+            crate::metrics::FinalAnswerDeliveryOutcome::Ok
+        } else {
+            crate::metrics::FinalAnswerDeliveryOutcome::Partial
+        }
+    }
+
+    fn outcome_for_fallback(self) -> crate::metrics::FinalAnswerDeliveryOutcome {
+        if !self.attachment_delivered {
+            crate::metrics::FinalAnswerDeliveryOutcome::Failed
+        } else {
+            crate::metrics::FinalAnswerDeliveryOutcome::Partial
+        }
+    }
+}
 
 /// Edit with retry: if rate-limited, waits the indicated duration and retries.
 #[allow(dead_code)] // available for non-critical edits that can tolerate drops
@@ -69,6 +96,7 @@ pub(crate) async fn send_final(
     msg_id: MessageId,
     html: &str,
     view: &CompositeView,
+    tg_long_answer_fix_enabled: bool,
 ) {
     let chat_id = ctx.chat_id;
 
@@ -104,34 +132,154 @@ pub(crate) async fn send_final(
     let dropped = view
         .last_dropped_events
         .load(std::sync::atomic::Ordering::Relaxed);
+    let final_utf16_units = crate::metrics::record_final_answer_utf16_from_html(html);
+    let final_truncated = view
+        .last_final_answer_truncated
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if final_truncated {
+        crate::metrics::record_final_answer_truncated();
+    }
+    tracing::info!(
+        final_utf16_units,
+        html_len = html.len(),
+        final_truncated,
+        dropped_events = dropped,
+        "metrics: final answer observed"
+    );
 
-    // Short: fits in one message
-    if html.len() <= MAX_TG_MSG {
-        edit_must_deliver(&bot, chat_id, msg_id, html, true).await;
-        if dropped > 0 {
+    send_final_with_observed_budget(
+        bot,
+        ctx,
+        msg_id,
+        html,
+        view,
+        FinalDeliveryBudget {
+            dropped,
+            utf16_units: final_utf16_units,
+            long_answer_fix_enabled: tg_long_answer_fix_enabled,
+        },
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FinalDeliveryBudget {
+    pub(crate) dropped: usize,
+    pub(crate) utf16_units: u64,
+    pub(crate) long_answer_fix_enabled: bool,
+}
+
+#[cfg(all(test, not(debug_assertions)))]
+pub(crate) async fn send_final_with_budget_for_test(
+    bot: Bot,
+    ctx: ChatCtx,
+    msg_id: MessageId,
+    html: &str,
+    view: &CompositeView,
+    budget: FinalDeliveryBudget,
+) {
+    send_final_with_observed_budget(bot, ctx, msg_id, html, view, budget).await;
+}
+
+async fn send_final_with_observed_budget(
+    bot: Bot,
+    ctx: ChatCtx,
+    msg_id: MessageId,
+    html: &str,
+    view: &CompositeView,
+    budget: FinalDeliveryBudget,
+) {
+    let chat_id = ctx.chat_id;
+
+    // Short: fits in one message. With the long-answer fix enabled,
+    // Telegram's real budget is visible UTF-16 units after entity decoding and
+    // tag stripping; the legacy path remains byte-gated for flag-off goldens.
+    if fits_single_final_payload(html, budget.utf16_units, budget.long_answer_fix_enabled) {
+        if !tg_payload_within_utf16_budget(html, "final single edit") {
+            let result =
+                send_summary_attachment(&bot, ctx, msg_id, view, html.len(), budget.dropped).await;
+            crate::metrics::record_final_answer_delivery(result.outcome_for_fallback());
+            return;
+        }
+        if !edit_must_deliver(&bot, chat_id, msg_id, html, true).await {
+            tracing::warn!(
+                html_len = html.len(),
+                dropped_events = budget.dropped,
+                "final answer single-message edit failed; falling back to summary attachment"
+            );
+            let result =
+                send_summary_attachment(&bot, ctx, msg_id, view, html.len(), budget.dropped).await;
+            crate::metrics::record_final_answer_delivery(result.outcome_for_fallback());
+            return;
+        }
+        if budget.dropped > 0 {
             // Inline was head-truncated — attach full timeline.
             let html_doc = render_html_document(view);
             let input_file =
                 teloxide::types::InputFile::memory(html_doc).file_name("transcript.html");
             if let Err(e) = bot
                 .send_document(chat_id, input_file)
-                .caption(format!("📄 Full timeline (+{dropped} tool events)"))
+                .caption(format!(
+                    "📄 Full timeline (+{} tool events)",
+                    budget.dropped
+                ))
                 .maybe_thread(ctx.thread_id)
                 .maybe_reply_to(ctx.reply_to)
                 .await
             {
-                tracing::warn!("head-truncate full-timeline send_document failed: {e}");
+                crate::metrics::record_final_answer_attachment_send_failed();
+                let safe = redact_for_log(&e);
+                tracing::warn!("head-truncate full-timeline send_document failed: {safe}");
+                crate::metrics::record_final_answer_delivery(
+                    crate::metrics::FinalAnswerDeliveryOutcome::Partial,
+                );
+                return;
             }
         }
+        crate::metrics::record_final_answer_delivery(
+            crate::metrics::FinalAnswerDeliveryOutcome::Ok,
+        );
         return;
     }
 
-    // Medium: fits in 2 chunks
-    if html.len() <= FILE_THRESHOLD {
+    // Medium: split into ordered Telegram messages. Flag-off keeps the legacy
+    // byte threshold; flag-on uses the observed UTF-16 budget so multi-part text
+    // answers up to the measured corpus ceiling avoid lossy attachment fallback.
+    if fits_split_final_payload(html, budget.utf16_units, budget.long_answer_fix_enabled) {
         let chunks = split_html(html, MAX_TG_MSG - 100);
-        if let Some(first) = chunks.first() {
-            edit_must_deliver(&bot, chat_id, msg_id, first, true).await;
+        if let Some((chunk_idx, _)) = chunks
+            .iter()
+            .enumerate()
+            .find(|(_, chunk)| !tg_payload_within_utf16_budget(chunk, "final split chunk"))
+        {
+            tracing::warn!(
+                html_len = html.len(),
+                chunk_count = chunks.len(),
+                chunk_idx,
+                dropped_events = budget.dropped,
+                "final answer split chunk exceeded Telegram budget; falling back to summary attachment"
+            );
+            let result =
+                send_summary_attachment(&bot, ctx, msg_id, view, html.len(), budget.dropped).await;
+            crate::metrics::record_final_answer_delivery(result.outcome_for_fallback());
+            return;
         }
+        if let Some(first) = chunks.first()
+            && !edit_must_deliver(&bot, chat_id, msg_id, first, true).await
+        {
+            tracing::warn!(
+                html_len = html.len(),
+                chunk_count = chunks.len(),
+                first_chunk_len = first.len(),
+                dropped_events = budget.dropped,
+                "final answer first chunk edit failed; falling back to summary attachment"
+            );
+            let result =
+                send_summary_attachment(&bot, ctx, msg_id, view, html.len(), budget.dropped).await;
+            crate::metrics::record_final_answer_delivery(result.outcome_for_fallback());
+            return;
+        }
+        let mut later_chunk_failed = false;
         for chunk in chunks.iter().skip(1) {
             let res = bot
                 .send_message(chat_id, chunk.as_str())
@@ -140,33 +288,118 @@ pub(crate) async fn send_final(
                 .maybe_reply_to(ctx.reply_to)
                 .await;
             if let Err(e) = res {
-                tracing::warn!("send chunk (HTML) failed: {e}, retrying plain text");
+                let safe = redact_for_log(&e);
+                tracing::warn!("send chunk (HTML) failed: {safe}, retrying plain text");
                 if let Err(e2) = bot
                     .send_message(chat_id, chunk.as_str())
                     .maybe_thread(ctx.thread_id)
                     .maybe_reply_to(ctx.reply_to)
                     .await
                 {
-                    tracing::error!("send chunk (plain) also failed: {e2}");
+                    later_chunk_failed = true;
+                    let safe2 = redact_for_log(&e2);
+                    tracing::error!("send chunk (plain) also failed: {safe2}");
                 }
             }
         }
+        crate::metrics::record_final_answer_delivery(if later_chunk_failed {
+            crate::metrics::FinalAnswerDeliveryOutcome::Partial
+        } else {
+            crate::metrics::FinalAnswerDeliveryOutcome::Ok
+        });
         return;
     }
 
+    let result = send_summary_attachment(&bot, ctx, msg_id, view, html.len(), budget.dropped).await;
+    crate::metrics::record_final_answer_delivery(result.outcome_for_full_answer());
+}
+
+fn fits_single_final_payload(
+    html: &str,
+    final_utf16_units: u64,
+    tg_long_answer_fix_enabled: bool,
+) -> bool {
+    if tg_long_answer_fix_enabled {
+        final_utf16_units <= MAX_TG_MSG as u64
+    } else {
+        html.len() <= MAX_TG_MSG
+    }
+}
+
+fn fits_split_final_payload(
+    html: &str,
+    final_utf16_units: u64,
+    tg_long_answer_fix_enabled: bool,
+) -> bool {
+    if tg_long_answer_fix_enabled {
+        final_utf16_units <= LONG_ANSWER_SPLIT_UTF16_THRESHOLD
+    } else {
+        html.len() <= FILE_THRESHOLD
+    }
+}
+
+fn tg_payload_within_utf16_budget(html: &str, payload_kind: &str) -> bool {
+    let utf16_units = markup::telegram_html_text_utf16_units(html);
+    let within_budget = utf16_units <= MAX_TG_MSG as u64;
+    debug_assert!(
+        within_budget,
+        "{payload_kind} exceeds Telegram payload budget: {utf16_units} UTF-16 units > {MAX_TG_MSG}"
+    );
+    if !within_budget {
+        tracing::warn!(
+            payload_kind,
+            utf16_units,
+            max_utf16_units = MAX_TG_MSG,
+            html_len = html.len(),
+            "final answer payload exceeds Telegram UTF-16 budget; falling back to summary attachment"
+        );
+    }
+    within_budget
+}
+
+async fn send_summary_attachment(
+    bot: &Bot,
+    ctx: ChatCtx,
+    msg_id: MessageId,
+    view: &CompositeView,
+    html_len: usize,
+    dropped: usize,
+) -> SummaryAttachmentResult {
     let summary = view.render_summary(SUMMARY_CHARS);
-    edit_must_deliver(&bot, chat_id, msg_id, &summary, true).await;
+    let summary_delivered = if tg_payload_within_utf16_budget(&summary, "final summary edit") {
+        edit_must_deliver(bot, ctx.chat_id, msg_id, &summary, true).await
+    } else {
+        false
+    };
+    if !summary_delivered {
+        tracing::warn!(
+            html_len,
+            summary_len = summary.len(),
+            dropped_events = dropped,
+            "final answer summary edit failed; sending attachment anyway"
+        );
+    }
 
     let html_doc = render_html_document(view);
     let input_file = teloxide::types::InputFile::memory(html_doc).file_name("response.html");
-    if let Err(e) = bot
-        .send_document(chat_id, input_file)
+    let attachment_delivered = match bot
+        .send_document(ctx.chat_id, input_file)
         .caption("📄 Full response")
         .maybe_thread(ctx.thread_id)
         .maybe_reply_to(ctx.reply_to)
         .await
     {
-        tracing::warn!("send_document failed: {e}");
+        Ok(_) => true,
+        Err(e) => {
+            crate::metrics::record_final_answer_attachment_send_failed();
+            let safe = redact_for_log(&e);
+            tracing::warn!("send_document failed: {safe}");
+            false
+        }
+    };
+    SummaryAttachmentResult {
+        summary_delivered,
+        attachment_delivered,
     }
 }
 
@@ -227,9 +460,10 @@ pub(crate) async fn ask_permission(
         // BUG_REGISTRY B23 (silent let-else) + B36 fallout:
         // log loudly so operator can see HTML-injection / TG API failures
         // instead of seeing fake "Permission denied by user" tool results.
+        let safe = redact_for_log(e);
         tracing::error!(
             tool = %tool_name,
-            error = %e,
+            error = %safe,
             preview = %preview,
             "permission card send FAILED — user will see no prompt and \
              tool will be auto-denied. Likely HTML injection in preview."

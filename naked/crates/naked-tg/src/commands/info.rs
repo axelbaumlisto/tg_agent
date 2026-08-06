@@ -23,6 +23,8 @@ pub(crate) async fn cmd_help(
 /compact — compact session history
 /model — switch model
 /reasoning — set thinking level
+/yolo — auto-approve tools (1st: 30d for this topic; 2nd in chat: permanent)
+/yolo off — turn off & reset YOLO for this chat
 /sessions — list active sessions
 /metrics — bot performance stats
 /reload — reload config
@@ -206,6 +208,24 @@ pub(crate) async fn cmd_metrics(
 mod tests {
     use super::fmt_age;
     use std::time::Duration;
+
+    /// Source-text assertion (same convention as research.rs help tests):
+    /// the /help command literal is the operator-facing contract, and
+    /// `/yolo off` is the ONLY way to revoke a permanent chat-wide YOLO
+    /// grant, so it must stay discoverable in help.
+    #[test]
+    fn help_documents_yolo_commands() {
+        let src = include_str!("info.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("/yolo —"),
+            "/help must document the /yolo command"
+        );
+        assert!(
+            prod.contains("/yolo off"),
+            "/help must document /yolo off (only way to revoke permanent YOLO)"
+        );
+    }
 
     #[test]
     fn fmt_age_seconds_only() {

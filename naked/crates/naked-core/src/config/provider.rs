@@ -123,6 +123,23 @@ impl ProviderConfig {
             .unwrap_or(model)
     }
 
+    /// Is `model` selectable on this provider?
+    ///
+    /// Accepts the literal id, an alias KEY (what menus show), or an alias
+    /// TARGET (the upstream id). Single source of truth: this predicate was
+    /// open-coded in three places with two DIFFERENT shapes — `turn::
+    /// validate_model` and `set_session_provider` checked
+    /// `models | alias keys | alias values` while `ModelSelector::validate`
+    /// checked `models (literal or alias-resolved) | alias keys`. A model
+    /// could therefore pass one gate and fail another, which is how a `/model`
+    /// pick can be accepted and then rejected at turn time.
+    pub fn serves_model(&self, model: &str) -> bool {
+        let real = self.resolve_model_alias(model);
+        self.models.iter().any(|m| m == model || m == real)
+            || self.model_aliases.contains_key(model)
+            || self.model_aliases.values().any(|v| v == model)
+    }
+
     /// Look up the capability block for `model`, trying the literal id
     /// first and falling back to the alias-resolved id if the literal
     /// wasn't registered. Returns a cloned permissive default
@@ -241,5 +258,111 @@ mod tests {
         let caps = pc.capabilities_for("unknown-model");
         // Should return default capabilities, not panic
         assert!(caps.context_window.is_none() || caps.context_window.is_some());
+    }
+
+    /// Alias-resolved capability fallback: caps registered under the
+    /// canonical target id must be inherited when looked up via the alias.
+    /// Guards the `resolve_model_alias` fallback branch in
+    /// [`ProviderConfig::capabilities_for`] — deleting it makes an alias
+    /// lookup return `unknown()` instead of the canonical caps.
+    #[test]
+    fn capabilities_for_alias_inherits_canonical_target() {
+        use crate::model_catalog::ModelCapabilities;
+
+        // Distinctive, non-default caps registered under the CANONICAL id.
+        let canonical_caps = ModelCapabilities {
+            supports_vision: Some(true),
+            context_window: Some(200_000),
+            ..ModelCapabilities::unknown()
+        };
+
+        let mut pc = test_pc(); // model_aliases: {"fast" -> "gpt-4o-mini"}
+        pc.capabilities
+            .insert("gpt-4o-mini".into(), canonical_caps.clone());
+
+        // Alias lookup inherits the canonical target's caps (fallback branch),
+        // NOT unknown().
+        let via_alias = pc.capabilities_for("fast");
+        assert_eq!(via_alias.supports_vision, Some(true));
+        assert_eq!(via_alias.context_window, Some(200_000));
+        let unknown = ModelCapabilities::unknown();
+        assert_ne!(
+            via_alias.context_window, unknown.context_window,
+            "alias must not fall through to unknown()"
+        );
+    }
+
+    /// Literal-registered id wins over any alias resolution (literal-first).
+    #[test]
+    fn capabilities_for_literal_registered_wins() {
+        use crate::model_catalog::ModelCapabilities;
+
+        let literal_caps = ModelCapabilities {
+            context_window: Some(512),
+            ..ModelCapabilities::unknown()
+        };
+        let canonical_caps = ModelCapabilities {
+            context_window: Some(200_000),
+            ..ModelCapabilities::unknown()
+        };
+
+        let mut pc = test_pc(); // model_aliases: {"fast" -> "gpt-4o-mini"}
+        // Register BOTH the alias key literally and the canonical target,
+        // with different caps; literal must win.
+        pc.capabilities.insert("fast".into(), literal_caps);
+        pc.capabilities.insert("gpt-4o-mini".into(), canonical_caps);
+
+        let caps = pc.capabilities_for("fast");
+        assert_eq!(caps.context_window, Some(512));
+    }
+
+    /// A model that is neither literally registered nor an alias falls back
+    /// to the permissive `unknown()` default.
+    #[test]
+    fn capabilities_for_totally_unknown_is_unknown_default() {
+        use crate::model_catalog::ModelCapabilities;
+
+        let pc = test_pc();
+        let caps = pc.capabilities_for("totally-unknown");
+        let unknown = ModelCapabilities::unknown();
+        assert_eq!(caps.supports_vision, unknown.supports_vision);
+        assert_eq!(caps.context_window, unknown.context_window);
+        assert_eq!(caps.status, unknown.status);
+    }
+    // ── serves_model: one predicate for every model-selectability gate ─────
+    //
+    // Was open-coded in three places with TWO different shapes, so a model
+    // could pass `/model` and then be rejected at turn time. These pin the
+    // union all callers now share.
+
+    #[test]
+    fn serves_model_accepts_literal_alias_key_and_alias_target() {
+        let pc = test_pc();
+        assert!(pc.serves_model("gpt-4o"), "literal id");
+        assert!(pc.serves_model("fast"), "alias key (what menus show)");
+        assert!(
+            pc.serves_model("gpt-4o-mini"),
+            "alias target is also a listed model"
+        );
+    }
+
+    #[test]
+    fn serves_model_accepts_alias_target_not_in_models() {
+        // Alias points at an upstream id the provider does not list directly.
+        let pc = ProviderConfig {
+            models: vec!["listed".into()],
+            model_aliases: HashMap::from([("nice-name".into(), "opaque-upstream-id".into())]),
+            ..Default::default()
+        };
+        assert!(pc.serves_model("nice-name"), "alias key");
+        assert!(pc.serves_model("opaque-upstream-id"), "alias target");
+        assert!(pc.serves_model("listed"));
+    }
+
+    #[test]
+    fn serves_model_rejects_unknown() {
+        let pc = test_pc();
+        assert!(!pc.serves_model("claude-sonnet-4-6"));
+        assert!(!pc.serves_model(""));
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::fs;
 
-use crate::config::{Config, SessionConfig};
+use crate::config::{Config, SessionConfig, YOLO_TTL_SECS};
 use crate::error::{AgentError, Result};
 use crate::services::provider_svc::ProviderService;
 use crate::services::session_state::SessionState;
@@ -67,10 +67,16 @@ impl SessionConfigService {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<()> {
-        if let Some(p) = provider
-            && !config.providers.contains_key(p)
-        {
-            return Err(AgentError::ProviderNotConfigured(p.to_string()));
+        // B105: accept a retired provider name if `provider_aliases` maps it
+        // to a live one. Without this, an alias is settable by an inherited
+        // session pin but NOT by an explicit `/model` pick, which would be an
+        // inconsistent surface. Validation below runs against the RESOLVED
+        // provider so the model check uses the catalog that will serve it.
+        if let Some(p) = provider {
+            let (resolved, _) = config.resolve_provider_alias(p);
+            if !config.providers.contains_key(&resolved) {
+                return Err(AgentError::ProviderNotConfigured(p.to_string()));
+            }
         }
 
         if let Some(m) = model {
@@ -83,24 +89,23 @@ impl SessionConfigService {
                         .map(|s| s.metadata.provider.clone())
                 })
                 .unwrap_or_else(|| config.default_provider.clone());
+            // Resolve aliases before the per-provider model check.
+            let (target_provider, _) = config.resolve_provider_alias(&target_provider);
 
-            if let Some(pc) = config.providers.get(&target_provider) {
-                let valid = pc.models.iter().any(|x| x == m)
-                    || pc.model_aliases.contains_key(m)
-                    || pc.model_aliases.values().any(|v| v == m);
-                if !valid {
-                    let available: Vec<_> = pc
-                        .models
-                        .iter()
-                        .chain(pc.model_aliases.keys())
-                        .take(8)
-                        .cloned()
-                        .collect();
-                    return Err(AgentError::Config(format!(
-                        "model '{m}' not found on provider '{target_provider}'. Available: {}",
-                        available.join(", ")
-                    )));
-                }
+            if let Some(pc) = config.providers.get(&target_provider)
+                && !pc.serves_model(m)
+            {
+                let available: Vec<_> = pc
+                    .models
+                    .iter()
+                    .chain(pc.model_aliases.keys())
+                    .take(8)
+                    .cloned()
+                    .collect();
+                return Err(AgentError::Config(format!(
+                    "model '{m}' not found on provider '{target_provider}'. Available: {}",
+                    available.join(", ")
+                )));
             }
         }
 
@@ -150,6 +155,9 @@ impl SessionConfigService {
     pub async fn set_session_yolo(&self, session_id: &str, enabled_at: Option<i64>) -> Result<()> {
         let mut sc = self.load_config(session_id);
         sc.yolo_enabled_at = enabled_at;
+        // Stamp the current TTL window on enable so a restart judges this grant
+        // against the window it was created under; clear it on disable.
+        sc.yolo_ttl_secs = enabled_at.map(|_| YOLO_TTL_SECS);
         self.persist_config(session_id, &sc).await
     }
 
@@ -239,6 +247,73 @@ mod tests {
 
         svc.set_session_reasoning(&sid, "off").await.unwrap();
         assert_eq!(svc.session_reasoning(&sid).await, None);
+    }
+
+    #[tokio::test]
+    async fn set_session_yolo_stamps_and_clears_ttl() {
+        let tc = TestCore::build();
+        let svc = build_service(&tc);
+        let sid = tc.core.create_session(&tc.workspace()).await;
+
+        // Enabling stamps both the timestamp and the 30d TTL window so a
+        // restart judges the grant against the window it was created under.
+        let ts = 1_700_000_000;
+        svc.set_session_yolo(&sid, Some(ts)).await.unwrap();
+        let cfg = svc.load_config(&sid);
+        assert_eq!(cfg.yolo_enabled_at, Some(ts));
+        assert_eq!(cfg.yolo_ttl_secs, Some(YOLO_TTL_SECS));
+
+        // Disabling clears both fields.
+        svc.set_session_yolo(&sid, None).await.unwrap();
+        let cfg = svc.load_config(&sid);
+        assert_eq!(cfg.yolo_enabled_at, None);
+        assert_eq!(cfg.yolo_ttl_secs, None);
+    }
+
+    // ── D-INV-PROVIDER-ALIAS (B105), `/model` surface ─────────────────────
+    //
+    // An alias must be settable EXPLICITLY too, not only inherited from an
+    // old session pin — otherwise `/model` rejects the very name the bot
+    // itself still shows. Dropping the alias resolution in
+    // `set_session_provider` fails the first test.
+
+    #[tokio::test]
+    async fn b105_set_provider_accepts_aliased_retired_name() {
+        let tc = TestCore::build();
+        let svc = build_service(&tc);
+        let sid = tc.core.create_session(&tc.workspace()).await;
+
+        let mut cfg: crate::config::Config = (**tc.core.config()).clone();
+        cfg.provider_aliases
+            .insert("qwen".into(), "noop/noop-model".into());
+        cfg.providers.insert(
+            "noop".into(),
+            crate::config::ProviderConfig {
+                api_key: "k".into(),
+                models: vec!["noop-model".into()],
+                ..Default::default()
+            },
+        );
+
+        svc.set_session_provider(Arc::new(cfg), &sid, Some("qwen"), None)
+            .await
+            .expect("an aliased retired provider must be accepted");
+    }
+
+    #[tokio::test]
+    async fn b105_set_provider_still_rejects_unaliased_unknown() {
+        let tc = TestCore::build();
+        let svc = build_service(&tc);
+        let sid = tc.core.create_session(&tc.workspace()).await;
+
+        let cfg = Arc::clone(&tc.core.config());
+        let err = svc
+            .set_session_provider(cfg, &sid, Some("totally_unknown"), None)
+            .await;
+        assert!(
+            err.is_err(),
+            "a name with no alias and no catalog entry must still be rejected"
+        );
     }
 
     #[tokio::test]

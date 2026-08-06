@@ -37,6 +37,7 @@ pub(crate) use streaming::stream_response;
 
 // ── Structural pipeline modules ────────────────────────────────────────────
 mod bootstrap;
+mod harness;
 mod runtime;
 mod wiring;
 
@@ -44,5 +45,12 @@ mod wiring;
 
 #[tokio::main]
 async fn main() {
+    // Headless test-interface: `naked-tg harness` drives the real core over a
+    // stdin/stdout JSONL protocol instead of Telegram. Dispatched before any
+    // Telegram/bootstrap wiring so it needs no bot token or live config.
+    if std::env::args().nth(1).as_deref() == Some("harness") {
+        harness::run().await;
+        return;
+    }
     bootstrap::run().await;
 }

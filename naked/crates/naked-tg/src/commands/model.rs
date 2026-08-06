@@ -56,7 +56,8 @@ pub(crate) async fn cmd_provider(
         {
             Ok(m) => tracing::debug!(msg_id = m.id.0, "sent provider keyboard"),
             Err(e) => {
-                tracing::error!("failed to send provider keyboard: {e}");
+                let safe = redact_for_log(&e);
+                tracing::error!("failed to send provider keyboard: {safe}");
                 return Err(e);
             }
         }

@@ -19,12 +19,15 @@ pub(crate) use tokio::sync::{RwLock, oneshot};
 
 pub(crate) use naked_core::AgentCore;
 pub(crate) use naked_core::config::Config;
+pub(crate) use naked_core::research::tool::redact::redact_for_log;
 pub(crate) use naked_core::types::{
     AgentEvent, AgentHandle, Permission, PermissionResponse, TurnUsage,
 };
 
 // ── Re-export from sibling crate modules ──────────────────────────────────
-pub(crate) use naked_tg::channel_map::{ChannelSessionMap, format_tg_channel_id};
+pub(crate) use naked_tg::channel_map::{
+    ChannelSessionMap, YoloEscalation, YoloTier, format_tg_channel_id,
+};
 
 // ── Re-export naked_tg library helpers used throughout ──────────────────────
 pub(crate) use naked_tg::helpers::parse_interval;
@@ -61,9 +64,112 @@ pub(crate) const REPLY_QUOTE_MAX_CHARS: usize = 1000;
 // ── Type aliases ───────────────────────────────────────────────────────────
 
 /// Global rate limiter for Telegram API calls (edit_message_text).
-/// Key: call_id → (sender, chat_id, thread_id) so /yolo can drain only matching topic.
+/// Key: call_id → (sender, chat_id, thread_id). A temporary `/yolo` grant
+/// drains only the matching topic; a permanent escalation drains chat-wide
+/// (see `approve_pending_perms`' `chat_wide` below).
 pub(crate) type PendingPermissions =
     Arc<RwLock<HashMap<String, (oneshot::Sender<bool>, i64, Option<i32>)>>>;
+
+/// Approve (send `true` to) pending permission requests for a chat and return
+/// how many were released. When `chat_wide` is true EVERY pending request in
+/// the chat is approved (used on a permanent escalation, which auto-approves
+/// across all topics); otherwise only the given topic's requests are approved.
+/// Single source of truth shared by the callback and command yolo paths (DRY).
+pub(crate) async fn approve_pending_perms(
+    pending_perms: &PendingPermissions,
+    cid: i64,
+    tid: Option<i32>,
+    chat_wide: bool,
+) -> usize {
+    let mut perms = pending_perms.write().await;
+    let matching: Vec<String> = perms
+        .iter()
+        .filter(|(_, (_, c, t))| *c == cid && (chat_wide || *t == tid))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let n = matching.len();
+    for key in matching {
+        if let Some((tx, _, _)) = perms.remove(&key) {
+            let _ = tx.send(true);
+        }
+    }
+    n
+}
+
+/// Deny (send `false` to) and remove EVERY pending permission request for a
+/// chat, across all topics, returning how many were drained. Called by
+/// `/yolo off` (BUG_REGISTRY B87): every pending card carries a live "⚡ YOLO"
+/// button, and revocation resets the per-chat escalation count — so a card
+/// left alive after `/yolo off` could be tapped later (by any chat member) to
+/// silently re-enable/escalate YOLO. Draining is chat-wide (matching
+/// `clear_yolo_chat`) and fail-closed: the parked `ask_permission` future
+/// resolves `false` immediately, so the pending tool is denied rather than
+/// left dangling until timeout. Other chats' cards are untouched. There are
+/// no non-YOLO-capable entries to preserve: every `pending_perms` entry IS a
+/// permission card with a ⚡ button (see `ask_permission`).
+pub(crate) async fn deny_pending_perms(pending_perms: &PendingPermissions, cid: i64) -> usize {
+    let mut perms = pending_perms.write().await;
+    let matching: Vec<String> = perms
+        .iter()
+        .filter(|(_, (_, c, _))| *c == cid)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let n = matching.len();
+    for key in matching {
+        if let Some((tx, _, _)) = perms.remove(&key) {
+            let _ = tx.send(false);
+        }
+    }
+    n
+}
+
+/// Atomically CLAIM the triggering permission `call_id` for a yolo enable:
+/// remove it from the pending map IFF it belongs to this chat/topic and, when
+/// it does, send its approval (`true`). Returns whether the claim succeeded
+/// (the `call_id` was present AND matched this chat/topic).
+///
+/// Pure w.r.t. locking (the caller passes a `&mut` to the map it already holds
+/// under a single write lock) so it stays unit-testable AND the check +
+/// state-change happen together. This closes the callback TOCTOU (security): a
+/// concurrent deny/allow/timeout can no longer remove the `call_id` between a
+/// read-only "is this live?" check and the enable, which would otherwise let an
+/// already-answered/expired card still enable + count toward permanent.
+///
+/// The claimed perm's approval is sent HERE, and the perm is removed, so the
+/// follow-up chat/topic drain ([`approve_pending_perms`]) cannot re-find it —
+/// the claimed request is released exactly once (no double `tx.send`).
+pub(crate) fn claim_pending_perm(
+    perms: &mut HashMap<String, (oneshot::Sender<bool>, i64, Option<i32>)>,
+    call_id: &str,
+    cid: i64,
+    tid: Option<i32>,
+) -> bool {
+    // Verify ownership BEFORE removing so a tap claiming another chat/topic
+    // cannot drain an unrelated pending request.
+    let matches = perms
+        .get(call_id)
+        .map(|(_, c, t)| *c == cid && *t == tid)
+        .unwrap_or(false);
+    if matches && let Some((tx, _, _)) = perms.remove(call_id) {
+        let _ = tx.send(true);
+    }
+    matches
+}
+
+/// Persist the channel-map snapshot IMMEDIATELY when an enable reached the
+/// permanent tier, so a restart before the periodic 30s flush can't lose the
+/// chat-wide grant. Temporary grants ride the periodic flush (no need to force
+/// a write on every temp enable). Shared by both enable paths (DRY). A flush
+/// error is logged, not propagated: the in-memory grant is still active and the
+/// next periodic flush retries.
+pub(crate) async fn persist_permanent(channel_map: &ChannelSessionMap, tier: &YoloTier) {
+    if matches!(tier, YoloTier::Permanent)
+        && let Err(e) = channel_map.flush().await
+    {
+        let safe = redact_for_log(&e);
+        tracing::error!("failed to flush channel_map after permanent yolo: {safe}");
+    }
+}
 
 // ── ChatCtx ────────────────────────────────────────────────────────────────
 
@@ -244,7 +350,10 @@ pub(crate) async fn safe_send(
                 Ok(m) => last_msg = Some(m),
                 Err(e) => {
                     // HTML parse error → retry without parse_mode.
-                    tracing::warn!("safe_send chunk (mode={mode:?}) failed: {e}, retrying plain");
+                    let safe = redact_for_log(&e);
+                    tracing::warn!(
+                        "safe_send chunk (mode={mode:?}) failed: {safe}, retrying plain"
+                    );
                     let fallback = bot
                         .send_message(ctx.chat_id, chunk.as_str())
                         .maybe_thread(ctx.thread_id)
@@ -285,7 +394,8 @@ pub(crate) async fn safe_send(
         .maybe_thread(ctx.thread_id)
         .await
     {
-        tracing::warn!("safe_send: send_document failed: {e}");
+        let safe = redact_for_log(&e);
+        tracing::warn!("safe_send: send_document failed: {safe}");
     }
     Ok(msg)
 }
@@ -366,7 +476,10 @@ pub(crate) async fn send_typing_raw(
                 tracing::warn!(chat_id, ?thread_id, "typing: API error: {}", json);
             }
         }
-        Err(e) => tracing::debug!(chat_id, ?thread_id, "typing: network error: {e}"),
+        Err(e) => {
+            let safe = redact_for_log(&e);
+            tracing::debug!(chat_id, ?thread_id, "typing: network error: {safe}");
+        }
     }
 }
 
@@ -596,7 +709,8 @@ pub(crate) async fn run_health_server(port: u16) {
             l
         }
         Err(e) => {
-            tracing::warn!("Failed to bind health port {port}: {e}");
+            let safe = redact_for_log(&e);
+            tracing::warn!("Failed to bind health port {port}: {safe}");
             return;
         }
     };
@@ -696,6 +810,147 @@ mod safe_send_tests {
         assert!(
             !prod.contains("fn tg_truncate"),
             "tg_truncate must not exist (replaced by tail_truncate + safe_send)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod yolo_helper_tests {
+    use super::*;
+
+    fn pending() -> PendingPermissions {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[test]
+    fn claim_pending_perm_removes_and_sends_only_on_exact_match() {
+        // Fix 2: the atomic claim gates escalation AND releases the perm. A
+        // failed claim (unknown/wrong chat/wrong topic) leaves the map untouched
+        // and sends nothing; an exact match removes the perm and approves it
+        // exactly once.
+        let mut perms: HashMap<String, (oneshot::Sender<bool>, i64, Option<i32>)> = HashMap::new();
+        let (tx, mut rx) = oneshot::channel::<bool>();
+        perms.insert("live".into(), (tx, 100, Some(7)));
+
+        assert!(
+            !claim_pending_perm(&mut perms, "gone", 100, Some(7)),
+            "unknown call_id (stale/answered card) is rejected"
+        );
+        assert!(
+            !claim_pending_perm(&mut perms, "live", 999, Some(7)),
+            "wrong chat is rejected"
+        );
+        assert!(
+            !claim_pending_perm(&mut perms, "live", 100, Some(8)),
+            "wrong topic is rejected"
+        );
+        assert!(
+            perms.contains_key("live"),
+            "failed claims leave the perm pending"
+        );
+        assert!(rx.try_recv().is_err(), "failed claims send nothing");
+
+        // Exact match: claim succeeds, perm removed, approval sent exactly once.
+        assert!(
+            claim_pending_perm(&mut perms, "live", 100, Some(7)),
+            "exact match claims"
+        );
+        assert!(!perms.contains_key("live"), "claimed perm removed");
+        assert!(
+            matches!(rx.try_recv(), Ok(true)),
+            "claimed perm approved exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_pending_perms_drains_only_the_chat_across_all_topics() {
+        // B87: `/yolo off` must fail-closed every pending card of the chat
+        // (all topics — revocation is chat-wide like `clear_yolo_chat`) while
+        // leaving other chats' cards pending and unanswered.
+        let perms = pending();
+        let (tx_a, rx_a) = oneshot::channel::<bool>();
+        let (tx_b, rx_b) = oneshot::channel::<bool>();
+        let (tx_c, mut rx_c) = oneshot::channel::<bool>();
+        {
+            let mut p = perms.write().await;
+            p.insert("a".into(), (tx_a, 100, Some(7))); // chat 100, topic 7
+            p.insert("b".into(), (tx_b, 100, Some(8))); // chat 100, topic 8
+            p.insert("c".into(), (tx_c, 200, Some(7))); // ANOTHER chat
+        }
+        let n = deny_pending_perms(&perms, 100).await;
+        assert_eq!(n, 2, "both of chat 100's cards drained, across topics");
+        assert_eq!(rx_a.await, Ok(false), "denied, not approved");
+        assert_eq!(rx_b.await, Ok(false), "sibling topic denied too");
+        assert!(
+            rx_c.try_recv().is_err(),
+            "other chat's card gets no verdict"
+        );
+        let remaining = perms.read().await;
+        assert_eq!(remaining.len(), 1);
+        assert!(
+            remaining.contains_key("c"),
+            "other chat's card still pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_pending_perms_topic_scoped_vs_chat_wide() {
+        // Fix 3: temporary enable approves only the current topic; permanent
+        // enable approves the whole chat (all topics).
+        let perms = pending();
+        let (tx_a, rx_a) = oneshot::channel::<bool>();
+        let (tx_b, rx_b) = oneshot::channel::<bool>();
+        {
+            let mut p = perms.write().await;
+            p.insert("a".into(), (tx_a, 100, Some(7))); // topic 7
+            p.insert("b".into(), (tx_b, 100, Some(8))); // topic 8
+        }
+        // Topic-scoped: only topic 7 released, topic 8 still pending.
+        let n = approve_pending_perms(&perms, 100, Some(7), false).await;
+        assert_eq!(n, 1);
+        assert_eq!(rx_a.await, Ok(true), "topic-7 request approved");
+        assert_eq!(perms.read().await.len(), 1, "topic-8 request still pending");
+
+        // Chat-wide: the remaining sibling-topic request is released even though
+        // the enable came from a different topic.
+        let n = approve_pending_perms(&perms, 100, Some(7), true).await;
+        assert_eq!(n, 1);
+        assert_eq!(
+            rx_b.await,
+            Ok(true),
+            "sibling topic-8 request approved chat-wide"
+        );
+        assert!(perms.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_permanent_flushes_only_on_permanent_and_survives_reopen() {
+        // Fix 2: a permanent escalation is flushed immediately so it survives a
+        // restart BEFORE the periodic flush; a temporary enable is not forced.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let map = ChannelSessionMap::open(dir.path()).await.expect("open");
+
+        // 1st enable: temporary — persist_permanent must NOT force a flush, so a
+        // fresh reopen (from disk) sees no grant at all.
+        let first = map.enable_yolo(1, Some(5), None).await;
+        assert!(matches!(first.tier, YoloTier::Temporary { .. }));
+        persist_permanent(&map, &first.tier).await;
+        let reopened = ChannelSessionMap::open(dir.path()).await.expect("reopen");
+        assert!(
+            !reopened.is_yolo(1, Some(5)).await,
+            "temporary enable is not force-flushed, so nothing persisted yet"
+        );
+
+        // 2nd distinct enable: permanent — persist_permanent flushes so it
+        // survives a reopen without waiting for the periodic writer. A permanent
+        // grant is chat-wide, so is_yolo is true for ANY topic after reload.
+        let second = map.enable_yolo(1, Some(6), None).await;
+        assert!(matches!(second.tier, YoloTier::Permanent));
+        persist_permanent(&map, &second.tier).await;
+        let reopened2 = ChannelSessionMap::open(dir.path()).await.expect("reopen2");
+        assert!(
+            reopened2.is_yolo(1, Some(999)).await,
+            "permanent grant survived restart via immediate flush"
         );
     }
 }

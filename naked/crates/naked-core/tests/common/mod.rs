@@ -1268,18 +1268,6 @@ pub fn build_tools_with_memory(workspace: PathBuf) -> ToolRegistry {
     ToolRegistry::new(tools)
 }
 
-macro_rules! need_naked_home {
-    () => {
-        match std::env::var("NAKED_HOME") {
-            Ok(v) if !v.is_empty() => {}
-            _ => {
-                eprintln!("SKIP: NAKED_HOME not set (required for memory e2e tests)");
-                return;
-            }
-        }
-    };
-}
-
 pub fn fixture_image_path() -> Option<PathBuf> {
     // crates/naked-core/tests/e2e_live.rs → naked/
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -139,8 +139,16 @@ impl LoopConfig {
     /// Record one health event iff a tracker is attached and the
     /// provider id is non-empty. Centralised so the three call sites
     /// don't repeat the same guard.
-    pub(crate) fn record_health(
+    /// B106: record health against the provider that ACTUALLY served the
+    /// turn. `served_by = None` keeps the configured identity.
+    ///
+    /// Without this, a turn that groq rejected with 413 and deepseek then
+    /// answered was written to `model_health.jsonl` as `groq: success` —
+    /// poisoning the very data the catalog/selector reads to decide which
+    /// provider is healthy.
+    pub(crate) fn record_health_as(
         &self,
+        served_by: Option<&str>,
         kind: crate::model_catalog::HealthEventKind,
         latency_ms: Option<u64>,
         detail: Option<String>,
@@ -149,7 +157,8 @@ impl LoopConfig {
             return;
         }
         if let Some(h) = &self.health {
-            h.record(&self.provider, &self.model, kind, latency_ms, detail);
+            let provider = served_by.unwrap_or(&self.provider);
+            h.record(provider, &self.model, kind, latency_ms, detail);
         }
     }
 }
@@ -163,6 +172,24 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// B106: name of the provider that actually served the last stream,
+    /// falling back to the configured one when no fallback happened.
+    pub(crate) fn effective_provider_name(&self) -> Option<String> {
+        self.provider.last_fallback().map(|f| f.served_by)
+    }
+
+    /// B106: record health against whoever actually answered.
+    pub(crate) fn record_health_effective(
+        &self,
+        kind: crate::model_catalog::HealthEventKind,
+        latency_ms: Option<u64>,
+        detail: Option<String>,
+    ) {
+        let served = self.effective_provider_name();
+        self.config
+            .record_health_as(served.as_deref(), kind, latency_ms, detail);
+    }
+
     pub fn new(provider: Box<dyn Provider>, tools: ToolRegistry, config: LoopConfig) -> Self {
         let own_source = Self::detect_own_source_dir(&config.cwd);
         Self {

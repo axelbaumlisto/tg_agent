@@ -24,6 +24,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::Utc;
 use naked_core::config::{AudioProviderCfg, TgMediaConfig, VisionProviderCfg};
+use naked_core::research::tool::redact::redact_for_log;
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -150,7 +151,8 @@ pub fn sweep_old_artifacts(workspace: &Path, retention_days: u64) {
                     tracing::info!("swept old artifact dir: {}", path.display());
                 }
                 Err(e) => {
-                    tracing::warn!("failed to sweep {}: {e}", path.display());
+                    let safe = redact_for_log(&e);
+                    tracing::warn!("failed to sweep {}: {safe}", path.display());
                 }
             }
         }
@@ -263,11 +265,12 @@ async fn resolve_file_path(
             Err(e) => {
                 if attempt + 1 < DOWNLOAD_ATTEMPTS && is_transient_download_error(&e) {
                     let delay = DOWNLOAD_BACKOFF_BASE * 3_u32.pow(attempt as u32);
+                    let safe = redact_for_log(&e);
                     tracing::warn!(
                         attempt = attempt + 1,
                         max = DOWNLOAD_ATTEMPTS,
                         sleep_ms = delay.as_millis() as u64,
-                        error = %e,
+                        error = %safe,
                         "getFile transient error, retrying"
                     );
                     tokio::time::sleep(delay).await;
@@ -352,11 +355,12 @@ pub async fn download_to_artifacts(
             Err(e) => {
                 if attempt + 1 < DOWNLOAD_ATTEMPTS && is_transient_download_error(&e) {
                     let delay = DOWNLOAD_BACKOFF_BASE * 3_u32.pow(attempt as u32);
+                    let safe = redact_for_log(&e);
                     tracing::warn!(
                         attempt = attempt + 1,
                         max = DOWNLOAD_ATTEMPTS,
                         sleep_ms = delay.as_millis() as u64,
-                        error = %e,
+                        error = %safe,
                         "file download transient error, retrying"
                     );
                     tokio::time::sleep(delay).await;
@@ -466,12 +470,13 @@ pub async fn transcribe_audio(
         Err(e) => {
             let reason = classify_media_error(e);
             crate::metrics::record_transcription("fail", Some(reason));
+            let safe = redact_for_log(e);
             tracing::warn!(
                 model = %cfg.model,
                 bytes_in,
                 duration_ms = elapsed_ms,
                 reason,
-                error = %e,
+                error = %safe,
                 "transcription failed"
             );
         }
@@ -779,6 +784,7 @@ mod tests {
     /// deterministic deltas — we snapshot before/after.
     #[test]
     fn record_transcription_increments_outcome_buckets() {
+        let _guard = crate::metrics::TRANSCRIPTION_TEST_LOCK.blocking_lock();
         let before = crate::metrics::snapshot();
         crate::metrics::record_transcription("ok", None);
         crate::metrics::record_transcription("fail", Some("auth"));
@@ -799,6 +805,149 @@ mod tests {
             after.transcription_fail_other - before.transcription_fail_other,
             1
         );
+    }
+
+    #[derive(Clone)]
+    struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn transcribe_fixture_call(api_url: String) -> Result<String> {
+        let cfg = AudioProviderCfg {
+            api_url,
+            api_key: "test-key".to_string(),
+            model: "test-whisper".to_string(),
+            language: None,
+        };
+        transcribe_audio(
+            http_for_test(),
+            &cfg,
+            b"fake ogg bytes",
+            "voice.ogg",
+            "audio/ogg",
+        )
+        .await
+    }
+
+    /// D-INV-TRANSCRIBE-OBS (B01): the real transcription wrapper must emit one
+    /// log event and bump exactly one outcome counter for every provider result.
+    /// The HTTP paths are hermetic: OK, 401, 429, and transport/network failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transcribe_audio_observes_ok_auth_rate_limit_and_network_paths() {
+        use tracing::Level;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = crate::metrics::TRANSCRIPTION_TEST_LOCK.lock().await;
+        let log_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let make_writer = {
+            let log_bytes = log_bytes.clone();
+            move || SharedLog(log_bytes.clone())
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_ansi(false)
+            .with_writer(make_writer)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello from mock whisper"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let before_ok = crate::metrics::snapshot();
+        let ok = transcribe_fixture_call(server.uri()).await;
+        let after_ok = crate::metrics::snapshot();
+        assert_eq!(ok.expect("OK transcription"), "hello from mock whisper");
+        assert_eq!(after_ok.transcription_ok - before_ok.transcription_ok, 1);
+        assert_eq!(
+            after_ok.transcription_fail - before_ok.transcription_fail,
+            0
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let before_auth = crate::metrics::snapshot();
+        let auth = transcribe_fixture_call(server.uri()).await;
+        let after_auth = crate::metrics::snapshot();
+        assert!(auth.is_err(), "401 must be an error");
+        assert_eq!(
+            after_auth.transcription_fail - before_auth.transcription_fail,
+            1
+        );
+        assert_eq!(
+            after_auth.transcription_fail_auth - before_auth.transcription_fail_auth,
+            1
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("too many requests"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let before_rate = crate::metrics::snapshot();
+        let rate = transcribe_fixture_call(server.uri()).await;
+        let after_rate = crate::metrics::snapshot();
+        assert!(rate.is_err(), "429 must be an error");
+        assert_eq!(
+            after_rate.transcription_fail - before_rate.transcription_fail,
+            1
+        );
+        assert_eq!(
+            after_rate.transcription_fail_rate - before_rate.transcription_fail_rate,
+            1
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+        let network_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        let before_network = crate::metrics::snapshot();
+        let network = transcribe_fixture_call(network_url).await;
+        let after_network = crate::metrics::snapshot();
+        assert!(network.is_err(), "closed listener must be a network error");
+        assert_eq!(
+            after_network.transcription_fail - before_network.transcription_fail,
+            1
+        );
+        assert_eq!(
+            after_network.transcription_fail_network - before_network.transcription_fail_network,
+            1
+        );
+
+        let logs =
+            String::from_utf8(log_bytes.lock().expect("log lock").clone()).expect("logs are utf8");
+        assert!(logs.contains("transcription complete"), "logs:\n{logs}");
+        assert_eq!(
+            logs.matches("transcription complete").count(),
+            1,
+            "logs:\n{logs}"
+        );
+        assert_eq!(
+            logs.matches("transcription failed").count(),
+            3,
+            "logs:\n{logs}"
+        );
+        assert!(logs.contains("reason=\"auth\""), "logs:\n{logs}");
+        assert!(logs.contains("reason=\"rate_limit\""), "logs:\n{logs}");
+        assert!(logs.contains("reason=\"network\""), "logs:\n{logs}");
     }
 
     #[test]

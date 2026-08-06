@@ -278,10 +278,11 @@ pub(crate) async fn drop_slash_for_persona(
                 .maybe_thread(msg.thread_id)
                 .await
             {
+                let safe = redact_for_log(&e);
                 tracing::warn!(
                     chat_id,
                     persona = %persona.name,
-                    "failed to send slash-disabled hint: {e}"
+                    "failed to send slash-disabled hint: {safe}"
                 );
             }
         }
@@ -308,11 +309,12 @@ pub(crate) async fn resolve_session_workspace(chat_id: i64, config: &Config) -> 
     if let Some(persona) = config.chat_personas.get(&chat_id) {
         let ws = persona.workspace_expanded();
         if let Err(e) = tokio::fs::create_dir_all(ws.join(".naked")).await {
+            let safe = redact_for_log(&e);
             tracing::warn!(
                 chat_id,
                 persona = %persona.name,
                 workspace = %ws.display(),
-                "failed to ensure persona workspace dir exists: {e}"
+                "failed to ensure persona workspace dir exists: {safe}"
             );
         }
         tracing::info!(

@@ -177,7 +177,7 @@ impl super::AgentLoop {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    self.config.record_health(
+                    self.record_health_effective(
                         crate::model_catalog::HealthEventKind::Error,
                         None,
                         Some(e.to_string()),
@@ -350,7 +350,7 @@ impl super::AgentLoop {
                     continue;
                 }
                 let _ = tx.send(AgentEvent::Error(e.clone())).await;
-                self.config.record_health(
+                self.record_health_effective(
                     crate::model_catalog::HealthEventKind::Error,
                     None,
                     Some(e.clone()),
@@ -368,7 +368,7 @@ impl super::AgentLoop {
             let _ = tx
                 .send(AgentEvent::Error("stream retries exhausted".into()))
                 .await;
-            self.config.record_health(
+            self.record_health_effective(
                 crate::model_catalog::HealthEventKind::Error,
                 None,
                 Some("stream retries exhausted".into()),

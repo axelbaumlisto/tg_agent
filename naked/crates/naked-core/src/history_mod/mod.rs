@@ -76,6 +76,21 @@ pub fn estimate_image_tokens_in_chars(
 pub const MAX_TURN_IMAGE_BYTES: usize = 48 * 1024 * 1024;
 
 /// Built-in context window registry (tokens). Checked via substring match.
+/// LEGACY / LAST-RESORT ONLY — do NOT add models here.
+///
+/// `session_ops::turn::pre_compact` resolves the context window with this
+/// precedence (B50): 1. session override, 2. `capabilities.<model>.
+/// context_window`, 3. `providers.<X>.context_window`, 4. global
+/// `Config.context_window`, 5. this table. Production sets the global
+/// fallback, so **this table is never reached** in the shipped deployment
+/// (verified 2026-08-05: live turns log
+/// `context_window=1048576` for deepseek and `1000000` for anthropic, both
+/// from `capabilities`).
+///
+/// Adding entries here therefore has no effect AND creates a second,
+/// silently diverging source of truth against `capabilities` — the B06 class.
+/// Put real values in `state/naked.json` under
+/// `providers.<X>.capabilities.<model>.context_window` instead.
 const MODEL_CONTEXT_WINDOWS: &[(&str, u32)] = &[
     // Anthropic
     ("claude-sonnet", 200_000),
@@ -282,9 +297,18 @@ impl ConversationHistory {
     }
 
     pub fn push_tool_result(&mut self, call_id: &str, output: &str, is_error: bool) {
-        const MAX_TOOL_OUTPUT: usize = 8000;
-        let trimmed = if output.len() > MAX_TOOL_OUTPUT {
-            let safe_end = output.floor_char_boundary(MAX_TOOL_OUTPUT);
+        // B104: this ingest backstop used to be a hard 8000 bytes, which
+        // bound TIGHTER than the model-aware router in `loop_::tools`
+        // (24K for >=100K windows, 180K for >=500K). A 16.6 KB skill body
+        // therefore still lost 8.6 KB on a 200K-window model even after
+        // the router decided it fit. Derive the ceiling from the SAME
+        // limits table so the backstop can only ever be the looser of the
+        // two, while still bounding callers that bypass the router.
+        let max_tool_output =
+            crate::tool::large_output::limits_for_context_window(self.context_window_tokens as u64)
+                .hard_limit_chars;
+        let trimmed = if output.len() > max_tool_output {
+            let safe_end = output.floor_char_boundary(max_tool_output);
             let cut = output.len() - safe_end;
             format!("{}...\n[truncated {cut} bytes]", &output[..safe_end])
         } else {

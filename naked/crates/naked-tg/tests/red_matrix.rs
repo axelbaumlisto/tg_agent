@@ -37,7 +37,7 @@ async fn red_a1_channel_map_survives_restart() {
     let map1 = ChannelSessionMap::open(dir.path()).await.unwrap();
     map1.set(-5084292206, None, "sess-a".into()).await;
     map1.set(-5084292206, Some(7), "sess-a-topic".into()).await;
-    map1.enable_yolo(-5084292206, Some(7)).await;
+    map1.enable_yolo(-5084292206, Some(7), None).await;
     map1.allow_add(-5084292206, None, "bash").await;
     map1.flush().await.unwrap();
     drop(map1);

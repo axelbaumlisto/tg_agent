@@ -87,6 +87,15 @@ pub(crate) struct CompositeView {
     /// after rendering; if > 0, it knows to attach the full-history
     /// HTML document so nothing is lost.
     pub(crate) last_dropped_events: std::sync::atomic::AtomicUsize,
+    /// PLAN_TG_LONG_ANSWERS_v2 S5: set by `render_final` when the inline
+    /// final answer was shortened. Observability only; send behaviour is
+    /// unchanged until the later UTF-16 budget/splitter steps.
+    pub(crate) last_final_answer_truncated: std::sync::atomic::AtomicBool,
+    /// B106: set when the provider the user picked did NOT serve this turn
+    /// (silent 429/413/5xx fallback inside `ResilientProvider`). Rendered as
+    /// a one-line banner at the TOP of the final answer so the user is never
+    /// told an answer came from a model that actually refused it.
+    pub(crate) fallback_notice: Option<String>,
 }
 
 const SPINNER: &[&str] = &["⏳", "⌛", "⏳", "⌛"];
@@ -112,6 +121,8 @@ impl CompositeView {
             started_at: std::time::Instant::now(),
             had_provider_error: false,
             last_dropped_events: std::sync::atomic::AtomicUsize::new(0),
+            last_final_answer_truncated: std::sync::atomic::AtomicBool::new(false),
+            fallback_notice: None,
         }
     }
 

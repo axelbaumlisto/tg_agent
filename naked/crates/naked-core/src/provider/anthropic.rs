@@ -402,6 +402,47 @@ mod tests {
     }
 
     #[test]
+    fn d_inv_thinking_temp_anthropic_thinking_model_never_serializes_temperature() {
+        // D-INV-THINKING-TEMP (B71+B81): a thinking-capable model on the
+        // native anthropic path must NEVER receive a `temperature` key,
+        // for ANY requested value and ANY reasoning state.
+        let temps = [0.0_f32, 0.5, 1.0, -0.1, 1.5, f32::NAN];
+        let reasonings: [Option<&str>; 3] = [None, Some("off"), Some("medium")];
+        for temp in temps {
+            for reasoning in reasonings {
+                let request = b71_request("claude-sonnet-4", Some(temp), reasoning);
+                let body = build_anthropic_request_body(
+                    &request,
+                    request.max_tokens,
+                    "claude-sonnet-4-6",
+                    true,
+                );
+                assert!(
+                    body.get("temperature").is_none(),
+                    "thinking model must omit temperature for temp={temp:?}, \
+                     reasoning={reasoning:?}; got {:?}",
+                    body.get("temperature")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn d_inv_thinking_temp_anthropic_claude_name_alone_blocks_temperature() {
+        // D-INV-THINKING-TEMP: even when capabilities do NOT declare thinking
+        // support, an upstream `claude-*` model name is treated as
+        // thinking-capable and must still suppress the explicit temperature.
+        let request = b71_request("claude-sonnet-4", Some(0.5), None);
+        let body =
+            build_anthropic_request_body(&request, request.max_tokens, "claude-sonnet-4-6", false);
+        assert!(
+            body.get("temperature").is_none(),
+            "claude-* upstream name alone must block temperature; got {:?}",
+            body.get("temperature")
+        );
+    }
+
+    #[test]
     fn b71_anthropic_plain_model_allows_temperature() {
         let request = b71_request("plain-model", Some(0.7), None);
         let body = build_anthropic_request_body(&request, request.max_tokens, "plain-model", false);
