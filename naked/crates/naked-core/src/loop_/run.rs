@@ -241,12 +241,34 @@ impl super::AgentLoop {
                     );
                     continue 'outer;
                 }
+                // B119c: "the model stopped" is not the same as "the model
+                // answered". `TurnStreamOutcome::empty` means no text, no
+                // tools AND no thinking, so a turn that only reasoned is not
+                // empty and used to be filed as Success. That is how the
+                // 2026-08-08 turn — 20 reasoning-only iterations that never
+                // produced an answer — scored as healthy, hiding the failure
+                // from the operator who watches model health. The user still
+                // sees `(no text — reasoning only)`, so this is a health and
+                // metrics correction, not a silence fix.
+                let answered = history.messages().last().is_some_and(|msg| {
+                    msg.blocks.iter().any(|b| {
+                        matches!(b, crate::types::ContentBlock::Text { text } if !text.trim().is_empty())
+                    })
+                });
                 let _ = tx.send(AgentEvent::Idle).await;
-                self.record_health_effective(
-                    crate::model_catalog::HealthEventKind::Success,
-                    None,
-                    None,
-                );
+                if answered {
+                    self.record_health_effective(
+                        crate::model_catalog::HealthEventKind::Success,
+                        None,
+                        None,
+                    );
+                } else {
+                    self.record_health_effective(
+                        crate::model_catalog::HealthEventKind::Empty,
+                        None,
+                        Some("turn ended with reasoning but no answer text".into()),
+                    );
+                }
                 return Ok(cumulative_usage);
             }
 

@@ -19,8 +19,8 @@ use crate::types::{AgentEvent, Permission, PermissionResponse};
 /// 2. **`permission_rx` present** — sends a `PermissionRequest` event
 ///    and awaits a matching `PermissionResponse`. On approval the
 ///    fingerprint is cached for future calls.
-/// 3. **`permission_rx == None`** — caller is in non-interactive mode
-///    (CLI tests, headless research). Approve by default.
+/// 3. **`permission_rx == None`** — no consent can be obtained, so deny
+///    the call (fail closed).
 ///
 /// Returns the boolean decision; the caller is responsible for the
 /// "denied" event/history bookkeeping (kept there because it depends
@@ -94,10 +94,9 @@ pub(super) async fn request_or_cached_approval(
     }
 
     let Some(prx) = permission_rx.as_mut() else {
-        // No permission channel wired — non-interactive callers
-        // implicitly approve everything (matches pre-extraction
-        // behaviour).
-        return true;
+        // No permission channel is available to obtain consent, so dangerous
+        // calls must fail closed rather than execute unattended.
+        return false;
     };
 
     let _ = tx
@@ -165,7 +164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_permission_channel_implicitly_approves() {
+    async fn no_permission_channel_denies() {
         let cache = ApprovalCache::new();
         let (tx, _rx, _perm_tx, _perm_rx) = make_channels();
         let mut none_rx: Option<mpsc::Receiver<PermissionResponse>> = None;
@@ -181,7 +180,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(allowed);
+        assert!(!allowed);
     }
 
     #[tokio::test]

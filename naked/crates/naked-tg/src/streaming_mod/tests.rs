@@ -1543,6 +1543,86 @@ See [docs](https://example.com/path?a=1&b=2)."#;
         }
     }
 
+    /// B119b: the rejected-stream drain must give up, not park forever.
+    ///
+    /// It used to `await events.recv()` with no timeout. A rejected start
+    /// whose agent task ignores its cancelled token held this future — and the
+    /// task — indefinitely.
+    ///
+    /// This waits out the real timeout (~10s): `--bins` tests compile into the
+    /// binary, not a dev target, so tokio's `test-util` paused clock is not
+    /// available here. Ten seconds once is cheaper than the alternative of
+    /// weakening the assertion to a constant check only.
+    #[tokio::test]
+    async fn rejected_stream_drain_gives_up_instead_of_parking_forever() {
+        // Sender is kept alive and never sends Idle: the exact wedged-task shape.
+        let (_events_tx, events_rx) = tokio::sync::mpsc::channel::<AgentEvent>(4);
+        let (perm_tx, _perm_rx) = tokio::sync::mpsc::channel(4);
+
+        // The drain's own timeout must be short enough that a wedged task is
+        // abandoned rather than held for the life of the process.
+        assert!(
+            crate::streaming::pipeline::REJECTED_DRAIN_TIMEOUT
+                <= std::time::Duration::from_secs(30),
+            "an unbounded-in-practice drain timeout defeats the purpose"
+        );
+
+        let outer = crate::streaming::pipeline::REJECTED_DRAIN_TIMEOUT * 3;
+        let drained = tokio::time::timeout(
+            outer,
+            crate::streaming::pipeline::drain_rejected_stream(events_rx, perm_tx),
+        )
+        .await;
+
+        assert!(
+            drained.is_ok(),
+            "drain must return on its own timeout; it parked instead"
+        );
+    }
+
+    /// B119a: every rejected start must produce a user-visible message.
+    ///
+    /// Only `ThreadCapacityExceeded` used to speak. The other three variants
+    /// were logged and drained, so a user who sent a message got no
+    /// placeholder, no text, and no run to /abort — the message simply
+    /// vanished. This asserts on the exhaustive match, which is also why
+    /// adding a variant now fails to compile instead of failing silently.
+    #[test]
+    fn every_registration_rejection_has_user_visible_text() {
+        use naked_tg::run_registry::{ChatThreadKey, RegisterRunError};
+
+        let all = [
+            RegisterRunError::DuplicateRunId {
+                run_id: "r1".into(),
+            },
+            RegisterRunError::DuplicateSessionId {
+                session_id: "s1".into(),
+                existing: "r1".into(),
+            },
+            RegisterRunError::DuplicateSourceRef {
+                source_ref: "src".into(),
+                existing: "r1".into(),
+            },
+            RegisterRunError::ThreadCapacityExceeded {
+                key: ChatThreadKey::new(1_i64, None),
+                active: 3,
+                cap: 3,
+            },
+        ];
+
+        for err in all {
+            let msg = crate::streaming::pipeline::reject_message(&err);
+            assert!(
+                !msg.trim().is_empty(),
+                "rejection {err:?} must tell the user something"
+            );
+            assert!(
+                msg.contains('\u{26a0}'),
+                "rejection {err:?} must read as a warning, got: {msg}"
+            );
+        }
+    }
+
     /// B118b at the transport seam: the stall warning must reach TELEGRAM, not
     /// just `render_final`'s return value.
     ///

@@ -2715,3 +2715,60 @@ async fn loop_guard_counts_identical_calls_across_iterations() {
         "the denial must name the turn-wide count, proving state survived the iteration boundary"
     );
 }
+
+/// B119c: a turn that only reasoned must not be filed as a healthy success.
+///
+/// `TurnStreamOutcome::empty` is documented as "no text, no tools, no
+/// thinking", so a reasoning-only turn is not empty and used to take the
+/// success path unconditionally. That is how the 2026-08-08 turn — 20
+/// reasoning-only iterations that never produced an answer — was recorded as
+/// healthy, hiding the failure from the operator watching model health.
+///
+/// The user still sees `(no text — reasoning only)`, so this pins the HEALTH
+/// signal, not the presence of output.
+#[tokio::test]
+async fn reasoning_only_turn_is_not_recorded_as_success() {
+    let health = std::sync::Arc::new(crate::model_catalog::ModelHealth::new(
+        crate::model_catalog::ModelHealthConfig::default(),
+    ));
+    let provider = MockProvider::new(vec![vec![
+        StreamChunk::Thinking("рассуждаю, но ответа не дам".into()),
+        StreamChunk::Done,
+    ]]);
+    let agent_loop = AgentLoop::new(
+        Box::new(provider),
+        crate::tool::registry::ToolRegistry::new(vec![]),
+        LoopConfig {
+            max_iterations: 10,
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "mock".into(),
+            provider: "mockprov".into(),
+            max_tokens: 1024,
+            health: Some(std::sync::Arc::clone(&health)),
+            ..Default::default()
+        },
+    );
+
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("вопрос");
+    let (tx, _rx) = mpsc::channel(64);
+    let result = agent_loop
+        .run(&mut history, tx, CancellationToken::new(), None, None)
+        .await;
+    assert!(result.is_ok(), "the turn itself still completes");
+
+    let snap = health.snapshot();
+    let window = snap
+        .iter()
+        .find(|((p, _), _)| p == "mockprov")
+        .map(|(_, w)| w)
+        .expect("health must have recorded the turn");
+    assert_eq!(
+        window.success, 0,
+        "a turn with no answer text must not count as success: {window:?}"
+    );
+    assert_eq!(
+        window.empty, 1,
+        "it must be recorded as an empty/no-answer turn instead: {window:?}"
+    );
+}

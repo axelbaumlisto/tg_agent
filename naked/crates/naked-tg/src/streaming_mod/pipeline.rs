@@ -204,14 +204,15 @@ pub(crate) async fn stream_response(
                 naked_tg::run_registry::RegisterRunError::ThreadCapacityExceeded { .. }
             ) {
                 crate::metrics::record_run_registry_cap_reject();
-                let _ = bot
-                    .send_message(
-                        ctx.chat_id,
-                        "⚠️ 3 runs already active in this thread — abort or wait for one to finish before starting another.",
-                    )
-                    .maybe_thread(ctx.thread_id)
-                    .await;
             }
+            // B119a: EVERY rejection must reach the user. Only the capacity
+            // case used to, so a duplicate session/source/run-id made the bot
+            // answer nothing at all: no placeholder, no text, and no
+            // registered run to /abort. The user saw a message that vanished.
+            let _ = bot
+                .send_message(ctx.chat_id, reject_message(&err))
+                .maybe_thread(ctx.thread_id)
+                .await;
             let safe = redact_for_log(format!("{err:?}"));
             tracing::warn!(chat_id = chat_id_raw, ?tid, error = %safe, "run registry rejected stream start");
             abort_for_reject.cancel();
@@ -768,7 +769,54 @@ async fn send_final_to_all_sinks(
     }
 }
 
-async fn drain_rejected_stream(
+/// B119a: user-facing text for a rejected stream start.
+///
+/// One place decides what each rejection says, so a new `RegisterRunError`
+/// variant cannot be added without the compiler pointing here — which is how
+/// the three silent variants slipped in behind the one that spoke.
+pub(crate) fn reject_message(err: &naked_tg::run_registry::RegisterRunError) -> &'static str {
+    use naked_tg::run_registry::RegisterRunError as E;
+    match err {
+        E::ThreadCapacityExceeded { .. } => {
+            "⚠️ 3 runs already active in this thread — abort or wait for one to finish before starting another."
+        }
+        E::DuplicateSessionId { .. } => {
+            "⚠️ Для этой сессии уже идёт ход. Дождись его окончания или /abort."
+        }
+        E::DuplicateSourceRef { .. } => {
+            "⚠️ Эта задача уже выполняется. Дождись результата или /abort."
+        }
+        E::DuplicateRunId { .. } => "⚠️ Внутренняя коллизия id хода — повтори запрос.",
+    }
+}
+
+/// B119b: bound the drain.
+///
+/// This used to await `events.recv()` with no timeout. A rejected start whose
+/// agent task ignores its cancelled token parked this future — and the task
+/// holding it — forever. The drain is best-effort cleanup, so giving up is
+/// strictly better than leaking.
+pub(crate) const REJECTED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub(crate) async fn drain_rejected_stream(
+    events: tokio::sync::mpsc::Receiver<AgentEvent>,
+    permissions: tokio::sync::mpsc::Sender<PermissionResponse>,
+) {
+    if tokio::time::timeout(
+        REJECTED_DRAIN_TIMEOUT,
+        drain_rejected_stream_inner(events, permissions),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = REJECTED_DRAIN_TIMEOUT.as_secs(),
+            "rejected-stream drain timed out — abandoning it rather than parking the task"
+        );
+    }
+}
+
+async fn drain_rejected_stream_inner(
     mut events: tokio::sync::mpsc::Receiver<AgentEvent>,
     permissions: tokio::sync::mpsc::Sender<PermissionResponse>,
 ) {
