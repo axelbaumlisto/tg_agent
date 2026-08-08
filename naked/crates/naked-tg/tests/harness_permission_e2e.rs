@@ -123,6 +123,81 @@ impl Drop for HarnessProc {
     }
 }
 
+fn run_burst(count: usize) -> serde_json::Value {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let mut h = HarnessProc::spawn(state.path());
+    wait_for(&h.rx, |e| e["event"] == "ready", "ready");
+
+    send(
+        &mut h.stdin,
+        serde_json::json!({"cmd":"burst","chat":-100123_i64,"topic":7,"count":count,"text":"part"}),
+    );
+    let ev = wait_for(
+        &h.rx,
+        |e| e["event"] == "burst_flushed" || e["event"] == "error",
+        "burst_flushed",
+    );
+    assert_eq!(ev["event"], "burst_flushed", "burst command failed: {ev}");
+
+    send(&mut h.stdin, serde_json::json!({"cmd":"shutdown"}));
+    let _ = h.child.wait();
+    ev
+}
+
+#[test]
+fn harness_burst_drives_real_coalescer_overflow_and_clean_under_cap() {
+    let overflow = run_burst(19);
+    assert_eq!(overflow["chat"], -100123_i64, "chat echoed: {overflow}");
+    assert_eq!(overflow["topic"], 7, "topic echoed: {overflow}");
+    assert_eq!(overflow["count"], 19, "count echoed: {overflow}");
+    assert_eq!(overflow["merged"], 16, "real cap must merge 16: {overflow}");
+    assert_eq!(
+        overflow["dropped"], 3,
+        "overflow count must be surfaced: {overflow}"
+    );
+    assert_eq!(
+        overflow["addressed"], true,
+        "flushed supergroup payload must remain addressed: {overflow}"
+    );
+    assert_eq!(
+        overflow["payload_has_notice"], true,
+        "overflow payload must carry the omission notice: {overflow}"
+    );
+    let payload = overflow["payload_text"].as_str().expect("payload text");
+    assert!(
+        payload.contains("⚠️ Пропущено 3 части входящего сообщения: превышен лимит 16."),
+        "payload must include exact omission notice: {payload:?}"
+    );
+    assert!(
+        payload.contains("part-15"),
+        "last retained part missing: {payload:?}"
+    );
+    assert!(
+        !payload.contains("part-16"),
+        "dropped overflow part leaked into payload: {payload:?}"
+    );
+
+    let under_cap = run_burst(3);
+    assert_eq!(under_cap["merged"], 3, "under-cap merge count: {under_cap}");
+    assert_eq!(
+        under_cap["dropped"], 0,
+        "under-cap must report no drops: {under_cap}"
+    );
+    assert_eq!(
+        under_cap["addressed"], true,
+        "under-cap supergroup payload must be addressed: {under_cap}"
+    );
+    assert_eq!(
+        under_cap["payload_has_notice"], false,
+        "happy path must not get warning noise: {under_cap}"
+    );
+    let payload = under_cap["payload_text"].as_str().expect("payload text");
+    assert!(
+        !payload.contains("Пропущено"),
+        "happy path payload must stay clean: {payload:?}"
+    );
+}
+
 #[test]
 fn harness_drives_permission_gate_and_restart() {
     let state = tempfile::tempdir().expect("state tempdir");

@@ -259,24 +259,13 @@ impl UpdateDispatcher {
                     let text_debounce =
                         Duration::from_millis(deps.config.telegram.coalesce_text_ms);
                     album
-                        .submit_text(msg, key, text_debounce, move |mut msgs| async move {
-                            let _permit = task_tracker_for_flush.acquire().await;
-                            msgs.sort_by_key(|m| m.id.0);
-                            let merged = msgs.len();
-                            let mut primary = msgs.remove(0);
-                            if should_count_coalesced(merged) {
-                                crate::metrics::record_text_coalesced();
-                            }
-                            let joined = join_text_messages(&primary, &msgs);
-                            if let Err(e) = overwrite_message_text(&mut primary, joined) {
-                                let safe = redact_for_log(&e);
-                                tracing::error!("text burst synthesis failed: {safe}");
-                                return;
-                            }
-                            if let Err(e) = deps_for_flush.handle(primary, Vec::new()).await {
-                                let safe = redact_for_log(&e);
-                                tracing::error!("handle_message (text burst) error: {safe}");
-                            }
+                        .submit_text(msg, key, text_debounce, move |msgs| {
+                            handle_text_burst_flush(
+                                msgs,
+                                deps_for_flush,
+                                task_tracker_for_flush,
+                                |_, _| {},
+                            )
                         })
                         .await
                 } else {
@@ -468,7 +457,10 @@ impl UpdateDispatcher {
     }
 }
 
-async fn text_burst_key_if_eligible(deps: &BotDeps, msg: &Message) -> Option<album::TextBurstKey> {
+pub(crate) async fn text_burst_key_if_eligible(
+    deps: &BotDeps,
+    msg: &Message,
+) -> Option<album::TextBurstKey> {
     // Feature gate first: default 0 preserves current Solo behaviour.
     if deps.config.telegram.coalesce_text_ms == 0 {
         return None;
@@ -520,6 +512,34 @@ async fn steer_sender_exists(key: (i64, Option<i32>)) -> bool {
     !crate::shared::RUN_REGISTRY
         .list_for_thread(naked_tg::run_registry::ChatThreadKey::new(key.0, key.1))
         .is_empty()
+}
+
+pub(crate) async fn handle_text_burst_flush<F>(
+    mut msgs: Vec<Message>,
+    deps: BotDeps,
+    task_tracker: Arc<tokio::sync::Semaphore>,
+    observe: F,
+) where
+    F: FnOnce(&Message, usize) + Send + 'static,
+{
+    let _permit = task_tracker.acquire().await;
+    msgs.sort_by_key(|m| m.id.0);
+    let merged = msgs.len();
+    let mut primary = msgs.remove(0);
+    if should_count_coalesced(merged) {
+        crate::metrics::record_text_coalesced();
+    }
+    let joined = join_text_messages(&primary, &msgs);
+    if let Err(e) = overwrite_message_text(&mut primary, joined) {
+        let safe = redact_for_log(&e);
+        tracing::error!("text burst synthesis failed: {safe}");
+        return;
+    }
+    observe(&primary, merged);
+    if let Err(e) = deps.handle(primary, Vec::new()).await {
+        let safe = redact_for_log(&e);
+        tracing::error!("handle_message (text burst) error: {safe}");
+    }
 }
 
 fn should_count_coalesced(merged_len: usize) -> bool {

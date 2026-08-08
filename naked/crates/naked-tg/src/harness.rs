@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -44,7 +45,7 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_stream::Stream;
 
 use naked_core::AgentCore;
-use naked_core::config::Config;
+use naked_core::config::{Config, TelegramConfig};
 use naked_core::error::Result as CoreResult;
 use naked_core::provider::{ChatRequest, Provider};
 use naked_core::types::{ModelInfo, StreamChunk};
@@ -352,6 +353,8 @@ struct Harness {
     agent: Arc<AgentCore>,
     channel_map: Arc<ChannelSessionMap>,
     pending_perms: PendingPermissions,
+    album_buffer: crate::album::InboundCoalescer,
+    task_tracker: Arc<tokio::sync::Semaphore>,
     bot: Bot,
     bot_token: Arc<String>,
     bot_identity: Arc<naked_tg::bot_identity::BotIdentity>,
@@ -380,13 +383,17 @@ struct PendingTurn {
 const HERMETIC_GUARD: &str = "NAKED_HARNESS_HERMETIC";
 
 /// Resolve the hermetic state root for this harness process. Prefers
-/// `NAKED_HARNESS_STATE_DIR`; otherwise a UNIQUE per-process tempdir so a bare
+/// `NAKED_HARNESS_STATE_DIR`, accepts `NAKED_STATE_ROOT` as the shorter manual
+/// harness alias, otherwise a UNIQUE per-process tempdir so a bare
 /// `naked-tg harness` can never read or write the real `~/.naked`. `run`
 /// installs this as `HOME` (via a one-time re-exec) so EVERY persistence path
 /// — sessions store, channel-map snapshot + restore, and naked-core telemetry
 /// / memory (all anchored at `HOME/.naked`) — lands under it.
 fn base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("NAKED_HARNESS_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("NAKED_STATE_ROOT") {
         return PathBuf::from(dir);
     }
     let pid = std::process::id();
@@ -425,6 +432,10 @@ fn build_config(base: &Path) -> Config {
         session_dir: base.join("sessions"),
         default_provider: "harness".into(),
         default_model: "harness-model".into(),
+        telegram: TelegramConfig {
+            coalesce_text_ms: 50,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -447,6 +458,8 @@ impl Harness {
             agent,
             channel_map,
             pending_perms: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            album_buffer: crate::album::InboundCoalescer::default(),
+            task_tracker: Arc::new(tokio::sync::Semaphore::new(50)),
             bot,
             bot_token: Arc::new(bot_token),
             bot_identity: Arc::new(naked_tg::bot_identity::BotIdentity {
@@ -572,6 +585,7 @@ pub(crate) async fn run() {
         };
         match cmd.get("cmd").and_then(Value::as_str) {
             Some("msg") => handle_msg(&mut harness, &cmd, &mut out).await,
+            Some("burst") => handle_burst(&mut harness, &cmd, &mut out).await,
             Some("callback") => handle_callback_cmd(&mut harness, &cmd, &mut out).await,
             Some("session") => handle_session(&mut harness, &cmd, &mut out).await,
             Some("restart") => {
@@ -609,6 +623,182 @@ fn chat_topic(cmd: &Value) -> (i64, Option<i32>) {
         .map(|t| t as i32)
         .filter(|t| *t != 0);
     (chat, topic)
+}
+
+#[derive(Debug)]
+struct BurstObservation {
+    merged: usize,
+    dropped: usize,
+    addressed: bool,
+    payload_text: String,
+}
+
+async fn handle_burst(harness: &mut Harness, cmd: &Value, out: &mut tokio::io::Stdout) {
+    let (chat, topic) = chat_topic(cmd);
+    harness.admit_chat(chat);
+    let count = cmd.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if !(1..=256).contains(&count) {
+        emit(
+            out,
+            json!({"event":"error","message":"burst count must be in 1..=256"}),
+        )
+        .await;
+        return;
+    }
+    let text = cmd.get("text").and_then(Value::as_str).unwrap_or("part");
+    if text.trim().is_empty() {
+        emit(
+            out,
+            json!({"event":"error","message":"burst text must be non-empty"}),
+        )
+        .await;
+        return;
+    }
+
+    let deps = harness.deps();
+    let debounce = Duration::from_millis(deps.config.telegram.coalesce_text_ms);
+    let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<BurstObservation>();
+
+    for idx in 0..count {
+        harness.msg_seq += 1;
+        let part_text = if count == 1 {
+            text.to_string()
+        } else {
+            format!("{text}-{idx}")
+        };
+        let msg = build_message(
+            harness.msg_seq,
+            chat,
+            topic,
+            &part_text,
+            &harness.bot_identity,
+        );
+        let Some(key) = crate::runtime::text_burst_key_if_eligible(&deps, &msg).await else {
+            emit(
+                out,
+                json!({"event":"error","message":"burst message was not eligible for text coalescing","chat":chat,"topic":topic,"index":idx}),
+            )
+            .await;
+            return;
+        };
+
+        let deps_for_flush = deps.clone();
+        let task_tracker = harness.task_tracker.clone();
+        let bot_identity = harness.bot_identity.clone();
+        let obs_tx = obs_tx.clone();
+        match harness
+            .album_buffer
+            .submit_text(msg, key, debounce, move |msgs| {
+                crate::runtime::handle_text_burst_flush(
+                    msgs,
+                    deps_for_flush,
+                    task_tracker,
+                    move |primary, merged| {
+                        let payload_text = primary
+                            .text()
+                            .or_else(|| primary.caption())
+                            .unwrap_or_default()
+                            .to_string();
+                        let dropped = overflow_notice_count(&payload_text).unwrap_or(0);
+                        let addressed =
+                            naked_tg::bot_identity::is_addressed_to_bot(primary, &bot_identity);
+                        let _ = obs_tx.send(BurstObservation {
+                            merged,
+                            dropped,
+                            addressed,
+                            payload_text,
+                        });
+                    },
+                )
+            })
+            .await
+        {
+            crate::album::Decision::Buffered => {}
+            crate::album::Decision::Solo(_) => {
+                emit(
+                    out,
+                    json!({"event":"error","message":"burst unexpectedly bypassed text coalescing","chat":chat,"topic":topic,"index":idx}),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    drop(obs_tx);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut observation: Option<BurstObservation> = None;
+    let mut permission: Option<(String, String)> = None;
+    loop {
+        if let (Some(obs), Some((call_id, tool))) = (observation.as_ref(), permission.as_ref()) {
+            emit(
+                out,
+                json!({
+                    "event":"burst_flushed",
+                    "chat":chat,
+                    "topic":topic,
+                    "count":count,
+                    "merged":obs.merged,
+                    "dropped":obs.dropped,
+                    "addressed":obs.addressed,
+                    "payload_has_notice":obs.dropped > 0,
+                    "payload_text":obs.payload_text.clone(),
+                    "call_id":call_id,
+                    "tool":tool,
+                }),
+            )
+            .await;
+            return;
+        }
+
+        tokio::select! {
+            obs = obs_rx.recv(), if observation.is_none() => {
+                match obs {
+                    Some(obs) => observation = Some(obs),
+                    None => {
+                        emit(
+                            out,
+                            json!({"event":"error","message":"burst flush observation channel closed","chat":chat,"topic":topic}),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            captured = harness.captured_rx.recv(), if permission.is_none() => {
+                match captured {
+                    Some(call) => {
+                        if let Some(card) = permission_card(&call) {
+                            permission = Some(card);
+                        }
+                    }
+                    None => {
+                        emit(
+                            out,
+                            json!({"event":"error","message":"capture channel closed while waiting for burst card","chat":chat,"topic":topic}),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                emit(
+                    out,
+                    json!({"event":"error","message":"timeout waiting for burst flush/card","chat":chat,"topic":topic}),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+fn overflow_notice_count(payload: &str) -> Option<usize> {
+    let marker = "⚠️ Пропущено ";
+    let rest = payload.get(payload.find(marker)? + marker.len()..)?;
+    let digits = rest.split_whitespace().next()?;
+    digits.parse().ok()
 }
 
 async fn handle_msg(harness: &mut Harness, cmd: &Value, out: &mut tokio::io::Stdout) {
