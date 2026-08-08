@@ -49,6 +49,14 @@ impl super::AgentLoop {
         // of empty responses (the actual `glm-5-turbo` failure mode) are
         // capped.
         let mut empty_budget = EmptyContentBudget::new();
+        // B118a: the guard's thresholds (3 identical calls, 8 consecutive
+        // failures) and its own messages say "this turn", but it used to be
+        // constructed inside the iteration loop, so every counter reset after
+        // each model round-trip. A model that makes one failing call per
+        // iteration never accumulated anything and could retry forever — the
+        // 2026-08-08 incident spent 13 minutes and 2.8M tokens that way.
+        // One guard per turn is what the thresholds were written for.
+        let mut loop_guard = crate::loop_guard::LoopGuard::default();
         // R1: SteerPipeline owns pending vec + delivered set.
         let mut steer = SteerPipeline::new();
         let started = std::time::Instant::now();
@@ -68,9 +76,8 @@ impl super::AgentLoop {
                 return Err(AgentError::Cancelled);
             }
 
-            // Per-iteration guard — blocks identical repeated calls and
-            // halts after too many consecutive failures.
-            let mut loop_guard = crate::loop_guard::LoopGuard::default();
+            // Turn-scoped guard (see construction above): blocks identical
+            // repeated calls and halts after too many consecutive failures.
 
             // Drain steer messages between iterations.
             steer.drain(&mut steer_rx, history, &tx).await;

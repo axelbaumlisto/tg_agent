@@ -1543,6 +1543,63 @@ See [docs](https://example.com/path?a=1&b=2)."#;
         }
     }
 
+    /// B118b at the transport seam: the stall warning must reach TELEGRAM, not
+    /// just `render_final`'s return value.
+    ///
+    /// The unit tests pin the string composition; this pins the bytes actually
+    /// PUT ON THE WIRE by `send_final`, through the same mock-bot transport the
+    /// other delivery tests use. Without it, a later change to how the final
+    /// message is assembled for sending could drop the banner again while every
+    /// render test stayed green.
+    #[tokio::test]
+    async fn send_final_puts_stall_warning_on_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok_message_response("ok"))
+            .mount(&server)
+            .await;
+
+        let mut view = CompositeView::new("test-model".into());
+        view.stall_notice = Some(
+            "\u{1f534} \u{417}\u{430}\u{432}\u{438}\u{441}\u{43b}\u{43e} 2 \u{43c}\u{438}\u{43d}"
+                .into(),
+        );
+        view.response_text = "\u{412}\u{43e}\u{437}\u{44c}\u{43c}\u{443} erp_analyst".into();
+        let html = view.render_final_with_long_answer_fix(false);
+
+        let unique = unique_test_id();
+        crate::streaming::flush::send_final(
+            mock_bot(&server.uri()),
+            crate::shared::ChatCtx {
+                chat_id: ChatId(990_000 + unique as i64),
+                thread_id: None,
+                reply_to: None,
+            },
+            MessageId(123),
+            &html,
+            &view,
+            false,
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap();
+        let bodies: String = received
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            bodies.contains(
+                "\u{417}\u{430}\u{432}\u{438}\u{441}\u{43b}\u{43e} 2 \u{43c}\u{438}\u{43d}"
+            ),
+            "stall warning never reached the transport; bodies={bodies}"
+        );
+        assert!(
+            bodies.contains("erp_analyst"),
+            "model answer never reached the transport; bodies={bodies}"
+        );
+    }
+
     #[tokio::test]
     async fn send_final_part1_non429_falls_back_to_attachment_without_orphan_chunks() {
         let server = MockServer::start().await;
@@ -3633,5 +3690,64 @@ mod resilience_tests {
         };
         assert_eq!(cb0, "s:abort:run-kb");
         assert_eq!(cb1, "s:sendnow:run-kb");
+    }
+    /// B118b: a turn that stalled and then answered must still say it stalled.
+    ///
+    /// The 2026-08-08 incident: the agent was stuck for minutes on a failing
+    /// API, the stall detector fired twice into the journal, then the model
+    /// emitted one short sentence. `render_final` takes the response_text
+    /// branch and drops the whole event timeline, so the warning the user
+    /// needed most was the one thing guaranteed not to be shown.
+    #[test]
+    fn render_final_keeps_stall_warning_when_model_still_answered() {
+        let mut v = CompositeView::new("test-model".into());
+        v.events.push(TurnEvent::Note(
+            "🔴 Зависло 2 мин — /abort чтобы прервать".into(),
+        ));
+        v.stall_notice = Some("🔴 Зависло 2 мин — /abort чтобы прервать".into());
+        v.response_text = "Возьму выборку через erp_analyst".into();
+
+        let out = v.render_final();
+        assert!(
+            out.contains("Зависло 2 мин"),
+            "the stall warning must survive into the final answer, got: {out}"
+        );
+        assert!(
+            out.contains("erp_analyst"),
+            "the model's answer must still be shown, got: {out}"
+        );
+    }
+
+    /// A note that is not a stall warning must NOT be promoted to a banner.
+    /// `Note` also carries steer echoes and test branch markers; treating all
+    /// of them as warnings would put noise above every answer.
+    #[test]
+    fn render_final_does_not_promote_ordinary_notes_to_banner() {
+        let mut v = CompositeView::new("test-model".into());
+        v.events.push(TurnEvent::Note("steer received".into()));
+        v.response_text = "готово".into();
+
+        let out = v.render_final();
+        assert!(
+            !out.contains("steer received"),
+            "ordinary notes must stay in the timeline, not the banner: {out}"
+        );
+    }
+
+    /// Both banners can apply at once and must not swallow each other.
+    #[test]
+    fn render_final_shows_fallback_and_stall_banners_together() {
+        let mut v = CompositeView::new("groq/x".into());
+        v.fallback_notice = Some("Отвечал deepseek — groq не смог: 413".into());
+        v.stall_notice = Some("⚠️ Нет ответа 60с".into());
+        v.response_text = "ответ".into();
+
+        let out = v.render_final();
+        assert!(
+            out.contains("Отвечал deepseek"),
+            "fallback banner lost: {out}"
+        );
+        assert!(out.contains("Нет ответа 60с"), "stall banner lost: {out}");
+        assert!(out.contains("ответ"), "body lost: {out}");
     }
 }

@@ -432,20 +432,34 @@ impl CompositeView {
         }
     }
 
-    /// B106: prepend the fallback banner exactly once, then delegate.
+    /// B118b: carry stall warnings into the final message.
+    ///
+    /// The stall warning renders in the streaming bubble as a `Note`, but the
+    /// final render drops every event as soon as `response_text` is non-empty.
+    /// So a turn that stalled for minutes and then produced one short sentence
+    /// erased its own warning: the user saw a confident-looking answer with no
+    /// hint that the agent had been stuck. `stall_notice` survives that.
+    fn stall_banner(&self) -> String {
+        match &self.stall_notice {
+            Some(text) if !text.trim().is_empty() => {
+                format!("<i>{}</i>\n\n", escape_html(text.trim()))
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// B106/B118b: prepend the banners exactly once, then delegate.
     ///
     /// The body below has four exit points; prepending at each of them was
     /// duplication waiting to rot (a fifth branch would silently ship without
-    /// the warning). Composing here keeps "who answered" a single concern.
+    /// the warning). Composing here keeps "who answered" and "was it stuck"
+    /// single concerns, and is why B118b was a two-line change.
     pub(crate) fn render_final_with_long_answer_fix(
         &self,
         tg_long_answer_fix_enabled: bool,
     ) -> String {
         let body = self.render_final_body(tg_long_answer_fix_enabled);
-        match self.fallback_banner() {
-            b if b.is_empty() => body,
-            b => b + &body,
-        }
+        self.fallback_banner() + &self.stall_banner() + &body
     }
 
     fn render_final_body(&self, tg_long_answer_fix_enabled: bool) -> String {

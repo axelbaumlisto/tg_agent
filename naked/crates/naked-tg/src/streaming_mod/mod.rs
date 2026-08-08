@@ -59,6 +59,15 @@ pub(crate) enum TurnEvent {
 }
 
 pub(crate) struct CompositeView {
+    /// B118b: the stall warning shown to the user, if this turn ever stalled.
+    ///
+    /// Deliberately NOT a `TurnEvent::Note`: notes are also steer echoes and
+    /// test branch markers, and `render_final` drops the whole timeline once
+    /// `response_text` is non-empty. A turn that hung for minutes and then
+    /// answered in one sentence therefore erased its own warning. Keeping the
+    /// warning in its own field is the same shape as `fallback_notice` (B106)
+    /// and means "was this turn stuck" has exactly one representation.
+    pub(crate) stall_notice: Option<String>,
     thinking: String,
     in_thinking: bool,
     /// Chronological timeline. **The single source of truth for ordering.**
@@ -123,6 +132,7 @@ impl CompositeView {
             last_dropped_events: std::sync::atomic::AtomicUsize::new(0),
             last_final_answer_truncated: std::sync::atomic::AtomicBool::new(false),
             fallback_notice: None,
+            stall_notice: None,
         }
     }
 

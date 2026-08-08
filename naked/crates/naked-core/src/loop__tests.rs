@@ -2641,3 +2641,77 @@ async fn b80a_inner_loop_completes_only_when_events_are_drained() {
         "B80a: drainer must observe all >256 emitted events; saw {drained}"
     );
 }
+
+/// B118a: the loop guard must accumulate ACROSS iterations, not just within one.
+///
+/// The guard's thresholds and its own wording say "this turn", but it used to
+/// be constructed inside the iteration loop. A model that emits one identical
+/// call per model round-trip therefore reset the counter every time and could
+/// retry forever. This is the shape of the 2026-08-08 incident: 20 consecutive
+/// reasoning-only iterations, each retrying a failing approach, 2.8M tokens,
+/// no answer.
+///
+/// Three iterations each send the SAME call with the SAME arguments. With a
+/// turn-scoped guard the third is blocked; with a per-iteration guard all three
+/// execute.
+#[tokio::test]
+async fn loop_guard_counts_identical_calls_across_iterations() {
+    let identical_call = |id: &str| {
+        vec![
+            StreamChunk::ToolUse {
+                id: id.into(),
+                name: "echo".into(),
+                input: serde_json::json!({"text": "same"}),
+            },
+            StreamChunk::Done,
+        ]
+    };
+    let provider = MockProvider::new(vec![
+        identical_call("i1"),
+        identical_call("i2"),
+        identical_call("i3"),
+        vec![StreamChunk::Text("done".into()), StreamChunk::Done],
+    ]);
+
+    let executions = std::sync::Arc::new(AtomicUsize::new(0));
+    let agent_loop = make_loop(
+        provider,
+        vec![Box::new(RecordingEchoTool {
+            executions: std::sync::Arc::clone(&executions),
+        })],
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("test");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+    let result = agent_loop.run(&mut history, tx, cancel, None, None).await;
+    assert!(result.is_ok());
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        2,
+        "the third identical call — made in a LATER iteration — must be blocked; \
+         a per-iteration guard would let all 3 through"
+    );
+
+    let mut saw_cross_iteration_denial = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let AgentEvent::ToolEnd {
+            call_id,
+            output,
+            state,
+            ..
+        } = ev
+            && call_id == "i3"
+            && output.contains("already ran 3 times")
+            && state == ToolState::Error
+        {
+            saw_cross_iteration_denial = true;
+        }
+    }
+    assert!(
+        saw_cross_iteration_denial,
+        "the denial must name the turn-wide count, proving state survived the iteration boundary"
+    );
+}

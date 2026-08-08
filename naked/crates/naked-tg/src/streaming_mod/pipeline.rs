@@ -334,17 +334,20 @@ pub(crate) async fn stream_response(
             stall_level = 0;
         } else if event.is_none() {
             let elapsed = last_event_at.elapsed().as_secs();
+            // B118b: the bubble Note keeps the live view honest; `stall_notice`
+            // is what survives into the final answer. Both are set from this
+            // one place so they can never disagree about whether a turn stalled.
             if stall_level == 0 && elapsed >= 60 {
                 stall_level = 1;
-                view.events.push(TurnEvent::Note(
-                    "⚠️ Нет ответа 60с — возможно, зависло".to_string(),
-                ));
+                let note = "⚠️ Нет ответа 60с — возможно, зависло".to_string();
+                view.stall_notice = Some(note.clone());
+                view.events.push(TurnEvent::Note(note));
                 dirty = true;
             } else if stall_level == 1 && elapsed >= 120 {
                 stall_level = 2;
-                view.events.push(TurnEvent::Note(
-                    "🔴 Зависло 2 мин — /abort чтобы прервать".to_string(),
-                ));
+                let note = "🔴 Зависло 2 мин — /abort чтобы прервать".to_string();
+                view.stall_notice = Some(note.clone());
+                view.events.push(TurnEvent::Note(note));
                 dirty = true;
             }
         }
