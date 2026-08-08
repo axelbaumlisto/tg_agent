@@ -256,12 +256,20 @@ struct RunningHandle {
 /// "first successful run after N failures" hooks.
 #[async_trait]
 pub trait TaskNotifier: Send + Sync {
+    /// B121b: returns whether the alert actually reached the operator.
+    ///
+    /// This used to return `()`, and the caller inserted the spec into
+    /// `alerted` BEFORE calling it — so a failed delivery (chat deleted, bot
+    /// kicked, thread gone) still counted as "already alerted" and silenced
+    /// every subsequent failure for that spec. A dead target chat could
+    /// therefore mute the scheduler permanently. There is deliberately no
+    /// default implementation: an implementor must state whether it delivered.
     async fn notify_failure(
         &self,
         spec: &ResearchSpec,
         consecutive_failures: u32,
         last_error: &str,
-    );
+    ) -> bool;
     async fn notify_success(&self, _spec: &ResearchSpec, _run_id: &str) {}
 
     /// Fired by [`supervised_run_loop`] when the scheduler's main loop panics.
@@ -283,7 +291,10 @@ impl TaskNotifier for NoopNotifier {
         _spec: &ResearchSpec,
         _consecutive_failures: u32,
         _last_error: &str,
-    ) {
+    ) -> bool {
+        // Honest answer: a no-op notifier delivers nothing. Claiming success
+        // here would re-create the very bug this return value exists to stop.
+        false
     }
 }
 

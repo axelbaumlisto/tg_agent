@@ -3,7 +3,7 @@ use crate::scheduler::lifecycle::*;
 use crate::scheduler::tasks::*;
 use chrono::Duration as ChronoDuration;
 use naked_core::research::SchedulerEvent;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn spec_with(id: &str, mutate: impl FnOnce(&mut ResearchSpec)) -> ResearchSpec {
     let mut s = ResearchSpec {
@@ -171,6 +171,10 @@ fn plan_returns_empty_when_no_slots() {
 
 struct CountingNotifier {
     calls: AtomicUsize,
+    /// B121b: lets a test model an alert that was attempted but NOT delivered
+    /// (dead chat, kicked bot). Defaults to delivering, so existing tests keep
+    /// their old meaning.
+    delivers: AtomicBool,
 }
 #[async_trait]
 impl TaskNotifier for CountingNotifier {
@@ -179,8 +183,9 @@ impl TaskNotifier for CountingNotifier {
         _spec: &ResearchSpec,
         _consecutive_failures: u32,
         _last_error: &str,
-    ) {
+    ) -> bool {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.delivers.load(Ordering::SeqCst)
     }
 }
 
@@ -197,6 +202,7 @@ async fn alert_fires_once_per_streak_then_silent_until_pause() {
     let state = Arc::new(Mutex::new(SchedulerState::default()));
     let counting = Arc::new(CountingNotifier {
         calls: AtomicUsize::new(0),
+        delivers: AtomicBool::new(true),
     });
     let notifier: Arc<dyn TaskNotifier> = counting.clone();
     let spec = spec_with("x", |_| {});
@@ -254,7 +260,14 @@ async fn alert_fires_once_per_streak_then_silent_until_pause() {
 #[tokio::test]
 async fn success_resets_failure_counter_and_alert_flag() {
     let state = Arc::new(Mutex::new(SchedulerState::default()));
-    let notifier: Arc<dyn TaskNotifier> = Arc::new(NoopNotifier);
+    // B121b: this test asserts the alerted flag is SET and then cleared, so it
+    // needs a notifier that actually delivers. `NoopNotifier` now honestly
+    // reports `false` (it delivers nothing), and an undelivered alert must not
+    // be recorded as sent — that was the bug.
+    let notifier: Arc<dyn TaskNotifier> = Arc::new(CountingNotifier {
+        calls: AtomicUsize::new(0),
+        delivers: AtomicBool::new(true),
+    });
     let spec = spec_with("x", |_| {});
     let cfg = cfg_with(3, 0);
     for _ in 0..3 {
@@ -954,7 +967,8 @@ impl TaskNotifier for PanicCountingNotifier {
         _spec: &ResearchSpec,
         _consecutive_failures: u32,
         _last_error: &str,
-    ) {
+    ) -> bool {
+        true
     }
     async fn notify_supervisor_panic(&self, details: &str) {
         self.panics.fetch_add(1, Ordering::SeqCst);
@@ -1659,4 +1673,158 @@ fn operator_context_struct_fields() {
 async fn cancel_task_returns_false_for_unknown() {
     let sched = ResearchScheduler::start(std::sync::Weak::new(), SchedulerConfig::default()).0;
     assert!(!sched.cancel_task("nonexistent").await);
+}
+
+// ── B121: a dead worker and an undelivered alert must both stay visible ────
+
+/// B121b: an alert that was NOT delivered must not be recorded as sent.
+///
+/// `alerted` used to be inserted before calling the notifier, so a failed
+/// delivery (chat deleted, bot kicked) still counted as "already alerted" and
+/// `evaluate_outcome` went Quiet for every later failure. A dead target chat
+/// could mute a spec permanently — silencing exactly the channel that reports
+/// trouble.
+#[tokio::test]
+async fn undelivered_alert_is_retried_on_the_next_failure() {
+    let state = Arc::new(Mutex::new(SchedulerState::default()));
+    let counting = Arc::new(CountingNotifier {
+        calls: AtomicUsize::new(0),
+        delivers: AtomicBool::new(false), // delivery keeps failing
+    });
+    let notifier: Arc<dyn TaskNotifier> = counting.clone();
+    let spec = spec_with("x", |_| {});
+    let cfg = cfg_with(1, 0); // alert from the very first failure
+
+    for _ in 0..3 {
+        apply_outcome(
+            &state,
+            &notifier,
+            None,
+            &spec,
+            &RunOutcome::Failure("boom".into()),
+            &cfg,
+        )
+        .await;
+    }
+
+    assert!(
+        !state.lock().await.alerted.contains("x"),
+        "an undelivered alert must not be recorded as sent"
+    );
+    assert_eq!(
+        counting.calls.load(Ordering::SeqCst),
+        3,
+        "every failure must re-attempt delivery while it keeps failing"
+    );
+}
+
+/// The mirror case: once delivery succeeds, stop repeating yourself.
+#[tokio::test]
+async fn delivered_alert_is_sent_once_and_then_stays_quiet() {
+    let state = Arc::new(Mutex::new(SchedulerState::default()));
+    let counting = Arc::new(CountingNotifier {
+        calls: AtomicUsize::new(0),
+        delivers: AtomicBool::new(true),
+    });
+    let notifier: Arc<dyn TaskNotifier> = counting.clone();
+    let spec = spec_with("x", |_| {});
+    let cfg = cfg_with(1, 0);
+
+    for _ in 0..3 {
+        apply_outcome(
+            &state,
+            &notifier,
+            None,
+            &spec,
+            &RunOutcome::Failure("boom".into()),
+            &cfg,
+        )
+        .await;
+    }
+
+    assert!(state.lock().await.alerted.contains("x"));
+    assert_eq!(
+        counting.calls.load(Ordering::SeqCst),
+        1,
+        "a delivered alert must not repeat on every later failure"
+    );
+}
+
+/// B121a: a worker that PANICS must be recorded as a failure, not vanish.
+///
+/// Terminal accounting (`apply_outcome`) runs INSIDE the spawned future, so a
+/// panic before that line finished the `JoinHandle` with `Err(JoinError)`.
+/// Stage 3 of the sweep used to `drop()` the handle without looking, which
+/// discarded the panic: no failure counter, no alert, no auto-pause, and the
+/// slot freed — a crashed task laundered into "nothing happened", which reads
+/// to an operator exactly like a healthy idle job.
+#[tokio::test]
+async fn panicked_worker_is_recorded_as_a_failure_not_forgotten() {
+    let dir = tempdir().unwrap();
+    let store: Arc<dyn ResearchStore> = Arc::new(FsResearchStore::new(dir.path().to_path_buf()));
+    let spec = spec_with("panicky", |_| {});
+    store.create_spec(&spec).await.unwrap();
+    let mut infl = Inflight::scheduled(spec.id.clone(), 1);
+    infl.mark_running();
+    store.save_inflight(&spec.id, &infl).await.unwrap();
+
+    // A worker that dies the way a real bug kills one.
+    let handle: JoinHandle<RunOutcome> = tokio::spawn(async move {
+        panic!("boom inside the worker");
+    });
+    // Let it finish so the sweep sees `is_finished()`.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let state = Arc::new(Mutex::new(SchedulerState::default()));
+    state.lock().await.running.insert(
+        spec.id.clone(),
+        RunningHandle {
+            started_at: Instant::now(),
+            timeout: Duration::from_secs(600),
+            handle,
+            cancel: CancellationToken::new(),
+            cancel_requested_at: None,
+            attempt_id: "attempt-1".into(),
+        },
+    );
+
+    let counting = Arc::new(CountingNotifier {
+        calls: AtomicUsize::new(0),
+        delivers: AtomicBool::new(true),
+    });
+    let notifier: Arc<dyn TaskNotifier> = counting.clone();
+    let cfg = cfg_with(1, 0); // alert on the first failure
+
+    tasks::sweep_running(
+        &state,
+        &notifier,
+        std::slice::from_ref(&spec),
+        &cfg,
+        &store,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        state
+            .lock()
+            .await
+            .failures
+            .get(&spec.id)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "a panicked worker must increment the failure counter that drives alerting"
+    );
+    assert_eq!(
+        counting.calls.load(Ordering::SeqCst),
+        1,
+        "the operator must be told the task died"
+    );
+
+    let infl = store.load_inflight(&spec.id).await.unwrap().unwrap();
+    assert!(
+        infl.state.is_terminal(),
+        "the ledger must not keep claiming the dead worker is still running"
+    );
 }

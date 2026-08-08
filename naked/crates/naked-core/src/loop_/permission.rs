@@ -19,8 +19,8 @@ use crate::types::{AgentEvent, Permission, PermissionResponse};
 /// 2. **`permission_rx` present** — sends a `PermissionRequest` event
 ///    and awaits a matching `PermissionResponse`. On approval the
 ///    fingerprint is cached for future calls.
-/// 3. **`permission_rx == None`** — no consent can be obtained, so deny
-///    the call (fail closed).
+/// 3. **`permission_rx == None`** — caller is in non-interactive mode
+///    (CLI tests, headless research). Approve by default.
 ///
 /// Returns the boolean decision; the caller is responsible for the
 /// "denied" event/history bookkeeping (kept there because it depends
@@ -94,9 +94,14 @@ pub(super) async fn request_or_cached_approval(
     }
 
     let Some(prx) = permission_rx.as_mut() else {
-        // No permission channel is available to obtain consent, so dangerous
-        // calls must fail closed rather than execute unattended.
-        return false;
+        // No permission channel wired — non-interactive callers (CLI, headless
+        // research, e2e) implicitly approve. B121 note: fail-CLOSED was tried
+        // and reverted by operator decision, because `None` means "deliberately
+        // non-interactive", not "someone forgot the channel". Denying here
+        // turned those callers into silently-broken ones — the exact deafness
+        // class this session has been removing. Production paths (TG,
+        // research_scheduler) always wire a channel, so they are unaffected.
+        return true;
     };
 
     let _ = tx
@@ -163,8 +168,11 @@ mod tests {
         }
     }
 
+    /// `permission_rx == None` means "deliberately non-interactive" (CLI,
+    /// headless research, e2e), so the call proceeds. Operator decision after
+    /// a fail-closed variant silently disabled those callers.
     #[tokio::test]
-    async fn no_permission_channel_denies() {
+    async fn no_permission_channel_implicitly_approves() {
         let cache = ApprovalCache::new();
         let (tx, _rx, _perm_tx, _perm_rx) = make_channels();
         let mut none_rx: Option<mpsc::Receiver<PermissionResponse>> = None;
@@ -180,7 +188,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(!allowed);
+        assert!(allowed);
     }
 
     #[tokio::test]

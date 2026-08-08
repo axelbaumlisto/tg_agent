@@ -254,6 +254,45 @@ pub(crate) async fn spawn_task(
 /// over-budget entries as timed-out failures (drop the slot, let the underlying
 /// task finish naturally), refresh the heartbeat on the on-disk inflight
 /// ledger for live entries, and update the failure counters accordingly.
+/// B121a: record the outcome of a worker that died without recording its own.
+///
+/// Two stages of `sweep_running` need this: a hard-aborted timeout worker and
+/// a panicked one. Both must write the ledger the dead worker cannot write and
+/// then run the same `apply_outcome` accounting, or the failure never reaches
+/// the counter that drives alerting. Extracted rather than copied, because a
+/// second copy is how the panic path came to be missing in the first place —
+/// the timeout path had it and the natural-finish path silently did not.
+// REGISTRY-WAIVE: mirrors `sweep_running`'s own 6-arg signature; a struct wrapping them would exist for one call site only.
+#[allow(clippy::too_many_arguments)] // mirrors `sweep_running`'s own signature; grouping them would invent a struct that exists nowhere else
+async fn record_death_for_worker(
+    id: &str,
+    detail: &str,
+    state: &Arc<Mutex<SchedulerState>>,
+    notifier: &Arc<dyn TaskNotifier>,
+    core: Option<&Arc<AgentCore>>,
+    store: &Arc<dyn ResearchStore>,
+    specs: &[ResearchSpec],
+    config: &SchedulerConfig,
+) {
+    if let Ok(Some(mut infl)) = store.load_inflight(id).await
+        && !infl.state.is_terminal()
+    {
+        infl.mark_failed(detail.to_string());
+        let _ = store.save_inflight(id, &infl).await;
+    }
+    if let Some(spec) = specs.iter().find(|s| s.id == id) {
+        apply_outcome(
+            state,
+            notifier,
+            core,
+            spec,
+            &RunOutcome::Failure(detail.to_string()),
+            config,
+        )
+        .await;
+    }
+}
+
 pub(crate) async fn sweep_running(
     state: &Arc<Mutex<SchedulerState>>,
     notifier: &Arc<dyn TaskNotifier>,
@@ -369,31 +408,44 @@ pub(crate) async fn sweep_running(
                 "scheduler task ignored cooperative cancel after grace window — escalating to hard abort"
             );
         }
-        // Ensure the on-disk ledger reflects the timeout
-        // even though the aborted worker won't get to
-        // overwrite it.
-        if let Ok(Some(mut infl)) = store.load_inflight(&id).await
-            && !infl.state.is_terminal()
-        {
-            infl.mark_failed(format!(
+        record_death_for_worker(
+            &id,
+            &format!(
                 "task timeout (> {timeout_secs}s) — worker hard-aborted after {grace_secs}s grace"
-            ));
-            let _ = store.save_inflight(&id, &infl).await;
-        }
-        if let Some(spec) = specs.iter().find(|s| s.id == id) {
-            let outcome =
-                RunOutcome::Failure(format!("task timeout (> {timeout_secs}s, hard-abort)"));
-            apply_outcome(state, notifier, core, spec, &outcome, config).await;
-        }
+            ),
+            state,
+            notifier,
+            core,
+            store,
+            specs,
+            config,
+        )
+        .await;
         drop(removed);
     }
     // Stage 3: naturally-finished slots. Successful / errored / cooperatively
     // cancelled handles already updated their own counters via
-    // `apply_outcome` from inside the spawned future. We just drop
-    // the handle here.
+    // `apply_outcome` from inside the spawned future.
+    //
+    // B121a: but that accounting lives INSIDE the future, so a panic before it
+    // runs finishes the handle with `Err(JoinError)`. This used to
+    // `drop(removed)` without looking, which discarded the panic entirely: no
+    // failure counter, no alert, no auto-pause, and the slot freed — a crashed
+    // task laundered into "nothing happened". Awaiting a handle that already
+    // reports `is_finished()` does not block.
     for id in to_drop {
         let removed = state.lock().await.running.remove(&id);
-        drop(removed);
+        let Some(handle) = removed else { continue };
+        let Err(join_err) = handle.handle.await else {
+            continue; // ran to completion; it did its own accounting
+        };
+        let detail = if join_err.is_panic() {
+            "worker panicked before recording its outcome"
+        } else {
+            "worker was cancelled before recording its outcome"
+        };
+        tracing::error!(spec = %id, %join_err, "scheduler: {detail}");
+        record_death_for_worker(&id, detail, state, notifier, core, store, specs, config).await;
     }
 
     // Independent pass: detect ledgers whose `last_heartbeat` is
@@ -520,9 +572,11 @@ pub(crate) async fn apply_outcome(
             // Record alert / clear counter as appropriate before
             // releasing the lock so concurrent ticks don't double-fire.
             match &decision {
-                FailurePolicy::AlertOnce { .. } => {
-                    s.alerted.insert(spec.id.clone());
-                }
+                // B121b: do NOT mark it alerted here. Delivery has not been
+                // attempted yet, and recording it as sent is exactly what let
+                // a dead chat mute this spec forever. The insert now happens
+                // below, only if the notifier confirms delivery.
+                FailurePolicy::AlertOnce { .. } => {}
                 FailurePolicy::AutoPause { .. } => {
                     s.failures.remove(&spec.id);
                     s.alerted.remove(&spec.id);
@@ -541,7 +595,17 @@ pub(crate) async fn apply_outcome(
                 consecutive = count,
                 "scheduler: alert threshold reached, notifying operator"
             );
-            notifier.notify_failure(spec, count, &last_err).await;
+            if notifier.notify_failure(spec, count, &last_err).await {
+                state.lock().await.alerted.insert(spec.id.clone());
+            } else {
+                // Stay un-alerted so the NEXT failure tries again, rather than
+                // going quiet about a job nobody was told about.
+                tracing::error!(
+                    spec = %spec.id,
+                    consecutive = count,
+                    "scheduler: failure alert was NOT delivered — will retry on the next failure"
+                );
+            }
         }
         FailurePolicy::AutoPause { count } => {
             tracing::warn!(
