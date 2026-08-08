@@ -109,15 +109,78 @@ pub(crate) struct StreamResponseOutcome {
     pub(crate) wall_timeout: bool,
 }
 
-/// B113: single definition of "the agent made progress".
+/// B113/B124: single definition of "the agent made progress".
 ///
 /// Consumed by BOTH the run-registry silence warner and the UI stall detector.
-/// A keep-alive `Heartbeat` is explicitly NOT progress: it is emitted while a
-/// tool or provider call is blocked, so counting it as progress is what let a
-/// wedged turn look healthy to the user. Any future keep-alive variant is
-/// classified once, here.
+/// Progress means user-visible change or terminal/semantic turn advancement,
+/// not merely "some event arrived". Keep this match exhaustive: a new
+/// `AgentEvent` variant must be classified deliberately instead of silently
+/// joining the progress set by default.
 fn is_progress_event(event: &AgentEvent) -> bool {
-    !matches!(event, AgentEvent::Heartbeat)
+    match event {
+        AgentEvent::ThinkingDelta(_) => true,
+        AgentEvent::TextDelta(_) => true,
+        AgentEvent::ToolStart { .. } => true,
+        AgentEvent::ToolEnd { .. } => true,
+        AgentEvent::PermissionRequest { .. } => true,
+        // Heartbeat is only a keep-alive emitted while work may be blocked;
+        // counting it as progress is what hid wedged turns in B113.
+        AgentEvent::Heartbeat => false,
+        AgentEvent::SubAgentProgress { .. } => true,
+        // Usage is visible in live token/capacity text and the final footer.
+        AgentEvent::UsageUpdate(_) => true,
+        // Compaction sends a side message to the user, so it is visible.
+        AgentEvent::ContextCompacted { .. } => true,
+        // CycleRestarted currently renders nothing in the stream. Treat it as
+        // non-progress so a restart loop trips the stall warning instead of
+        // keeping a dead spinner fresh. If this event gains user-visible
+        // rendering later, classify that deliberate new behaviour here.
+        AgentEvent::CycleRestarted { .. } => false,
+        AgentEvent::ToolOutput { .. } => true,
+        AgentEvent::SteerReceived { .. } => true,
+        AgentEvent::Error(_) => true,
+        AgentEvent::Idle => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallWarning {
+    Level1,
+    Level2,
+}
+
+fn update_stall_detector(
+    event: Option<&AgentEvent>,
+    last_progress_at: &mut tokio::time::Instant,
+    stall_level: &mut u8,
+    now: tokio::time::Instant,
+) -> Option<StallWarning> {
+    if event.is_some_and(is_progress_event) {
+        *last_progress_at = now;
+        *stall_level = 0;
+        return None;
+    }
+    if event.is_some() {
+        return None;
+    }
+
+    let elapsed = now.duration_since(*last_progress_at).as_secs();
+    if *stall_level == 0 && elapsed >= 60 {
+        *stall_level = 1;
+        Some(StallWarning::Level1)
+    } else if *stall_level == 1 && elapsed >= 120 {
+        *stall_level = 2;
+        Some(StallWarning::Level2)
+    } else {
+        None
+    }
+}
+
+fn stall_warning_text(warning: StallWarning) -> &'static str {
+    match warning {
+        StallWarning::Level1 => "⚠️ Нет ответа 60с — возможно, зависло",
+        StallWarning::Level2 => "🔴 Зависло 2 мин — /abort чтобы прервать",
+    }
 }
 
 /// B106: annotate the view when the provider the user picked did not actually
@@ -300,7 +363,7 @@ pub(crate) async fn stream_response(
     let mut last_sent = String::new();
     let mut html_broken = false;
     let mut aborted_for_switch = false;
-    let mut last_event_at = tokio::time::Instant::now();
+    let mut last_progress_at = tokio::time::Instant::now();
     let mut stall_level: u8 = 0; // 0=none, 1=warned 60s, 2=critical 120s
 
     // Fixed-interval ticker for streaming flushes.
@@ -330,27 +393,19 @@ pub(crate) async fn stream_response(
         // running, `stall_level` never left 0, and the user never saw the 60s /
         // 2min warnings — while `warn_silent_runs` DID fire in the journal.
         // Ops saw a silent run, the user saw a healthy spinner.
-        if event.as_ref().is_some_and(is_progress_event) {
-            last_event_at = tokio::time::Instant::now();
-            stall_level = 0;
-        } else if event.is_none() {
-            let elapsed = last_event_at.elapsed().as_secs();
+        if let Some(warning) = update_stall_detector(
+            event.as_ref(),
+            &mut last_progress_at,
+            &mut stall_level,
+            tokio::time::Instant::now(),
+        ) {
             // B118b: the bubble Note keeps the live view honest; `stall_notice`
             // is what survives into the final answer. Both are set from this
             // one place so they can never disagree about whether a turn stalled.
-            if stall_level == 0 && elapsed >= 60 {
-                stall_level = 1;
-                let note = "⚠️ Нет ответа 60с — возможно, зависло".to_string();
-                view.stall_notice = Some(note.clone());
-                view.events.push(TurnEvent::Note(note));
-                dirty = true;
-            } else if stall_level == 1 && elapsed >= 120 {
-                stall_level = 2;
-                let note = "🔴 Зависло 2 мин — /abort чтобы прервать".to_string();
-                view.stall_notice = Some(note.clone());
-                view.events.push(TurnEvent::Note(note));
-                dirty = true;
-            }
+            let note = stall_warning_text(warning).to_string();
+            view.stall_notice = Some(note.clone());
+            view.events.push(TurnEvent::Note(note));
+            dirty = true;
         }
 
         let has_event = event.is_some();
@@ -1052,5 +1107,192 @@ mod b113_tests {
             name: "bash".into(),
             input: serde_json::json!({}),
         }));
+    }
+
+    fn cycle_restarted_event() -> AgentEvent {
+        AgentEvent::CycleRestarted {
+            cycle_number: 7,
+            archived_messages: 42,
+            archive_path: "/tmp/archive.jsonl".into(),
+        }
+    }
+
+    fn tool_start_event() -> AgentEvent {
+        AgentEvent::ToolStart {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            input: serde_json::json!({"cmd": "true"}),
+        }
+    }
+
+    #[test]
+    fn b124_cycle_restarted_does_not_reset_stall_detector() {
+        let start = tokio::time::Instant::now();
+        let mut last_progress_at = start;
+        let mut stall_level = 0;
+        let after_61s = start + std::time::Duration::from_secs(61);
+        let restarted = cycle_restarted_event();
+
+        assert_eq!(
+            update_stall_detector(
+                Some(&restarted),
+                &mut last_progress_at,
+                &mut stall_level,
+                after_61s,
+            ),
+            None,
+            "CycleRestarted itself renders nothing, so it should not emit a stall note directly"
+        );
+        assert_eq!(
+            update_stall_detector(None, &mut last_progress_at, &mut stall_level, after_61s),
+            Some(StallWarning::Level1),
+            "a stream containing only CycleRestarted events must reach the 60s stall warning"
+        );
+        assert_eq!(stall_level, 1);
+    }
+
+    #[test]
+    fn b124_visible_progress_resets_stall_detector() {
+        let start = tokio::time::Instant::now();
+        let mut last_progress_at = start;
+        let mut stall_level = 1;
+        let after_61s = start + std::time::Duration::from_secs(61);
+        let tool_start = tool_start_event();
+
+        assert_eq!(
+            update_stall_detector(
+                Some(&tool_start),
+                &mut last_progress_at,
+                &mut stall_level,
+                after_61s,
+            ),
+            None
+        );
+        assert_eq!(
+            stall_level, 0,
+            "ordinary tool progress must clear stale stall state"
+        );
+        assert_eq!(
+            update_stall_detector(
+                None,
+                &mut last_progress_at,
+                &mut stall_level,
+                after_61s + std::time::Duration::from_secs(1),
+            ),
+            None,
+            "healthy visible progress must not be followed by a false stall warning"
+        );
+    }
+
+    #[test]
+    fn b124_progress_classification_covers_every_agent_event_variant() {
+        use naked_core::types::{Permission, SubAgentEvent, ToolState, TurnUsage};
+
+        let cases: Vec<(&str, AgentEvent, bool)> = vec![
+            (
+                "ThinkingDelta updates the live reasoning timeline",
+                AgentEvent::ThinkingDelta("thinking".into()),
+                true,
+            ),
+            (
+                "TextDelta updates the live answer",
+                AgentEvent::TextDelta("answer".into()),
+                true,
+            ),
+            (
+                "ToolStart renders a tool row and starts real work",
+                tool_start_event(),
+                true,
+            ),
+            (
+                "ToolEnd renders tool completion/output",
+                AgentEvent::ToolEnd {
+                    call_id: "call-1".into(),
+                    name: "bash".into(),
+                    state: ToolState::Completed,
+                    output: "ok".into(),
+                },
+                true,
+            ),
+            (
+                "PermissionRequest shows a user decision dialog",
+                AgentEvent::PermissionRequest {
+                    call_id: "call-1".into(),
+                    tool_name: "bash".into(),
+                    input: serde_json::json!({"cmd": "true"}),
+                    permission: Permission::WorkspaceWrite,
+                },
+                true,
+            ),
+            (
+                "Heartbeat is only a keep-alive while work is blocked",
+                AgentEvent::Heartbeat,
+                false,
+            ),
+            (
+                "SubAgentProgress renders child-agent state",
+                AgentEvent::SubAgentProgress {
+                    agent_id: "sub-1".into(),
+                    event: SubAgentEvent::Started {
+                        prompt_preview: "inspect".into(),
+                    },
+                },
+                true,
+            ),
+            (
+                "UsageUpdate changes visible token/capacity/footer bookkeeping",
+                AgentEvent::UsageUpdate(TurnUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Default::default()
+                }),
+                true,
+            ),
+            (
+                "ContextCompacted sends a visible side message",
+                AgentEvent::ContextCompacted {
+                    before_msgs: 100,
+                    after_msgs: 40,
+                    summary_hint: Some("goal".into()),
+                    files_count: 3,
+                },
+                true,
+            ),
+            (
+                "CycleRestarted currently renders nothing; a restart loop must trip the stall detector",
+                cycle_restarted_event(),
+                false,
+            ),
+            (
+                "ToolOutput updates the running-tool stdout/stderr preview",
+                AgentEvent::ToolOutput {
+                    call_id: "call-1".into(),
+                    chunk: "line".into(),
+                },
+                true,
+            ),
+            (
+                "SteerReceived renders delivery proof and deletes temp acks",
+                AgentEvent::SteerReceived {
+                    text: "new instruction".into(),
+                    msg_ids: vec![11, 12],
+                },
+                true,
+            ),
+            (
+                "Error renders a user-visible failure",
+                AgentEvent::Error("boom".into()),
+                true,
+            ),
+            ("Idle is terminal turn advancement", AgentEvent::Idle, true),
+        ];
+
+        for (reason, event, expected) in cases {
+            assert_eq!(
+                is_progress_event(&event),
+                expected,
+                "wrong progress classification: {reason}; event={event:?}"
+            );
+        }
     }
 }
