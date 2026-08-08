@@ -19,12 +19,30 @@ pub trait McpTransport: Send + Sync {
     async fn close(&self) -> Result<()>;
 }
 
+/// Fallback when a server config does not set `tool_timeout_secs` — the value
+/// that used to be hardcoded for every server.
+const DEFAULT_MCP_TIMEOUT_SECS: u64 = 60;
+
 pub struct StdioTransport {
     stdin: Mutex<tokio::process::ChildStdin>,
     stdout: Mutex<BufReader<tokio::process::ChildStdout>>,
     #[allow(dead_code)]
     child: Mutex<Child>,
     next_id: AtomicU64,
+    /// B120a: one in-flight request per transport.
+    ///
+    /// `stdin` and `stdout` were separate locks, so two callers could
+    /// interleave a write with the other's read. Read-only tools genuinely run
+    /// in parallel (`loop_/tools.rs` uses `join_all`), so this was reachable.
+    /// Holding one lock across the whole exchange makes "the next line is my
+    /// answer" true instead of merely usual.
+    exchange: Mutex<()>,
+    /// B120c: the configured deadline, previously ignored in favour of a
+    /// hardcoded 60s.
+    request_timeout: std::time::Duration,
+    /// B120a: set when a timeout leaves an unread reply in the pipe. The
+    /// stream is then desynchronised and cannot be trusted again.
+    desynced: std::sync::atomic::AtomicBool,
 }
 
 impl StdioTransport {
@@ -82,6 +100,14 @@ impl StdioTransport {
             stdout: Mutex::new(BufReader::new(stdout)),
             child: Mutex::new(child),
             next_id: AtomicU64::new(1),
+            exchange: Mutex::new(()),
+            // B120c: honour the configured deadline. It was parsed and then
+            // ignored in favour of a hardcoded 60s, so a short timeout set by
+            // an operator did nothing at all.
+            request_timeout: std::time::Duration::from_secs(
+                config.tool_timeout_secs.unwrap_or(DEFAULT_MCP_TIMEOUT_SECS),
+            ),
+            desynced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -108,22 +134,49 @@ impl McpTransport for StdioTransport {
     }
 
     async fn send_and_recv(&self, req: &JsonRpcRequest) -> Result<JsonRpcResponse> {
-        self.send(req).await?;
+        // B120a: hold one lock for the whole exchange.
+        let _exchange = self.exchange.lock().await;
+
+        if self.desynced.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AgentError::ProviderTyped(ProviderError::Mcp {
+                context: "MCP: transport desynchronised by an earlier timeout — refusing to guess which reply is mine".into(),
+                source: String::new(),
+            }));
+        }
+
+        let timeout = self.request_timeout;
+
+        // B120b: the write half needs a deadline too. A server that stops
+        // reading its stdin used to park the turn forever, because the read
+        // timeout below could never start.
+        match tokio::time::timeout(timeout, self.send(req)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                // A partial line may have been written; the server's framing is
+                // no longer trustworthy.
+                self.desynced
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(AgentError::ProviderTyped(ProviderError::Mcp {
+                    context: format!("MCP: request write timed out after {timeout:?}"),
+                    source: String::new(),
+                }));
+            }
+        }
 
         let mut stdout = self.stdout.lock().await;
         let mut line = String::new();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            stdout.read_line(&mut line),
-        )
-        .await
-        {
+        match tokio::time::timeout(timeout, stdout.read_line(&mut line)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
+                // The reply may still arrive later and would then be read as
+                // the NEXT call's answer. Refuse to reuse this stream.
+                self.desynced
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(AgentError::ProviderTyped(
                     crate::provider::error::ProviderError::Mcp {
-                        context: "response timed out after 60s".into(),
+                        context: format!("response timed out after {timeout:?}"),
                         source: String::new(),
                     },
                 ));
@@ -143,6 +196,23 @@ impl McpTransport for StdioTransport {
                 source: e.to_string(),
             })
         })?;
+
+        // B120a: THE check. Every request carries a unique `id` and every
+        // response echoes it, but nothing compared them, so a stale or
+        // out-of-order reply parsed cleanly into a valid-looking result and the
+        // agent answered confidently from another tool's output. A wrong answer
+        // that looks right is worse than an error.
+        if resp.id != req.id {
+            self.desynced
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(AgentError::ProviderTyped(ProviderError::Mcp {
+                context: format!(
+                    "MCP: response id {:?} does not match request id {:?} — refusing to use another call's result",
+                    resp.id, req.id
+                ),
+                source: String::new(),
+            }));
+        }
 
         Ok(resp)
     }
@@ -271,5 +341,132 @@ mod tests {
             headers: HashMap::new(),
             tool_timeout_secs: None,
         }
+    }
+
+    /// Build a fake MCP server from a shell script over real pipes, so the
+    /// framing logic under test is the real one (MockTransport replaces
+    /// `send_and_recv` wholesale and therefore cannot see any of this).
+    fn scripted_server(script: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: "fake".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            tool_timeout_secs: Some(3),
+            ..Default::default()
+        }
+    }
+
+    /// B120a: a reply carrying someone else's id must be REFUSED, not used.
+    ///
+    /// Requests carry a unique id and responses echo it, but nothing compared
+    /// them. A stale reply (left in the pipe after a timeout) or an
+    /// out-of-order one parsed cleanly into a valid-looking result, so the
+    /// agent answered confidently from another tool's output. Read-only tools
+    /// really do run concurrently (`loop_/tools.rs` uses `join_all`), and
+    /// production runs two MCP servers, so this was reachable.
+    #[tokio::test]
+    async fn response_with_foreign_id_is_rejected_not_used() {
+        // Always answers id=999, whatever was asked.
+        let t = StdioTransport::spawn(&scripted_server(
+            r#"while read line; do printf '{"jsonrpc":"2.0","id":999,"result":{"stolen":true}}\n'; done"#,
+        ))
+        .await
+        .expect("spawn fake server");
+
+        let req = JsonRpcRequest::new(7, "tools/call", None);
+        let err = t
+            .send_and_recv(&req)
+            .await
+            .expect_err("a foreign id must not be accepted as this call's answer");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not match request id"),
+            "error must name the id mismatch, got: {msg}"
+        );
+    }
+
+    /// A well-behaved server must still work — the guard must not reject
+    /// legitimate traffic.
+    #[tokio::test]
+    async fn matching_id_is_accepted() {
+        let t = StdioTransport::spawn(&scripted_server(
+            r#"while read line; do id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/'); printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"; done"#,
+        ))
+        .await
+        .expect("spawn fake server");
+
+        let req = JsonRpcRequest::new(42, "tools/call", None);
+        let resp = t.send_and_recv(&req).await.expect("echoed id must be fine");
+        assert_eq!(resp.id, Some(42));
+    }
+
+    /// B120a: once a timeout leaves an unread reply in the pipe, the stream is
+    /// desynchronised — the next call must not inherit that pending answer.
+    #[tokio::test]
+    async fn transport_refuses_to_continue_after_a_timeout_desync() {
+        // Never answers: forces the read timeout.
+        let t = StdioTransport::spawn(&scripted_server("sleep 30"))
+            .await
+            .expect("spawn fake server");
+
+        let first = JsonRpcRequest::new(1, "tools/call", None);
+        assert!(
+            t.send_and_recv(&first).await.is_err(),
+            "a silent server must time out"
+        );
+
+        let second = JsonRpcRequest::new(2, "tools/call", None);
+        let err = format!("{}", t.send_and_recv(&second).await.unwrap_err());
+        assert!(
+            err.contains("desynchronised"),
+            "after a timeout the transport must refuse to guess, got: {err}"
+        );
+    }
+
+    /// B120c: the configured timeout must be the one that fires.
+    #[tokio::test]
+    async fn configured_timeout_is_used_instead_of_the_old_hardcoded_60s() {
+        let t = StdioTransport::spawn(&scripted_server("sleep 30"))
+            .await
+            .expect("spawn fake server");
+        let started = std::time::Instant::now();
+        let _ = t.send_and_recv(&JsonRpcRequest::new(1, "x", None)).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(15),
+            "a 3s configured timeout must not wait the old hardcoded 60s; waited {waited:?}"
+        );
+    }
+
+    /// B120b: the WRITE half needs its own deadline.
+    ///
+    /// The 60s timeout only ever covered `read_line`. A server that never
+    /// reads its stdin fills the pipe, `write_all`/`flush` block, and the read
+    /// timeout can never start — the turn parks forever. Writing more than one
+    /// pipe buffer (64 KiB on Linux) to a non-reading child reproduces it.
+    #[tokio::test]
+    async fn write_half_times_out_when_the_server_never_reads_stdin() {
+        // Never reads stdin; just stays alive so the pipe stays open.
+        let t = StdioTransport::spawn(&scripted_server("sleep 30"))
+            .await
+            .expect("spawn fake server");
+
+        let big = "x".repeat(512 * 1024);
+        let req = JsonRpcRequest::new(1, "tools/call", Some(serde_json::json!({ "payload": big })));
+
+        let started = std::time::Instant::now();
+        let err = t
+            .send_and_recv(&req)
+            .await
+            .expect_err("a server that never drains stdin must not park us forever");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the write must be bounded by the configured timeout"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("write timed out") || msg.contains("timed out"),
+            "error must say it timed out, got: {msg}"
+        );
     }
 }
