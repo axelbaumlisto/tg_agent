@@ -617,12 +617,13 @@ pub fn spawn_memory_classify(
                 &result.content,
                 "auto",
             ) {
-                Ok(true) => tracing::info!(
+                Ok(outcome) if outcome.inserted => tracing::info!(
+                    truncated = outcome.truncated,
                     "memory auto-captured: [{}] {}",
                     result.memory_type,
-                    result.content
+                    outcome.content
                 ),
-                Ok(false) => tracing::debug!("memory auto-capture: duplicate skipped"),
+                Ok(_) => tracing::debug!("memory auto-capture: duplicate skipped"),
                 Err(e) => tracing::warn!("memory auto-capture write failed: {e}"),
             }
         }

@@ -5,16 +5,64 @@
 //!   * `**` — match any sequence including `/`
 //!   * `?`  — match exactly one char
 //!   * `~/` and `$HOME/` — expand to `$HOME` at match time
-//!   * Empty pattern or `"*"` — match anything
+//!   * `*` is the explicit match-anything wildcard; an empty pattern matches nothing
+//!   * Path-like patterns are canonicalised before matching. Ruleset evaluation uses
+//!     a tri-state matcher so canonicalisation failures force `Ask` instead of being
+//!     collapsed into a non-match that a later `Allow` can override.
+
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchResult {
+    Yes,
+    No,
+    Indeterminate,
+}
 
 #[must_use]
 pub fn matches(pattern: &str, target: &str) -> bool {
-    if pattern.is_empty() || pattern == "*" {
-        return true;
+    matches!(match_rule(pattern, target), MatchResult::Yes)
+}
+
+#[must_use]
+pub(crate) fn match_rule(pattern: &str, target: &str) -> MatchResult {
+    if pattern.is_empty() {
+        return MatchResult::No;
     }
+    if pattern == "*" {
+        return MatchResult::Yes;
+    }
+
     let pattern = expand_home(pattern);
     let target = expand_home(target);
-    match_glob(&pattern, &target)
+    if is_path_like_pattern(&pattern) {
+        let pattern = match canonicalize_path_pattern(&pattern) {
+            Ok(pattern) => pattern,
+            Err(()) => return MatchResult::Indeterminate,
+        };
+        let target = match canonicalize_nearest(&target) {
+            Ok(target) => target,
+            Err(()) => return MatchResult::Indeterminate,
+        };
+        return if match_glob(&pattern, &target) {
+            MatchResult::Yes
+        } else {
+            MatchResult::No
+        };
+    }
+
+    if match_glob(&pattern, &target) {
+        MatchResult::Yes
+    } else {
+        MatchResult::No
+    }
+}
+
+fn is_path_like_pattern(pattern: &str) -> bool {
+    pattern.contains('/') || pattern.starts_with('~') || pattern.starts_with("$HOME")
 }
 
 fn expand_home(s: &str) -> String {
@@ -27,6 +75,71 @@ fn expand_home(s: &str) -> String {
         out = format!("{home}/{}", &out[2..]);
     }
     out
+}
+
+fn canonicalize_path_pattern(pattern: &str) -> Result<String, ()> {
+    let first_glob = pattern.find(['*', '?']);
+    match first_glob {
+        Some(idx) => {
+            let (prefix, suffix) = pattern.split_at(idx);
+            let prefix_for_canon = if prefix.is_empty() { "." } else { prefix };
+            let mut out = canonicalize_nearest(prefix_for_canon)?;
+            if !suffix.is_empty() && (prefix.is_empty() || prefix.ends_with('/')) {
+                out.push('/');
+            }
+            out.push_str(suffix);
+            Ok(out)
+        }
+        None => canonicalize_nearest(pattern),
+    }
+}
+
+fn canonicalize_nearest(path: &str) -> Result<String, ()> {
+    if path.is_empty() {
+        return Err(());
+    }
+
+    let mut probe = absolute_path(path)?;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&probe) {
+            Ok(_) => {
+                let base = std::fs::canonicalize(&probe).map_err(|_| ())?;
+                let joined = join_normalized_suffix(base, suffix);
+                return Ok(joined.to_string_lossy().into_owned());
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
+        }
+        let name = probe.file_name().ok_or(())?.to_os_string();
+        suffix.insert(0, name);
+        if !probe.pop() {
+            return Err(());
+        }
+    }
+}
+
+fn absolute_path(path: &str) -> Result<PathBuf, ()> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir().map_err(|_| ())?.join(path))
+    }
+}
+
+fn join_normalized_suffix(mut base: PathBuf, suffix: Vec<std::ffi::OsString>) -> PathBuf {
+    for part in suffix {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            base.pop();
+        } else {
+            base.push(part);
+        }
+    }
+    base
 }
 
 /// Recursive glob matcher. Handles `*`, `**`, `?`. Linear in
@@ -83,7 +196,7 @@ mod tests {
     #[test]
     fn star_matches_anything() {
         assert!(matches("*", "anything"));
-        assert!(matches("", "anything"));
+        assert!(!matches("", "anything"));
     }
 
     #[test]
@@ -111,6 +224,44 @@ mod tests {
         assert!(matches(".env*", ".env"));
         assert!(matches(".env*", ".env.local"));
         assert!(!matches(".env*", "config.env"));
+    }
+
+    #[test]
+    fn canonical_path_pattern_allows_create_under_existing_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let pattern = format!("{}/**", project.display());
+        let target = project.join("new.txt");
+        assert!(matches(&pattern, &target.display().to_string()));
+    }
+
+    #[test]
+    fn canonical_path_pattern_rejects_dot_dot_escape() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().join("project");
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&ssh).unwrap();
+        let pattern = format!("{}/**", project.display());
+        let target = project.join("..").join(".ssh").join("authorized_keys");
+        assert!(!matches(&pattern, &target.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_pattern_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, project.join("link")).unwrap();
+        let pattern = format!("{}/**", project.display());
+        let target = project.join("link").join("created.txt");
+        assert!(!matches(&pattern, &target.display().to_string()));
     }
 
     #[test]

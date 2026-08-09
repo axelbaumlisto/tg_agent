@@ -307,7 +307,7 @@ fn t5_permissions_ruleset_real_workspace_glob() {
     // Allow rule.
     assert_eq!(rs.evaluate("read", "src/foo.rs"), Action::Allow);
     assert_eq!(rs.evaluate("read", "src/sub/dir/x.py"), Action::Allow);
-    // More specific deny wins (last match).
+    // More specific deny wins by precedence, not by order.
     assert_eq!(rs.evaluate("read", "src/secrets/api.key"), Action::Deny);
     // Unmatched (read on .env) → Ask.
     assert_eq!(rs.evaluate("read", ".env"), Action::Ask);

@@ -330,6 +330,115 @@ async fn dedup_survives_reopen() {
 }
 
 #[tokio::test]
+async fn upsert_existing_finding_replaces_row_and_keeps_dedup() {
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("id-upsert-replace", "t");
+    store.create_spec(&spec).await.unwrap();
+
+    let original = make_finding("id-upsert-replace", "https://x.com/ad/replace");
+    assert!(!store.upsert_finding(&original).await.unwrap());
+
+    let mut updated = original.clone();
+    updated.title = Some("updated title".into());
+    updated.excerpt = Some("updated excerpt".into());
+    assert!(store.upsert_finding(&updated).await.unwrap());
+
+    let findings = store
+        .list_findings("id-upsert-replace", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        findings.len(),
+        1,
+        "upsert must replace, not append duplicate rows"
+    );
+    assert_eq!(findings[0].dedup_hash, original.dedup_hash);
+    assert_eq!(findings[0].title.as_deref(), Some("updated title"));
+    assert_eq!(findings[0].excerpt.as_deref(), Some("updated excerpt"));
+
+    let same = make_finding("id-upsert-replace", "https://x.com/ad/replace");
+    assert!(!store.try_append_finding(&same).await.unwrap());
+    assert_eq!(store.count_findings("id-upsert-replace").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn upsert_existing_finding_missing_file_is_inconsistent() {
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("id-upsert-missing", "t");
+    store.create_spec(&spec).await.unwrap();
+
+    let first = make_finding("id-upsert-missing", "https://x.com/ad/a");
+    assert!(!store.upsert_finding(&first).await.unwrap());
+    let path = tmp.path().join("id-upsert-missing").join("findings.jsonl");
+    std::fs::remove_file(&path).unwrap();
+
+    let mut updated = first.clone();
+    updated.title = Some("updated after missing file".into());
+    let err = store
+        .upsert_finding(&updated)
+        .await
+        .expect_err("missing findings.jsonl after dedup hit must surface an inconsistency");
+    assert!(
+        err.to_string()
+            .contains("findings.jsonl missing for existing finding rewrite"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        !path.exists(),
+        "missing rewrite input must not be silently recreated as a one-row file"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upsert_existing_finding_read_error_keeps_file_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("id-upsert-read-error", "t");
+    store.create_spec(&spec).await.unwrap();
+
+    let first = make_finding("id-upsert-read-error", "https://x.com/ad/a");
+    let second = make_finding("id-upsert-read-error", "https://x.com/ad/b");
+    assert!(!store.upsert_finding(&first).await.unwrap());
+    assert!(!store.upsert_finding(&second).await.unwrap());
+
+    let path = tmp
+        .path()
+        .join("id-upsert-read-error")
+        .join("findings.jsonl");
+    let original_bytes = std::fs::read(&path).unwrap();
+    let original_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut updated = first.clone();
+    updated.title = Some("updated after read failure".into());
+    let err = store
+        .upsert_finding(&updated)
+        .await
+        .expect_err("unreadable findings.jsonl must surface an error");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode)).unwrap();
+    assert!(
+        matches!(&err, AgentError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "expected PermissionDenied I/O error, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original_bytes,
+        "read failure on rewrite path must leave findings.jsonl byte-for-byte intact"
+    );
+    assert_eq!(
+        assert_findings_file_all_valid(&path).len(),
+        2,
+        "the pre-existing findings must not be collapsed to the replacement row"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_upsert_keeps_file_valid() {
     let tmp = tempdir().unwrap();
     let store = Arc::new(FsResearchStore::new(tmp.path().to_path_buf()));

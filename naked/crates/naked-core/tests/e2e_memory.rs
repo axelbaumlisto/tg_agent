@@ -469,7 +469,10 @@ async fn t98_memory_user_scope_roundtrip() {
         "user",
     )
     .unwrap();
-    assert!(stored_a, "alice's preference should be newly stored");
+    assert!(
+        stored_a.inserted,
+        "alice's preference should be newly stored"
+    );
     let stored_b = MemoryService::store(
         &workspace,
         MemoryScope::User(bob.clone()),
@@ -478,7 +481,7 @@ async fn t98_memory_user_scope_roundtrip() {
         "user",
     )
     .unwrap();
-    assert!(stored_b, "bob's preference should be newly stored");
+    assert!(stored_b.inserted, "bob's preference should be newly stored");
 
     // list(User(alice)) returns alice only.
     let alice_entries = MemoryService::list(&workspace, Some(MemoryScope::User(alice.clone())));

@@ -79,8 +79,18 @@ pub(crate) async fn memory_cmd(args: &[String]) -> Result<()> {
 
             let scope_label = scope.to_string();
             match MemoryService::store(&workspace, scope, memory_type, content, "user") {
-                Ok(true) => eprintln!("Stored: [{scope_label}/{memory_type}] {content}"),
-                Ok(false) => eprintln!("Duplicate — already exists."),
+                Ok(outcome) if outcome.inserted => {
+                    if outcome.truncated {
+                        eprintln!(
+                            "Stored (truncated to {} chars): [{scope_label}/{memory_type}] {}",
+                            outcome.content.chars().count(),
+                            outcome.content
+                        );
+                    } else {
+                        eprintln!("Stored: [{scope_label}/{memory_type}] {}", outcome.content);
+                    }
+                }
+                Ok(_) => eprintln!("Duplicate — already exists."),
                 Err(e) => eprintln!("Error: {e}"),
             }
         }

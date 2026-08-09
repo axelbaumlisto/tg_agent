@@ -4,6 +4,14 @@ use super::store::{MAX_ENTRY_CHARS, MAX_INJECTION_CHARS, MarkdownMemoryStore};
 use super::types::{MemoryEntry, MemoryScope, MemoryType};
 use crate::config::MemoryConfig;
 
+/// Result of an attempted memory store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreOutcome {
+    pub inserted: bool,
+    pub content: String,
+    pub truncated: bool,
+}
+
 /// High-level API for the memory system.
 pub struct MemoryService;
 
@@ -109,32 +117,26 @@ impl MemoryService {
         rendered
     }
 
-    /// Store a new memory entry. Truncates content to MAX_ENTRY_CHARS.
+    /// Store a new memory entry. Content longer than MAX_ENTRY_CHARS is
+    /// UTF-8-safely truncated; the returned outcome reports the exact content
+    /// persisted by the store.
     pub fn store(
         workspace: &Path,
         scope: MemoryScope,
         memory_type: MemoryType,
         content: &str,
         source: &str,
-    ) -> std::io::Result<bool> {
-        // UTF-8 safe truncation: `MAX_ENTRY_CHARS` is named in chars, not
-        // bytes. Memory entries persist arbitrary user text (Russian,
-        // Vietnamese, emoji, …) so we must walk char boundaries — slicing
-        // on a raw byte index panics inside multi-byte codepoints.
-        let content = if content.chars().count() > MAX_ENTRY_CHARS {
-            let mut t: String = content
-                .chars()
-                .take(MAX_ENTRY_CHARS.saturating_sub(3))
-                .collect();
-            t.push_str("...");
-            t
-        } else {
-            content.to_string()
-        };
+    ) -> std::io::Result<StoreOutcome> {
+        let (content, truncated) = truncate_entry_content(content);
 
         let path = scope_path(workspace, &scope);
-        let entry = MemoryEntry::new(memory_type, content, source, scope);
-        MarkdownMemoryStore::append(&path, &entry)
+        let entry = MemoryEntry::new(memory_type, content.clone(), source, scope);
+        let inserted = MarkdownMemoryStore::append(&path, &entry)?;
+        Ok(StoreOutcome {
+            inserted,
+            content,
+            truncated,
+        })
     }
 
     /// Search entries by substring (case-insensitive) across global + project.
@@ -506,6 +508,23 @@ fn record_injection_dropped(dropped: DroppedByScope) {
         max_chars = MAX_INJECTION_CHARS,
         "memory injection truncated: dropped entries due to prompt budget"
     );
+}
+
+fn truncate_entry_content(content: &str) -> (String, bool) {
+    // UTF-8 safe truncation: `MAX_ENTRY_CHARS` is named in chars, not
+    // bytes. Memory entries persist arbitrary user text (Russian,
+    // Vietnamese, emoji, …) so we must walk char boundaries — slicing
+    // on a raw byte index panics inside multi-byte codepoints.
+    if content.chars().count() > MAX_ENTRY_CHARS {
+        let mut truncated: String = content
+            .chars()
+            .take(MAX_ENTRY_CHARS.saturating_sub(3))
+            .collect();
+        truncated.push_str("...");
+        (truncated, true)
+    } else {
+        (content.to_string(), false)
+    }
 }
 
 fn scope_path(workspace: &Path, scope: &MemoryScope) -> std::path::PathBuf {

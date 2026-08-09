@@ -93,10 +93,6 @@ impl Tool for MemoryTool {
                         "enum": ["project", "global", "user"],
                         "description": "Scope: project (current workspace), global (all projects), or user (the current author in a chat). Default: project"
                     },
-                    "user_id": {
-                        "type": "string",
-                        "description": "Explicit user id for scope=user. If omitted, the active chat author is used."
-                    },
                     "id": {
                         "type": "string",
                         "description": "Memory entry ID (required for delete)"
@@ -125,21 +121,20 @@ impl Tool for MemoryTool {
             .and_then(|v| v.as_str())
             .unwrap_or("project")
             .to_ascii_lowercase();
-        let explicit_user = input
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let trusted_user = self.context.user_id();
 
+        let trusted_user_scope = || match trusted_user.clone() {
+            Some(id) if !id.is_empty() => Ok(MemoryScope::User(id)),
+            _ => Err("scope=user requires an active chat author in trusted context".into()),
+        };
         let resolved_scope: Result<MemoryScope, String> = match scope_str.as_str() {
             "project" => Ok(MemoryScope::Project),
             "global" => Ok(MemoryScope::Global),
-            "user" => match explicit_user.clone().or_else(|| self.context.user_id()) {
-                Some(id) if !id.is_empty() => Ok(MemoryScope::User(id)),
-                _ => {
-                    Err("scope=user requires a user_id or an active chat author in context".into())
-                }
+            "user" => trusted_user_scope(),
+            other => match other.parse::<MemoryScope>() {
+                Ok(MemoryScope::User(_)) => trusted_user_scope(),
+                parsed => parsed,
             },
-            other => other.parse::<MemoryScope>(),
         };
 
         self.dispatch_action(
@@ -148,10 +143,14 @@ impl Tool for MemoryTool {
             &input,
             &scope_str,
             resolved_scope,
-            explicit_user,
+            trusted_user,
         )
         .await
     }
+}
+
+fn is_user_scope_request(scope: &str) -> bool {
+    scope == "user" || scope.starts_with("user:")
 }
 
 impl MemoryTool {
@@ -164,7 +163,7 @@ impl MemoryTool {
         input: &serde_json::Value,
         scope_str: &str,
         resolved_scope: Result<MemoryScope, String>,
-        explicit_user: Option<String>,
+        trusted_user: Option<String>,
     ) -> ToolResult {
         match action {
             "store" => {
@@ -190,10 +189,21 @@ impl MemoryTool {
                 let scope_label = scope.to_string();
 
                 match MemoryService::store(&self.workspace, scope, memory_type, content, "model") {
-                    Ok(true) => ToolResult::ok(format!(
-                        "Stored {scope_label} {memory_type} memory: {content}"
-                    )),
-                    Ok(false) => ToolResult::ok("Memory already exists (duplicate skipped)"),
+                    Ok(outcome) if outcome.inserted => {
+                        if outcome.truncated {
+                            ToolResult::ok(format!(
+                                "Stored {scope_label} {memory_type} memory (truncated to {} chars): {}",
+                                outcome.content.chars().count(),
+                                outcome.content
+                            ))
+                        } else {
+                            ToolResult::ok(format!(
+                                "Stored {scope_label} {memory_type} memory: {}",
+                                outcome.content
+                            ))
+                        }
+                    }
+                    Ok(_) => ToolResult::ok("Memory already exists (duplicate skipped)"),
                     Err(e) => ToolResult::err(format!("Error storing memory: {e}")),
                 }
             }
@@ -202,7 +212,17 @@ impl MemoryTool {
                 if content.is_empty() {
                     return ToolResult::err("Error: content (query) is required for search");
                 }
-                let sender = explicit_user.clone().or_else(|| self.context.user_id());
+                let sender = if is_user_scope_request(scope_str) {
+                    match &resolved_scope {
+                        Ok(MemoryScope::User(uid)) => Some(uid.clone()),
+                        Ok(_) => None,
+                        Err(e) => {
+                            return ToolResult::err(format!("Error: {e}"));
+                        }
+                    }
+                } else {
+                    trusted_user.clone()
+                };
                 let results =
                     MemoryService::search_for(&self.workspace, content, sender.as_deref());
                 if results.is_empty() {
@@ -235,7 +255,7 @@ impl MemoryTool {
                 let scope_filter = match scope_str {
                     "global" => Some(MemoryScope::Global),
                     "project" => Some(MemoryScope::Project),
-                    "user" => match resolved_scope {
+                    s if is_user_scope_request(s) => match resolved_scope {
                         Ok(s) => Some(s),
                         Err(e) => {
                             return ToolResult::err(format!("Error: {e}"));
@@ -407,12 +427,19 @@ impl MemoryTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::store::{MAX_ENTRY_CHARS, MemoryPaths};
     use crate::tool::policy::{ToolDecision, ToolPolicy, default_pipeline};
     use std::path::Path;
     use tempfile::tempdir;
 
     fn make_tool(dir: &Path) -> MemoryTool {
         MemoryTool::new(dir.to_path_buf())
+    }
+
+    fn make_tool_with_user(dir: &Path, user_id: &str) -> MemoryTool {
+        let context = MemoryContext::new();
+        context.set_user_id(Some(user_id.to_string()));
+        MemoryTool::with_context(dir.to_path_buf(), context)
     }
 
     #[tokio::test]
@@ -437,6 +464,240 @@ mod tests {
         assert!(
             res.output.contains("dark theme"),
             "search result: {}",
+            res.output
+        );
+    }
+
+    #[tokio::test]
+    async fn user_scope_reads_ignore_model_supplied_foreign_user_id() {
+        let tmp = tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(tmp.path().join("home"));
+        let tool = make_tool_with_user(tmp.path(), "alice");
+
+        let bob = MemoryService::store(
+            tmp.path(),
+            MemoryScope::User("bob".into()),
+            MemoryType::Preference,
+            "bob-private-password",
+            "test",
+        )
+        .unwrap();
+        assert!(bob.inserted);
+        let alice = MemoryService::store(
+            tmp.path(),
+            MemoryScope::User("alice".into()),
+            MemoryType::Preference,
+            "alice-private-note",
+            "test",
+        )
+        .unwrap();
+        assert!(alice.inserted);
+
+        let search = tool
+            .execute(
+                serde_json::json!({
+                    "action": "search",
+                    "scope": "user",
+                    "user_id": "bob",
+                    "content": "private"
+                }),
+                tmp.path(),
+            )
+            .await;
+        assert!(!search.is_error, "search failed: {}", search.output);
+        eprintln!("foreign-user search output:\n{}", search.output);
+        assert!(
+            search.output.contains("alice-private-note"),
+            "trusted current user memory should still be readable: {}",
+            search.output
+        );
+        assert!(
+            !search.output.contains("bob-private-password"),
+            "model-supplied foreign user_id leaked another user's memory: {}",
+            search.output
+        );
+
+        let list = tool
+            .execute(
+                serde_json::json!({"action": "list", "scope": "user", "user_id": "bob"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!list.is_error, "list failed: {}", list.output);
+        eprintln!("foreign-user list output:\n{}", list.output);
+        assert!(
+            list.output.contains("alice-private-note"),
+            "list: {}",
+            list.output
+        );
+        assert!(
+            !list.output.contains("bob-private-password"),
+            "list: {}",
+            list.output
+        );
+
+        let legacy_scope_spelling = tool
+            .execute(
+                serde_json::json!({"action": "list", "scope": "user:bob"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(
+            !legacy_scope_spelling.is_error,
+            "legacy user:<id> spelling should resolve through trusted context: {}",
+            legacy_scope_spelling.output
+        );
+        assert!(
+            legacy_scope_spelling.output.contains("alice-private-note"),
+            "list: {}",
+            legacy_scope_spelling.output
+        );
+        assert!(
+            !legacy_scope_spelling
+                .output
+                .contains("bob-private-password"),
+            "list: {}",
+            legacy_scope_spelling.output
+        );
+    }
+
+    #[tokio::test]
+    async fn user_scope_read_without_trusted_context_is_rejected() {
+        let tmp = tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(tmp.path().join("home"));
+        let tool = make_tool(tmp.path());
+        MemoryService::store(
+            tmp.path(),
+            MemoryScope::User("bob".into()),
+            MemoryType::Preference,
+            "bob-private-password",
+            "test",
+        )
+        .unwrap();
+
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "list", "scope": "user", "user_id": "bob"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(
+            res.is_error,
+            "foreign user read should require trusted context: {}",
+            res.output
+        );
+        assert!(
+            res.output.contains("trusted context"),
+            "error: {}",
+            res.output
+        );
+        assert!(
+            !res.output.contains("bob-private-password"),
+            "error leaked memory: {}",
+            res.output
+        );
+
+        let legacy_scope_spelling = tool
+            .execute(
+                serde_json::json!({"action": "list", "scope": "user:bob"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(
+            legacy_scope_spelling.is_error,
+            "user:<id> must not bypass trusted context: {}",
+            legacy_scope_spelling.output
+        );
+        assert!(
+            !legacy_scope_spelling
+                .output
+                .contains("bob-private-password"),
+            "error leaked memory: {}",
+            legacy_scope_spelling.output
+        );
+    }
+
+    #[tokio::test]
+    async fn short_store_output_is_unchanged() {
+        let tmp = tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(tmp.path().join("home"));
+        let tool = make_tool(tmp.path());
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "store", "content": "prefer dark theme", "memory_type": "preference"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!res.is_error, "store failed: {}", res.output);
+        eprintln!("short store output: {}", res.output);
+        assert_eq!(
+            res.output, "Stored project preference memory: prefer dark theme",
+            "short store output should stay byte-for-byte unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlong_store_reports_truncated_persisted_content() {
+        let tmp = tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(tmp.path().join("home"));
+        let tool = make_tool(tmp.path());
+        let submitted = format!("{}DO_NOT_REPORT", "x".repeat(MAX_ENTRY_CHARS + 20));
+        let expected = format!("{}...", "x".repeat(MAX_ENTRY_CHARS.saturating_sub(3)));
+
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "store", "content": submitted, "memory_type": "preference"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!res.is_error, "store failed: {}", res.output);
+        eprintln!("overlong store output: {}", res.output);
+        assert!(
+            res.output.contains("truncated to 500 chars"),
+            "output: {}",
+            res.output
+        );
+        assert!(
+            res.output.contains(&expected),
+            "output did not echo stored text: {}",
+            res.output
+        );
+        assert!(
+            !res.output.contains("DO_NOT_REPORT"),
+            "output echoed unpersisted tail: {}",
+            res.output
+        );
+
+        let stored = MemoryService::list(tmp.path(), Some(MemoryScope::Project));
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].content, expected);
+    }
+
+    #[tokio::test]
+    async fn same_user_reads_still_work_with_trusted_context() {
+        let tmp = tempdir().unwrap();
+        let _root = MemoryPaths::set_test_root(tmp.path().join("home"));
+        let tool = make_tool_with_user(tmp.path(), "alice");
+        MemoryService::store(
+            tmp.path(),
+            MemoryScope::User("alice".into()),
+            MemoryType::Preference,
+            "alice likes compact summaries",
+            "test",
+        )
+        .unwrap();
+
+        let res = tool
+            .execute(
+                serde_json::json!({"action": "search", "scope": "user", "content": "compact"}),
+                tmp.path(),
+            )
+            .await;
+        assert!(!res.is_error, "same-user search failed: {}", res.output);
+        eprintln!("same-user search output:\n{}", res.output);
+        assert!(
+            res.output.contains("alice likes compact summaries"),
+            "search: {}",
             res.output
         );
     }
@@ -510,6 +771,10 @@ mod tests {
         assert!(
             schema.contains("project_knowledge"),
             "persistent factual knowledge must use MemoryType::ProjectKnowledge: {schema}"
+        );
+        assert!(
+            !schema.contains("user_id"),
+            "model-facing schema must not let the model choose a user id: {schema}"
         );
     }
 

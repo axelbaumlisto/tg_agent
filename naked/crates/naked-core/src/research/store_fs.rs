@@ -195,10 +195,36 @@ impl FsResearchStore {
         id: &str,
         limit: Option<usize>,
     ) -> Result<Vec<Finding>> {
+        self.read_findings_healing_locked_with_missing(id, limit, MissingFindingsFile::TreatAsEmpty)
+            .await
+    }
+
+    async fn read_existing_findings_healing_locked(&self, id: &str) -> Result<Vec<Finding>> {
+        self.read_findings_healing_locked_with_missing(id, None, MissingFindingsFile::Error)
+            .await
+    }
+
+    async fn read_findings_healing_locked_with_missing(
+        &self,
+        id: &str,
+        limit: Option<usize>,
+        missing: MissingFindingsFile,
+    ) -> Result<Vec<Finding>> {
         let path = self.dir(id).join("findings.jsonl");
         let original = match fs::read(&path).await {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e)
+                if e.kind() == ErrorKind::NotFound
+                    && missing == MissingFindingsFile::TreatAsEmpty =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(AgentError::Config(format!(
+                    "findings.jsonl missing for existing finding rewrite: research_id={id} path={}",
+                    path.display()
+                )));
+            }
             Err(e) => return Err(e.into()),
         };
         let parsed = parse_findings_jsonl_bytes(&original);
@@ -270,6 +296,12 @@ impl FsResearchStore {
         fsync_parent_dir_best_effort(parent);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingFindingsFile {
+    TreatAsEmpty,
+    Error,
 }
 
 struct ParsedFindingsJsonl {
@@ -616,36 +648,36 @@ impl FindingStore for FsResearchStore {
             return Ok(false);
         }
 
-        // Existing finding — rewrite the file, replacing the old entry
-        let content = fs::read_to_string(&path).await.unwrap_or_default();
+        // Existing finding — rewrite the file, replacing the old entry.
+        // The dedup set says this hash exists, so a missing/unreadable file is
+        // not an ordinary empty list here: propagating the read error keeps the
+        // old bytes intact instead of overwriting them with a single row.
+        let findings = self
+            .read_existing_findings_healing_locked(&finding.research_id)
+            .await?;
+        let replacement = serde_json::to_string(finding).map_err(|e| {
+            AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
+                context: "finding".into(),
+                source: e.to_string(),
+            })
+        })?;
         let mut lines = Vec::new();
         let mut replaced = false;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(f) = serde_json::from_str::<Finding>(line)
-                && f.dedup_hash == finding.dedup_hash
-            {
-                let new_line = serde_json::to_string(finding).map_err(|e| {
+        for existing in findings {
+            if existing.dedup_hash == finding.dedup_hash {
+                lines.push(replacement.clone());
+                replaced = true;
+            } else {
+                lines.push(serde_json::to_string(&existing).map_err(|e| {
                     AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
                         context: "finding".into(),
                         source: e.to_string(),
                     })
-                })?;
-                lines.push(new_line);
-                replaced = true;
-                continue;
+                })?);
             }
-            lines.push(line.to_string());
         }
         if !replaced {
-            lines.push(serde_json::to_string(finding).map_err(|e| {
-                AgentError::ProviderTyped(crate::provider::error::ProviderError::Serialize {
-                    context: "finding".into(),
-                    source: e.to_string(),
-                })
-            })?);
+            lines.push(replacement);
         }
         let new_content = lines.join("\n") + if lines.is_empty() { "" } else { "\n" };
         self.atomic_write(&path, new_content.as_bytes()).await?;
