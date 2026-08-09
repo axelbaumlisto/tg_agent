@@ -72,6 +72,13 @@ pub static RESEARCH_STORE_FILES_HEALED_COUNT: std::sync::atomic::AtomicU64 =
 pub static RESEARCH_STORE_HEAL_FAILED_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// B145: malformed non-findings research state detected while keeping reads
+/// resilient. Incremented by bad `runs.jsonl` row count, damaged `spec.json`
+/// listing entries, and malformed/unreadable `inflight.json` file count so
+/// corruption is distinguishable from absence.
+pub static RESEARCH_STORE_MALFORMED_STATE_DETECTED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// B59 / FOLLOWUP F4: findings file-mutex acquisitions that had to wait
 /// (contention on the per-research-id write lock).
 pub static RESEARCH_STORE_FILE_LOCK_WAIT_COUNT: std::sync::atomic::AtomicU64 =

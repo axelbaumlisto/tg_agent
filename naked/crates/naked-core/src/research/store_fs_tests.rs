@@ -1,8 +1,11 @@
 use super::*;
 use crate::research::spec::{Finding, ResearchSpec, RunRecord, dedup_hash};
 use chrono::Utc;
+use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::tempdir;
 use tokio::sync::Barrier;
 
@@ -52,6 +55,26 @@ fn make_finding(spec_id: &str, url: &str) -> Finding {
     }
 }
 
+fn make_run(spec_id: &str, run_id: &str) -> RunRecord {
+    // REGISTRY-WAIVE: exhaustive test struct ctor — RunRecord has no Default impl.
+    RunRecord {
+        run_id: run_id.to_string(),
+        spec_id: spec_id.to_string(),
+        started_at: Utc::now(),
+        finished_at: Utc::now(),
+        new_findings: 0,
+        total_findings_after: 0,
+        stop_reason: "ok".to_string(),
+        provider: "p".to_string(),
+        model: "m".to_string(),
+        verification_rounds: None,
+        dead_removed: None,
+        replacements_found: None,
+        remaining_issues: None,
+        elapsed_secs: None,
+    }
+}
+
 fn assert_findings_file_all_valid(path: &std::path::Path) -> Vec<Finding> {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("failed to read findings file {}: {e}", path.display()));
@@ -86,6 +109,50 @@ fn corrupt_backups(dir: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     backups.sort();
     backups
+}
+
+fn b145_metric_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn malformed_state_count() -> u64 {
+    crate::types::RESEARCH_STORE_MALFORMED_STATE_DETECTED_COUNT.load(Ordering::Relaxed)
+}
+
+#[derive(Clone)]
+struct SharedLog(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn capture_warn_logs_async<F, Fut, R>(f: F) -> (R, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = R>,
+{
+    let log_bytes = Arc::new(Mutex::new(Vec::new()));
+    let make_writer = {
+        let log_bytes = log_bytes.clone();
+        move || SharedLog(log_bytes.clone())
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(make_writer)
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let result = f().await;
+    let logs = String::from_utf8(log_bytes.lock().unwrap().clone()).unwrap();
+    (result, logs)
 }
 
 fn mixed_corrupt_findings_bytes(valid: &[Finding], bad_suffix: &str) -> Vec<u8> {
@@ -715,6 +782,338 @@ async fn runs_are_append_only_and_limited() {
     assert_eq!(last3.len(), 3);
     assert_eq!(last3[0].run_id, "r2");
     assert_eq!(last3[2].run_id, "r4");
+}
+
+#[tokio::test]
+async fn b145_malformed_jsonl_row_returns_good_rows_and_counts() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("b145-mixed-jsonl", "t");
+    store.create_spec(&spec).await.unwrap();
+    let runs_path = tmp.path().join("b145-mixed-jsonl").join("runs.jsonl");
+    let run_a = make_run("b145-mixed-jsonl", "run-a");
+    let run_b = make_run("b145-mixed-jsonl", "run-b");
+    let content = format!(
+        "{}\n{{\"run_id\":\n{}\n",
+        serde_json::to_string(&run_a).unwrap(),
+        serde_json::to_string(&run_b).unwrap()
+    );
+    std::fs::write(&runs_path, content).unwrap();
+
+    let before = malformed_state_count();
+    let runs = store.list_runs("b145-mixed-jsonl", None).await.unwrap();
+    let after = malformed_state_count();
+
+    assert_eq!(
+        runs.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run-a", "run-b"],
+        "malformed rows must not abort the whole listing"
+    );
+    assert_eq!(
+        after.saturating_sub(before),
+        1,
+        "one malformed row must be counted"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn b145_all_garbage_jsonl_returns_empty_but_counts_and_warns() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("b145-garbage-jsonl", "t");
+    store.create_spec(&spec).await.unwrap();
+    let runs_path = tmp.path().join("b145-garbage-jsonl").join("runs.jsonl");
+    std::fs::write(&runs_path, "not-json\n{\"run_id\":\n").unwrap();
+
+    let before = malformed_state_count();
+    let (runs, logs) =
+        capture_warn_logs_async(|| store.list_runs("b145-garbage-jsonl", None)).await;
+    let after = malformed_state_count();
+
+    assert!(
+        runs.unwrap().is_empty(),
+        "all-garbage JSONL has no surviving rows"
+    );
+    assert_eq!(
+        after.saturating_sub(before),
+        2,
+        "all-garbage JSONL must be distinguishable from a genuinely absent file"
+    );
+    assert!(
+        logs.contains("research store: skipping malformed jsonl row"),
+        "malformed JSONL must be audible at warn level; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains(&runs_path.display().to_string()),
+        "warning must include the damaged file path; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains("row=1") && logs.contains("row=2"),
+        "warning must include 1-based row numbers; logs were:\n{logs}"
+    );
+}
+
+#[tokio::test]
+async fn b145_valid_and_absent_jsonl_do_not_count() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("b145-valid-jsonl", "t");
+    store.create_spec(&spec).await.unwrap();
+    let run_a = make_run("b145-valid-jsonl", "run-a");
+    let run_b = make_run("b145-valid-jsonl", "run-b");
+    store.append_run(&run_a).await.unwrap();
+    store.append_run(&run_b).await.unwrap();
+
+    let before = malformed_state_count();
+    let valid = store.list_runs("b145-valid-jsonl", None).await.unwrap();
+    let absent = store.list_runs("b145-absent-jsonl", None).await.unwrap();
+    let after = malformed_state_count();
+
+    assert_eq!(
+        valid.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run-a", "run-b"],
+        "valid JSONL should still return every row"
+    );
+    assert!(
+        absent.is_empty(),
+        "absent JSONL still returns an empty listing"
+    );
+    assert_eq!(
+        after, before,
+        "valid and genuinely absent JSONL must not increment the corruption counter"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn b145_malformed_inflight_returns_none_counts_and_preserves_file() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let spec = make_spec("b145-bad-inflight", "t");
+    store.create_spec(&spec).await.unwrap();
+    let inflight_path = tmp.path().join("b145-bad-inflight").join("inflight.json");
+    let damaged = b"{\"state\":";
+    std::fs::write(&inflight_path, damaged).unwrap();
+
+    let before = malformed_state_count();
+    let (loaded, logs) = capture_warn_logs_async(|| store.load_inflight("b145-bad-inflight")).await;
+    let after = malformed_state_count();
+
+    assert!(
+        loaded.unwrap().is_none(),
+        "malformed inflight still degrades to None"
+    );
+    assert_eq!(
+        after.saturating_sub(before),
+        1,
+        "malformed inflight.json must be counted"
+    );
+    assert_eq!(
+        std::fs::read(&inflight_path).unwrap(),
+        damaged,
+        "load_inflight must not overwrite or remove the damaged file"
+    );
+    assert!(
+        logs.contains("research store: ignoring malformed inflight.json"),
+        "malformed inflight must be audible at warn level; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains(&inflight_path.display().to_string()),
+        "warning must include the damaged inflight path; logs were:\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn b145_list_specs_skips_damaged_spec_counts_and_keeps_valid_specs() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    let valid = make_spec("b145-valid-spec", "valid");
+    store.create_spec(&valid).await.unwrap();
+    let damaged_dir = tmp.path().join("b145-damaged-spec");
+    std::fs::create_dir_all(&damaged_dir).unwrap();
+    let damaged_path = damaged_dir.join("spec.json");
+    std::fs::write(&damaged_path, b"{\"id\":").unwrap();
+
+    let before = malformed_state_count();
+    let (listed, logs) = capture_warn_logs_async(|| store.list_specs()).await;
+    let after = malformed_state_count();
+    let listed = listed.unwrap();
+
+    assert_eq!(
+        listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        vec!["b145-valid-spec"],
+        "one damaged spec.json must not hide valid specs or kill the listing"
+    );
+    assert_eq!(
+        listed.len(),
+        1,
+        "returned spec count must reflect only the valid on-disk spec"
+    );
+    assert_eq!(
+        after.saturating_sub(before),
+        1,
+        "damaged spec.json must be counted exactly once"
+    );
+    assert!(
+        logs.contains("research store: skipping malformed spec.json during listing"),
+        "damaged spec.json must be audible at warn level; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains(&damaged_path.display().to_string()),
+        "warning must include the damaged spec path; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains("count="),
+        "warning must include the corruption counter value; logs were:\n{logs}"
+    );
+}
+
+#[tokio::test]
+async fn b145_absent_spec_json_does_not_count() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    std::fs::create_dir_all(tmp.path().join("b145-no-spec-json")).unwrap();
+
+    let before = malformed_state_count();
+    let listed = store.list_specs().await.unwrap();
+    let after = malformed_state_count();
+
+    assert!(
+        listed.is_empty(),
+        "a research directory without spec.json is an absent entry, not damage"
+    );
+    assert_eq!(
+        after, before,
+        "absent spec.json must stay silent and uncounted"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn b145_list_all_inflight_skips_invalid_utf8_counts_and_keeps_valid_entries() {
+    use crate::research::inflight::Inflight;
+
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    store
+        .create_spec(&make_spec("b145-valid-inflight-list", "valid"))
+        .await
+        .unwrap();
+    let valid = Inflight::scheduled("b145-valid-inflight-list", 1);
+    store
+        .save_inflight("b145-valid-inflight-list", &valid)
+        .await
+        .unwrap();
+    store
+        .create_spec(&make_spec("b145-invalid-utf8-inflight-list", "bad"))
+        .await
+        .unwrap();
+    let bad_path = tmp
+        .path()
+        .join("b145-invalid-utf8-inflight-list")
+        .join("inflight.json");
+    std::fs::write(&bad_path, [0xff]).unwrap();
+
+    let before = malformed_state_count();
+    let (listed, logs) = capture_warn_logs_async(|| store.list_all_inflight()).await;
+    let after = malformed_state_count();
+    let listed = listed.unwrap();
+
+    assert_eq!(
+        listed
+            .iter()
+            .map(|i| i.spec_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b145-valid-inflight-list"],
+        "invalid UTF-8 inflight.json must be skipped without killing the listing"
+    );
+    assert_eq!(listed.len(), 1, "only the valid inflight entry is returned");
+    assert_eq!(
+        after.saturating_sub(before),
+        1,
+        "invalid UTF-8 inflight.json must be counted exactly once"
+    );
+    assert!(
+        logs.contains("research store: skipping unreadable inflight.json"),
+        "unreadable inflight must be audible at warn level; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains(&bad_path.display().to_string()),
+        "warning must include the damaged inflight path; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains("count="),
+        "warning must include the corruption counter value; logs were:\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn b145_purge_terminal_inflight_skips_invalid_utf8_and_counts() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    store
+        .create_spec(&make_spec("b145-invalid-utf8-inflight-purge", "bad"))
+        .await
+        .unwrap();
+    let bad_path = tmp
+        .path()
+        .join("b145-invalid-utf8-inflight-purge")
+        .join("inflight.json");
+    std::fs::write(&bad_path, [0xff]).unwrap();
+
+    let before = malformed_state_count();
+    let (removed, logs) = capture_warn_logs_async(|| {
+        store.purge_terminal_inflight(Utc::now(), chrono::Duration::zero())
+    })
+    .await;
+    let after = malformed_state_count();
+
+    assert_eq!(removed.unwrap(), 0, "damaged inflight files are not purged");
+    assert_eq!(
+        after.saturating_sub(before),
+        1,
+        "invalid UTF-8 inflight.json during purge must be counted exactly once"
+    );
+    assert!(
+        logs.contains("research store: skipping unreadable inflight.json"),
+        "unreadable inflight during purge must be audible; logs were:\n{logs}"
+    );
+    assert!(
+        logs.contains(&bad_path.display().to_string()),
+        "warning must include the damaged inflight path; logs were:\n{logs}"
+    );
+}
+
+#[tokio::test]
+async fn b145_absent_inflight_json_does_not_count_in_list_or_purge() {
+    let _guard = b145_metric_lock().lock().await;
+    let tmp = tempdir().unwrap();
+    let store = FsResearchStore::new(tmp.path().to_path_buf());
+    store
+        .create_spec(&make_spec("b145-no-inflight-json", "absent"))
+        .await
+        .unwrap();
+
+    let before = malformed_state_count();
+    let listed = store.list_all_inflight().await.unwrap();
+    let removed = store
+        .purge_terminal_inflight(Utc::now(), chrono::Duration::zero())
+        .await
+        .unwrap();
+    let after = malformed_state_count();
+
+    assert!(listed.is_empty(), "absent inflight.json is empty state");
+    assert_eq!(removed, 0, "absent inflight.json has nothing to purge");
+    assert_eq!(
+        after, before,
+        "absent inflight.json must stay silent and uncounted"
+    );
 }
 
 #[tokio::test]

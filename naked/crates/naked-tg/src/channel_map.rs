@@ -1855,3 +1855,31 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod b144_permanent_scope_tests {
+    use super::*;
+
+    /// B144 Limit, pinned: a PERMANENT yolo escalation is a CHAT-wide grant, so
+    /// the chat-wide `approve_pending_perms` drain beside it releases nothing
+    /// that `is_yolo` would not allow a moment later anyway. If this ever
+    /// becomes topic-scoped, the drain must narrow WITH it — the registry entry
+    /// states they must agree, and this test is what makes that checkable.
+    #[tokio::test]
+    async fn permanent_yolo_covers_every_topic_of_that_chat_only() {
+        let m = ChannelSessionMap::default();
+        for i in 0..YOLO_PERMANENT_AFTER {
+            m.enable_yolo(-100, Some(10), Some(&format!("c{i}"))).await;
+        }
+        assert!(m.is_yolo(-100, Some(10)).await, "escalating topic");
+        assert!(
+            m.is_yolo(-100, Some(20)).await,
+            "sibling topic is granted too"
+        );
+        assert!(m.is_yolo(-100, None).await, "chat root is granted too");
+        assert!(
+            !m.is_yolo(-200, Some(20)).await,
+            "a DIFFERENT chat must stay ungranted"
+        );
+    }
+}

@@ -666,6 +666,7 @@ struct PrometheusInputs {
     fff_grep_fallback: u64,
     ip_hallucin: u64,
     research_store_corrupt_rows: u64,
+    research_store_malformed_state: u64,
     research_store_files_healed: u64,
     research_store_heal_failed: u64,
     research_store_file_lock_wait: u64,
@@ -769,6 +770,7 @@ impl Default for PrometheusInputs {
             fff_grep_fallback: 0,
             ip_hallucin: 0,
             research_store_corrupt_rows: 0,
+            research_store_malformed_state: 0,
             research_store_files_healed: 0,
             research_store_heal_failed: 0,
             research_store_file_lock_wait: 0,
@@ -918,6 +920,9 @@ impl MediaRoutingSnapshot {
             ip_hallucin: naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed),
             research_store_corrupt_rows:
                 naked_core::types::RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT
+                    .load(Ordering::Relaxed),
+            research_store_malformed_state:
+                naked_core::types::RESEARCH_STORE_MALFORMED_STATE_DETECTED_COUNT
                     .load(Ordering::Relaxed),
             research_store_files_healed: naked_core::types::RESEARCH_STORE_FILES_HEALED_COUNT
                 .load(Ordering::Relaxed),
@@ -1125,6 +1130,9 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_core_research_store_corrupt_rows_detected_total (B59) Invalid findings.jsonl rows detected by the research store healing path.\n\
              # TYPE naked_core_research_store_corrupt_rows_detected_total counter\n\
              naked_core_research_store_corrupt_rows_detected_total {research_store_corrupt_rows}\n\
+             # HELP naked_core_research_store_malformed_state_detected_total (B145) Malformed runs.jsonl rows, spec.json listing entries, or inflight.json files detected while keeping research reads resilient.\n\
+             # TYPE naked_core_research_store_malformed_state_detected_total counter\n\
+             naked_core_research_store_malformed_state_detected_total {research_store_malformed_state}\n\
              # HELP naked_core_research_store_files_healed_total (B59) findings.jsonl files successfully healed after corrupt-row detection.\n\
              # TYPE naked_core_research_store_files_healed_total counter\n\
              naked_core_research_store_files_healed_total {research_store_files_healed}\n\
@@ -1302,6 +1310,7 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         fff_grep_fallback = inputs.fff_grep_fallback,
         ip_hallucin = inputs.ip_hallucin,
         research_store_corrupt_rows = inputs.research_store_corrupt_rows,
+        research_store_malformed_state = inputs.research_store_malformed_state,
         research_store_files_healed = inputs.research_store_files_healed,
         research_store_heal_failed = inputs.research_store_heal_failed,
         research_store_file_lock_wait = inputs.research_store_file_lock_wait,
@@ -1827,6 +1836,7 @@ mod tests {
             fff_grep_fallback: 405,
             ip_hallucin: 41,
             research_store_corrupt_rows: 42,
+            research_store_malformed_state: 46,
             research_store_files_healed: 43,
             research_store_heal_failed: 44,
             research_store_file_lock_wait: 45,
@@ -1995,6 +2005,9 @@ mod tests {
             "# HELP naked_core_research_store_corrupt_rows_detected_total (B59) Invalid findings.jsonl rows detected by the research store healing path.\n",
             "# TYPE naked_core_research_store_corrupt_rows_detected_total counter\n",
             "naked_core_research_store_corrupt_rows_detected_total 42\n",
+            "# HELP naked_core_research_store_malformed_state_detected_total (B145) Malformed runs.jsonl rows, spec.json listing entries, or inflight.json files detected while keeping research reads resilient.\n",
+            "# TYPE naked_core_research_store_malformed_state_detected_total counter\n",
+            "naked_core_research_store_malformed_state_detected_total 46\n",
             "# HELP naked_core_research_store_files_healed_total (B59) findings.jsonl files successfully healed after corrupt-row detection.\n",
             "# TYPE naked_core_research_store_files_healed_total counter\n",
             "naked_core_research_store_files_healed_total 43\n",
@@ -2800,6 +2813,7 @@ mod tests {
         let p = snapshot().render_prometheus();
         for metric in [
             "naked_core_research_store_corrupt_rows_detected_total",
+            "naked_core_research_store_malformed_state_detected_total",
             "naked_core_research_store_files_healed_total",
             "naked_core_research_store_heal_failed_total",
         ] {

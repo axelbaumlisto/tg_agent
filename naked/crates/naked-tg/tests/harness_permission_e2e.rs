@@ -593,6 +593,66 @@ fn stale_callback_does_not_consume_parked_turn() {
     let _ = h.child.wait();
 }
 
+/// B144: a callback carrying a REAL call_id but coming from the WRONG chat must
+/// be treated as stale/foreign by the real dispatcher. It must not release the
+/// permission oneshot, must not execute the tool, and must leave the original
+/// pending prompt answerable by its owner.
+///
+/// Mutation: remove the chat/topic ownership check before claiming the pending
+/// permission → the foreign callback removes the entry, releases the turn, and
+/// this test sees `tool_executed` instead of `callback_ignored`.
+#[test]
+fn foreign_chat_callback_does_not_consume_permission_and_owner_can_still_answer() {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let mut h = HarnessProc::spawn(state.path());
+
+    wait_for(&h.rx, |e| e["event"] == "ready", "ready");
+
+    let owner_chat = 616_161_i64;
+    let foreign_chat = 717_171_i64;
+    send(
+        &mut h.stdin,
+        serde_json::json!({"cmd":"msg","chat":owner_chat,"topic":serde_json::Value::Null,"text":"do the thing"}),
+    );
+    let ev = wait_for(
+        &h.rx,
+        |e| e["event"] == "permission_requested" && e["chat"] == owner_chat,
+        "owner permission_requested",
+    );
+    let call = ev["call_id"].as_str().expect("call_id string").to_string();
+
+    send(
+        &mut h.stdin,
+        serde_json::json!({"cmd":"callback","chat":foreign_chat,"topic":serde_json::Value::Null,"data":format!("p:{call}:allow")}),
+    );
+    let ev = wait_for(
+        &h.rx,
+        |e| e["event"] == "callback_ignored" || e["event"] == "tool_executed",
+        "foreign callback outcome",
+    );
+    assert_eq!(
+        ev["event"], "callback_ignored",
+        "foreign chat must not resolve or execute the owner's pending permission: {ev}"
+    );
+
+    send(
+        &mut h.stdin,
+        serde_json::json!({"cmd":"callback","chat":owner_chat,"topic":serde_json::Value::Null,"data":format!("p:{call}:allow")}),
+    );
+    let ev = wait_for(
+        &h.rx,
+        |e| e["event"] == "tool_executed",
+        "owner tool_executed",
+    );
+    assert_eq!(
+        ev["call_id"], call,
+        "the real owner must still be able to answer after a foreign tap: {ev}"
+    );
+
+    send(&mut h.stdin, serde_json::json!({"cmd":"shutdown"}));
+    let _ = h.child.wait();
+}
+
 /// Fix 2 (SECURITY): untrusted user text must not be able to redirect the
 /// scripted write target. The write path is derived OUT-OF-BAND (state root +
 /// per-turn call_id), so text carrying its own `HARNESS_TARGET=/tmp/...` marker

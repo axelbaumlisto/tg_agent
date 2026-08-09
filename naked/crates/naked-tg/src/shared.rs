@@ -123,19 +123,32 @@ pub(crate) async fn deny_pending_perms(pending_perms: &PendingPermissions, cid: 
     n
 }
 
-/// Atomically CLAIM the triggering permission `call_id` for a yolo enable:
-/// remove it from the pending map IFF it belongs to this chat/topic and, when
-/// it does, send its approval (`true`). Returns whether the claim succeeded
-/// (the `call_id` was present AND matched this chat/topic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingPermClaim {
+    /// The call_id existed, belonged to this chat/topic, was removed, and the
+    /// awaiting turn received the decision.
+    Delivered,
+    /// The call_id was unknown/already used, or it belonged to a different
+    /// chat/topic. The pending map is left untouched.
+    NotFoundOrMismatched,
+    /// The call_id belonged to this chat/topic and was removed, but the
+    /// awaiting turn was already gone so the decision could not be delivered.
+    ReceiverGone,
+}
+
+/// Atomically CLAIM the triggering permission `call_id`: remove it from the
+/// pending map IFF it belongs to this chat/topic, and when it does, send the
+/// supplied `decision` (`true` = allow, `false` = deny). Returns whether the
+/// claim delivered, was stale/foreign, or found a dead receiver.
 ///
 /// Pure w.r.t. locking (the caller passes a `&mut` to the map it already holds
 /// under a single write lock) so it stays unit-testable AND the check +
 /// state-change happen together. This closes the callback TOCTOU (security): a
 /// concurrent deny/allow/timeout can no longer remove the `call_id` between a
-/// read-only "is this live?" check and the enable, which would otherwise let an
-/// already-answered/expired card still enable + count toward permanent.
+/// read-only "is this live?" check and the enable/decision, which would
+/// otherwise let an already-answered/expired or foreign card still act.
 ///
-/// The claimed perm's approval is sent HERE, and the perm is removed, so the
+/// The claimed perm's decision is sent HERE, and the perm is removed, so the
 /// follow-up chat/topic drain ([`approve_pending_perms`]) cannot re-find it —
 /// the claimed request is released exactly once (no double `tx.send`).
 pub(crate) fn claim_pending_perm(
@@ -143,17 +156,24 @@ pub(crate) fn claim_pending_perm(
     call_id: &str,
     cid: i64,
     tid: Option<i32>,
-) -> bool {
+    decision: bool,
+) -> PendingPermClaim {
     // Verify ownership BEFORE removing so a tap claiming another chat/topic
     // cannot drain an unrelated pending request.
     let matches = perms
         .get(call_id)
         .map(|(_, c, t)| *c == cid && *t == tid)
         .unwrap_or(false);
-    if matches && let Some((tx, _, _)) = perms.remove(call_id) {
-        let _ = tx.send(true);
+    if !matches {
+        return PendingPermClaim::NotFoundOrMismatched;
     }
-    matches
+    let Some((tx, _, _)) = perms.remove(call_id) else {
+        return PendingPermClaim::NotFoundOrMismatched;
+    };
+    match tx.send(decision) {
+        Ok(()) => PendingPermClaim::Delivered,
+        Err(_) => PendingPermClaim::ReceiverGone,
+    }
 }
 
 /// Persist the channel-map snapshot IMMEDIATELY when an enable reached the
@@ -823,25 +843,28 @@ mod yolo_helper_tests {
     }
 
     #[test]
-    fn claim_pending_perm_removes_and_sends_only_on_exact_match() {
-        // Fix 2: the atomic claim gates escalation AND releases the perm. A
-        // failed claim (unknown/wrong chat/wrong topic) leaves the map untouched
-        // and sends nothing; an exact match removes the perm and approves it
-        // exactly once.
+    fn claim_pending_perm_checks_owner_delivers_decision_and_reports_dead_receiver() {
+        // B144: the atomic claim is the single ownership check shared by yolo
+        // and single allow/deny callbacks. A failed claim (unknown/wrong
+        // chat/wrong topic) leaves the map untouched and sends nothing; an
+        // exact match removes the perm and sends the requested decision.
         let mut perms: HashMap<String, (oneshot::Sender<bool>, i64, Option<i32>)> = HashMap::new();
         let (tx, mut rx) = oneshot::channel::<bool>();
         perms.insert("live".into(), (tx, 100, Some(7)));
 
-        assert!(
-            !claim_pending_perm(&mut perms, "gone", 100, Some(7)),
+        assert_eq!(
+            claim_pending_perm(&mut perms, "gone", 100, Some(7), true),
+            PendingPermClaim::NotFoundOrMismatched,
             "unknown call_id (stale/answered card) is rejected"
         );
-        assert!(
-            !claim_pending_perm(&mut perms, "live", 999, Some(7)),
+        assert_eq!(
+            claim_pending_perm(&mut perms, "live", 999, Some(7), true),
+            PendingPermClaim::NotFoundOrMismatched,
             "wrong chat is rejected"
         );
-        assert!(
-            !claim_pending_perm(&mut perms, "live", 100, Some(8)),
+        assert_eq!(
+            claim_pending_perm(&mut perms, "live", 100, Some(8), true),
+            PendingPermClaim::NotFoundOrMismatched,
             "wrong topic is rejected"
         );
         assert!(
@@ -850,16 +873,39 @@ mod yolo_helper_tests {
         );
         assert!(rx.try_recv().is_err(), "failed claims send nothing");
 
-        // Exact match: claim succeeds, perm removed, approval sent exactly once.
-        assert!(
-            claim_pending_perm(&mut perms, "live", 100, Some(7)),
-            "exact match claims"
+        // Exact allow: claim succeeds, perm removed, approval sent exactly once.
+        assert_eq!(
+            claim_pending_perm(&mut perms, "live", 100, Some(7), true),
+            PendingPermClaim::Delivered,
+            "exact allow claims"
         );
         assert!(!perms.contains_key("live"), "claimed perm removed");
         assert!(
             matches!(rx.try_recv(), Ok(true)),
             "claimed perm approved exactly once"
         );
+
+        // Exact deny uses the SAME ownership check, but sends false.
+        let (deny_tx, mut deny_rx) = oneshot::channel::<bool>();
+        perms.insert("deny".into(), (deny_tx, 100, None));
+        assert_eq!(
+            claim_pending_perm(&mut perms, "deny", 100, None, false),
+            PendingPermClaim::Delivered,
+            "exact deny claims"
+        );
+        assert!(matches!(deny_rx.try_recv(), Ok(false)), "deny sends false");
+
+        // If the receiver is gone, the claim still removes the stale entry but
+        // reports that no live turn received the decision.
+        let (dead_tx, dead_rx) = oneshot::channel::<bool>();
+        drop(dead_rx);
+        perms.insert("dead".into(), (dead_tx, 100, Some(7)));
+        assert_eq!(
+            claim_pending_perm(&mut perms, "dead", 100, Some(7), true),
+            PendingPermClaim::ReceiverGone,
+            "dead receiver is surfaced, not reported as success"
+        );
+        assert!(!perms.contains_key("dead"), "dead claim is removed");
     }
 
     #[tokio::test]

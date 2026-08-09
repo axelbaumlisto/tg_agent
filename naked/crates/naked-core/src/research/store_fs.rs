@@ -24,6 +24,7 @@ use crate::error::{AgentError, Result};
 use crate::types::{
     RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT, RESEARCH_STORE_FILE_LOCK_WAIT_COUNT,
     RESEARCH_STORE_FILES_HEALED_COUNT, RESEARCH_STORE_HEAL_FAILED_COUNT,
+    RESEARCH_STORE_MALFORMED_STATE_DETECTED_COUNT,
 };
 
 /// Filesystem-backed research store. Holds a per-id mutex to serialize the
@@ -167,14 +168,15 @@ impl FsResearchStore {
         }
         let content = fs::read_to_string(path).await?;
         let mut out = Vec::new();
-        for line in content.lines() {
+        for (idx, line) in content.lines().enumerate() {
+            let row = idx + 1;
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
             match serde_json::from_str::<T>(line) {
                 Ok(v) => out.push(v),
-                Err(e) => tracing::trace!("research store: skipping malformed jsonl row: {e}"),
+                Err(e) => Self::record_malformed_jsonl_row(path, row, &e),
             }
         }
         if let Some(n) = limit {
@@ -182,6 +184,59 @@ impl FsResearchStore {
             out = out.split_off(start);
         }
         Ok(out)
+    }
+
+    fn bump_malformed_state_count() -> u64 {
+        RESEARCH_STORE_MALFORMED_STATE_DETECTED_COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    fn record_malformed_jsonl_row(path: &Path, row: usize, error: &serde_json::Error) {
+        let count = Self::bump_malformed_state_count();
+        tracing::warn!(
+            path = %path.display(),
+            row,
+            count,
+            "research store: skipping malformed jsonl row: {error}"
+        );
+    }
+
+    fn record_malformed_spec(path: &Path, error: &serde_json::Error) {
+        let count = Self::bump_malformed_state_count();
+        tracing::warn!(
+            path = %path.display(),
+            count,
+            "research store: skipping malformed spec.json during listing: {error}"
+        );
+    }
+
+    fn record_spec_read_error(path: &Path, error: &std::io::Error) {
+        let count = Self::bump_malformed_state_count();
+        tracing::warn!(
+            path = %path.display(),
+            count,
+            "research store: skipping unreadable spec.json during listing: {error}"
+        );
+    }
+
+    fn record_malformed_inflight(path: &Path, id: Option<&str>, error: &serde_json::Error) {
+        let count = Self::bump_malformed_state_count();
+        tracing::warn!(
+            spec = id.unwrap_or("<unknown>"),
+            path = %path.display(),
+            count,
+            "research store: ignoring malformed inflight.json: {error}"
+        );
+    }
+
+    fn record_inflight_read_error(path: &Path, error: &std::io::Error) {
+        let count = Self::bump_malformed_state_count();
+        tracing::warn!(
+            path = %path.display(),
+            count,
+            "research store: skipping unreadable inflight.json: {error}"
+        );
     }
 
     async fn read_findings_healing(&self, id: &str, limit: Option<usize>) -> Result<Vec<Finding>> {
@@ -505,10 +560,13 @@ impl SpecStore for FsResearchStore {
             if !spec_path.exists() {
                 continue;
             }
-            if let Ok(data) = fs::read_to_string(&spec_path).await
-                && let Ok(spec) = serde_json::from_str::<ResearchSpec>(&data)
-            {
-                out.push(spec);
+            match fs::read_to_string(&spec_path).await {
+                Ok(data) => match serde_json::from_str::<ResearchSpec>(&data) {
+                    Ok(spec) => out.push(spec),
+                    Err(e) => Self::record_malformed_spec(&spec_path, &e),
+                },
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => Self::record_spec_read_error(&spec_path, &e),
             }
         }
         out.sort_by_key(|r| std::cmp::Reverse(r.created_at));
@@ -829,7 +887,7 @@ impl InflightStore for FsResearchStore {
         match serde_json::from_str::<Inflight>(&data) {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
-                tracing::warn!(spec = %id, "ignoring malformed inflight.json: {e}");
+                Self::record_malformed_inflight(&path, Some(id), &e);
                 Ok(None)
             }
         }
@@ -867,15 +925,17 @@ impl InflightStore for FsResearchStore {
                 continue;
             }
             // REGISTRY-WAIVE: intentional fallback: missing path → empty result
-            let Ok(data) = fs::read_to_string(&inflight_path).await else {
-                continue;
+            let data = match fs::read_to_string(&inflight_path).await {
+                Ok(data) => data,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    Self::record_inflight_read_error(&inflight_path, &e);
+                    continue;
+                }
             };
             match serde_json::from_str::<Inflight>(&data) {
                 Ok(v) => out.push(v),
-                Err(e) => tracing::warn!(
-                    path = %inflight_path.display(),
-                    "ignoring malformed inflight.json: {e}"
-                ),
+                Err(e) => Self::record_malformed_inflight(&inflight_path, None, &e),
             }
         }
         Ok(out)
@@ -900,16 +960,18 @@ impl InflightStore for FsResearchStore {
                 continue;
             }
             // REGISTRY-WAIVE: intentional fallback: missing path → empty result
-            let Ok(data) = fs::read_to_string(&inflight_path).await else {
-                continue;
+            let data = match fs::read_to_string(&inflight_path).await {
+                Ok(data) => data,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    Self::record_inflight_read_error(&inflight_path, &e);
+                    continue;
+                }
             };
             let infl = match serde_json::from_str::<Inflight>(&data) {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(
-                        path = %inflight_path.display(),
-                        "ignoring malformed inflight.json during purge: {e}"
-                    );
+                    Self::record_malformed_inflight(&inflight_path, None, &e);
                     continue;
                 }
             };

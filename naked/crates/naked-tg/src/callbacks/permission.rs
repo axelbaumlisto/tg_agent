@@ -86,11 +86,8 @@ async fn escalate_if_live(
     // Atomic claim under a SINGLE write lock (removes + approves the triggering
     // perm iff it is live for this chat/topic). The lock is dropped BEFORE the
     // channel_map await below — never held across it.
-    let claimed = {
-        let mut perms = pending_perms.write().await;
-        claim_pending_perm(&mut perms, call_id, cid, tid)
-    };
-    if !claimed {
+    let claimed = claim_permission_decision(pending_perms, call_id, cid, tid, true).await;
+    if claimed != PendingPermClaim::Delivered {
         return None;
     }
     // Dedup on the permission `call_id`: tapping the same card twice must count
@@ -106,14 +103,52 @@ async fn handle_single_permission(
     action: &str,
 ) -> Result<(), teloxide::RequestError> {
     let allowed = action == "allow";
-    let sender = pending_perms.write().await.remove(call_id);
-    if let Some((tx, _, _)) = sender {
-        let _ = tx.send(allowed);
+    let cb_ctx = ChatCtx::from_callback(q);
+    let cid = cb_ctx.chat_id.0;
+    let tid = cb_ctx.raw_thread_id();
+    let claim = claim_permission_decision(pending_perms, call_id, cid, tid, allowed).await;
+    match claim {
+        PendingPermClaim::Delivered => {
+            delete_callback_message(bot, q).await;
+            bot.answer_callback_query(q.id.clone())
+                .text(permission_decision_toast(allowed, claim))
+                .await?;
+        }
+        PendingPermClaim::NotFoundOrMismatched => {
+            bot.answer_callback_query(q.id.clone())
+                .text(permission_decision_toast(allowed, claim))
+                .await?;
+        }
+        PendingPermClaim::ReceiverGone => {
+            delete_callback_message(bot, q).await;
+            bot.answer_callback_query(q.id.clone())
+                .text(permission_decision_toast(allowed, claim))
+                .await?;
+        }
     }
-    let label = if allowed { "✅" } else { "❌ Denied" };
-    delete_callback_message(bot, q).await;
-    bot.answer_callback_query(q.id.clone()).text(label).await?;
     Ok(())
+}
+
+async fn claim_permission_decision(
+    pending_perms: &PendingPermissions,
+    call_id: &str,
+    cid: i64,
+    tid: Option<i32>,
+    allowed: bool,
+) -> PendingPermClaim {
+    let mut perms = pending_perms.write().await;
+    claim_pending_perm(&mut perms, call_id, cid, tid, allowed)
+}
+
+fn permission_decision_toast(allowed: bool, claim: PendingPermClaim) -> &'static str {
+    match claim {
+        PendingPermClaim::Delivered if allowed => "✅",
+        PendingPermClaim::Delivered => "❌ Denied",
+        PendingPermClaim::NotFoundOrMismatched => {
+            "⚠️ Запрос устарел или из другого чата — карточка недействительна."
+        }
+        PendingPermClaim::ReceiverGone => "⚠️ Решение не доставлено: ход уже завершён.",
+    }
 }
 
 async fn delete_callback_message(bot: &Bot, q: &CallbackQuery) {
@@ -219,6 +254,100 @@ mod tests {
             pending.read().await.contains_key("live"),
             "mismatched claim leaves the perm pending"
         );
+    }
+
+    #[tokio::test]
+    async fn single_permission_claim_allows_denies_rejects_foreign_and_reports_dead_receiver() {
+        let pending: PendingPermissions = Arc::new(RwLock::new(HashMap::new()));
+
+        let (allow_tx, allow_rx) = tokio::sync::oneshot::channel::<bool>();
+        pending
+            .write()
+            .await
+            .insert("allow".into(), (allow_tx, 10, Some(1)));
+        assert_eq!(
+            claim_permission_decision(&pending, "allow", 10, Some(1), true).await,
+            PendingPermClaim::Delivered,
+            "exact chat/topic allow is delivered"
+        );
+        assert_eq!(allow_rx.await, Ok(true));
+
+        let (deny_tx, deny_rx) = tokio::sync::oneshot::channel::<bool>();
+        pending
+            .write()
+            .await
+            .insert("deny".into(), (deny_tx, 10, Some(1)));
+        assert_eq!(
+            claim_permission_decision(&pending, "deny", 10, Some(1), false).await,
+            PendingPermClaim::Delivered,
+            "exact chat/topic deny is delivered"
+        );
+        assert_eq!(deny_rx.await, Ok(false));
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<bool>();
+        pending
+            .write()
+            .await
+            .insert("foreign".into(), (tx, 10, Some(1)));
+        assert_eq!(
+            claim_permission_decision(&pending, "foreign", 11, Some(1), true).await,
+            PendingPermClaim::NotFoundOrMismatched,
+            "wrong chat is stale/foreign"
+        );
+        assert_eq!(
+            claim_permission_decision(&pending, "foreign", 10, Some(2), true).await,
+            PendingPermClaim::NotFoundOrMismatched,
+            "wrong topic is stale/foreign"
+        );
+        assert_eq!(
+            claim_permission_decision(&pending, "missing", 10, Some(1), true).await,
+            PendingPermClaim::NotFoundOrMismatched,
+            "unknown call_id is stale"
+        );
+        assert!(
+            pending.read().await.contains_key("foreign"),
+            "foreign/stale claims must leave the real owner's entry pending"
+        );
+        assert!(rx.try_recv().is_err(), "foreign/stale claims send nothing");
+
+        let (dead_tx, dead_rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(dead_rx);
+        pending
+            .write()
+            .await
+            .insert("dead".into(), (dead_tx, 10, Some(1)));
+        assert_eq!(
+            claim_permission_decision(&pending, "dead", 10, Some(1), true).await,
+            PendingPermClaim::ReceiverGone,
+            "dead receiver is not reported as success"
+        );
+        assert!(
+            !pending.read().await.contains_key("dead"),
+            "dead receiver entry is removed because no live turn can answer it"
+        );
+    }
+
+    #[test]
+    fn single_permission_toasts_distinguish_stale_foreign_and_dead_receiver() {
+        assert_eq!(
+            permission_decision_toast(true, PendingPermClaim::Delivered),
+            "✅"
+        );
+        assert_eq!(
+            permission_decision_toast(false, PendingPermClaim::Delivered),
+            "❌ Denied"
+        );
+        assert!(
+            permission_decision_toast(true, PendingPermClaim::NotFoundOrMismatched)
+                .contains("из другого чата"),
+            "foreign/stale taps get an explicit stale/foreign toast"
+        );
+        let dead = permission_decision_toast(true, PendingPermClaim::ReceiverGone);
+        assert!(
+            dead.contains("не доставлено"),
+            "dead receiver toast: {dead}"
+        );
+        assert!(!dead.contains('✅'), "dead receiver must not show success");
     }
 
     #[test]
