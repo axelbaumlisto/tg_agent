@@ -5,6 +5,7 @@
 //! media-group processing.
 
 use super::*;
+use teloxide::types::{MediaKind as TgMediaKind, MessageKind as TgMessageKind};
 
 // ── Media extraction & dispatch ─────────────────────────────────────────
 
@@ -56,136 +57,291 @@ pub(crate) enum StickerFormat {
     Video,
 }
 
-pub(crate) fn extract_media_items(msg: &Message) -> Vec<MediaItem> {
-    let mid = msg.id.0;
+#[derive(Debug, Clone)]
+pub(crate) enum ExtractedMediaItem {
+    Supported(MediaItem),
+    Unsupported(UnsupportedMediaItem),
+}
 
-    if let Some(v) = msg.voice() {
-        return vec![MediaItem {
+impl ExtractedMediaItem {
+    pub(crate) fn supported(&self) -> Option<&MediaItem> {
+        match self {
+            ExtractedMediaItem::Supported(item) => Some(item),
+            ExtractedMediaItem::Unsupported(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unsupported(&self) -> Option<&UnsupportedMediaItem> {
+        match self {
+            ExtractedMediaItem::Supported(_) => None,
+            ExtractedMediaItem::Unsupported(item) => Some(item),
+        }
+    }
+
+    pub(crate) fn is_supported(&self) -> bool {
+        self.supported().is_some()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UnsupportedMediaItem {
+    pub(crate) kind: UnsupportedMediaKind,
+}
+
+impl UnsupportedMediaItem {
+    fn prompt_marker(&self) -> String {
+        format!(
+            "[⚠ unsupported Telegram attachment: {} — I cannot read this attachment type yet; no file was downloaded or parsed.]",
+            self.kind.as_str()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsupportedMediaKind {
+    VideoNote,
+    Contact,
+    Location,
+    Venue,
+    Poll,
+    Dice,
+    PaidMedia,
+    Game,
+    Checklist,
+    Story,
+    Migration,
+}
+
+impl UnsupportedMediaKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            UnsupportedMediaKind::VideoNote => "video_note",
+            UnsupportedMediaKind::Contact => "contact",
+            UnsupportedMediaKind::Location => "location",
+            UnsupportedMediaKind::Venue => "venue",
+            UnsupportedMediaKind::Poll => "poll",
+            UnsupportedMediaKind::Dice => "dice",
+            UnsupportedMediaKind::PaidMedia => "paid_media",
+            UnsupportedMediaKind::Game => "game",
+            UnsupportedMediaKind::Checklist => "checklist",
+            UnsupportedMediaKind::Story => "story",
+            UnsupportedMediaKind::Migration => "migration",
+        }
+    }
+}
+
+pub(crate) fn extract_media_items(msg: &Message) -> Vec<ExtractedMediaItem> {
+    match &msg.kind {
+        TgMessageKind::Common(common) => extract_common_media_items(&common.media_kind, msg.id.0),
+        TgMessageKind::Dice(_) => unsupported(UnsupportedMediaKind::Dice),
+        TgMessageKind::NewChatMembers(_)
+        | TgMessageKind::LeftChatMember(_)
+        | TgMessageKind::NewChatTitle(_)
+        | TgMessageKind::NewChatPhoto(_)
+        | TgMessageKind::DeleteChatPhoto(_)
+        | TgMessageKind::GroupChatCreated(_)
+        | TgMessageKind::SupergroupChatCreated(_)
+        | TgMessageKind::ChannelChatCreated(_)
+        | TgMessageKind::MessageAutoDeleteTimerChanged(_)
+        | TgMessageKind::Pinned(_)
+        | TgMessageKind::ChatShared(_)
+        | TgMessageKind::UsersShared(_)
+        | TgMessageKind::Invoice(_)
+        | TgMessageKind::SuccessfulPayment(_)
+        | TgMessageKind::RefundedPayment(_)
+        | TgMessageKind::ConnectedWebsite(_)
+        | TgMessageKind::WriteAccessAllowed(_)
+        | TgMessageKind::PassportData(_)
+        | TgMessageKind::ProximityAlertTriggered(_)
+        | TgMessageKind::ChatBoostAdded(_)
+        | TgMessageKind::ChatBackground(_)
+        | TgMessageKind::ChecklistTasksDone(_)
+        | TgMessageKind::ChecklistTasksAdded(_)
+        | TgMessageKind::DirectMessagePriceChanged(_)
+        | TgMessageKind::ForumTopicCreated(_)
+        | TgMessageKind::ForumTopicEdited(_)
+        | TgMessageKind::ForumTopicClosed(_)
+        | TgMessageKind::ForumTopicReopened(_)
+        | TgMessageKind::GeneralForumTopicHidden(_)
+        | TgMessageKind::GeneralForumTopicUnhidden(_)
+        | TgMessageKind::Giveaway(_)
+        | TgMessageKind::GiveawayCompleted(_)
+        | TgMessageKind::GiveawayCreated(_)
+        | TgMessageKind::GiveawayWinners(_)
+        | TgMessageKind::PaidMessagePriceChanged(_)
+        | TgMessageKind::GiftInfo(_)
+        | TgMessageKind::UniqueGiftInfo(_)
+        | TgMessageKind::VideoChatScheduled(_)
+        | TgMessageKind::VideoChatStarted(_)
+        | TgMessageKind::VideoChatEnded(_)
+        | TgMessageKind::VideoChatParticipantsInvited(_)
+        | TgMessageKind::WebAppData(_)
+        | TgMessageKind::Empty {} => Vec::new(),
+    }
+}
+
+fn extract_common_media_items(kind: &TgMediaKind, mid: i32) -> Vec<ExtractedMediaItem> {
+    match kind {
+        TgMediaKind::Voice(v) => supported(MediaItem {
             kind: media::MediaKind::Voice,
-            file_id: v.file.id.clone().to_string(),
+            file_id: v.voice.file.id.clone().to_string(),
             file_name: format!("voice_{mid}.ogg"),
-            mime_hint: v.mime_type.as_ref().map(|m| m.to_string()),
-            duration_secs: Some(u64::from(v.duration.seconds())),
+            mime_hint: v.voice.mime_type.as_ref().map(|m| m.to_string()),
+            duration_secs: Some(u64::from(v.voice.duration.seconds())),
             emoji: None,
-            size_hint: Some(v.file.size),
+            size_hint: Some(v.voice.file.size),
             sticker_format: None,
-        }];
+        }),
+        TgMediaKind::Audio(a) => {
+            let ext = a
+                .audio
+                .mime_type
+                .as_ref()
+                .and_then(|m| mime_ext(m.essence_str()))
+                .unwrap_or("bin");
+            let name = a
+                .audio
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("audio_{mid}.{ext}"));
+            supported(MediaItem {
+                kind: media::MediaKind::Audio,
+                file_id: a.audio.file.id.clone().to_string(),
+                file_name: name,
+                mime_hint: a.audio.mime_type.as_ref().map(|m| m.to_string()),
+                duration_secs: Some(u64::from(a.audio.duration.seconds())),
+                emoji: None,
+                size_hint: Some(a.audio.file.size),
+                sticker_format: None,
+            })
+        }
+        TgMediaKind::Photo(p) => p
+            .photo
+            .iter()
+            .max_by_key(|p| p.width * p.height)
+            .map(|best| {
+                supported_one(MediaItem {
+                    kind: media::MediaKind::Photo,
+                    file_id: best.file.id.clone().to_string(),
+                    file_name: format!("photo_{mid}.jpg"),
+                    mime_hint: Some("image/jpeg".to_string()),
+                    duration_secs: None,
+                    emoji: None,
+                    size_hint: Some(best.file.size),
+                    sticker_format: None,
+                })
+            })
+            .map(|item| vec![item])
+            .unwrap_or_default(),
+        TgMediaKind::Video(v) => {
+            let name = v
+                .video
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("video_{mid}.mp4"));
+            supported(MediaItem {
+                kind: media::MediaKind::Video,
+                file_id: v.video.file.id.clone().to_string(),
+                file_name: name,
+                mime_hint: v.video.mime_type.as_ref().map(|m| m.to_string()),
+                duration_secs: Some(u64::from(v.video.duration.seconds())),
+                emoji: None,
+                size_hint: Some(v.video.file.size),
+                sticker_format: None,
+            })
+        }
+        TgMediaKind::Animation(a) => {
+            let name = a
+                .animation
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("animation_{mid}.mp4"));
+            supported(MediaItem {
+                kind: media::MediaKind::Animation,
+                file_id: a.animation.file.id.clone().to_string(),
+                file_name: name,
+                mime_hint: a.animation.mime_type.as_ref().map(|m| m.to_string()),
+                duration_secs: Some(u64::from(a.animation.duration.seconds())),
+                emoji: None,
+                size_hint: Some(a.animation.file.size),
+                sticker_format: None,
+            })
+        }
+        TgMediaKind::Document(d) => {
+            let name = d
+                .document
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("document_{mid}.bin"));
+            supported(MediaItem {
+                kind: media::MediaKind::Document,
+                file_id: d.document.file.id.clone().to_string(),
+                file_name: name,
+                mime_hint: d.document.mime_type.as_ref().map(|m| m.to_string()),
+                duration_secs: None,
+                emoji: None,
+                size_hint: Some(d.document.file.size),
+                sticker_format: None,
+            })
+        }
+        TgMediaKind::Sticker(s) => {
+            let format = if s.sticker.is_animated() {
+                StickerFormat::Animated
+            } else if s.sticker.is_video() {
+                StickerFormat::Video
+            } else {
+                StickerFormat::Static
+            };
+            // .tgs is Lottie JSON, .webm is video — vision models can't ingest
+            // either. Use the proper extension so the on-disk artifact is sane.
+            let ext = match format {
+                StickerFormat::Static => "webp",
+                StickerFormat::Animated => "tgs",
+                StickerFormat::Video => "webm",
+            };
+            let mime = match format {
+                StickerFormat::Static => "image/webp",
+                StickerFormat::Animated => "application/x-tgsticker",
+                StickerFormat::Video => "video/webm",
+            };
+            supported(MediaItem {
+                kind: media::MediaKind::Sticker,
+                file_id: s.sticker.file.id.clone().to_string(),
+                file_name: format!("sticker_{mid}.{ext}"),
+                mime_hint: Some(mime.to_string()),
+                duration_secs: None,
+                emoji: s.sticker.emoji.clone(),
+                size_hint: Some(s.sticker.file.size),
+                sticker_format: Some(format),
+            })
+        }
+        TgMediaKind::Contact(_) => unsupported(UnsupportedMediaKind::Contact),
+        TgMediaKind::PaidMedia(_) => unsupported(UnsupportedMediaKind::PaidMedia),
+        TgMediaKind::Game(_) => unsupported(UnsupportedMediaKind::Game),
+        TgMediaKind::Venue(_) => unsupported(UnsupportedMediaKind::Venue),
+        TgMediaKind::Location(_) => unsupported(UnsupportedMediaKind::Location),
+        TgMediaKind::Poll(_) => unsupported(UnsupportedMediaKind::Poll),
+        TgMediaKind::Checklist(_) => unsupported(UnsupportedMediaKind::Checklist),
+        TgMediaKind::Story(_) => unsupported(UnsupportedMediaKind::Story),
+        TgMediaKind::VideoNote(_) => unsupported(UnsupportedMediaKind::VideoNote),
+        TgMediaKind::Migration(_) => unsupported(UnsupportedMediaKind::Migration),
+        TgMediaKind::Text(_) => Vec::new(),
     }
-    if let Some(a) = msg.audio() {
-        let ext = a
-            .mime_type
-            .as_ref()
-            .and_then(|m| mime_ext(m.essence_str()))
-            .unwrap_or("bin");
-        let name = a
-            .file_name
-            .clone()
-            .unwrap_or_else(|| format!("audio_{mid}.{ext}"));
-        return vec![MediaItem {
-            kind: media::MediaKind::Audio,
-            file_id: a.file.id.clone().to_string(),
-            file_name: name,
-            mime_hint: a.mime_type.as_ref().map(|m| m.to_string()),
-            duration_secs: Some(u64::from(a.duration.seconds())),
-            emoji: None,
-            size_hint: Some(a.file.size),
-            sticker_format: None,
-        }];
-    }
-    if let Some(photos) = msg.photo()
-        && let Some(best) = photos.iter().max_by_key(|p| p.width * p.height)
-    {
-        return vec![MediaItem {
-            kind: media::MediaKind::Photo,
-            file_id: best.file.id.clone().to_string(),
-            file_name: format!("photo_{mid}.jpg"),
-            mime_hint: Some("image/jpeg".to_string()),
-            duration_secs: None,
-            emoji: None,
-            size_hint: Some(best.file.size),
-            sticker_format: None,
-        }];
-    }
-    if let Some(v) = msg.video() {
-        let name = v
-            .file_name
-            .clone()
-            .unwrap_or_else(|| format!("video_{mid}.mp4"));
-        return vec![MediaItem {
-            kind: media::MediaKind::Video,
-            file_id: v.file.id.clone().to_string(),
-            file_name: name,
-            mime_hint: v.mime_type.as_ref().map(|m| m.to_string()),
-            duration_secs: Some(u64::from(v.duration.seconds())),
-            emoji: None,
-            size_hint: Some(v.file.size),
-            sticker_format: None,
-        }];
-    }
-    if let Some(a) = msg.animation() {
-        let name = a
-            .file_name
-            .clone()
-            .unwrap_or_else(|| format!("animation_{mid}.mp4"));
-        return vec![MediaItem {
-            kind: media::MediaKind::Animation,
-            file_id: a.file.id.clone().to_string(),
-            file_name: name,
-            mime_hint: a.mime_type.as_ref().map(|m| m.to_string()),
-            duration_secs: Some(u64::from(a.duration.seconds())),
-            emoji: None,
-            size_hint: Some(a.file.size),
-            sticker_format: None,
-        }];
-    }
-    if let Some(d) = msg.document() {
-        let name = d
-            .file_name
-            .clone()
-            .unwrap_or_else(|| format!("document_{mid}.bin"));
-        return vec![MediaItem {
-            kind: media::MediaKind::Document,
-            file_id: d.file.id.clone().to_string(),
-            file_name: name,
-            mime_hint: d.mime_type.as_ref().map(|m| m.to_string()),
-            duration_secs: None,
-            emoji: None,
-            size_hint: Some(d.file.size),
-            sticker_format: None,
-        }];
-    }
-    if let Some(s) = msg.sticker() {
-        let format = if s.is_animated() {
-            StickerFormat::Animated
-        } else if s.is_video() {
-            StickerFormat::Video
-        } else {
-            StickerFormat::Static
-        };
-        // .tgs is Lottie JSON, .webm is video — vision models can't ingest
-        // either. Use the proper extension so the on-disk artifact is sane.
-        let ext = match format {
-            StickerFormat::Static => "webp",
-            StickerFormat::Animated => "tgs",
-            StickerFormat::Video => "webm",
-        };
-        let mime = match format {
-            StickerFormat::Static => "image/webp",
-            StickerFormat::Animated => "application/x-tgsticker",
-            StickerFormat::Video => "video/webm",
-        };
-        return vec![MediaItem {
-            kind: media::MediaKind::Sticker,
-            file_id: s.file.id.clone().to_string(),
-            file_name: format!("sticker_{mid}.{ext}"),
-            mime_hint: Some(mime.to_string()),
-            duration_secs: None,
-            emoji: s.emoji.clone(),
-            size_hint: Some(s.file.size),
-            sticker_format: Some(format),
-        }];
-    }
-    Vec::new()
+}
+
+fn supported(item: MediaItem) -> Vec<ExtractedMediaItem> {
+    vec![supported_one(item)]
+}
+
+fn supported_one(item: MediaItem) -> ExtractedMediaItem {
+    ExtractedMediaItem::Supported(item)
+}
+
+fn unsupported(kind: UnsupportedMediaKind) -> Vec<ExtractedMediaItem> {
+    vec![ExtractedMediaItem::Unsupported(UnsupportedMediaItem {
+        kind,
+    })]
 }
 
 pub(crate) fn mime_ext(mime: &str) -> Option<&'static str> {
@@ -228,19 +384,31 @@ pub struct NativeImage {
 /// Process one or more media items → produce the user-facing "media block"
 /// that gets prepended to the agent prompt. Errors degrade to `[⚠ … error: …]`
 /// and a path-only fallback whenever we've managed to save the file.
-pub(crate) async fn process_media_items(items: &[MediaItem], ctx: &MediaCtx<'_>) -> MediaProcessed {
+pub(crate) async fn process_media_items(
+    items: &[ExtractedMediaItem],
+    ctx: &MediaCtx<'_>,
+) -> MediaProcessed {
     let mut text_blocks: Vec<String> = Vec::with_capacity(items.len());
     let mut native_images: Vec<NativeImage> = Vec::new();
     for item in items {
-        match process_one_media(item, ctx).await {
-            Ok(out) => {
-                text_blocks.push(out.text);
-                native_images.extend(out.native_images);
-            }
-            Err(e) => {
-                let safe = redact_for_log(&e);
-                tracing::warn!(kind = item.kind.as_str(), error = %safe, "media processing failed");
-                text_blocks.push(format!("[\u{26A0} {} error: {}]", item.kind.as_str(), safe));
+        match item {
+            ExtractedMediaItem::Supported(item) => match process_one_media(item, ctx).await {
+                Ok(out) => {
+                    text_blocks.push(out.text);
+                    native_images.extend(out.native_images);
+                }
+                Err(e) => {
+                    let safe = redact_for_log(&e);
+                    tracing::warn!(kind = item.kind.as_str(), error = %safe, "media processing failed");
+                    text_blocks.push(format!("[\u{26A0} {} error: {}]", item.kind.as_str(), safe));
+                }
+            },
+            ExtractedMediaItem::Unsupported(item) => {
+                tracing::info!(
+                    kind = item.kind.as_str(),
+                    "unsupported Telegram media surfaced"
+                );
+                text_blocks.push(item.prompt_marker());
             }
         }
     }

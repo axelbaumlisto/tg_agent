@@ -180,16 +180,18 @@ pub(crate) async fn handle_message(
     let native_cap_bytes = config
         .tg_media
         .provider_image_cap(&provider_type, provider_base_url.as_deref());
-    if !media_items.is_empty() {
+    let supported_media_count = media_items.iter().filter(|i| i.is_supported()).count();
+    if supported_media_count > 0 {
         let has_oversize = media_items
             .iter()
+            .filter_map(|i| i.supported())
             .any(|i| i.size_hint.is_some_and(|s| u64::from(s) > native_cap_bytes));
         tracing::info!(
             model = %pre_model,
             provider = %pre_prov,
             native = route_images_natively,
             native_cap_bytes,
-            count = media_items.len(),
+            count = supported_media_count,
             "media routing decision"
         );
         crate::metrics::record_media_routing(
@@ -484,7 +486,7 @@ async fn start_new_agent_turn(
 struct IncomingContent {
     text_direct: Option<String>,
     caption: Option<String>,
-    media_items: Vec<crate::media_dispatch::MediaItem>,
+    media_items: Vec<crate::media_dispatch::ExtractedMediaItem>,
 }
 
 fn collect_incoming_content(msg: &Message, extra_album_msgs: &[Message]) -> IncomingContent {
@@ -525,20 +527,22 @@ struct MediaProcessEnv<'a> {
 async fn process_media_if_any(
     bot: &Bot,
     ctx: ChatCtx,
-    media_items: &[crate::media_dispatch::MediaItem],
+    media_items: &[crate::media_dispatch::ExtractedMediaItem],
     caption: &Option<String>,
     env: MediaProcessEnv<'_>,
 ) -> Option<crate::media_dispatch::MediaProcessed> {
     if media_items.is_empty() {
         return None;
     }
-    let _ = send_text(
-        bot,
-        ctx.chat_id,
-        ctx.thread_id,
-        "\u{1F4E5} processing media\u{2026}",
-    )
-    .await;
+    if media_items.iter().any(|i| i.is_supported()) {
+        let _ = send_text(
+            bot,
+            ctx.chat_id,
+            ctx.thread_id,
+            "\u{1F4E5} processing media\u{2026}",
+        )
+        .await;
+    }
     let media_ctx = crate::media_dispatch::MediaCtx {
         bot_token: env.bot_token,
         config: env.config,
@@ -708,6 +712,14 @@ mod tests {
             src.contains("handle_command("),
             "slash commands must route through handle_command"
         );
+    }
+
+    #[test]
+    fn text_only_base_text_has_no_media_noise() {
+        let text = "just text".to_string();
+        let payload = super::build_base_text(None, Some(&text), None);
+        assert_eq!(payload.as_bytes(), b"just text");
+        assert!(!payload.contains("unsupported Telegram attachment"));
     }
 
     #[test]

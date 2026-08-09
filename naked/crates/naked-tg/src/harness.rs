@@ -586,6 +586,7 @@ pub(crate) async fn run() {
         match cmd.get("cmd").and_then(Value::as_str) {
             Some("msg") => handle_msg(&mut harness, &cmd, &mut out).await,
             Some("burst") => handle_burst(&mut harness, &cmd, &mut out).await,
+            Some("album") => handle_album(&mut harness, &cmd, &mut out).await,
             Some("callback") => handle_callback_cmd(&mut harness, &cmd, &mut out).await,
             Some("session") => handle_session(&mut harness, &cmd, &mut out).await,
             Some("restart") => {
@@ -631,6 +632,22 @@ struct BurstObservation {
     dropped: usize,
     addressed: bool,
     payload_text: String,
+}
+
+#[derive(Debug)]
+struct AlbumGroupSpec {
+    id: String,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct AlbumObservation {
+    group_id: String,
+    merged: usize,
+    dropped: usize,
+    addressed: bool,
+    payload_text: String,
+    extra_count: usize,
 }
 
 async fn handle_burst(harness: &mut Harness, cmd: &Value, out: &mut tokio::io::Stdout) {
@@ -792,6 +809,199 @@ async fn handle_burst(harness: &mut Harness, cmd: &Value, out: &mut tokio::io::S
             }
         }
     }
+}
+
+async fn handle_album(harness: &mut Harness, cmd: &Value, out: &mut tokio::io::Stdout) {
+    let (chat, topic) = chat_topic(cmd);
+    harness.admit_chat(chat);
+    let groups = match parse_album_groups(cmd) {
+        Ok(groups) => groups,
+        Err(message) => {
+            emit(out, json!({"event":"error","message":message})).await;
+            return;
+        }
+    };
+    let total_count: usize = groups.iter().map(|g| g.count).sum();
+    let expected_flushes = groups.len();
+    let deps = harness.deps();
+    let (obs_tx, mut obs_rx) = mpsc::unbounded_channel::<AlbumObservation>();
+
+    for group in &groups {
+        for idx in 0..group.count {
+            harness.msg_seq += 1;
+            let caption = (idx == 0).then(|| format!("album {}", group.id));
+            let msg = build_photo_message(
+                harness.msg_seq,
+                chat,
+                topic,
+                &group.id,
+                caption.as_deref(),
+                &harness.bot_identity,
+            );
+            let deps_for_flush = deps.clone();
+            let task_tracker = harness.task_tracker.clone();
+            let bot_identity = harness.bot_identity.clone();
+            let obs_tx = obs_tx.clone();
+            match harness
+                .album_buffer
+                .submit_album(msg, move |msgs| {
+                    crate::runtime::handle_album_flush(
+                        msgs,
+                        deps_for_flush,
+                        task_tracker,
+                        move |primary, extras, merged| {
+                            let group_id = primary
+                                .media_group_id()
+                                .map(|id| id.0.to_string())
+                                .unwrap_or_default();
+                            let payload_text = primary
+                                .caption()
+                                .or_else(|| primary.text())
+                                .unwrap_or_default()
+                                .to_string();
+                            let dropped = overflow_notice_count(&payload_text).unwrap_or(0);
+                            let addressed =
+                                naked_tg::bot_identity::is_addressed_to_bot(primary, &bot_identity);
+                            let _ = obs_tx.send(AlbumObservation {
+                                group_id,
+                                merged,
+                                dropped,
+                                addressed,
+                                payload_text,
+                                extra_count: extras.len(),
+                            });
+                        },
+                    )
+                })
+                .await
+            {
+                crate::album::Decision::Buffered => {}
+                crate::album::Decision::Solo(_) => {
+                    emit(
+                        out,
+                        json!({"event":"error","message":"album message unexpectedly bypassed coalescing","chat":chat,"topic":topic,"group_id":group.id,"index":idx}),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+    drop(obs_tx);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut observations: Vec<AlbumObservation> = Vec::new();
+    let mut permissions: Vec<(String, String)> = Vec::new();
+    loop {
+        if observations.len() == expected_flushes && !permissions.is_empty() {
+            observations.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+            let flushes: Vec<Value> = observations
+                .iter()
+                .map(|obs| {
+                    json!({
+                        "group_id":obs.group_id.clone(),
+                        "merged":obs.merged,
+                        "dropped":obs.dropped,
+                        "addressed":obs.addressed,
+                        "payload_has_notice":obs.dropped > 0,
+                        "payload_text":obs.payload_text.clone(),
+                        "extra_count":obs.extra_count,
+                    })
+                })
+                .collect();
+            let permission_tools: Vec<Value> = permissions
+                .iter()
+                .map(|(call_id, tool)| json!({"call_id":call_id,"tool":tool}))
+                .collect();
+            emit(
+                out,
+                json!({
+                    "event":"album_flushed",
+                    "chat":chat,
+                    "topic":topic,
+                    "total_count":total_count,
+                    "flush_count":observations.len(),
+                    "permission_count":permissions.len(),
+                    "flushes":flushes,
+                    "permissions":permission_tools,
+                }),
+            )
+            .await;
+            return;
+        }
+
+        tokio::select! {
+            obs = obs_rx.recv(), if observations.len() < expected_flushes => {
+                match obs {
+                    Some(obs) => observations.push(obs),
+                    None => {
+                        emit(
+                            out,
+                            json!({"event":"error","message":"album flush observation channel closed","chat":chat,"topic":topic,"observed":observations.len(),"expected":expected_flushes}),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            captured = harness.captured_rx.recv() => {
+                match captured {
+                    Some(call) => {
+                        if let Some(card) = permission_card(&call) {
+                            permissions.push(card);
+                        }
+                    }
+                    None => {
+                        emit(
+                            out,
+                            json!({"event":"error","message":"capture channel closed while waiting for album card","chat":chat,"topic":topic}),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                emit(
+                    out,
+                    json!({"event":"error","message":"timeout waiting for album flush/card","chat":chat,"topic":topic,"observed":observations.len(),"expected":expected_flushes,"permissions":permissions.len()}),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+fn parse_album_groups(cmd: &Value) -> Result<Vec<AlbumGroupSpec>, String> {
+    let groups = cmd
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "album groups must be a non-empty array".to_string())?;
+    if groups.is_empty() {
+        return Err("album groups must be a non-empty array".to_string());
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    let mut total = 0usize;
+    for (idx, group) in groups.iter().enumerate() {
+        let id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("album group {idx} id must be non-empty"))?
+            .to_string();
+        let count = group.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if !(1..=256).contains(&count) {
+            return Err(format!("album group {idx} count must be in 1..=256"));
+        }
+        total = total.saturating_add(count);
+        out.push(AlbumGroupSpec { id, count });
+    }
+    if total > 512 {
+        return Err("album total count must be <=512".to_string());
+    }
+    Ok(out)
 }
 
 fn overflow_notice_count(payload: &str) -> Option<usize> {
@@ -1001,6 +1211,45 @@ fn build_message(
     // `date` must be a valid unix ts for teloxide; 0 is accepted by its serde.
     v["date"] = json!(1_700_000_000);
     serde_json::from_value(v).expect("valid harness Message json")
+}
+
+fn build_photo_message(
+    seq: i32,
+    chat: i64,
+    topic: Option<i32>,
+    media_group_id: &str,
+    caption: Option<&str>,
+    identity: &naked_tg::bot_identity::BotIdentity,
+) -> Message {
+    let mut v = json!({
+        "message_id": seq,
+        "date": 1_700_000_000,
+        "chat": match topic {
+            Some(_) => json!({"id": chat, "type": "supergroup", "title": "harness"}),
+            None => json!({"id": chat, "type": "private", "first_name": "harness"}),
+        },
+        "from": {"id": 1, "is_bot": false, "first_name": "harness"},
+        "media_group_id": media_group_id,
+        "photo": [
+            {"file_id": format!("photo-{seq}"), "file_unique_id": format!("unique-{seq}"), "width": 1, "height": 1, "file_size": 10}
+        ],
+    });
+    if let Some(tid) = topic {
+        v["message_thread_id"] = json!(tid);
+        v["is_topic_message"] = json!(true);
+        let mention = format!("@{}", identity.username);
+        let full_caption = match caption {
+            Some(c) if !c.trim().is_empty() => format!("{mention} {c}"),
+            _ => mention.clone(),
+        };
+        v["caption"] = json!(full_caption);
+        v["caption_entities"] = json!([
+            {"type": "mention", "offset": 0, "length": mention.chars().count()}
+        ]);
+    } else if let Some(caption) = caption.filter(|c| !c.trim().is_empty()) {
+        v["caption"] = json!(caption);
+    }
+    serde_json::from_value(v).expect("valid harness photo Message json")
 }
 
 fn build_callback_query(seq: i32, chat: i64, topic: Option<i32>, data: &str) -> CallbackQuery {

@@ -2,8 +2,8 @@ mod tests {
     use super::super::helpers::*;
     use super::super::*;
     use crate::media_dispatch::{
-        MediaItem, MediaProcessed, NativeImage, StickerFormat, decide_native_route, fmt_duration,
-        looks_like_supported_image,
+        ExtractedMediaItem, MediaCtx, MediaItem, MediaProcessed, NativeImage, StickerFormat,
+        UnsupportedMediaKind, decide_native_route, fmt_duration, looks_like_supported_image,
     };
 
     // ── render_thinking_block ───────────────────────────────────────────
@@ -803,6 +803,11 @@ See [docs](https://example.com/path?a=1&b=2)."#;
         serde_json::from_value(v).expect("valid Message JSON")
     }
 
+    fn only_supported(items: &[ExtractedMediaItem]) -> &MediaItem {
+        assert_eq!(items.len(), 1, "expected exactly one extracted media item");
+        items[0].supported().expect("expected supported media item")
+    }
+
     fn base_private_chat() -> serde_json::Value {
         serde_json::json!({
             "message_id": 1,
@@ -981,11 +986,11 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             "mime_type": "audio/ogg"
         });
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, media::MediaKind::Voice);
-        assert_eq!(items[0].file_id, "voice-abc");
-        assert!(items[0].file_name.ends_with(".ogg"));
-        assert_eq!(items[0].duration_secs, Some(12));
+        let item = only_supported(&items);
+        assert_eq!(item.kind, media::MediaKind::Voice);
+        assert_eq!(item.file_id, "voice-abc");
+        assert!(item.file_name.ends_with(".ogg"));
+        assert_eq!(item.duration_secs, Some(12));
     }
 
     #[test]
@@ -997,10 +1002,10 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             {"file_id":"big","file_unique_id":"b","width":1280,"height":720,"file_size":200000}
         ]);
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, media::MediaKind::Photo);
-        assert_eq!(items[0].file_id, "big");
-        assert_eq!(items[0].mime_hint.as_deref(), Some("image/jpeg"));
+        let item = only_supported(&items);
+        assert_eq!(item.kind, media::MediaKind::Photo);
+        assert_eq!(item.file_id, "big");
+        assert_eq!(item.mime_hint.as_deref(), Some("image/jpeg"));
     }
 
     #[test]
@@ -1014,10 +1019,10 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             "mime_type": "text/markdown"
         });
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, media::MediaKind::Document);
-        assert_eq!(items[0].file_name, "notes.md");
-        assert_eq!(items[0].mime_hint.as_deref(), Some("text/markdown"));
+        let item = only_supported(&items);
+        assert_eq!(item.kind, media::MediaKind::Document);
+        assert_eq!(item.file_name, "notes.md");
+        assert_eq!(item.mime_hint.as_deref(), Some("text/markdown"));
     }
 
     #[test]
@@ -1027,6 +1032,120 @@ See [docs](https://example.com/path?a=1&b=2)."#;
         m["text"] = serde_json::Value::String("just text".into());
         let items = extract_media_items(&make_message(m));
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn extract_media_items_supported_kinds_still_extract_as_supported() {
+        let cases = [
+            (
+                "voice",
+                serde_json::json!({
+                    "file_id": "voice-1", "file_unique_id": "u", "duration": 1, "mime_type": "audio/ogg"
+                }),
+                media::MediaKind::Voice,
+            ),
+            (
+                "audio",
+                serde_json::json!({
+                    "file_id": "audio-1", "file_unique_id": "u", "duration": 2, "file_name": "song.mp3", "mime_type": "audio/mpeg"
+                }),
+                media::MediaKind::Audio,
+            ),
+            (
+                "photo",
+                serde_json::json!([
+                    {"file_id":"photo-1","file_unique_id":"u","width":10,"height":10,"file_size":100}
+                ]),
+                media::MediaKind::Photo,
+            ),
+            (
+                "video",
+                serde_json::json!({
+                    "file_id": "video-1", "file_unique_id": "u", "width": 640, "height": 480, "duration": 3, "file_name": "clip.mp4", "mime_type": "video/mp4"
+                }),
+                media::MediaKind::Video,
+            ),
+            (
+                "animation",
+                serde_json::json!({
+                    "file_id": "animation-1", "file_unique_id": "u", "width": 320, "height": 240, "duration": 4, "file_name": "anim.mp4", "mime_type": "video/mp4"
+                }),
+                media::MediaKind::Animation,
+            ),
+            (
+                "document",
+                serde_json::json!({
+                    "file_id": "document-1", "file_unique_id": "u", "file_name": "notes.txt", "mime_type": "text/plain"
+                }),
+                media::MediaKind::Document,
+            ),
+            (
+                "sticker",
+                serde_json::json!({
+                    "file_id": "sticker-1", "file_unique_id": "u", "type": "regular", "width": 128, "height": 128, "is_animated": false, "is_video": false, "emoji": "🙂"
+                }),
+                media::MediaKind::Sticker,
+            ),
+        ];
+
+        for (field, payload, expected) in cases {
+            let mut m = base_private_chat();
+            m["from"] = user(Some("alice"), "Alice", false);
+            m[field] = payload;
+            let items = extract_media_items(&make_message(m));
+            let item = only_supported(&items);
+            assert_eq!(item.kind, expected, "{field} should remain supported");
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_media_items_video_note_reaches_prompt_payload_as_unsupported() {
+        let mut m = base_private_chat();
+        m["from"] = user(Some("alice"), "Alice", false);
+        m["video_note"] = serde_json::json!({
+            "file_id": "video-note-1",
+            "file_unique_id": "vn-u",
+            "length": 240,
+            "duration": 5,
+            "file_size": 12345
+        });
+        let items = extract_media_items(&make_message(m));
+        assert_eq!(items.len(), 1);
+        let unsupported = items[0]
+            .unsupported()
+            .expect("video_note must be distinct from no media");
+        assert_eq!(unsupported.kind, UnsupportedMediaKind::VideoNote);
+
+        let cfg = Config::default();
+        let http = Arc::new(reqwest::Client::new());
+        let base_url = Arc::new("https://api.telegram.org".to_string());
+        let ctx = MediaCtx {
+            bot_token: "test-token",
+            config: &cfg,
+            http,
+            base_url,
+            user_caption: None,
+            msg_id: 1,
+            route_images_natively: false,
+            native_cap_bytes: 0,
+            active_model: "test-model",
+        };
+        let processed = process_media_items(&items, &ctx).await;
+        assert!(
+            processed
+                .text
+                .contains("unsupported Telegram attachment: video_note"),
+            "prompt payload must tell the model the video_note was not read, got: {}",
+            processed.text
+        );
+        assert!(
+            processed
+                .text
+                .contains("cannot read this attachment type yet"),
+            "prompt payload must forbid pretending the attachment was read, got: {}",
+            processed.text
+        );
+        assert!(processed.native_images.is_empty());
     }
 
     #[test]
@@ -1050,10 +1169,10 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             ]
         });
         let items = extract_media_items(&make_message(reply_target));
-        assert_eq!(items.len(), 1, "should extract the single photo");
-        assert_eq!(items[0].kind, media::MediaKind::Photo);
+        let item = only_supported(&items);
+        assert_eq!(item.kind, media::MediaKind::Photo);
         assert_eq!(
-            items[0].file_id, "reply-big",
+            item.file_id, "reply-big",
             "should pick the highest-resolution PhotoSize for vision routing"
         );
     }
@@ -1276,9 +1395,9 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             "emoji": "\u{1F525}"
         });
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, media::MediaKind::Sticker);
-        assert_eq!(items[0].emoji.as_deref(), Some("\u{1F525}"));
+        let item = only_supported(&items);
+        assert_eq!(item.kind, media::MediaKind::Sticker);
+        assert_eq!(item.emoji.as_deref(), Some("\u{1F525}"));
     }
 
     #[test]
@@ -1294,10 +1413,11 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             "file_size": 32_000,
         });
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items[0].sticker_format, Some(StickerFormat::Static));
-        assert_eq!(items[0].mime_hint.as_deref(), Some("image/webp"));
-        assert!(items[0].file_name.ends_with(".webp"));
-        assert_eq!(items[0].size_hint, Some(32_000));
+        let item = only_supported(&items);
+        assert_eq!(item.sticker_format, Some(StickerFormat::Static));
+        assert_eq!(item.mime_hint.as_deref(), Some("image/webp"));
+        assert!(item.file_name.ends_with(".webp"));
+        assert_eq!(item.size_hint, Some(32_000));
     }
 
     #[test]
@@ -1313,10 +1433,11 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             "file_size": 12_000,
         });
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items[0].sticker_format, Some(StickerFormat::Animated));
-        assert!(items[0].file_name.ends_with(".tgs"));
+        let item = only_supported(&items);
+        assert_eq!(item.sticker_format, Some(StickerFormat::Animated));
+        assert!(item.file_name.ends_with(".tgs"));
         assert_eq!(
-            items[0].mime_hint.as_deref(),
+            item.mime_hint.as_deref(),
             Some("application/x-tgsticker"),
             "animated stickers must NOT be advertised as image/* — vision providers will reject them"
         );
@@ -1335,9 +1456,10 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             "file_size": 80_000,
         });
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items[0].sticker_format, Some(StickerFormat::Video));
-        assert!(items[0].file_name.ends_with(".webm"));
-        assert_eq!(items[0].mime_hint.as_deref(), Some("video/webm"));
+        let item = only_supported(&items);
+        assert_eq!(item.sticker_format, Some(StickerFormat::Video));
+        assert!(item.file_name.ends_with(".webm"));
+        assert_eq!(item.mime_hint.as_deref(), Some("video/webm"));
     }
 
     #[test]
@@ -1350,10 +1472,10 @@ See [docs](https://example.com/path?a=1&b=2)."#;
             { "file_id": "p3", "file_unique_id": "u3", "width": 800, "height": 600, "file_size": 200_000 },
         ]);
         let items = extract_media_items(&make_message(m));
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, media::MediaKind::Photo);
+        let item = only_supported(&items);
+        assert_eq!(item.kind, media::MediaKind::Photo);
         // We pick the largest resolution → its size_hint should be 200_000.
-        assert_eq!(items[0].size_hint, Some(200_000));
+        assert_eq!(item.size_hint, Some(200_000));
     }
 
     // ── TG HTTP mock (wiremock) ─────────────────────────────────────────

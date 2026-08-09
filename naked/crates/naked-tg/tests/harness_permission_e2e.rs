@@ -144,6 +144,119 @@ fn run_burst(count: usize) -> serde_json::Value {
     ev
 }
 
+fn run_album(groups: serde_json::Value) -> serde_json::Value {
+    let state = tempfile::tempdir().expect("state tempdir");
+    let mut h = HarnessProc::spawn(state.path());
+    wait_for(&h.rx, |e| e["event"] == "ready", "ready");
+
+    send(
+        &mut h.stdin,
+        serde_json::json!({"cmd":"album","chat":-100123_i64,"topic":7,"groups":groups}),
+    );
+    let ev = wait_for(
+        &h.rx,
+        |e| e["event"] == "album_flushed" || e["event"] == "error",
+        "album_flushed",
+    );
+    assert_eq!(ev["event"], "album_flushed", "album command failed: {ev}");
+
+    send(&mut h.stdin, serde_json::json!({"cmd":"shutdown"}));
+    let _ = h.child.wait();
+    ev
+}
+
+#[test]
+fn harness_album_drives_real_coalescer_group_separation_and_overflow() {
+    let same_group = run_album(serde_json::json!([
+        {"id":"same-group","count":2}
+    ]));
+    assert_eq!(
+        same_group["flush_count"], 1,
+        "same group must flush once: {same_group}"
+    );
+    assert_eq!(
+        same_group["permission_count"], 1,
+        "same group must reach one agent turn: {same_group}"
+    );
+    let flushes = same_group["flushes"].as_array().expect("flushes array");
+    assert_eq!(flushes.len(), 1, "same group flush rows: {same_group}");
+    assert_eq!(
+        flushes[0]["group_id"], "same-group",
+        "same group id: {same_group}"
+    );
+    assert_eq!(
+        flushes[0]["merged"], 2,
+        "two photos must coalesce: {same_group}"
+    );
+    assert_eq!(
+        flushes[0]["extra_count"], 1,
+        "one extra photo must reach handle_album_flush: {same_group}"
+    );
+    assert_eq!(
+        flushes[0]["dropped"], 0,
+        "under-cap same group must not drop: {same_group}"
+    );
+    assert_eq!(
+        flushes[0]["addressed"], true,
+        "album caption mention must remain addressed: {same_group}"
+    );
+
+    let distinct = run_album(serde_json::json!([
+        {"id":"group-a","count":1},
+        {"id":"group-b","count":1}
+    ]));
+    assert_eq!(
+        distinct["flush_count"], 2,
+        "different media_group_ids must not merge: {distinct}"
+    );
+    let flushes = distinct["flushes"].as_array().expect("flushes array");
+    let groups: Vec<_> = flushes
+        .iter()
+        .map(|f| f["group_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        groups,
+        vec!["group-a", "group-b"],
+        "distinct group ids: {distinct}"
+    );
+    assert!(
+        flushes
+            .iter()
+            .all(|f| f["merged"] == 1 && f["dropped"] == 0),
+        "distinct single-photo groups must stay separate one-item flushes: {distinct}"
+    );
+
+    let overflow = run_album(serde_json::json!([
+        {"id":"overflow-group","count":19}
+    ]));
+    assert_eq!(
+        overflow["flush_count"], 1,
+        "overflow group must still flush once: {overflow}"
+    );
+    let flushes = overflow["flushes"].as_array().expect("flushes array");
+    assert_eq!(
+        flushes[0]["merged"], 16,
+        "real cap must retain 16 album items: {overflow}"
+    );
+    assert_eq!(
+        flushes[0]["dropped"], 3,
+        "overflow count must reach album payload: {overflow}"
+    );
+    assert_eq!(
+        flushes[0]["payload_has_notice"], true,
+        "album overflow payload must carry notice: {overflow}"
+    );
+    let payload = flushes[0]["payload_text"].as_str().expect("payload text");
+    assert!(
+        payload.contains("⚠️ Пропущено 3 части входящего сообщения: превышен лимит 16."),
+        "album payload must include exact dropped-count notice: {payload:?}"
+    );
+    assert!(
+        payload.starts_with("@harness_bot"),
+        "overflow notice must be appended after the addressing mention, not prepended over it: {payload:?}"
+    );
+}
+
 #[test]
 fn harness_burst_drives_real_coalescer_overflow_and_clean_under_cap() {
     let overflow = run_burst(19);

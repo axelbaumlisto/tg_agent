@@ -270,16 +270,13 @@ impl UpdateDispatcher {
                         .await
                 } else {
                     album
-                        .submit_album(msg, move |mut msgs| async move {
-                            let _permit = task_tracker_for_flush.acquire().await;
-                            // Sort by message_id so the user's perceived order
-                            // matches the order of images in the agent prompt.
-                            msgs.sort_by_key(|m| m.id.0);
-                            let primary = msgs.remove(0);
-                            if let Err(e) = deps_for_flush.handle(primary, msgs).await {
-                                let safe = redact_for_log(&e);
-                                tracing::error!("handle_message (album) error: {safe}");
-                            }
+                        .submit_album(msg, move |msgs| {
+                            handle_album_flush(
+                                msgs,
+                                deps_for_flush,
+                                task_tracker_for_flush,
+                                |_, _, _| {},
+                            )
                         })
                         .await
                 };
@@ -512,6 +509,27 @@ async fn steer_sender_exists(key: (i64, Option<i32>)) -> bool {
     !crate::shared::RUN_REGISTRY
         .list_for_thread(naked_tg::run_registry::ChatThreadKey::new(key.0, key.1))
         .is_empty()
+}
+
+pub(crate) async fn handle_album_flush<F>(
+    mut msgs: Vec<Message>,
+    deps: BotDeps,
+    task_tracker: Arc<tokio::sync::Semaphore>,
+    observe: F,
+) where
+    F: FnOnce(&Message, &[Message], usize) + Send + 'static,
+{
+    let _permit = task_tracker.acquire().await;
+    // Sort by message_id so the user's perceived order matches the order of
+    // images in the agent prompt.
+    msgs.sort_by_key(|m| m.id.0);
+    let merged = msgs.len();
+    let primary = msgs.remove(0);
+    observe(&primary, &msgs, merged);
+    if let Err(e) = deps.handle(primary, msgs).await {
+        let safe = redact_for_log(&e);
+        tracing::error!("handle_message (album) error: {safe}");
+    }
 }
 
 pub(crate) async fn handle_text_burst_flush<F>(
