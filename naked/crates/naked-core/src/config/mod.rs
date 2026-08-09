@@ -513,11 +513,26 @@ impl Config {
     /// Resolve the default provider, returning its resolved config.
     pub fn resolve_default_provider(&self) -> Result<(String, ResolvedProvider)> {
         let name = if self.default_provider.is_empty() {
-            self.providers
-                .keys()
-                .next()
-                .ok_or_else(|| AgentError::ProviderNotConfigured("(default)".to_string()))?
-                .clone()
+            // B146: never GUESS which provider the operator meant. `providers` is a
+            // HashMap, so `keys().next()` is randomised per process — a typo'd or
+            // dropped `default_provider` would boot a working-looking agent on an
+            // arbitrary model/cost/safety profile, and possibly a different one on
+            // the next start. Report the missing decision and name the choices.
+            let mut available: Vec<&str> = self.providers.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            match available.as_slice() {
+                [] => return Err(AgentError::ProviderNotConfigured("(default)".to_string())),
+                // Exactly one provider configured: there is nothing to guess
+                // BETWEEN, so this is unambiguous rather than arbitrary. This is
+                // the legitimate half of the old `keys().next()` behaviour.
+                [only] => (*only).to_string(),
+                _ => {
+                    return Err(AgentError::Config(format!(
+                        "default_provider is not set; configure one of: {}",
+                        available.join(", ")
+                    )));
+                }
+            }
         } else {
             self.default_provider.clone()
         };

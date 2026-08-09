@@ -406,8 +406,13 @@ fn mcp_servers_get_names() {
     assert_eq!(servers[0].name, "my-server");
 }
 
+/// Renamed from `resolve_default_provider_picks_first` (B146). "Picks first"
+/// described the defect: with SEVERAL providers the old code picked an
+/// arbitrary `HashMap` entry. The scenario this test actually covers is the
+/// legitimate half — exactly ONE provider, where there is nothing to guess
+/// between — and that behaviour is unchanged.
 #[test]
-fn resolve_default_provider_picks_first() {
+fn resolve_default_provider_uses_the_only_provider() {
     let json = r#"{"providers": {"only": {"type": "openai_compat", "api_key": "k"}}}"#;
     let cfg = Config::from_json_str(json).unwrap();
     let (name, resolved) = cfg.resolve_default_provider().unwrap();
@@ -1716,4 +1721,69 @@ fn config_default_has_sane_values() {
     assert!(config.max_tokens > 0);
     assert!(config.providers.is_empty());
     assert!(config.telegram.allowed_chat_ids.is_empty());
+}
+
+/// B146: an unset `default_provider` must be an explicit error naming the
+/// choices, never an arbitrary `HashMap` pick. The old fallback was
+/// `providers.keys().next()`, whose order is randomised per process, so the
+/// same config could boot on a different provider on the next start.
+#[test]
+fn b146_empty_default_provider_refuses_to_guess() {
+    let mut cfg = Config {
+        default_provider: String::new(),
+        ..Default::default()
+    };
+    for name in ["zeta", "alpha", "mid"] {
+        cfg.providers
+            .insert(name.to_string(), ProviderConfig::default());
+    }
+
+    let err = cfg
+        .resolve_default_provider()
+        .expect_err("an unset default_provider must not resolve to an arbitrary provider");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("default_provider is not set"),
+        "error must name the missing decision, got: {msg}"
+    );
+    // Sorted, so the message is stable across processes — the bug was instability.
+    assert!(
+        msg.contains("alpha, mid, zeta"),
+        "error must list the available providers in a stable order, got: {msg}"
+    );
+}
+
+/// B146 companion: with NO providers at all the pre-existing
+/// `ProviderNotConfigured` shape is preserved — that error is about an empty
+/// install, not about an undecided choice, and callers may match on it.
+#[test]
+fn b146_no_providers_keeps_provider_not_configured() {
+    let cfg = Config {
+        default_provider: String::new(),
+        ..Default::default()
+    };
+
+    let err = cfg.resolve_default_provider().expect_err("no providers");
+    assert!(
+        matches!(err, AgentError::ProviderNotConfigured(_)),
+        "empty install must stay ProviderNotConfigured, got: {err:?}"
+    );
+}
+
+/// B146: the ordinary path is untouched — an explicitly set provider resolves.
+#[test]
+fn b146_set_default_provider_still_resolves() {
+    let mut cfg = Config {
+        default_provider: "zeta".to_string(),
+        ..Default::default()
+    };
+    cfg.providers
+        .insert("alpha".to_string(), ProviderConfig::default());
+    cfg.providers
+        .insert("zeta".to_string(), ProviderConfig::default());
+
+    let (name, _) = cfg
+        .resolve_default_provider()
+        .expect("an explicitly chosen provider must resolve");
+    assert_eq!(name, "zeta");
 }
