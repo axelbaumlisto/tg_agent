@@ -11,7 +11,7 @@ use naked_core::memory::daily::DigestStalenessSnapshot;
 use naked_core::metrics_hist::{
     DurationHistogramSnapshot, LatencySnapshot, ToolClass, tool_snapshot,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,6 +71,11 @@ static FINAL_ANSWER_DELIVERY_FAILED: AtomicU64 = AtomicU64::new(0);
 static FINAL_ANSWER_TRUNCATED: AtomicU64 = AtomicU64::new(0);
 static FINAL_ANSWER_ATTACHMENT_SEND_FAILED: AtomicU64 = AtomicU64::new(0);
 
+/// B135/S2: file-backed tick-source metric fragments rejected by `/metrics`.
+/// Invalid or oversized fragments are omitted so one bad bridge file cannot
+/// poison the whole Prometheus scrape.
+static TICK_SOURCE_METRICS_FRAGMENT_REJECTED: AtomicU64 = AtomicU64::new(0);
+
 /// B05: current boot-time config health for multimodal fallback.
 /// State gauge: 1 when the default model is not vision-capable AND no
 /// `tg_media.vision` describer fallback is configured, otherwise 0.
@@ -84,6 +89,168 @@ pub fn set_memory_metrics_workspace(workspace: PathBuf) {
 
 pub fn set_config_describer_missing(missing: bool) {
     CONFIG_DESCRIBER_MISSING.store(u64::from(missing), Ordering::Relaxed);
+}
+
+fn metrics_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("NAKED_METRICS_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(
+        std::env::var("HOME")
+            .unwrap_or_else(|_| ".".into())
+            .to_string()
+            + "/.naked/.metrics",
+    )
+}
+
+fn read_prometheus_fragment(file_name: &str) -> String {
+    std::fs::read_to_string(metrics_dir().join(file_name)).unwrap_or_default()
+}
+
+const TICK_SOURCE_PROM_FILE: &str = "research_tick_source_failures.prom";
+/// 64 KiB is far above the expected three small metric families for configured
+/// research sources, but bounds per-scrape memory even if the bridge file is corrupt.
+const TICK_SOURCE_PROM_MAX_BYTES: u64 = 64 * 1024;
+const TICK_SOURCE_HELP_TOTAL: &str = "# HELP naked_research_tick_source_failure_total Source-level failures observed by research tick wrappers (file-backed; B135).";
+const TICK_SOURCE_TYPE_TOTAL: &str = "# TYPE naked_research_tick_source_failure_total counter";
+const TICK_SOURCE_HELP_STREAK: &str = "# HELP naked_research_tick_source_failure_streak Consecutive failed observations for the same tick/brief/mode/source.";
+const TICK_SOURCE_TYPE_STREAK: &str = "# TYPE naked_research_tick_source_failure_streak gauge";
+const TICK_SOURCE_HELP_LAST_OBSERVED: &str = "# HELP naked_research_tick_source_last_observed_timestamp_seconds Unix timestamp of the most recent source observation by research tick wrappers.";
+const TICK_SOURCE_TYPE_LAST_OBSERVED: &str =
+    "# TYPE naked_research_tick_source_last_observed_timestamp_seconds gauge";
+const TICK_SOURCE_ALLOWED_HELP_TYPE_LINES: [&str; 6] = [
+    TICK_SOURCE_HELP_TOTAL,
+    TICK_SOURCE_TYPE_TOTAL,
+    TICK_SOURCE_HELP_STREAK,
+    TICK_SOURCE_TYPE_STREAK,
+    TICK_SOURCE_HELP_LAST_OBSERVED,
+    TICK_SOURCE_TYPE_LAST_OBSERVED,
+];
+const TICK_SOURCE_ALLOWED_FAMILIES: [&str; 3] = [
+    "naked_research_tick_source_failure_total",
+    "naked_research_tick_source_failure_streak",
+    "naked_research_tick_source_last_observed_timestamp_seconds",
+];
+
+fn read_tick_source_metrics_fragment_from_dir(dir: &Path) -> String {
+    let path = dir.join(TICK_SOURCE_PROM_FILE);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "cannot stat tick-source metrics fragment; omitting from /metrics");
+            return String::new();
+        }
+    };
+    if metadata.len() > TICK_SOURCE_PROM_MAX_BYTES {
+        TICK_SOURCE_METRICS_FRAGMENT_REJECTED.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            path = %path.display(),
+            size_bytes = metadata.len(),
+            max_bytes = TICK_SOURCE_PROM_MAX_BYTES,
+            "tick-source metrics fragment is oversized; omitting from /metrics"
+        );
+        return String::new();
+    }
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(_) => return String::new(),
+    };
+    if let Err(reason) = validate_tick_source_metrics_fragment(&body) {
+        TICK_SOURCE_METRICS_FRAGMENT_REJECTED.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(path = %path.display(), reason, "invalid tick-source metrics fragment; omitting from /metrics");
+        return String::new();
+    }
+    body
+}
+
+fn read_tick_source_metrics_fragment() -> String {
+    read_tick_source_metrics_fragment_from_dir(&metrics_dir())
+}
+
+fn validate_tick_source_metrics_fragment(body: &str) -> Result<(), &'static str> {
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("# HELP ") || line.starts_with("# TYPE ") {
+            if TICK_SOURCE_ALLOWED_HELP_TYPE_LINES.contains(&line) {
+                continue;
+            }
+            return Err("unexpected HELP/TYPE line");
+        }
+        validate_tick_source_sample_line(line)?;
+    }
+    Ok(())
+}
+
+fn validate_tick_source_sample_line(line: &str) -> Result<(), &'static str> {
+    let split_at = line
+        .rfind(|ch: char| ch.is_ascii_whitespace())
+        .ok_or("missing value")?;
+    let sample = line[..split_at].trim_end();
+    let value = line[split_at..].trim();
+    if sample.is_empty() || value.is_empty() {
+        return Err("missing sample or value");
+    }
+    let numeric = value.parse::<f64>().map_err(|_| "invalid numeric value")?;
+    if !numeric.is_finite() || numeric < 0.0 {
+        return Err("invalid numeric value");
+    }
+    let Some(open) = sample.find('{') else {
+        return Err("missing label set");
+    };
+    let family = &sample[..open];
+    if !TICK_SOURCE_ALLOWED_FAMILIES.contains(&family) {
+        return Err("unexpected metric family");
+    }
+    if !sample.ends_with('}') {
+        return Err("unterminated label set");
+    }
+    let labels = &sample[open + 1..sample.len() - 1];
+    validate_tick_source_labels(labels)
+}
+
+fn validate_tick_source_labels(labels: &str) -> Result<(), &'static str> {
+    let mut rest = labels;
+    for (idx, name) in ["tick", "brief", "mode", "source"].iter().enumerate() {
+        let prefix = format!("{name}=\"");
+        if !rest.starts_with(&prefix) {
+            return Err("unexpected label set");
+        }
+        rest = &rest[prefix.len()..];
+        let mut escaped = false;
+        let mut end = None;
+        for (pos, ch) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    end = Some(pos);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let end = end.ok_or("unterminated label value")?;
+        rest = &rest[end + 1..];
+        if idx == 3 {
+            if rest.is_empty() {
+                return Ok(());
+            }
+            return Err("unexpected extra labels");
+        }
+        if !rest.starts_with(',') {
+            return Err("missing label separator");
+        }
+        rest = &rest[1..];
+    }
+    Err("unexpected label set")
 }
 
 pub fn record_concurrent_same_key_turn_wait() {
@@ -518,6 +685,8 @@ struct PrometheusInputs {
     active_run_max_silent_seconds: u64,
     config_loaded_hash: Option<String>,
     model_health_body: String,
+    tick_source_metrics_body: String,
+    tick_source_metrics_fragment_rejected: u64,
 }
 
 impl Default for PrometheusInputs {
@@ -619,6 +788,8 @@ impl Default for PrometheusInputs {
             active_run_max_silent_seconds: 0,
             config_loaded_hash: None,
             model_health_body: String::new(),
+            tick_source_metrics_body: String::new(),
+            tick_source_metrics_fragment_rejected: 0,
         }
     }
 }
@@ -664,13 +835,8 @@ impl MediaRoutingSnapshot {
                 .ok()
         })
         .unwrap_or(0);
-        let model_health_body = std::fs::read_to_string(
-            std::env::var("HOME")
-                .unwrap_or_else(|_| ".".into())
-                .to_string()
-                + "/.naked/.metrics/model_health.prom",
-        )
-        .unwrap_or_default();
+        let model_health_body = read_prometheus_fragment("model_health.prom");
+        let tick_source_metrics_body = read_tick_source_metrics_fragment();
         let inputs = PrometheusInputs {
             media: *self,
             latency: naked_core::metrics_hist::snapshot(),
@@ -785,6 +951,9 @@ impl MediaRoutingSnapshot {
                 .get()
                 .map(|hash| hash.hash_hex.clone()),
             model_health_body,
+            tick_source_metrics_body,
+            tick_source_metrics_fragment_rejected: TICK_SOURCE_METRICS_FRAGMENT_REJECTED
+                .load(Ordering::Relaxed),
         };
         render_prometheus_from(&inputs)
     }
@@ -1068,6 +1237,10 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # TYPE naked_core_provider_stream_open_count counter\n\
              naked_core_provider_stream_open_count {provider_stream_open_count}\n\
              {latency_extra_metrics}\
+             # HELP naked_tg_tick_source_metrics_fragment_rejected_total Tick-source Prometheus bridge fragments omitted from /metrics because they were invalid or over the 64 KiB cap (B135).\n\
+             # TYPE naked_tg_tick_source_metrics_fragment_rejected_total counter\n\
+             naked_tg_tick_source_metrics_fragment_rejected_total {tick_source_metrics_fragment_rejected}\n\
+             {tick_source_metrics_body}\
              {model_health_body}",
         native = inputs.media.native_route_chosen,
         oversize = inputs.media.native_route_downgraded_oversize,
@@ -1183,6 +1356,8 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         provider_stream_open_sum_ms = inputs.latency.provider_sum_ms,
         provider_stream_open_count = inputs.latency.provider_count,
         latency_extra_metrics = latency_extra_metrics,
+        tick_source_metrics_fragment_rejected = inputs.tick_source_metrics_fragment_rejected,
+        tick_source_metrics_body = inputs.tick_source_metrics_body,
         model_health_body = inputs.model_health_body,
     )
 }
@@ -1401,6 +1576,8 @@ pub fn serve_prometheus_if_enabled() {
 mod tests {
     use super::*;
 
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn metric_value(body: &str, metric_line_prefix: &str) -> u64 {
         let line = body
             .lines()
@@ -1411,6 +1588,59 @@ mod tests {
             .unwrap_or_else(|| panic!("missing value for metric line `{line}`"))
             .parse::<u64>()
             .unwrap_or_else(|err| panic!("invalid value for metric line `{line}`: {err}"))
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let n = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "naked-tg-metrics-{label}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    fn valid_tick_source_fragment() -> String {
+        format!(
+            "{TICK_SOURCE_HELP_TOTAL}\n\
+             {TICK_SOURCE_TYPE_TOTAL}\n\
+             naked_research_tick_source_failure_total{{tick=\"playwright_generic\",brief=\"fixture\",mode=\"light\",source=\"dead\"}} 2\n\
+             {TICK_SOURCE_HELP_STREAK}\n\
+             {TICK_SOURCE_TYPE_STREAK}\n\
+             naked_research_tick_source_failure_streak{{tick=\"playwright_generic\",brief=\"fixture\",mode=\"light\",source=\"dead\"}} 2\n\
+             {TICK_SOURCE_HELP_LAST_OBSERVED}\n\
+             {TICK_SOURCE_TYPE_LAST_OBSERVED}\n\
+             naked_research_tick_source_last_observed_timestamp_seconds{{tick=\"playwright_generic\",brief=\"fixture\",mode=\"light\",source=\"dead\"}} 1786258596\n"
+        )
+    }
+
+    fn assert_prometheus_response_intact(body: &str, forbidden: &str) {
+        assert!(
+            body.contains("naked_core_turn_completed_total"),
+            "core counters must remain present after fragment rejection:\n{body}"
+        );
+        assert!(
+            body.contains("naked_tg_tick_source_metrics_fragment_rejected_total"),
+            "fragment rejection counter must be exposed:\n{body}"
+        );
+        assert!(
+            !body.contains(forbidden),
+            "invalid fragment leaked into /metrics:\n{body}"
+        );
+        for line in body.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let value = line
+                .split_whitespace()
+                .last()
+                .unwrap_or_else(|| panic!("metric line missing value: {line}"));
+            let parsed = value.parse::<f64>().unwrap_or_else(|err| {
+                panic!("metric line has invalid numeric value `{value}`: {line}: {err}")
+            });
+            assert!(
+                parsed.is_finite(),
+                "metric line has non-finite value: {line}"
+            );
+        }
     }
 
     #[test]
@@ -1620,6 +1850,8 @@ mod tests {
             active_run_max_silent_seconds: 49,
             config_loaded_hash: None,
             model_health_body: "# model health\nnaked_model_health_probe 777\n".to_string(),
+            tick_source_metrics_body: String::new(),
+            tick_source_metrics_fragment_rejected: 50,
         };
         let expected = concat!(
             "# HELP naked_tg_native_route_chosen_total Photos sent via native path.\n",
@@ -1967,6 +2199,9 @@ mod tests {
             "# HELP naked_core_parent_fsync_count Parent directory fsync duration for atomic writes (ms). observations\n",
             "# TYPE naked_core_parent_fsync_count counter\n",
             "naked_core_parent_fsync_count 171\n",
+            "# HELP naked_tg_tick_source_metrics_fragment_rejected_total Tick-source Prometheus bridge fragments omitted from /metrics because they were invalid or over the 64 KiB cap (B135).\n",
+            "# TYPE naked_tg_tick_source_metrics_fragment_rejected_total counter\n",
+            "naked_tg_tick_source_metrics_fragment_rejected_total 50\n",
             "# model health\n",
             "naked_model_health_probe 777\n",
         );
@@ -2221,6 +2456,104 @@ mod tests {
         assert!(rendered.contains("# TYPE naked_tg_config_describer_missing gauge"));
         assert!(rendered.contains("naked_tg_config_describer_missing 1"));
         assert!(!rendered.contains("naked_tg_config_describer_missing_total"));
+    }
+
+    #[test]
+    fn prometheus_includes_valid_file_backed_tick_source_failure_metrics() {
+        let fragment = valid_tick_source_fragment();
+        validate_tick_source_metrics_fragment(&fragment).expect("canonical fixture is valid");
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            tick_source_metrics_body: fragment,
+            ..PrometheusInputs::default()
+        });
+        assert!(rendered.contains(TICK_SOURCE_HELP_TOTAL));
+        assert!(rendered.contains(
+            "naked_research_tick_source_failure_total{tick=\"playwright_generic\",brief=\"fixture\",mode=\"light\",source=\"dead\"} 2"
+        ));
+        assert!(rendered.contains(
+            "naked_research_tick_source_last_observed_timestamp_seconds{tick=\"playwright_generic\",brief=\"fixture\",mode=\"light\",source=\"dead\"} 1786258596"
+        ));
+    }
+
+    #[test]
+    fn tick_source_fragment_missing_file_omits_only_fragment() {
+        let dir = unique_temp_dir("missing");
+        std::fs::create_dir_all(&dir).expect("create temp metrics dir");
+        let fragment = read_tick_source_metrics_fragment_from_dir(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(fragment.is_empty());
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            tick_source_metrics_body: fragment,
+            ..PrometheusInputs::default()
+        });
+        assert_prometheus_response_intact(&rendered, "this_is_not_valid_prometheus_at_all");
+    }
+
+    #[test]
+    fn tick_source_fragment_empty_file_omits_only_fragment() {
+        let dir = unique_temp_dir("empty");
+        std::fs::create_dir_all(&dir).expect("create temp metrics dir");
+        std::fs::write(dir.join(TICK_SOURCE_PROM_FILE), "").expect("write empty fragment");
+        let fragment = read_tick_source_metrics_fragment_from_dir(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(fragment.is_empty());
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            tick_source_metrics_body: fragment,
+            ..PrometheusInputs::default()
+        });
+        assert_prometheus_response_intact(&rendered, "this_is_not_valid_prometheus_at_all");
+    }
+
+    #[test]
+    fn tick_source_fragment_garbage_is_rejected_without_poisoning_response() {
+        let dir = unique_temp_dir("garbage");
+        std::fs::create_dir_all(&dir).expect("create temp metrics dir");
+        std::fs::write(
+            dir.join(TICK_SOURCE_PROM_FILE),
+            "this_is_not_valid_prometheus_at_all\n",
+        )
+        .expect("write garbage fragment");
+        let before = TICK_SOURCE_METRICS_FRAGMENT_REJECTED.load(Ordering::Relaxed);
+        let fragment = read_tick_source_metrics_fragment_from_dir(&dir);
+        let after = TICK_SOURCE_METRICS_FRAGMENT_REJECTED.load(Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(fragment.is_empty());
+        assert!(
+            after > before,
+            "garbage fragment must increment rejection counter: before={before} after={after}"
+        );
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            tick_source_metrics_body: fragment,
+            tick_source_metrics_fragment_rejected: after.saturating_sub(before),
+            ..PrometheusInputs::default()
+        });
+        assert_prometheus_response_intact(&rendered, "this_is_not_valid_prometheus_at_all");
+    }
+
+    #[test]
+    fn tick_source_fragment_oversized_is_rejected_without_reading_into_response() {
+        let dir = unique_temp_dir("oversized");
+        std::fs::create_dir_all(&dir).expect("create temp metrics dir");
+        std::fs::write(
+            dir.join(TICK_SOURCE_PROM_FILE),
+            vec![b'a'; (TICK_SOURCE_PROM_MAX_BYTES + 1) as usize],
+        )
+        .expect("write oversized fragment");
+        let before = TICK_SOURCE_METRICS_FRAGMENT_REJECTED.load(Ordering::Relaxed);
+        let fragment = read_tick_source_metrics_fragment_from_dir(&dir);
+        let after = TICK_SOURCE_METRICS_FRAGMENT_REJECTED.load(Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(fragment.is_empty());
+        assert!(
+            after > before,
+            "oversized fragment must increment rejection counter: before={before} after={after}"
+        );
+        let rendered = render_prometheus_from(&PrometheusInputs {
+            tick_source_metrics_body: fragment,
+            tick_source_metrics_fragment_rejected: after.saturating_sub(before),
+            ..PrometheusInputs::default()
+        });
+        assert_prometheus_response_intact(&rendered, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
 
     #[test]
