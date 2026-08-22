@@ -326,6 +326,12 @@ pub static FFF_GREP_FAST_INDEX_COUNT: std::sync::atomic::AtomicU64 =
 pub static FFF_GREP_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// B148: MCP servers that were CONFIGURED but failed to connect. Without this
+/// a total MCP outage is invisible to monitoring, because the log line for
+/// "all configured servers failed" used to be identical to "none configured".
+pub static MCP_CONNECT_FAILURE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// BUG_REGISTRY D-VALIDATE-IP-TOKENS (B37 stream guard): bumped
 /// each time an outgoing assistant message mentions noVNC/VNC
 /// keyword AND contains an `IP:port` token that's NOT in the

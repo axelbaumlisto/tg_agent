@@ -70,37 +70,36 @@ impl SubAgentTool {
     }
 
     fn build_tools(&self, mode: &str) -> ToolRegistry {
-        let tools: Vec<Box<dyn Tool>> =
-            match crate::agent_role::canonicalize_role(mode) {
-                Some(crate::agent_role::CanonicalRole::General)
-                | Some(crate::agent_role::CanonicalRole::Implementer)
-                | Some(crate::agent_role::CanonicalRole::Custom) => vec![
-                    Box::new(BashTool::new(self.tool_timeout_secs)),
-                    Box::new(ReadFileTool::default()),
-                    Box::new(FileSnapshotTool::default()),
-                    Box::new(WriteFileTool::default()),
-                    Box::new(
-                        EditFileTool::new(self.stale_edit_guard_enabled)
-                            .with_hashline_edit(self.hashline_edit_enabled),
-                    ),
-                    Box::new(GlobSearchTool),
-                    Box::new(GrepSearchTool),
-                    Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
-                ],
-                // Read-only postures (Explore, Plan, Review, Verifier) and
-                // unknown/None roles all fail closed to the read-only set.
-                // BashTool is intentionally excluded: a shell can write files,
-                // run editors, and mutate the workspace regardless of which
-                // file-op tools are present, so it is incompatible with the
-                // ReadOnly permission contract.
-                _ => vec![
-                    Box::new(ReadFileTool::default()),
-                    Box::new(FileSnapshotTool::default()),
-                    Box::new(GlobSearchTool),
-                    Box::new(GrepSearchTool),
-                    Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
-                ],
-            };
+        let tools: Vec<Box<dyn Tool>> = match crate::agent_role::canonicalize_role(mode) {
+            Some(crate::agent_role::CanonicalRole::General)
+            | Some(crate::agent_role::CanonicalRole::Implementer)
+            | Some(crate::agent_role::CanonicalRole::Custom) => vec![
+                Box::new(BashTool::new(self.tool_timeout_secs)),
+                Box::new(ReadFileTool::default()),
+                Box::new(FileSnapshotTool::default()),
+                Box::new(WriteFileTool::default()),
+                Box::new(
+                    EditFileTool::new(self.stale_edit_guard_enabled)
+                        .with_hashline_edit(self.hashline_edit_enabled),
+                ),
+                Box::new(GlobSearchTool),
+                Box::new(GrepSearchTool),
+                Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
+            ],
+            // Read-only postures (Explore, Plan, Review, Verifier) and
+            // unknown/None roles all fail closed to the read-only set.
+            // BashTool is intentionally excluded: a shell can write files,
+            // run editors, and mutate the workspace regardless of which
+            // file-op tools are present, so it is incompatible with the
+            // ReadOnly permission contract.
+            _ => vec![
+                Box::new(ReadFileTool::default()),
+                Box::new(FileSnapshotTool::default()),
+                Box::new(GlobSearchTool),
+                Box::new(GrepSearchTool),
+                Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
+            ],
+        };
         ToolRegistry::new(tools)
     }
 }
@@ -470,8 +469,14 @@ mod tests {
     fn build_tools_write_roles_include_write_tools() {
         let tool = make_tool();
         for alias in &[
-            "general", "worker", "default", "general-purpose",
-            "implementer", "implement", "implementation", "builder",
+            "general",
+            "worker",
+            "default",
+            "general-purpose",
+            "implementer",
+            "implement",
+            "implementation",
+            "builder",
             "custom",
         ] {
             let registry = tool.build_tools(alias);

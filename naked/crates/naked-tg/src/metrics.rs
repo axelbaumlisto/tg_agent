@@ -665,6 +665,7 @@ struct PrometheusInputs {
     fff_grep_fast_index: u64,
     fff_grep_fallback: u64,
     ip_hallucin: u64,
+    mcp_connect_failures: u64,
     research_store_corrupt_rows: u64,
     research_store_malformed_state: u64,
     research_store_files_healed: u64,
@@ -769,6 +770,7 @@ impl Default for PrometheusInputs {
             fff_grep_fast_index: 0,
             fff_grep_fallback: 0,
             ip_hallucin: 0,
+            mcp_connect_failures: 0,
             research_store_corrupt_rows: 0,
             research_store_malformed_state: 0,
             research_store_files_healed: 0,
@@ -918,6 +920,8 @@ impl MediaRoutingSnapshot {
                 .load(Ordering::Relaxed),
             fff_grep_fallback: naked_core::types::FFF_GREP_FALLBACK_COUNT.load(Ordering::Relaxed),
             ip_hallucin: naked_core::types::IP_TOKEN_HALLUCINATION_COUNT.load(Ordering::Relaxed),
+            mcp_connect_failures: naked_core::types::MCP_CONNECT_FAILURE_COUNT
+                .load(Ordering::Relaxed),
             research_store_corrupt_rows:
                 naked_core::types::RESEARCH_STORE_CORRUPT_ROWS_DETECTED_COUNT
                     .load(Ordering::Relaxed),
@@ -1127,6 +1131,9 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
              # HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n\
              # TYPE naked_core_ip_token_hallucination_total counter\n\
              naked_core_ip_token_hallucination_total {ip_hallucin}\n\
+             # HELP naked_core_mcp_connect_failure_total (B148) Configured MCP servers that failed to connect; a total outage used to log like an empty configuration.\n\
+             # TYPE naked_core_mcp_connect_failure_total counter\n\
+             naked_core_mcp_connect_failure_total {mcp_connect_failures}\n\
              # HELP naked_core_research_store_corrupt_rows_detected_total (B59) Invalid findings.jsonl rows detected by the research store healing path.\n\
              # TYPE naked_core_research_store_corrupt_rows_detected_total counter\n\
              naked_core_research_store_corrupt_rows_detected_total {research_store_corrupt_rows}\n\
@@ -1309,6 +1316,7 @@ fn render_prometheus_from(inputs: &PrometheusInputs) -> String {
         fff_grep_fast_index = inputs.fff_grep_fast_index,
         fff_grep_fallback = inputs.fff_grep_fallback,
         ip_hallucin = inputs.ip_hallucin,
+        mcp_connect_failures = inputs.mcp_connect_failures,
         research_store_corrupt_rows = inputs.research_store_corrupt_rows,
         research_store_malformed_state = inputs.research_store_malformed_state,
         research_store_files_healed = inputs.research_store_files_healed,
@@ -1835,6 +1843,7 @@ mod tests {
             fff_grep_fast_index: 404,
             fff_grep_fallback: 405,
             ip_hallucin: 41,
+            mcp_connect_failures: 42,
             research_store_corrupt_rows: 42,
             research_store_malformed_state: 46,
             research_store_files_healed: 43,
@@ -2002,6 +2011,9 @@ mod tests {
             "# HELP naked_core_ip_token_hallucination_total (B37) Outgoing assistant messages mentioning noVNC with IP tokens not in the boot-cached allow-list.\n",
             "# TYPE naked_core_ip_token_hallucination_total counter\n",
             "naked_core_ip_token_hallucination_total 41\n",
+            "# HELP naked_core_mcp_connect_failure_total (B148) Configured MCP servers that failed to connect; a total outage used to log like an empty configuration.\n",
+            "# TYPE naked_core_mcp_connect_failure_total counter\n",
+            "naked_core_mcp_connect_failure_total 42\n",
             "# HELP naked_core_research_store_corrupt_rows_detected_total (B59) Invalid findings.jsonl rows detected by the research store healing path.\n",
             "# TYPE naked_core_research_store_corrupt_rows_detected_total counter\n",
             "naked_core_research_store_corrupt_rows_detected_total 42\n",

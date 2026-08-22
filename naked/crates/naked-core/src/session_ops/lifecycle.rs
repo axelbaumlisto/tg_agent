@@ -38,11 +38,29 @@ impl AgentCore {
             old.close_all().await;
         }
         let result = McpRegistry::connect_all_with_diagnostics(&servers).await;
-        tracing::info!(
-            "MCP: {} tools from {} servers",
+        // B148: report connected-of-CONFIGURED. The old wording printed only the
+        // result, so "all configured servers failed" rendered exactly like "none
+        // configured" — an agent running with zero tools looked like an ordinary
+        // empty-MCP deployment, and the zero-count classifier whitelists the
+        // benign form by name.
+        let configured = servers.len();
+        let connected = result.registry.servers().len();
+        let failed_names: Vec<&str> = result.failures.iter().map(|f| f.name.as_str()).collect();
+        let line = mcp_status_line(
             result.registry.all_tools().len(),
-            result.registry.servers().len()
+            connected,
+            configured,
+            &failed_names,
         );
+        if configured > connected {
+            crate::types::message::MCP_CONNECT_FAILURE_COUNT.fetch_add(
+                (configured - connected) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            tracing::warn!("{line}");
+        } else {
+            tracing::info!("{line}");
+        }
         *self.catalog.mcp_registry.write().await = result.registry;
         result.failures
     }
@@ -328,5 +346,71 @@ impl AgentCore {
             skills.len(),
             self.catalog.mcp_registry.read().await.servers().len()
         );
+    }
+}
+
+/// B148: render the MCP connect summary as connected-of-CONFIGURED.
+///
+/// The old wording reported only the result (`N tools from M servers`), so a
+/// deployment whose every configured server failed logged exactly the same
+/// sentence as one with no MCP configured at all. The zero-count classifier
+/// whitelists the benign `MCP: 0 servers` form by name, so a total outage was
+/// invisible. Keeping the denominator makes the two cases distinguishable.
+pub(crate) fn mcp_status_line(
+    tools: usize,
+    connected: usize,
+    configured: usize,
+    failed_names: &[&str],
+) -> String {
+    if configured > connected {
+        format!(
+            "MCP: {tools} tools from {connected}/{configured} servers — {} failed to connect: {}",
+            configured - connected,
+            if failed_names.is_empty() {
+                "(unnamed)".to_string()
+            } else {
+                failed_names.join(", ")
+            }
+        )
+    } else {
+        format!("MCP: {tools} tools from {connected}/{configured} servers")
+    }
+}
+
+#[cfg(test)]
+mod b148_mcp_status_line_tests {
+    use super::mcp_status_line;
+
+    /// The whole point: an empty configuration and a total outage must not
+    /// produce the same sentence.
+    #[test]
+    fn total_failure_is_distinguishable_from_no_servers_configured() {
+        let none_configured = mcp_status_line(0, 0, 0, &[]);
+        let all_failed = mcp_status_line(0, 0, 2, &["playwright", "research_catalog"]);
+        assert_ne!(
+            none_configured, all_failed,
+            "0-of-0 and 0-of-2 must not render identically"
+        );
+        assert!(none_configured.contains("0/0"), "got: {none_configured}");
+        assert!(all_failed.contains("0/2"), "got: {all_failed}");
+        assert!(all_failed.contains("playwright"), "got: {all_failed}");
+        assert!(all_failed.contains("research_catalog"), "got: {all_failed}");
+    }
+
+    /// A partial outage must name what is missing rather than look healthy.
+    #[test]
+    fn partial_failure_names_the_missing_server() {
+        let line = mcp_status_line(24, 1, 2, &["research_catalog"]);
+        assert!(line.contains("1/2"), "got: {line}");
+        assert!(line.contains("1 failed to connect"), "got: {line}");
+        assert!(line.contains("research_catalog"), "got: {line}");
+    }
+
+    /// The healthy path stays quiet: no failure wording at all.
+    #[test]
+    fn healthy_line_mentions_no_failure() {
+        let line = mcp_status_line(44, 2, 2, &[]);
+        assert_eq!(line, "MCP: 44 tools from 2/2 servers");
+        assert!(!line.contains("failed"), "got: {line}");
     }
 }
