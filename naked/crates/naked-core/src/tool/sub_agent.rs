@@ -70,29 +70,37 @@ impl SubAgentTool {
     }
 
     fn build_tools(&self, mode: &str) -> ToolRegistry {
-        let tools: Vec<Box<dyn Tool>> = match mode {
-            "explore" => vec![
-                Box::new(ReadFileTool::default()),
-                Box::new(FileSnapshotTool::default()),
-                Box::new(GlobSearchTool),
-                Box::new(GrepSearchTool),
-                Box::new(BashTool::new(self.tool_timeout_secs)),
-                Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
-            ],
-            _ => vec![
-                Box::new(BashTool::new(self.tool_timeout_secs)),
-                Box::new(ReadFileTool::default()),
-                Box::new(FileSnapshotTool::default()),
-                Box::new(WriteFileTool::default()),
-                Box::new(
-                    EditFileTool::new(self.stale_edit_guard_enabled)
-                        .with_hashline_edit(self.hashline_edit_enabled),
-                ),
-                Box::new(GlobSearchTool),
-                Box::new(GrepSearchTool),
-                Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
-            ],
-        };
+        let tools: Vec<Box<dyn Tool>> =
+            match crate::agent_role::canonicalize_role(mode) {
+                Some(crate::agent_role::CanonicalRole::General)
+                | Some(crate::agent_role::CanonicalRole::Implementer)
+                | Some(crate::agent_role::CanonicalRole::Custom) => vec![
+                    Box::new(BashTool::new(self.tool_timeout_secs)),
+                    Box::new(ReadFileTool::default()),
+                    Box::new(FileSnapshotTool::default()),
+                    Box::new(WriteFileTool::default()),
+                    Box::new(
+                        EditFileTool::new(self.stale_edit_guard_enabled)
+                            .with_hashline_edit(self.hashline_edit_enabled),
+                    ),
+                    Box::new(GlobSearchTool),
+                    Box::new(GrepSearchTool),
+                    Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
+                ],
+                // Read-only postures (Explore, Plan, Review, Verifier) and
+                // unknown/None roles all fail closed to the read-only set.
+                // BashTool is intentionally excluded: a shell can write files,
+                // run editors, and mutate the workspace regardless of which
+                // file-op tools are present, so it is incompatible with the
+                // ReadOnly permission contract.
+                _ => vec![
+                    Box::new(ReadFileTool::default()),
+                    Box::new(FileSnapshotTool::default()),
+                    Box::new(GlobSearchTool),
+                    Box::new(GrepSearchTool),
+                    Box::new(WebSearchTool::from_legacy_exa(self.exa_keys.clone())),
+                ],
+            };
         ToolRegistry::new(tools)
     }
 }
@@ -393,13 +401,93 @@ mod tests {
         assert!(registry.get("grep_search").is_some());
     }
 
+    /// Every accepted alias for read-only roles must produce a registry
+    /// that contains no write_file or edit_file tool.
     #[test]
-    fn build_tools_code_includes_write_tools() {
+    fn build_tools_readonly_aliases_have_no_write_tools() {
         let tool = make_tool();
-        let registry = tool.build_tools("code");
-        assert!(registry.get("write_file").is_some());
-        assert!(registry.get("edit_file").is_some());
-        assert!(registry.get("bash").is_some());
+        // Explore aliases
+        for alias in &["explore", "explorer", "exploration"] {
+            let registry = tool.build_tools(alias);
+            assert!(
+                registry.get("write_file").is_none(),
+                "write_file present for alias '{alias}'"
+            );
+            assert!(
+                registry.get("edit_file").is_none(),
+                "edit_file present for alias '{alias}'"
+            );
+        }
+        // Plan aliases
+        for alias in &["plan", "planning", "awaiter"] {
+            let registry = tool.build_tools(alias);
+            assert!(
+                registry.get("write_file").is_none(),
+                "write_file present for alias '{alias}'"
+            );
+            assert!(
+                registry.get("edit_file").is_none(),
+                "edit_file present for alias '{alias}'"
+            );
+        }
+        // Review aliases
+        for alias in &["review", "reviewer", "code-review"] {
+            let registry = tool.build_tools(alias);
+            assert!(
+                registry.get("write_file").is_none(),
+                "write_file present for alias '{alias}'"
+            );
+            assert!(
+                registry.get("edit_file").is_none(),
+                "edit_file present for alias '{alias}'"
+            );
+        }
+        // Verifier aliases
+        for alias in &["verifier", "verify", "verification", "validator", "tester"] {
+            let registry = tool.build_tools(alias);
+            assert!(
+                registry.get("write_file").is_none(),
+                "write_file present for alias '{alias}'"
+            );
+            assert!(
+                registry.get("edit_file").is_none(),
+                "edit_file present for alias '{alias}'"
+            );
+        }
+        // Unknown / None role must also fail closed
+        let registry = tool.build_tools("unknown-role-xyz");
+        assert!(
+            registry.get("write_file").is_none(),
+            "write_file present for unknown role"
+        );
+        assert!(
+            registry.get("edit_file").is_none(),
+            "edit_file present for unknown role"
+        );
+    }
+
+    #[test]
+    fn build_tools_write_roles_include_write_tools() {
+        let tool = make_tool();
+        for alias in &[
+            "general", "worker", "default", "general-purpose",
+            "implementer", "implement", "implementation", "builder",
+            "custom",
+        ] {
+            let registry = tool.build_tools(alias);
+            assert!(
+                registry.get("write_file").is_some(),
+                "write_file missing for alias '{alias}'"
+            );
+            assert!(
+                registry.get("edit_file").is_some(),
+                "edit_file missing for alias '{alias}'"
+            );
+            assert!(
+                registry.get("bash").is_some(),
+                "bash missing for alias '{alias}'"
+            );
+        }
     }
 
     #[tokio::test]
