@@ -331,6 +331,23 @@ pub(crate) async fn build() -> WiredBot {
     // Startup janitor: nuke old media artifacts outside the retention window.
     crate::media::sweep_old_artifacts(&config.workspace, config.tg_media.artifact_retention_days);
 
+    // B156: snapshot retention. `prune_older_than` existed, was exported, and
+    // was called by NOBODY — its own doc-comment said "safe to call on every
+    // bot boot" while nothing did, so ~/.naked/snapshots/ reached 2964
+    // directories dating back to May. Both passes run here now: gc compacts
+    // each side-repo, and the workspace cap bounds how many exist at all.
+    // Blocking is fine — measured at ~161 KB per directory this is filesystem
+    // work on a few hundred small dirs, and it happens once per boot.
+    let pruned_dirs =
+        naked_core::snapshot::prune_to_workspace_cap(naked_core::snapshot::DEFAULT_MAX_WORKSPACES);
+    let gc_repos = naked_core::snapshot::prune_older_than(naked_core::snapshot::DEFAULT_MAX_AGE);
+    tracing::info!(
+        removed_workspaces = pruned_dirs,
+        gc_repos,
+        cap = naked_core::snapshot::DEFAULT_MAX_WORKSPACES,
+        "snapshot janitor complete"
+    );
+
     telegram::clear_webhook(&http_client, &base_url).await;
 
     let stream_deps = research_scheduler::StreamDeps {

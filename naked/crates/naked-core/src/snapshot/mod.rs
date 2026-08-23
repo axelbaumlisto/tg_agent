@@ -30,5 +30,7 @@ mod legacy_stash;
 pub use legacy_stash::{StashEntry, list_snapshots, pre_turn_snapshot, undo_last};
 
 pub use paths::{snapshot_dir_for, snapshot_git_dir};
-pub use prune::{DEFAULT_MAX_AGE, prune_older_than};
+pub use prune::{
+    DEFAULT_MAX_AGE, DEFAULT_MAX_WORKSPACES, prune_older_than, prune_to_workspace_cap,
+};
 pub use repo::{Snapshot, SnapshotId, SnapshotRepo};

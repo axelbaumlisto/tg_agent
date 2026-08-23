@@ -627,3 +627,73 @@ fn deterministic_merge_truncates_to_max_chars() {
     assert!(s.len() <= 80);
     assert!(s.starts_with("[merged]"));
 }
+
+/// B154 — the real production case, pinned as a test.
+///
+/// The operator asked why the bot remembers so little. Investigation showed the
+/// mechanism is healthy but ASYMMETRIC, and nothing covered that asymmetry:
+/// `day_boost` grants +1 to `Correction`/`Failure` only, so with the default
+/// `promote_min_repeat_days = 2` a negative memory promotes after ONE day while
+/// a `Preference` seen once is rejected and must reappear on a second day.
+///
+/// Both of these are real entries from `~/.naked/users/105928336/memory/`:
+///   2026-08-05 Correction  "only find popular groups"  -> promoted (in MEMORY.md)
+///   2026-08-02 Preference  "links are not clickable"   -> not promoted
+///
+/// The existing tests could not catch this: their `entry()` helper hardcodes
+/// `MemoryType::Preference`, so every case ran on one side of the branch.
+#[test]
+fn b154_correction_promotes_in_one_day_but_preference_needs_two() {
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        ..MemoryConfig::default()
+    };
+
+    let typed = |t: MemoryType, content: &str| {
+        let e = MemoryEntry::new(
+            t,
+            content.into(),
+            "auto_classify",
+            MemoryScope::User("op".into()),
+        );
+        let hints = ScoringHints {
+            repeat_days: 1, // seen on exactly ONE day — the common case
+            source_diversity: 1,
+            age_days: 0,
+            recall_count: 0,
+            reinforcements: 1,
+        };
+        (e, hints)
+    };
+
+    let (promoted, rejected) = partition_candidates(
+        vec![
+            typed(MemoryType::Correction, "only find popular groups"),
+            typed(MemoryType::Preference, "links are not clickable"),
+        ],
+        &cfg,
+    );
+
+    assert_eq!(
+        promoted.len(),
+        1,
+        "a Correction seen on one day must promote via day_boost"
+    );
+    assert_eq!(promoted[0].entry.content, "only find popular groups");
+    assert_eq!(
+        rejected.len(),
+        1,
+        "a Preference seen on one day must NOT promote"
+    );
+    assert_eq!(rejected[0].entry.content, "links are not clickable");
+
+    // The same Preference repeated on a second day does promote — this is what
+    // an infrequent user must do, and the reason the fix is documentation
+    // rather than a threshold change.
+    let (e, mut hints) = typed(MemoryType::Preference, "links are not clickable");
+    hints.repeat_days = 2;
+    let (promoted2, rejected2) = partition_candidates(vec![(e, hints)], &cfg);
+    assert_eq!(promoted2.len(), 1, "same preference on two days promotes");
+    assert!(rejected2.is_empty());
+}
