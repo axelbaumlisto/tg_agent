@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use super::{BASE_RETRY_DELAY_MS, MAX_STREAM_RETRIES};
+use super::{BASE_RETRY_DELAY_MS, MAX_STREAM_RETRIES, RATE_LIMIT_EXTRA_DELAY_MS};
 
 struct TurnBackstop {
     fired: Arc<AtomicBool>,
@@ -162,11 +162,33 @@ impl super::AgentLoop {
                         return Err(e);
                     }
                     if retry < MAX_STREAM_RETRIES {
-                        let delay = Backoff {
+                        let mut delay = Backoff {
                             base_ms: BASE_RETRY_DELAY_MS,
                             max_attempts: MAX_STREAM_RETRIES + 1,
                         }
                         .delay(retry);
+                        // B157: a 429 from a concurrency-limited proxy is
+                        // often SELF-collision — the demote above fires a
+                        // new request while the previous stream's slot is
+                        // still held server-side. The blind 1s exponential
+                        // re-collides at +1s (observed 14× on 2026-08-26).
+                        // Honour retry_after when the proxy sent one, and
+                        // otherwise impose a 2s floor for rate-limit retries
+                        // so the slot has time to drain.
+                        if let AgentError::ProviderTyped(
+                            crate::provider::error::ProviderError::RateLimited {
+                                retry_after, ..
+                            },
+                        ) = &e
+                        {
+                            let server_hint = retry_after.map(std::time::Duration::from_secs);
+                            let floor = std::time::Duration::from_millis(RATE_LIMIT_EXTRA_DELAY_MS);
+                            if let Some(hint) = server_hint {
+                                delay = delay.max(hint.max(floor));
+                            } else {
+                                delay = delay.max(floor);
+                            }
+                        }
                         self.config.observer.on_retry(
                             RetryKind::Connect,
                             retry + 1,

@@ -28,6 +28,12 @@ mod tools;
 
 const MAX_STREAM_RETRIES: usize = 3;
 const BASE_RETRY_DELAY_MS: u64 = 1000;
+/// B157: minimum delay for rate-limit (429) connect retries. A
+/// concurrency-limited proxy holds the previous stream's slot briefly
+/// after we abandon it, so a fast retry re-collides with ourselves.
+/// Two seconds drains the slot on the airpx.cc deployment this was
+/// measured on; non-429 retries keep the plain exponential backoff.
+const RATE_LIMIT_EXTRA_DELAY_MS: u64 = 2_000;
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many times to retry the *same* turn after the provider closes the

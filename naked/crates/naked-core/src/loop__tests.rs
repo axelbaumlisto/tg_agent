@@ -2772,3 +2772,89 @@ async fn reasoning_only_turn_is_not_recorded_as_success() {
         "it must be recorded as an empty/no-answer turn instead: {window:?}"
     );
 }
+
+/// B157: a 429 connect failure must not be retried at the blind 1s
+/// exponential backoff — the rate-limit floor (2s) applies so a
+/// concurrency-limited proxy has time to drain our previous stream's
+/// slot. The provider first rejects with RateLimited, then answers
+/// normally; we measure the wall time between the two calls.
+#[tokio::test]
+async fn b157_rate_limited_connect_retry_respects_two_second_floor() {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct RateLimitThenAnswerProvider {
+        call_count: AtomicUsize,
+        call_times: std::sync::Arc<Mutex<Vec<Instant>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RateLimitThenAnswerProvider {
+        fn name(&self) -> &str {
+            "mock429"
+        }
+        fn models(&self) -> Vec<crate::types::ModelInfo> {
+            vec![]
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> crate::error::Result<Pin<Box<dyn tokio_stream::Stream<Item = StreamChunk> + Send>>>
+        {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            self.call_times.lock().unwrap().push(Instant::now());
+            if idx == 0 {
+                return Err(AgentError::ProviderTyped(
+                    crate::provider::error::ProviderError::RateLimited {
+                        retry_after: None,
+                        body: "Too many concurrent requests for this API key".into(),
+                    },
+                ));
+            }
+            Ok(Box::pin(tokio_stream::iter(vec![
+                StreamChunk::Text("recovered".into()),
+                StreamChunk::Done,
+            ])))
+        }
+    }
+
+    let call_times = std::sync::Arc::new(Mutex::new(Vec::<Instant>::new()));
+    let provider = RateLimitThenAnswerProvider {
+        call_count: AtomicUsize::new(0),
+        call_times: call_times.clone(),
+    };
+
+    let agent_loop = AgentLoop::new(
+        Box::new(provider),
+        crate::tool::registry::ToolRegistry::new(vec![]),
+        LoopConfig {
+            max_iterations: 5,
+            max_wall: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            model: "mock429".into(),
+            max_tokens: 1024,
+            ..Default::default()
+        },
+    );
+    let mut history = ConversationHistory::new("sys".into());
+    history.push_user("ping");
+    let (tx, _rx) = mpsc::channel(64);
+
+    let result = agent_loop
+        .run(&mut history, tx, CancellationToken::new(), None, None)
+        .await;
+    assert!(
+        result.is_ok(),
+        "turn must recover after the 429: {result:?}"
+    );
+
+    // Call times were recorded through the shared Arc — no raw-pointer
+    // access needed (the crate forbids `unsafe`).
+    let times: Vec<std::time::Instant> = call_times.lock().unwrap().clone();
+    assert_eq!(times.len(), 2, "exactly two provider calls expected");
+    let gap = times[1].duration_since(times[0]);
+    assert!(
+        gap >= std::time::Duration::from_secs(2),
+        "B157: rate-limit retry must wait >= 2s (self-collision floor), waited {gap:?}"
+    );
+}
