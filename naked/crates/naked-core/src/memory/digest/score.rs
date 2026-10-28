@@ -61,7 +61,7 @@ pub fn partition_candidates(
         let effective_days =
             effective_days(hints.repeat_days, effective_reinforcements, day_boost, cfg);
 
-        if effective_days < cfg.promote_min_repeat_days {
+        if !repeat_gate_passes(&entry, effective_days, cfg) {
             reasons.push(format!(
                 "appeared on only {} day(s) (need ≥{}){}",
                 hints.repeat_days,
@@ -149,7 +149,10 @@ fn promotion_roads(
     // and re-observation must be counted in both roads, otherwise
     // `would_promote_reobs=0` is ambiguous (no reobs candidates vs masked by
     // repeat-days). Overlap is expected; sums may exceed `candidates`.
-    let repeat_days = repeat_days_qualifies(hints.repeat_days, day_boost, cfg);
+    // Mirror the bypass here too, or the counterfactual log would report
+    // would_promote_repeat_days=0 for an entry the digest did promote.
+    let repeat_days =
+        is_user_explicit(entry) || repeat_days_qualifies(hints.repeat_days, day_boost, cfg);
     let reinforce =
         reinforcement_qualifies(hints.repeat_days, hints.reinforcements, day_boost, cfg);
     let reobs = include_reobs
@@ -165,6 +168,16 @@ fn promotion_roads(
         reinforce,
         reobs,
     }
+}
+
+/// `true` when the user told the agent to remember this, recorded by the
+/// classifier as `source:user_explicit` (B165). Such an entry skips the
+/// repeat-days gate: that gate exists to stop a *guess* about the user
+/// from hardening into a rule, and there is nothing to guess when the
+/// instruction was given out loud. Everything else — dedup, the entry
+/// size cap, compaction, the digest review — still applies.
+pub(crate) fn is_user_explicit(entry: &MemoryEntry) -> bool {
+    entry.source == "user_explicit"
 }
 
 fn day_boost(entry: &MemoryEntry) -> u32 {
@@ -183,6 +196,13 @@ fn day_boost(entry: &MemoryEntry) -> u32 {
 
 fn repeat_days_qualifies(repeat_days: u32, day_boost: u32, cfg: &MemoryConfig) -> bool {
     repeat_days.saturating_add(day_boost) >= cfg.promote_min_repeat_days
+}
+
+/// The repeat-days gate, including the explicit-instruction bypass.
+/// Takes the entry rather than a precomputed boost so the bypass cannot
+/// be forgotten at one of the call sites.
+fn repeat_gate_passes(entry: &MemoryEntry, effective_days: u32, cfg: &MemoryConfig) -> bool {
+    is_user_explicit(entry) || effective_days >= cfg.promote_min_repeat_days
 }
 
 fn reinforcement_qualifies(
@@ -291,7 +311,12 @@ pub fn pick_compaction_victims(
         .filter(|(_, e)| {
             e.created_at.date_naive() <= cutoff_date
                 && effective_recall(e, today, half_life) < spare
-                && e.content.len() <= cfg.compact_max_chars
+                // B164: this used to read `cfg.compact_max_chars`, the
+                // budget for the summary compaction PRODUCES. Reusing it
+                // here meant an entry could only be forgotten if it was
+                // already short, exempting exactly the bulky entries the
+                // sweep exists for.
+                && e.content.len() <= cfg.compact_max_victim_chars
         })
         .map(|(i, _)| i)
         .collect();

@@ -102,8 +102,24 @@ pub struct MemoryConfig {
     /// Hard upper bound on the LLM-generated merge summary. Anything
     /// longer is truncated server-side. Keep small so MEMORY.md never
     /// grows back faster than it shrinks. Default 240 chars.
+    ///
+    /// **Output only.** B164: this value also used to filter which
+    /// entries were allowed to BE compacted, so an entry could only
+    /// be forgotten if it was already short. In production that made
+    /// 30 of 35 `Failures` permanently exempt — the long, stale ones
+    /// the sweep exists for — and froze the section from 2026-06-03
+    /// onward. Victim eligibility now lives in
+    /// `compact_max_victim_chars`.
     #[serde(default = "default_compact_max_chars")]
     pub compact_max_chars: usize,
+    /// Largest entry that may be picked as a compaction VICTIM.
+    /// Distinct from `compact_max_chars`, which bounds the summary
+    /// that replaces the victims. Default `MAX_ENTRY_CHARS` (500) —
+    /// the cap the store already enforces on any single entry, so by
+    /// default nothing is exempt from forgetting merely for being
+    /// long. Lower it only to deliberately protect large entries.
+    #[serde(default = "default_compact_max_victim_chars")]
+    pub compact_max_victim_chars: usize,
     /// Don't compact entries younger than this many days — fresh rules
     /// are still earning their keep. Default 14.
     #[serde(default = "default_compact_min_age_days")]
@@ -178,6 +194,7 @@ impl Default for MemoryConfig {
             compact_threshold_per_section: default_compact_threshold(),
             compact_window: default_compact_window(),
             compact_max_chars: default_compact_max_chars(),
+            compact_max_victim_chars: default_compact_max_victim_chars(),
             compact_min_age_days: default_compact_min_age_days(),
             compact_spare_recall: default_compact_spare_recall(),
             compact_recall_half_life_days: default_compact_recall_half_life_days(),
@@ -228,6 +245,9 @@ fn default_compact_threshold() -> u32 {
 }
 fn default_compact_window() -> u32 {
     5
+}
+fn default_compact_max_victim_chars() -> usize {
+    crate::memory::store::MAX_ENTRY_CHARS
 }
 fn default_compact_max_chars() -> usize {
     240

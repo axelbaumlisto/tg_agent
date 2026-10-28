@@ -25,9 +25,28 @@ fn is_inside_workspace(path: &Path, workspace: &Path) -> bool {
             } else {
                 workspace.join(path)
             };
-            abs.starts_with(workspace)
+            // Lexically resolve .. and . so that paths like workspace/../../evil
+            // do not falsely pass a starts_with check (B160).
+            let normalized = lexical_normalize(&abs);
+            let norm_ws = lexical_normalize(workspace);
+            normalized.starts_with(&norm_ws)
         }
     }
+}
+
+/// Resolve `.` and `..` components without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // -- ReadFileTool ------------------------------------------------------------

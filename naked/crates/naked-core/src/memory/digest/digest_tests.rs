@@ -18,6 +18,76 @@ fn entry(content: &str, source: &str, age_days: i64) -> (MemoryEntry, ScoringHin
     (e, hints)
 }
 
+// ââ B165: an instruction to remember is not a guess about the user ââ
+//
+// The repeat-days gate exists so a *mis-classification* cannot harden into
+// a durable rule. When the user said "remember X" out loud there is nothing
+// to second-guess, and making them say it again on another day reads as the
+// bot ignoring them. Everything else still applies.
+
+#[test]
+fn explicit_instruction_promotes_on_the_first_day() {
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        ..MemoryConfig::default()
+    };
+    let mut e = entry("marker 42", "user_explicit", 1);
+    e.1.repeat_days = 1;
+
+    let (promoted, rejected) = partition_candidates(vec![e], &cfg);
+    assert_eq!(rejected.len(), 0, "rejected: {rejected:?}");
+    assert_eq!(promoted.len(), 1);
+    assert_eq!(promoted[0].entry.content, "marker 42");
+}
+
+#[test]
+fn explicit_bypass_holds_under_a_stricter_gate() {
+    // The bypass must not be a +1 fudge that a stricter config defeats.
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 7,
+        promote_min_recall_count: 0,
+        ..MemoryConfig::default()
+    };
+    let mut e = entry("marker 42", "user_explicit", 1);
+    e.1.repeat_days = 1;
+    assert_eq!(partition_candidates(vec![e], &cfg).0.len(), 1);
+}
+
+#[test]
+fn inferred_entry_still_needs_a_second_day() {
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 0,
+        ..MemoryConfig::default()
+    };
+    let mut e = entry("guessed habit", "auto_classify", 1);
+    e.1.repeat_days = 1;
+
+    let (promoted, rejected) = partition_candidates(vec![e], &cfg);
+    assert_eq!(promoted.len(), 0, "a guess must not take the fast path");
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].reason.contains("only 1 day"));
+}
+
+#[test]
+fn explicit_bypass_does_not_skip_the_recall_gate() {
+    // Only the repeat-days gate is bypassed. An operator who turned on the
+    // recall gate still gets it.
+    let cfg = MemoryConfig {
+        promote_min_repeat_days: 2,
+        promote_min_recall_count: 3,
+        ..MemoryConfig::default()
+    };
+    let mut e = entry("marker 42", "user_explicit", 1);
+    e.1.repeat_days = 1;
+    e.1.recall_count = 0;
+
+    let (promoted, rejected) = partition_candidates(vec![e], &cfg);
+    assert_eq!(promoted.len(), 0);
+    assert!(rejected[0].reason.contains("recalled only"));
+}
+
 #[test]
 fn partition_uses_repeat_days_gate() {
     let cfg = MemoryConfig {
@@ -406,6 +476,92 @@ fn cfg_with_compact(threshold: u32, window: u32, min_age: u32, spare: u32) -> Me
     }
 }
 
+// ── B164: victim eligibility must not be governed by the summary budget ──
+//
+// `compact_max_chars` bounds the summary compaction PRODUCES. It was also
+// used to filter the entries compaction CONSUMES, so an entry could only be
+// forgotten if it was already short. Every test above uses contents like
+// "r0_old_unused", which is why none of them noticed.
+
+/// Content longer than `compact_max_chars` (240) but within the store's
+/// per-entry cap (`MAX_ENTRY_CHARS` = 500) — the shape of a real memory.
+fn long_content(tag: &str) -> String {
+    format!("{tag}: {}", "x".repeat(300))
+}
+
+#[test]
+fn pick_compaction_accepts_entries_longer_than_the_summary_budget() {
+    let cfg = cfg_with_compact(5, 5, 14, 2);
+    let today = Utc::now().date_naive();
+    let entries: Vec<MemoryEntry> = (0..6)
+        .map(|i| entry_aged(&long_content(&format!("r{i}")), 30 - i, 0))
+        .collect();
+    for e in &entries {
+        assert!(
+            e.content.len() > cfg.compact_max_chars,
+            "fixture must exceed the summary budget to be a regression test"
+        );
+    }
+
+    let picks = pick_compaction_victims(&entries, &cfg, today);
+    assert_eq!(
+        picks.len(),
+        5,
+        "long stale entries must be forgettable; they are what the sweep is for"
+    );
+}
+
+#[test]
+fn pick_compaction_still_honours_the_dedicated_victim_cap() {
+    let today = Utc::now().date_naive();
+    let cfg = MemoryConfig {
+        compact_max_victim_chars: 100,
+        ..cfg_with_compact(5, 5, 14, 2)
+    };
+    let entries: Vec<MemoryEntry> = (0..6)
+        .map(|i| entry_aged(&long_content(&format!("r{i}")), 30 - i, 0))
+        .collect();
+    assert!(
+        pick_compaction_victims(&entries, &cfg, today).is_empty(),
+        "the dedicated knob must still be able to protect large entries"
+    );
+}
+
+#[test]
+fn pick_compaction_unfreezes_the_production_failures_section() {
+    // The exact shape found on 2026-10-28 in the project `Failures`
+    // section: 35 entries, all months old; 30 longer than the 240-char
+    // summary budget; 5 short, one of which is spared by recall decay
+    // (53 recalls). Under the old filter: 4 eligible against a window of
+    // 5 → nothing, forever, with every new long entry born exempt.
+    let cfg = cfg_with_compact(12, 5, 14, 2);
+    let today = Utc::now().date_naive();
+    let mut entries: Vec<MemoryEntry> = (0..30)
+        .map(|i| entry_aged(&long_content(&format!("long{i}")), 160 - i, 0))
+        .collect();
+    for i in 0..4 {
+        entries.push(entry_aged(&format!("short{i}"), 150 - i, 0));
+    }
+    // Recalled 53 times, last seen ~130 days ago: decayed to ≈2.6, which
+    // is still at or above `compact_spare_recall`, so it stays spared.
+    let mut hot = entry_aged("short_but_recalled", 130, 53);
+    hot.last_recalled_at = Some(Utc::now() - ChronoDuration::days(130));
+    entries.push(hot);
+    assert_eq!(entries.len(), 35);
+
+    let picks = pick_compaction_victims(&entries, &cfg, today);
+    assert_eq!(picks.len(), 5, "the section must become compactable again");
+    let picked: Vec<&str> = picks.iter().map(|&i| entries[i].content.as_str()).collect();
+    assert!(
+        !picked.contains(&"short_but_recalled"),
+        "recall decay must still protect a frequently used entry"
+    );
+    assert!(
+        picked.iter().any(|c| c.starts_with("long")),
+        "the long entries are the ones bloating the section; they must be reachable"
+    );
+}
+
 #[test]
 fn pick_compaction_skips_when_below_threshold() {
     let entries: Vec<MemoryEntry> = (0..4)
@@ -472,23 +628,35 @@ fn pick_compaction_skips_fresh_entries() {
 }
 
 #[test]
-fn pick_compaction_respects_max_chars() {
+fn pick_compaction_summary_budget_does_not_govern_victims() {
+    // This test used to be `pick_compaction_respects_max_chars` and
+    // asserted the opposite: with `compact_max_chars: 30` the two long
+    // entries were skipped and the call returned nothing. That pinned
+    // B164 as intended behaviour — the summary budget deciding what may
+    // be forgotten — and is why the production `Failures` section sat
+    // frozen at 35 entries for five months with a green suite.
+    //
+    // Shrinking the summary budget must now change only the length of
+    // what compaction writes, never which entries it may consume.
     let cfg = MemoryConfig {
         compact_max_chars: 30,
         ..cfg_with_compact(5, 5, 14, 2)
     };
     let today = Utc::now().date_naive();
-    // Mix of short (eligible) and very long entries (skipped).
     let entries = vec![
         entry_aged("short", 30, 0),
         entry_aged("short", 29, 0),
         entry_aged("short", 28, 0),
         entry_aged("short", 27, 0),
-        entry_aged(&"x".repeat(200), 26, 0), // too long
-        entry_aged(&"x".repeat(200), 25, 0), // too long
+        entry_aged(&"x".repeat(200), 26, 0),
+        entry_aged(&"x".repeat(200), 25, 0),
     ];
     let picks = pick_compaction_victims(&entries, &cfg, today);
-    assert!(picks.is_empty(), "only 4 short eligible — under window");
+    assert_eq!(
+        picks.len(),
+        5,
+        "a tiny summary budget must not exempt long entries from forgetting"
+    );
 }
 
 fn entry_with_recall(

@@ -14,7 +14,8 @@ Respond ONLY with JSON (no markdown fences, no explanation):
 {\"is_memory\": false}
 or
 {\"is_memory\": true, \"type\": \"preference|correction|project_knowledge|failure\", \
-\"content\": \"concise extracted rule\", \"scope\": \"project|global|user\"}
+\"content\": \"concise extracted rule\", \"scope\": \"project|global|user\", \
+\"explicit\": true|false}
 
 Guidelines:
 - preference: user states how they like things done (style, tools, language, etc.)
@@ -32,6 +33,12 @@ this is an attribution label the bot prepends, NOT part of the user's words. \
 Strip it before extracting the rule. The user's preference still belongs to the \
 named author (prefer scope=user when an author id is available).
 
+Set \"explicit\": true ONLY when the user directly instructs you to remember \
+something: \"запомни ...\", \"remember that ...\", \"не забудь ...\", \"keep in mind from now on\". \
+It is false for anything you merely inferred from how the user spoke. The \
+difference matters: an instruction to remember is acted on the same day, while \
+an inference must be seen again on another day before it is trusted. If the \
+user did not ask you to remember, say false.\n\n\
 Do NOT classify as memory:
 - Ordinary task instructions (\"fix this bug\", \"add a feature\")
 - Questions (\"what does this do?\")
@@ -44,10 +51,29 @@ Never use scope=user; pick project or global instead.";
 const CLASSIFIER_SYSTEM_PROMPT_WITH_USER: &str = "\n\nContext: the current author id is available. \
 You may use scope=user for facts that are specific to this author.";
 
+/// Source string recorded for a classified draft. `user_explicit` is the
+/// signal the promotion gate acts on the same day (B165), so the mapping
+/// is a named function rather than an inline literal at the call site:
+/// an inline `"auto_classify"` was provably deletable without failing a
+/// single test.
+pub fn draft_source(result: &ClassificationResult) -> &'static str {
+    if result.explicit {
+        "user_explicit"
+    } else {
+        "auto_classify"
+    }
+}
+
 pub struct ClassificationResult {
     pub memory_type: MemoryType,
     pub content: String,
     pub scope: MemoryScope,
+    /// The user told the agent to remember this, rather than the
+    /// classifier inferring it. Drives `source:user_explicit`, which the
+    /// promotion gate acts on the same day (B165). Absent or malformed
+    /// in the model's JSON means `false`: a missing flag must never
+    /// silently grant the fast path.
+    pub explicit: bool,
 }
 
 /// Classify a user message to determine if it contains memory-worthy content.
@@ -138,6 +164,11 @@ fn parse_classification(raw: &str, sender_id: Option<&str>) -> Option<Classifica
         .unwrap_or("project")
         .to_ascii_lowercase();
 
+    let explicit = val
+        .get("explicit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let memory_type: MemoryType = type_str.parse().ok()?;
     let scope: MemoryScope = match scope_str.as_str() {
         "global" => MemoryScope::Global,
@@ -159,6 +190,7 @@ fn parse_classification(raw: &str, sender_id: Option<&str>) -> Option<Classifica
         memory_type,
         content,
         scope,
+        explicit,
     })
 }
 
@@ -187,6 +219,65 @@ mod tests {
         let result = parse_classification(json, None).unwrap();
         assert_eq!(result.memory_type, MemoryType::Correction);
         assert_eq!(result.content, "No unwrap");
+    }
+
+    // ── B165: "remember X" must be distinguishable from an inference ──
+
+    fn mk(explicit: bool) -> ClassificationResult {
+        ClassificationResult {
+            memory_type: MemoryType::Preference,
+            content: "x".into(),
+            scope: MemoryScope::Project,
+            explicit,
+        }
+    }
+
+    #[test]
+    fn draft_source_distinguishes_instruction_from_inference() {
+        assert_eq!(draft_source(&mk(true)), "user_explicit");
+        assert_eq!(draft_source(&mk(false)), "auto_classify");
+    }
+
+    #[test]
+    fn parse_marks_explicit_instruction() {
+        let json = r#"{"is_memory": true, "type": "preference", "content": "marker 42",
+                       "scope": "user", "explicit": true}"#;
+        let result = parse_classification(json, Some("u1")).unwrap();
+        assert!(
+            result.explicit,
+            "an explicit instruction to remember must be carried through"
+        );
+    }
+
+    #[test]
+    fn parse_defaults_explicit_to_false_when_absent() {
+        // Every pre-B165 prompt response omits the field. Defaulting to
+        // true would hand the same-day promotion path to every guess the
+        // classifier makes.
+        let json =
+            r#"{"is_memory": true, "type": "preference", "content": "x", "scope": "project"}"#;
+        assert!(!parse_classification(json, None).unwrap().explicit);
+    }
+
+    #[test]
+    fn parse_defaults_explicit_to_false_when_malformed() {
+        for bad in [r#""yes""#, "1", "null", "{}"] {
+            let json = format!(
+                r#"{{"is_memory": true, "type": "preference", "content": "x",
+                     "scope": "project", "explicit": {bad}}}"#
+            );
+            assert!(
+                !parse_classification(&json, None).unwrap().explicit,
+                "a non-boolean explicit must not grant the fast path: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_explicit_false_stays_false() {
+        let json = r#"{"is_memory": true, "type": "preference", "content": "x",
+                       "scope": "project", "explicit": false}"#;
+        assert!(!parse_classification(json, None).unwrap().explicit);
     }
 
     #[test]

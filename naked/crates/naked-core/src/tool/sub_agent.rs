@@ -70,6 +70,17 @@ impl SubAgentTool {
     }
 
     fn build_tools(&self, mode: &str) -> ToolRegistry {
+        // POLICY (issue #194): the ReadOnly posture is *no command
+        // execution at all*, by design. "Read-only" here means the
+        // sub-agent cannot mutate the workspace by ANY path — and a
+        // shell is always such a path (it can write files, run
+        // editors, change git state regardless of which file-op
+        // tools are present). An explorer that genuinely needs to run
+        // a build to understand a failure must be given a
+        // write-capable role (general/implementer) EXPLICITLY — the
+        // caller then owns that authority decision instead of it
+        // leaking in through a tool. Do not add BashTool to the
+        // read-only set without renaming the permission.
         let tools: Vec<Box<dyn Tool>> = match crate::agent_role::canonicalize_role(mode) {
             Some(crate::agent_role::CanonicalRole::General)
             | Some(crate::agent_role::CanonicalRole::Implementer)

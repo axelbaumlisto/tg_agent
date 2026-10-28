@@ -152,15 +152,38 @@ async fn edit_file_rejects_non_unique_match() {
 
 #[tokio::test]
 async fn read_outside_workspace_allowed() {
-    let dir = tempfile::tempdir().unwrap();
+    // The workspace and the target live in two different temp roots, so the
+    // read is unambiguously out-of-workspace and does not depend on any host
+    // file existing.
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("outside.txt");
+    let expected = "content-from-outside-the-workspace";
+    std::fs::write(&target, expected).unwrap();
+
     let tool = ReadFileTool::default();
     let result = tool
         .execute(
-            serde_json::json!({"file_path": "/etc/hostname"}),
-            dir.path(),
+            serde_json::json!({"file_path": target.to_str().unwrap()}),
+            workspace.path(),
         )
         .await;
-    assert!(!result.is_error || result.output.contains("Failed to read"));
+
+    // Assert the observable outcome, not the absence of one. A tool that
+    // silently returned success with no content, or rejected the path for
+    // being outside the workspace, both fail here — which is the point: the
+    // previous form (`!is_error || contains("Failed to read")`) was true under
+    // every outcome, so no change to the product could turn it red.
+    assert!(
+        !result.is_error,
+        "out-of-workspace read must succeed, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains(expected),
+        "out-of-workspace read returned no content: {}",
+        result.output
+    );
 }
 
 #[tokio::test]
@@ -351,15 +374,26 @@ async fn atomic_replace_failure_leaves_original() {
     let dir = tempfile::tempdir().unwrap();
     let protected = dir.path().join("protected");
     std::fs::create_dir(&protected).unwrap();
-    let path = protected.join("original.txt");
-    std::fs::write(&path, b"original bytes").unwrap();
 
-    let original_mode = make_read_only_dir(&protected);
+    // Induce failure by making `path` itself a non-empty directory: the OS
+    // refuses to atomically rename a regular file onto a non-empty directory
+    // regardless of the caller's uid (root cannot bypass ENOTEMPTY/EISDIR).
+    // This replaces the earlier chmod-based approach, which failed when tests
+    // ran as root (root bypasses directory write-permission checks).
+    let path = protected.join("target");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("sentinel.txt"), b"original bytes").unwrap();
+
     let result = crate::tool::atomic_write::atomic_replace_file(&path, b"replacement bytes").await;
-    restore_dir_mode(&protected, original_mode);
 
     assert!(result.is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+    // The directory and its contents must be untouched.
+    assert!(path.is_dir(), "target directory was clobbered");
+    assert_eq!(
+        std::fs::read(path.join("sentinel.txt")).unwrap(),
+        b"original bytes",
+        "sentinel file inside target directory was modified"
+    );
 }
 
 #[tokio::test]
@@ -846,26 +880,149 @@ fn assert_no_atomic_temps(dir: &Path, file_name: &str) {
     assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
 }
 
+// ── FileSnapshotTool spec + negative tests ───────────────────────────────
+
+#[test]
+fn file_snapshot_spec() {
+    let tool = FileSnapshotTool::default();
+    assert_eq!(tool.spec().name, "file_snapshot");
+    assert_eq!(tool.spec().permission, Permission::ReadOnly);
+}
+
+#[tokio::test]
+async fn snapshot_nonexistent_file_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = FileSnapshotTool::default();
+    let result = tool
+        .execute(
+            serde_json::json!({"file_path": "no_such_file.txt"}),
+            dir.path(),
+        )
+        .await;
+    assert!(result.is_error, "expected error for nonexistent file");
+    assert!(
+        result.output.contains("Failed to read"),
+        "unexpected error: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn snapshot_binary_file_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bin.dat"), b"\x00\x01\x02\x03\x04\x05").unwrap();
+    let tool = FileSnapshotTool::default();
+    let result = tool
+        .execute(serde_json::json!({"file_path": "bin.dat"}), dir.path())
+        .await;
+    assert!(result.is_error, "expected error for binary file");
+    assert!(
+        result.output.contains("Binary file"),
+        "unexpected message: {}",
+        result.output
+    );
+}
+
+// ── Path-safety tests ────────────────────────────────────────────────────
+
+/// Absolute path passed to write is detected as out-of-workspace (existing test already covers
+/// this; these tests additionally pin the dotdot / empty / directory cases).
+
+#[tokio::test]
+async fn write_dotdot_escape_escalates_permission() {
+    // B118: `../../outside` must be treated as Dangerous even when the target does not yet exist.
+    let dir = tempfile::tempdir().unwrap();
+    let tool = WriteFileTool::default();
+    let perm = tool.effective_permission(
+        &serde_json::json!({
+            "file_path": "../../outside.txt",
+            "contents": "x"
+        }),
+        dir.path(),
+    );
+    assert_eq!(
+        perm,
+        Permission::Dangerous,
+        "relative dotdot escape must escalate to Dangerous"
+    );
+}
+
+#[tokio::test]
+async fn edit_dotdot_escape_escalates_permission() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = EditFileTool::default();
+    let perm = tool.effective_permission(
+        &serde_json::json!({
+            "file_path": "../../outside.txt",
+            "old_string": "a",
+            "new_string": "b"
+        }),
+        dir.path(),
+    );
+    assert_eq!(
+        perm,
+        Permission::Dangerous,
+        "relative dotdot escape must escalate to Dangerous"
+    );
+}
+
+#[tokio::test]
+async fn read_empty_path_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = ReadFileTool::default();
+    let result = tool
+        .execute(serde_json::json!({"file_path": ""}), dir.path())
+        .await;
+    // An empty path resolves to cwd itself (a directory) — reading a directory
+    // must produce an error.
+    assert!(
+        result.is_error,
+        "empty path must produce an error, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn read_directory_instead_of_file_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("subdir");
+    std::fs::create_dir(&sub).unwrap();
+    let tool = ReadFileTool::default();
+    let result = tool
+        .execute(serde_json::json!({"file_path": "subdir"}), dir.path())
+        .await;
+    assert!(
+        result.is_error,
+        "directory passed as file must error, got: {}",
+        result.output
+    );
+}
+
 #[cfg(unix)]
-fn make_read_only_dir(path: &Path) -> Option<std::fs::Permissions> {
-    use std::os::unix::fs::PermissionsExt;
+#[tokio::test]
+async fn write_symlink_outside_workspace_escalates_permission() {
+    use std::os::unix::fs::symlink;
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_target = outside.path().join("real_file.txt");
+    std::fs::write(&outside_target, b"existing").unwrap();
+    // Create a symlink inside the workspace that points outside.
+    let link_path = workspace.path().join("link.txt");
+    symlink(&outside_target, &link_path).unwrap();
 
-    let original = std::fs::metadata(path).unwrap().permissions();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
-    Some(original)
+    let tool = WriteFileTool::default();
+    // When the symlink EXISTS, canonicalize resolves to the real path outside
+    // the workspace → must be Dangerous.
+    let perm = tool.effective_permission(
+        &serde_json::json!({
+            "file_path": "link.txt",
+            "contents": "evil"
+        }),
+        workspace.path(),
+    );
+    assert_eq!(
+        perm,
+        Permission::Dangerous,
+        "symlink pointing outside workspace must escalate to Dangerous"
+    );
 }
-
-#[cfg(not(unix))]
-fn make_read_only_dir(_path: &Path) -> Option<std::fs::Permissions> {
-    None
-}
-
-#[cfg(unix)]
-fn restore_dir_mode(path: &Path, original: Option<std::fs::Permissions>) {
-    if let Some(original) = original {
-        std::fs::set_permissions(path, original).unwrap();
-    }
-}
-
-#[cfg(not(unix))]
-fn restore_dir_mode(_path: &Path, _original: Option<std::fs::Permissions>) {}

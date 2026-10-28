@@ -34,6 +34,44 @@ pub(crate) async fn cmd_help(
     Ok(())
 }
 
+/// `/start` — first-contact screen for a brand-new chat.
+///
+/// Separate from `/help` on purpose: `/help` is a reference sheet for
+/// someone who already knows the bot, while `/start` has to answer
+/// "what is this and what do I do now" in the first screenful. A new
+/// user who is shown fourteen commands learns nothing about the one
+/// thing that matters: you can just type.
+#[allow(unused_variables)]
+pub(crate) async fn cmd_start(
+    bot: &Bot,
+    agent: &std::sync::Arc<AgentCore>,
+    channel_map: &std::sync::Arc<ChannelSessionMap>,
+    config: &Config,
+    ctx: &ChatCtx,
+) -> Result<(), teloxide::RequestError> {
+    let welcome = "\
+<b>naked agent</b>
+
+\
+Just send a message — no command needed. Ask a question, paste code,
+attach an image or a voice note; the reply streams back as it is written.
+
+\
+<b>Three things worth knowing</b>
+
+\
+• <code>/new</code> — start over when the topic changes. Context is kept
+  per chat, so a fresh session gives cleaner answers.
+• <code>/stop</code> — interrupt a long answer at any moment.
+• <code>/model</code> — switch the model; <code>/status</code> shows which
+  one is active, plus usage and cost.
+
+\
+<code>/help</code> lists every command.";
+    reply_html(bot, ctx, welcome).await?;
+    Ok(())
+}
+
 #[allow(unused_variables)]
 pub(crate) async fn cmd_health(
     bot: &Bot,
@@ -224,6 +262,63 @@ mod tests {
         assert!(
             prod.contains("/yolo off"),
             "/help must document /yolo off (only way to revoke permanent YOLO)"
+        );
+    }
+
+    /// `/start` and `/help` answer different questions. If they ever
+    /// collapse back into one handler the new-user path silently
+    /// regresses to a command dump, which is invisible in tests that
+    /// only check that *something* is sent.
+    #[test]
+    fn start_is_not_the_help_sheet() {
+        let src = include_str!("info.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("pub(crate) async fn cmd_start("),
+            "/start must have its own handler, separate from /help"
+        );
+    }
+
+    /// The first screen must teach the core interaction, not the command
+    /// list. Everything here is a promise to a first-time user.
+    #[test]
+    fn start_welcome_teaches_plain_messaging() {
+        let src = include_str!("info.rs");
+        let start = src
+            .split("pub(crate) async fn cmd_start(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn cmd_health").next())
+            .unwrap_or("");
+        assert!(
+            start.contains("Just send a message"),
+            "/start must tell a new user that plain messages work"
+        );
+        for command in ["/new", "/stop", "/model"] {
+            assert!(
+                start.contains(command),
+                "/start must surface {command}, the commands a new user needs first"
+            );
+        }
+        assert!(
+            start.contains("/help"),
+            "/start must point at /help for the full list"
+        );
+    }
+
+    /// A welcome screen that scrolls is not a welcome screen. The help
+    /// sheet is allowed to be long; this one is not.
+    #[test]
+    fn start_welcome_stays_short() {
+        let src = include_str!("info.rs");
+        let start = src
+            .split("let welcome = ")
+            .nth(1)
+            .and_then(|tail| tail.split("reply_html").next())
+            .unwrap_or("");
+        let lines = start.lines().count();
+        assert!(
+            lines <= 30,
+            "/start welcome grew to {lines} source lines; keep it to one screen"
         );
     }
 

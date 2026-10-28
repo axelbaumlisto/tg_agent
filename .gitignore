@@ -21,3 +21,10 @@ STATUS.txt
 
 # pi-subagents run artifacts (transcripts/logs, tens of MB)
 .pi-subagents/
+
+# Operator runbook: enumerates where every credential pool lives
+# (~/.naked/secrets/..., naked/.secrets/...) and which host serves what.
+# It holds no secret values, but naked/ is exported to public GitHub and a
+# map to the keys is not something to publish. Keep it local; if it should
+# be versioned, it belongs in state/ (Forgejo only), not here.
+/naked/skills/RUNBOOK-local.md

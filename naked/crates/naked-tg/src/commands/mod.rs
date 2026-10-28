@@ -31,7 +31,8 @@ pub(crate) async fn handle_command(
     let cmd = cmd_word.split('@').next().unwrap_or(cmd_word);
     tracing::debug!(chat_id, cmd, cmd_word, "handle_command");
     match cmd {
-        "/start" | "/help" => info::cmd_help(bot, agent, channel_map, config, &ctx).await?,
+        "/start" => info::cmd_start(bot, agent, channel_map, config, &ctx).await?,
+        "/help" => info::cmd_help(bot, agent, channel_map, config, &ctx).await?,
         "/attribution" => {
             ops::cmd_attribution(
                 bot,

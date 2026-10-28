@@ -590,10 +590,16 @@ pub fn spawn_memory_classify(
         };
 
         if to_drafts {
+            // B165: an instruction to remember and a guess about the
+            // user's habits are not the same evidence, and must not be
+            // recorded as if they were. `user_explicit` clears the
+            // repeat-days gate on the first digest; `auto_classify`
+            // still has to be seen on a second day.
+            let source = crate::memory::classifier::draft_source(&result);
             let entry = crate::memory::types::MemoryEntry::new(
                 result.memory_type,
                 result.content.clone(),
-                "auto_classify",
+                source,
                 result.scope.clone(),
             );
             match crate::memory::store::MarkdownMemoryStore::append_daily(&workspace, &entry, true)

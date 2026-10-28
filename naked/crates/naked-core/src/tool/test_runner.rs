@@ -35,8 +35,19 @@ impl crate::tool::Tool for RunTestsTool {
 
         let (cmd, args) = detect_test_command(cwd, filter);
 
+        // A fixed wall-clock budget cannot tell a slow host from a hung test:
+        // it expires identically in both cases, so on a loaded machine the
+        // runner reports a timeout that says nothing about the code under
+        // test. The budget stays 120s by default and is overridable, so a
+        // busy CI host can raise it without patching the binary.
+        let timeout_secs = std::env::var("RING_TEST_RUNNER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(120);
+
         let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(timeout_secs),
             tokio::process::Command::new(&cmd)
                 .args(&args)
                 .current_dir(cwd)
@@ -51,7 +62,7 @@ impl crate::tool::Tool for RunTestsTool {
                 return ToolResult::err(format!("Failed to run {cmd}: {e}"));
             }
             Err(_) => {
-                return ToolResult::err(format!("{cmd} timed out after 120s"));
+                return ToolResult::err(format!("{cmd} timed out after {timeout_secs}s"));
             }
         };
 
