@@ -37,6 +37,11 @@ impl MemoryContext {
     }
 }
 
+/// How many days of drafts `verify` looks back over. Matches the digest's
+/// own `recent_shift_days` default: a draft older than this has already
+/// aged out and is genuinely gone.
+const RECENT_DRAFT_DAYS: i64 = 7;
+
 pub struct MemoryTool {
     workspace: PathBuf,
     context: MemoryContext,
@@ -69,14 +74,24 @@ impl Tool for MemoryTool {
                 `stats` returns counts (durable rules, drafts today, promotions/rejections \
                 over the last 7 days). Use `store` for explicit user rules / repeated \
                 corrections; use `dreams`/`stats` only when the user asks about the \
-                digest's behaviour."
+                digest's behaviour. \
+                IMPORTANT: every user message is ALSO classified in the background and \
+                memory-worthy content is written to today's drafts automatically, \
+                without `store` and without asking permission. A direct instruction \
+                (\"remember X\") is recorded as source:user_explicit and is promoted to \
+                MEMORY.md at the next daily digest; an inferred preference needs to be \
+                seen on a second day. So `store` failing or needing approval does NOT \
+                mean the request was lost. Before telling the user anything about \
+                whether something was remembered, call `verify` - it checks MEMORY.md \
+                and today's drafts together and reports which layer holds it. Never \
+                claim a memory was or was not saved without checking."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["store", "search", "list", "delete", "dreams", "daily_drafts", "stats"],
+                        "enum": ["store", "search", "list", "delete", "verify", "dreams", "daily_drafts", "stats"],
                         "description": "Action to perform"
                     },
                     "content": {
@@ -347,6 +362,105 @@ impl MemoryTool {
                 ToolResult::ok(lines.join("\n"))
             }
 
+            // B166: the only honest answer to "did you remember that?" needs
+            // both layers. `search` alone reads MEMORY.md and returns "no",
+            // which is how the bot came to report a loss for content that had
+            // in fact been captured to drafts seconds earlier.
+            "verify" => {
+                if content.is_empty() {
+                    return ToolResult::err(
+                        "Error: content (what to look for) is required for verify",
+                    );
+                }
+                // The durable half searches EVERY scope the author can see.
+                // The draft half must cover the same ground or `verify`
+                // reproduces the bug it exists to kill: the first version
+                // looked only at the resolved scope, which defaults to
+                // `project`, and reported NOT FOUND for a draft sitting in
+                // `user:<id>` — measured against the live bot on 2026-10-28.
+                let explicit_scope = input.get("scope").is_some();
+                let scopes: Vec<MemoryScope> = if explicit_scope {
+                    match resolved_scope {
+                        Ok(s) => vec![s],
+                        Err(e) => {
+                            return ToolResult::err(format!("Error: {e}"));
+                        }
+                    }
+                } else {
+                    let mut all = vec![MemoryScope::Project, MemoryScope::Global];
+                    if let Some(id) = trusted_user.clone().filter(|i| !i.is_empty()) {
+                        all.push(MemoryScope::User(id));
+                    }
+                    all
+                };
+                let scope_label = scopes
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sender = scopes.iter().find_map(|s| match s {
+                    MemoryScope::User(uid) => Some(uid.clone()),
+                    _ => None,
+                });
+                let durable =
+                    MemoryService::search_for(&self.workspace, content, sender.as_deref());
+
+                let today = chrono::Utc::now().date_naive();
+                let needle = content.to_lowercase();
+                let mut drafts: Vec<crate::memory::types::MemoryEntry> = Vec::new();
+                for scope in &scopes {
+                    for back in 0..RECENT_DRAFT_DAYS {
+                        let day = today - chrono::Duration::days(back);
+                        drafts.extend(
+                            MarkdownMemoryStore::read_daily(&self.workspace, scope, day)
+                                .into_iter()
+                                .filter(|e| e.content.to_lowercase().contains(&needle)),
+                        );
+                    }
+                }
+
+                let mut out = String::new();
+                if !durable.is_empty() {
+                    out.push_str(&format!(
+                        "DURABLE ({} in MEMORY.md — already active in every prompt):\n",
+                        durable.len()
+                    ));
+                    for e in &durable {
+                        out.push_str(&format!(
+                            "  [{}/{}] {}\n",
+                            e.scope, e.memory_type, e.content
+                        ));
+                    }
+                }
+                if !drafts.is_empty() {
+                    out.push_str(&format!(
+                        "DRAFT ({} captured, not yet durable):\n",
+                        drafts.len()
+                    ));
+                    for e in &drafts {
+                        let fate = if e.source == "user_explicit" {
+                            "explicit instruction — promotes at the next daily digest"
+                        } else {
+                            "inferred — needs to be seen on a second day before promotion"
+                        };
+                        out.push_str(&format!(
+                            "  [{}/{}] (src:{}) {} — {}\n",
+                            e.scope, e.memory_type, e.source, e.content, fate
+                        ));
+                    }
+                }
+                if out.is_empty() {
+                    ToolResult::ok(format!(
+                        "NOT FOUND in MEMORY.md or in the last {RECENT_DRAFT_DAYS} days of drafts \
+                         (scopes searched: {scope_label}). Note the background classifier runs \
+                         asynchronously, so content from the message being answered right now may \
+                         not be on disk yet."
+                    ))
+                } else {
+                    ToolResult::ok(out)
+                }
+            }
+
             "daily_drafts" => {
                 let scope = match resolved_scope {
                     Ok(s) => s,
@@ -417,7 +531,7 @@ impl MemoryTool {
             }
 
             _ => ToolResult::err(format!(
-                "Unknown action: {action}. Use store, search, list, delete, \
+                "Unknown action: {action}. Use store, search, list, delete, verify, \
                  dreams, daily_drafts, or stats."
             )),
         }
@@ -440,6 +554,201 @@ mod tests {
         let context = MemoryContext::new();
         context.set_user_id(Some(user_id.to_string()));
         MemoryTool::with_context(dir.to_path_buf(), context)
+    }
+
+    // -- B166: "did you remember that?" must be answerable truthfully --
+
+    fn draft_entry(content: &str, source: &str) -> crate::memory::types::MemoryEntry {
+        crate::memory::types::MemoryEntry::new(
+            MemoryType::Preference,
+            content.to_string(),
+            source,
+            MemoryScope::Project,
+        )
+    }
+
+    #[tokio::test]
+    async fn verify_finds_a_draft_that_search_alone_calls_missing() {
+        // The exact 2026-10-28 situation: the classifier captured the
+        // instruction to drafts, `search` looked only at MEMORY.md, and the
+        // bot told the user it had failed to remember.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let entry = draft_entry("marker b165-check", "user_explicit");
+        MarkdownMemoryStore::append_daily(dir.path(), &entry, true).unwrap();
+
+        let searched = tool
+            .execute(
+                json!({"action": "search", "content": "b165-check"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(
+            searched.output.contains("No memories found"),
+            "precondition: search must still be MEMORY.md-only: {}",
+            searched.output
+        );
+
+        let verified = tool
+            .execute(
+                json!({"action": "verify", "content": "b165-check"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(!verified.is_error, "{}", verified.output);
+        assert!(
+            verified.output.contains("DRAFT"),
+            "verify must report the draft layer: {}",
+            verified.output
+        );
+        assert!(
+            verified
+                .output
+                .contains("promotes at the next daily digest"),
+            "an explicit instruction must be reported as on its way, not as lost: {}",
+            verified.output
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_spans_scopes_like_the_durable_search_does() {
+        // Measured against the live bot on 2026-10-28: the draft sat in
+        // user:<id>, `verify` defaulted to scope=project, and it answered
+        // NOT FOUND -- the exact "accurate about my narrow view" failure
+        // this action was written to remove.
+        let dir = tempdir().unwrap();
+        let tool = make_tool_with_user(dir.path(), "6196099449");
+        let mut entry = draft_entry("marker in the user scope", "user_explicit");
+        entry.scope = MemoryScope::User("6196099449".into());
+        MarkdownMemoryStore::append_daily(dir.path(), &entry, true).unwrap();
+
+        let out = tool
+            .execute(
+                json!({"action": "verify", "content": "marker in the user scope"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(
+            out.output.contains("DRAFT"),
+            "a user-scope draft must be found without naming the scope: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_not_found_names_the_scopes_it_searched() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool_with_user(dir.path(), "42");
+        let out = tool
+            .execute(
+                json!({"action": "verify", "content": "absent"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.output.contains("NOT FOUND"), "{}", out.output);
+        assert!(
+            out.output.contains("user:42") && out.output.contains("project"),
+            "a negative answer must say where it looked: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_honours_an_explicitly_requested_scope() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool_with_user(dir.path(), "42");
+        let mut entry = draft_entry("only in user scope", "user_explicit");
+        entry.scope = MemoryScope::User("42".into());
+        MarkdownMemoryStore::append_daily(dir.path(), &entry, true).unwrap();
+
+        let out = tool
+            .execute(
+                json!({"action": "verify", "content": "only in user scope", "scope": "project"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(
+            out.output.contains("NOT FOUND"),
+            "an explicit scope must stay narrow: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_separates_an_inferred_draft_from_an_instruction() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        MarkdownMemoryStore::append_daily(
+            dir.path(),
+            &draft_entry("guessed habit xyzzy", "auto_classify"),
+            true,
+        )
+        .unwrap();
+
+        let out = tool
+            .execute(
+                json!({"action": "verify", "content": "xyzzy"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(
+            out.output.contains("needs to be seen on a second day"),
+            "a guess must not be reported as durable-bound: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_reports_durable_entries_as_active() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        tool.execute(
+            json!({"action": "store", "content": "always use tabs", "memory_type": "preference"}),
+            Path::new("."),
+        )
+        .await;
+
+        let out = tool
+            .execute(
+                json!({"action": "verify", "content": "always use tabs"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.output.contains("DURABLE"), "{}", out.output);
+    }
+
+    #[tokio::test]
+    async fn verify_says_not_found_and_warns_about_the_async_gap() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let out = tool
+            .execute(
+                json!({"action": "verify", "content": "never mentioned"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.output.contains("NOT FOUND"), "{}", out.output);
+        assert!(
+            out.output.contains("asynchronously"),
+            "a bare 'no' invites the same false report: {}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_is_read_only_so_it_is_never_gated_behind_approval() {
+        // The whole point is that the bot can check without an approval
+        // round-trip; `store` is what carries WorkspaceWrite.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        assert_eq!(
+            tool.effective_permission(&json!({"action": "verify", "content": "x"}), Path::new(".")),
+            Permission::ReadOnly
+        );
+        assert_eq!(
+            tool.effective_permission(&json!({"action": "store", "content": "x"}), Path::new(".")),
+            Permission::WorkspaceWrite
+        );
     }
 
     #[tokio::test]

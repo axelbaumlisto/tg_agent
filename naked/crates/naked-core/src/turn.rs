@@ -582,10 +582,20 @@ pub fn spawn_memory_classify(
     to_drafts: bool,
 ) {
     tokio::spawn(async move {
+        // B166: this task is detached, so whatever happens here is the only
+        // record that it happened at all. A silent `return` was indistinguishable
+        // from "nothing worth remembering" and from "the classifier call failed",
+        // which is how "Ð·Ð°Ð¿Ð¾Ð¼Ð½Ð¸ X" could vanish with nobody able to say whether it
+        // had been stored. The tool's `verify` action reads the drafts this
+        // writes; the log is what explains an empty one.
         let Some(result) =
             crate::memory::classifier::classify(&*provider, &model, &message, sender_id.as_deref())
                 .await
         else {
+            tracing::debug!(
+                chars = message.chars().count(),
+                "memory classify: nothing memory-worthy, or the classifier call failed"
+            );
             return;
         };
 
